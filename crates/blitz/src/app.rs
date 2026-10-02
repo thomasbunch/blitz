@@ -1323,7 +1323,10 @@ impl App {
                 lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
             }
             v.rect = Some(rect);
-            lock(&v.pane.term).snapshot(&mut v.snap, &self.pal);
+            let sel = self.selection.filter(|_| Some(id) == focus);
+            if !refresh(&mut lock(&v.pane.term), &mut v.snap, &self.pal, sel) {
+                self.selection = None;
+            }
             if Some(id) == focus {
                 v.snap.selection = self.selection;
             } else if split {
@@ -1497,6 +1500,20 @@ fn tab_name(cwd: Option<&Path>) -> String {
     });
     name.filter(|n| !n.is_empty())
         .unwrap_or_else(|| "shell".into())
+}
+
+/// Takes a fresh snapshot of `term` into `snap`. Returns false when that
+/// changed the text under `sel`: output that scrolls or rewrites selected
+/// text ends the selection, so a copy never takes text the user did not
+/// pick.
+fn refresh(
+    term: &mut vt::Terminal,
+    snap: &mut Snapshot,
+    pal: &Palette,
+    sel: Option<((u16, u16), (u16, u16))>,
+) -> bool {
+    let before = sel.map(|s| selection_text(snap, s));
+    !term.snapshot(snap, pal) || sel.map(|s| selection_text(snap, s)) == before
 }
 
 /// The text of the cells between two (column, row) points, inclusive, in
@@ -2008,6 +2025,27 @@ mod tests {
         );
         let s = fed(4, 1, "\x1b[8m\u{4e2d}\x1b[0mx");
         assert_eq!(selection_text(&s, ((0, 0), (3, 0))), "  x");
+    }
+
+    #[test]
+    fn app_output_that_moves_selected_text_ends_the_selection() {
+        let pal = crate::theme::dark();
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 10,
+            rows: 3,
+            ..vt::Options::default()
+        });
+        t.feed(b"a\r\nb\r\nc");
+        let mut s = Snapshot::default();
+        let sel = Some(((0, 1), (9, 1)));
+        assert!(refresh(&mut t, &mut s, &pal, None));
+        assert!(refresh(&mut t, &mut s, &pal, sel), "nothing new");
+        t.feed(b"\x1b[1;5Hx");
+        assert!(refresh(&mut t, &mut s, &pal, sel), "another row changed");
+        t.feed(b"\x1b[3;1H\r\nd");
+        assert!(!refresh(&mut t, &mut s, &pal, sel), "scrolled");
+        t.feed(b"\x1b[2;1Hz");
+        assert!(!refresh(&mut t, &mut s, &pal, sel), "rewritten");
     }
 
     #[test]
