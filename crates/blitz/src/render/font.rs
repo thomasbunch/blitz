@@ -138,8 +138,8 @@ impl Font {
 
     /// Rasterizes one grapheme cluster spanning `width` cells. Returns
     /// `None` when it has no ink. Characters missing from the font come
-    /// from the system fallback font, shrunk to fit their cells and
-    /// centred on them.
+    /// from the system fallback font, with their ink shrunk to fit their
+    /// cells if needed and centred on them.
     pub fn raster(&mut self, text: &str, style: u8, width: u8) -> Result<Option<Raster>> {
         // No shaping. A cluster is drawn as its base character
         // plus the marks the same font has; emoji ZWJ sequences show their
@@ -180,13 +180,24 @@ impl Font {
             face.GetMetrics(&mut fm);
         }
         let upem = f32::from(fm.designUnitsPerEm.max(1));
-        let advance = gm[0].advanceWidth as f32 * self.px / upem;
+        let to_px = self.px / upem;
+        let g = &gm[0];
+        // Fallback fonts (Segoe UI Symbol and friends) have wide
+        // advances around small ink, so fitting by advance shrinks symbols
+        // like U+273B to a dot. Fit and centre the ink box instead; the
+        // baseline stays put.
+        let ink_w = (g.advanceWidth as i32 - g.leftSideBearing - g.rightSideBearing) as f32 * to_px;
+        let ink_h =
+            (g.advanceHeight as i32 - g.topSideBearing - g.bottomSideBearing) as f32 * to_px;
         let cells = (self.cell_w * u32::from(width.max(1))) as f32;
-        let (em, x) = if primary && width <= 1 || advance <= 0.0 {
+        let (em, x) = if primary && width <= 1 || ink_w <= 0.0 {
             (self.px, 0.0)
         } else {
-            let k = (cells / advance).min(1.0);
-            (self.px * k, ((cells - advance * k) / 2.0).round())
+            let k = (cells / ink_w)
+                .min(self.cell_h as f32 / ink_h.max(1.0))
+                .min(1.0);
+            let left = g.leftSideBearing as f32 * to_px * k;
+            (self.px * k, ((cells - ink_w * k) / 2.0 - left).round())
         };
         let advances: Vec<f32> = gm
             .iter()
@@ -436,11 +447,20 @@ mod tests {
     #[test]
     fn fallback_glyphs_fit_their_cells() {
         let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
-        for (s, width) in [("\u{23F5}", 1), ("\u{2605}", 1), ("\u{25C9}", 1), ("中", 2)] {
+        let glyphs = [
+            ("\u{23F5}", 1),
+            ("\u{2605}", 1),
+            ("\u{25C9}", 1),
+            ("\u{273B}", 1),
+            ("\u{2714}", 1),
+            ("中", 2),
+        ];
+        for (s, width) in glyphs {
             let r = font.raster(s, 0, width).expect("raster").expect(s);
             assert!(ink(&r) > 0, "{s}");
             let cells = (font.cell_w * u32::from(width)) as i32;
             assert!(r.dx >= -1 && r.dx + r.w as i32 <= cells + 1, "{s} spills");
+            assert!(2 * r.w as i32 >= cells, "{s} is shrunk to {} px", r.w);
         }
     }
 }
