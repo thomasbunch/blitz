@@ -1089,6 +1089,8 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(_) => self.request_redraw(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;
+                // The cursor's cell stays, but its pixels move.
+                self.ime_cell = None;
                 let px = self.font_px();
                 if let Some(g) = &mut self.gfx
                     && let Err(e) = g.r.set_font_px(px)
