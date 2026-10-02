@@ -7,6 +7,13 @@
 //!
 //! - `send TEXT`: write TEXT to the child.
 //! - `type TEXT`: the same, one character every 40 ms.
+//! - `key CHORD`: press and release a chord such as `enter`,
+//!   `shift+enter` or `ctrl+c`, encoded for the input modes the program
+//!   has set.
+//! - `paste TEXT` or `paste @FILE`: paste, bracketed if the program asked
+//!   for it.
+//! - `mouse wheelup|wheeldown|click COL ROW`: a mouse event at a 0-based
+//!   cell, sent only if the program asked for mouse reports.
 //! - `waitfor MS TEXT`: wait until TEXT shows up in the output after the
 //!   previous match. Case, whitespace and escape sequences are ignored.
 //! - `waitany MS A|B|...`: the same for any of several texts.
@@ -33,7 +40,8 @@ use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
-use vt::Terminal;
+use vt::{Key, KeyInput, Locks, Mods, MouseEv, MouseKind, Terminal};
+use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
 
 use crate::pty::{Pty, PtyEvent, SpawnOpts, Writer};
 
@@ -440,6 +448,59 @@ impl Runner {
                     std::thread::sleep(Duration::from_millis(40));
                 }
             }
+            "key" => {
+                let mut text = String::new();
+                let keys = chord(rest, &mut text)?;
+                let modes = self.s.lock().term.input_modes();
+                let mut out = Vec::new();
+                for k in &keys {
+                    vt::encode_key(k, &modes, &mut out);
+                }
+                self.send(&out);
+                self.s.note(&format!("key {rest}: {}", esc(&out)));
+            }
+            "paste" => {
+                let text = match rest.strip_prefix('@') {
+                    Some(path) => {
+                        std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?
+                    }
+                    None => String::from_utf8_lossy(&unesc(rest)).into_owned(),
+                };
+                let bracketed = self.s.lock().term.input_modes().bracketed;
+                let mut out = Vec::new();
+                vt::encode_paste(&text, bracketed, &mut out);
+                self.send(&out);
+            }
+            "mouse" => {
+                let (kind, cell) = rest
+                    .split_once(' ')
+                    .ok_or("mouse wheelup|wheeldown|click COL ROW")?;
+                let (col, row) = two(cell)?;
+                let kinds: &[MouseKind] = match kind {
+                    "wheelup" => &[MouseKind::WheelUp],
+                    "wheeldown" => &[MouseKind::WheelDown],
+                    "click" => &[MouseKind::Press, MouseKind::Release],
+                    _ => return Err(format!("unknown mouse event {kind:?}")),
+                };
+                let modes = self.s.lock().term.input_modes();
+                let mut out = Vec::new();
+                for &kind in kinds {
+                    let ev = MouseEv {
+                        kind,
+                        button: 0,
+                        col,
+                        row,
+                        mods: Mods::default(),
+                    };
+                    vt::encode_mouse(ev, &modes, &mut out);
+                }
+                self.send(&out);
+                let sent = match out.is_empty() {
+                    true => "nothing, mouse reporting is off".to_owned(),
+                    false => esc(&out),
+                };
+                self.s.note(&format!("mouse {rest}: {sent}"));
+            }
             "waitfor" | "waitany" => {
                 let (ms, text) = rest
                     .split_once(' ')
@@ -581,6 +642,118 @@ impl Runner {
         };
         self.s.note(&summary);
     }
+}
+
+/// The key transitions for a chord such as `shift+enter`, as a keyboard
+/// would produce them: each modifier goes down, the key goes down and up,
+/// then the modifiers go up in reverse order. Names are case-insensitive;
+/// the key is a name (`enter`, `esc`, `up`, `f5`, ...) or one character.
+/// The inputs borrow their text from `text`.
+fn chord<'a>(spec: &str, text: &'a mut String) -> Result<Vec<KeyInput<'a>>, String> {
+    let spec = spec.trim().to_ascii_lowercase();
+    // A trailing "+" is the plus key: "+", "ctrl++".
+    let (modifiers, name) = match spec.strip_suffix('+') {
+        Some(rest) => (rest.strip_suffix('+').unwrap_or(rest), "+"),
+        None => spec.rsplit_once('+').unwrap_or(("", &spec)),
+    };
+    let mut held = Vec::new();
+    for m in modifiers.split('+').filter(|m| !m.is_empty()) {
+        held.push(match m {
+            "shift" => (Key::Shift, 0x10),
+            "ctrl" => (Key::Control, 0x11),
+            "alt" => (Key::Alt, 0x12),
+            "win" | "super" => (Key::Super, 0x5b),
+            _ => return Err(format!("unknown modifier {m:?}")),
+        });
+    }
+    // Virtual-key code, and the character ToUnicodeEx gives with no
+    // modifiers held.
+    let (key, vk, uc) = match name {
+        "enter" => (Key::Enter, 0x0d, 13),
+        "tab" => (Key::Tab, 0x09, 9),
+        "backspace" | "bs" => (Key::Backspace, 0x08, 8),
+        "esc" | "escape" => (Key::Escape, 0x1b, 27),
+        "space" => (Key::Char(' '), 0x20, 32),
+        "pgup" | "pageup" => (Key::PageUp, 0x21, 0),
+        "pgdn" | "pagedown" => (Key::PageDown, 0x22, 0),
+        "end" => (Key::End, 0x23, 0),
+        "home" => (Key::Home, 0x24, 0),
+        "left" => (Key::Left, 0x25, 0),
+        "up" => (Key::Up, 0x26, 0),
+        "right" => (Key::Right, 0x27, 0),
+        "down" => (Key::Down, 0x28, 0),
+        "insert" | "ins" => (Key::Insert, 0x2d, 0),
+        "delete" | "del" => (Key::Delete, 0x2e, 0),
+        f if f.len() > 1 && f.starts_with('f') && f[1..].parse::<u8>().is_ok() => {
+            let n: u8 = num(&f[1..])?;
+            if !(1..=24).contains(&n) {
+                return Err(format!("no key {f:?}"));
+            }
+            (Key::F(n), 0x6f + u16::from(n), 0)
+        }
+        _ => {
+            let mut chars = name.chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                return Err(format!("unknown key {name:?}"));
+            };
+            // Letters and digits have layout-independent codes; other
+            // characters go out as text only.
+            let vk = match c.is_ascii_alphanumeric() {
+                true => c.to_ascii_uppercase() as u16,
+                false => 0,
+            };
+            (Key::Char(c), vk, 0)
+        }
+    };
+    let held_down = |k: Key| held.iter().any(|&(h, _)| h == k);
+    let (shift, ctrl) = (held_down(Key::Shift), held_down(Key::Control));
+    text.clear();
+    if let Key::Char(c) = key {
+        text.push(if shift { c.to_ascii_uppercase() } else { c });
+    }
+    let text: &'a str = text;
+    let uc = match key {
+        Key::Char(c) if ctrl && c.is_ascii_alphabetic() => c as u16 & 0x1f,
+        Key::Char(_) => text.encode_utf16().next().unwrap_or(0),
+        _ => uc,
+    };
+    let input = |key: Key, vk: u16, down: bool, mods: Mods, text: &'a str, uc: u16| KeyInput {
+        vk,
+        // SAFETY: a table lookup with no pointers involved.
+        scan: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) } as u16,
+        extended: matches!(vk, 0x21..=0x28 | 0x2d | 0x2e | 0x5b),
+        down,
+        repeat: 1,
+        mods,
+        locks: Locks::default(),
+        text,
+        uc,
+        cs: 0,
+        key,
+        us_base: match key {
+            Key::Char(c) if c.is_ascii() => Some(c),
+            _ => None,
+        },
+    };
+    let press = |mods: &mut Mods, k: Key, down: bool| match k {
+        Key::Shift => mods.lshift = down,
+        Key::Control => mods.lctrl = down,
+        Key::Alt => mods.lalt = down,
+        _ => mods.lsuper = down,
+    };
+    let mut mods = Mods::default();
+    let mut out = Vec::new();
+    for &(k, vk) in &held {
+        press(&mut mods, k, true);
+        out.push(input(k, vk, true, mods, "", 0));
+    }
+    out.push(input(key, vk, true, mods, text, uc));
+    out.push(input(key, vk, false, mods, text, uc));
+    for &(k, vk) in held.iter().rev() {
+        press(&mut mods, k, false);
+        out.push(input(k, vk, false, mods, "", 0));
+    }
+    Ok(out)
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -967,6 +1140,45 @@ mod tests {
         for bad in ["(a", "a)", "*a", "[ab", "a{2", r"a\"] {
             assert!(Regex::new(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn debug_key_chords() {
+        let mut text = String::new();
+        let keys = chord("Shift+Enter", &mut text).unwrap();
+        let got: Vec<_> = keys
+            .iter()
+            .map(|k| (k.key, k.vk, k.scan, k.down, k.mods.lshift, k.uc))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Key::Shift, 0x10, 0x2a, true, true, 0),
+                (Key::Enter, 0x0d, 0x1c, true, true, 13),
+                (Key::Enter, 0x0d, 0x1c, false, true, 13),
+                (Key::Shift, 0x10, 0x2a, false, false, 0),
+            ]
+        );
+
+        let keys = chord("ctrl+c", &mut text).unwrap();
+        let c = &keys[1];
+        assert_eq!((c.key, c.vk, c.text, c.uc), (Key::Char('c'), 0x43, "c", 3));
+        assert!(c.mods.lctrl && !keys[3].mods.lctrl);
+        assert_eq!(c.us_base, Some('c'));
+
+        let keys = chord("shift+a", &mut text).unwrap();
+        assert_eq!((keys[1].text, keys[1].uc), ("A", u16::from(b'A')));
+
+        let keys = chord("up", &mut text).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].extended && keys[0].text.is_empty());
+
+        let keys = chord("ctrl++", &mut text).unwrap();
+        assert_eq!((keys[1].key, keys[1].mods.lctrl), (Key::Char('+'), true));
+        assert_eq!(chord("f5", &mut text).unwrap()[0].vk, 0x74);
+        assert!(chord("hyper+a", &mut text).is_err());
+        assert!(chord("f25", &mut text).is_err());
+        assert!(chord("nosuchkey", &mut text).is_err());
     }
 
     #[test]
