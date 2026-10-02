@@ -35,11 +35,11 @@ target\release\blitz.exe
 The shell is PowerShell 7 if installed, else Windows PowerShell, else cmd.
 
 For best results, place Microsoft's `conpty.dll` and `OpenConsole.exe`
-(NuGet package `Microsoft.Windows.Console.ConPTY`, folder
+(NuGet package `Microsoft.Windows.Console.ConPTY` 1.25 or later, folder
 `runtimes\win-x64`) next to `blitz.exe`, or set `BLITZ_CONPTY_DIR` to the
-folder that holds them. Without them blitz uses the console host built
-into Windows, which is slower and drops some features such as
-synchronized output.
+folder that holds them. With 1.24, PowerShell's cursor can drift after a
+resize. Without them blitz uses the console host built into Windows,
+which is slower and drops some features such as synchronized output.
 
 ## Claude Code
 
