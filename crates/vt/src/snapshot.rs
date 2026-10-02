@@ -35,7 +35,8 @@ impl Palette {
 }
 
 /// [`RenderCell::attrs`] bits. Inverse and invisible are already applied
-/// to the cell's colours; `INVERSE` is only informational.
+/// to the cell's colours, and a cell whose text would not show has none;
+/// `INVERSE` is only informational.
 pub mod attr {
     pub const BOLD: u16 = 1 << 0;
     pub const ITALIC: u16 = 1 << 1;

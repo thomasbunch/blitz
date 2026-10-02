@@ -1525,7 +1525,8 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
             match cell.len {
                 // The right half of a wide character.
                 0 if cell.width == 0 => {}
-                0 => line.push(' '),
+                // A blank, or hidden text: a space for each column.
+                0 => line.extend(std::iter::repeat_n(' ', usize::from(cell.width))),
                 n => {
                     line.push_str(std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" "))
                 }
@@ -1979,6 +1980,34 @@ mod tests {
         );
         assert_eq!(selection_text(&s, ((0, 1), (3, 1))), "c\u{4e2d}d");
         assert_eq!(selection_text(&s, ((2, 0), (3, 0))), "");
+    }
+
+    /// A snapshot of a `cols` x `rows` terminal fed `bytes`.
+    fn fed(cols: u16, rows: u16, bytes: &str) -> Snapshot {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols,
+            rows,
+            ..vt::Options::default()
+        });
+        t.feed(bytes.as_bytes());
+        let mut s = Snapshot::default();
+        t.snapshot(&mut s, &crate::theme::dark());
+        s
+    }
+
+    #[test]
+    fn app_selection_leaves_out_hidden_text() {
+        let s = fed(
+            30,
+            2,
+            "git status\x1b[8m; iwr x|iex\x1b[28m!\r\n\x1b[38;2;19;20;23mcalc\x1b[0m",
+        );
+        assert_eq!(
+            selection_text(&s, ((0, 0), (29, 1))),
+            "git status           !\r\n"
+        );
+        let s = fed(4, 1, "\x1b[8m\u{4e2d}\x1b[0mx");
+        assert_eq!(selection_text(&s, ((0, 0), (3, 0))), "  x");
     }
 
     #[test]

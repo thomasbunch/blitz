@@ -1424,7 +1424,9 @@ fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> R
         attrs,
         ..RenderCell::default()
     };
-    if let Some(c) = char::from_u32(cell.cp).filter(|&c| c != '\0') {
+    // Text drawn in its own background, concealed or not, is left out, so
+    // a selection cannot copy characters the screen never showed.
+    if let Some(c) = char::from_u32(cell.cp).filter(|&c| c != '\0' && fg != bg) {
         let mut len = c.encode_utf8(&mut rc.text).len();
         if cell.flags & cf::GRAPHEME != 0 {
             for c in row.grapheme(x).unwrap_or_default().chars() {

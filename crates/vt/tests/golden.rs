@@ -107,6 +107,21 @@ fn sgr_colours() {
 }
 
 #[test]
+fn hidden_text_has_no_characters() {
+    // Concealed, drawn in the background colour, and inverse with both
+    // colours equal.
+    let mut t = run(
+        20,
+        1,
+        "a\x1b[8mb\x1b[28mc\x1b[38;2;16;16;16md\x1b[0;7;38;2;16;16;16me\x1b[0mf",
+    );
+    let s = snap(&mut t);
+    let texts: Vec<&str> = (0..6).map(|x| text(&s.cells[x])).collect();
+    assert_eq!(texts, ["a", "", "c", "", "", "f"]);
+    assert_eq!(t.screen_text(), "abcdef", "the screen model keeps it");
+}
+
+#[test]
 fn wide_cjk_at_the_last_column() {
     let mut t = run(10, 3, "abcdefghi中x");
     assert_eq!(t.screen_text(), "abcdefghi\n中x\n");
