@@ -16,6 +16,8 @@ pub mod clipboard;
 #[cfg(windows)]
 pub mod debug;
 #[cfg(windows)]
+pub mod handoff;
+#[cfg(windows)]
 pub mod pane;
 #[cfg(windows)]
 pub mod pty;
