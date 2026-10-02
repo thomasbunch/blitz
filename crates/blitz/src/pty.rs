@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HMODULE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows::Win32::System::Console::COORD;
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
 use windows::Win32::System::LibraryLoader::{
     GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
     LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
@@ -19,10 +24,10 @@ use windows::Win32::System::LibraryLoader::{
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
@@ -376,6 +381,27 @@ impl Drop for Pty {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Puts this process in a job that kills every process it started, console
+/// hosts included, when this process exits. For headless runs, so a run that
+/// times out or crashes leaves nothing behind.
+pub fn kill_children_on_exit() -> io::Result<()> {
+    // SAFETY: plain Win32 calls with valid arguments. The job handle is
+    // deliberately never closed: closing it is what kills the children.
+    unsafe {
+        let job = CreateJobObjectW(None, PCWSTR::null())?;
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const info).cast(),
+            size_of_val(&info) as u32,
+        )?;
+        AssignProcessToJobObject(job, GetCurrentProcess())?;
+    }
+    Ok(())
 }
 
 /// Creates the child process attached to pseudoconsole `hpc`.

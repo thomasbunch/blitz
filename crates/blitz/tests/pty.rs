@@ -3,7 +3,7 @@
 //! ConPTY; otherwise the system's is used.
 #![cfg(windows)]
 
-use std::sync::mpsc;
+use std::sync::{Once, mpsc};
 use std::time::{Duration, Instant};
 
 use blitz::pty::{Pty, PtyEvent, SpawnOpts};
@@ -47,6 +47,9 @@ type Events = mpsc::Receiver<Result<(Instant, Vec<u8>), u32>>;
 /// bundled ConPTY's startup DA1 query, which otherwise holds output back
 /// for about 3 s.
 fn spawn(cmdline: &str) -> (Pty, Instant, Events) {
+    // A failing test must not leave console hosts running.
+    static JOB: Once = Once::new();
+    JOB.call_once(|| blitz::pty::kill_children_on_exit().expect("job object"));
     let (tx, rx) = mpsc::channel();
     let opts = SpawnOpts {
         cmdline,
