@@ -3,6 +3,86 @@
 
 use vt::{Key, KeyInput, Locks, Mods};
 
+use crate::layout::Dir;
+
+/// What a shortcut does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Copy the selection. Without one the key goes to the program.
+    Copy,
+    /// Paste clipboard text. Without text the key goes to the program.
+    Paste,
+    /// Scroll the main screen by a page; positive is up.
+    ScrollPage(i8),
+    NewTab,
+    ClosePane,
+    /// Next (1) or previous (-1) tab.
+    CycleTab(i8),
+    /// Tab 1 to 9, 0-based.
+    GoToTab(u8),
+    SplitRight,
+    SplitDown,
+    Focus(Dir),
+    JumpToAttention,
+    ToggleSidebar,
+}
+
+const CTRL: u8 = 1;
+const SHIFT: u8 = 2;
+const ALT: u8 = 4;
+
+/// Default shortcuts as (modifiers, virtual key, action). Keys are matched
+/// by virtual-key code: letter codes follow the key labels on Latin
+/// layouts and the US positions on others, and digits and arrows are
+/// physical keys everywhere.
+const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
+    (CTRL, b'C' as u16, Action::Copy),
+    (CTRL | SHIFT, b'C' as u16, Action::Copy),
+    (CTRL, 0x2d, Action::Copy),
+    (CTRL, b'V' as u16, Action::Paste),
+    (CTRL | SHIFT, b'V' as u16, Action::Paste),
+    (SHIFT, 0x2d, Action::Paste),
+    (SHIFT, 0x21, Action::ScrollPage(1)),
+    (SHIFT, 0x22, Action::ScrollPage(-1)),
+    (CTRL | SHIFT, b'T' as u16, Action::NewTab),
+    (CTRL | SHIFT, b'W' as u16, Action::ClosePane),
+    (CTRL, 0x09, Action::CycleTab(1)),
+    (CTRL | SHIFT, 0x09, Action::CycleTab(-1)),
+    (CTRL | SHIFT, b'R' as u16, Action::SplitRight),
+    (CTRL | SHIFT, b'D' as u16, Action::SplitDown),
+    (CTRL | ALT, 0x25, Action::Focus(Dir::Left)),
+    (CTRL | ALT, 0x26, Action::Focus(Dir::Up)),
+    (CTRL | ALT, 0x27, Action::Focus(Dir::Right)),
+    (CTRL | ALT, 0x28, Action::Focus(Dir::Down)),
+    (CTRL | SHIFT, b'J' as u16, Action::JumpToAttention),
+    (CTRL | SHIFT, b'B' as u16, Action::ToggleSidebar),
+];
+
+/// The shortcut a key press triggers, if any. Modifiers must match
+/// exactly, so AltGr (Ctrl+Alt) and Win never trigger Ctrl shortcuts.
+pub fn action(k: &KeyInput) -> Option<Action> {
+    if !k.down {
+        return None;
+    }
+    let m = &k.mods;
+    if m.lsuper || m.rsuper {
+        return None;
+    }
+    let held = [
+        (m.lctrl || m.rctrl, CTRL),
+        (m.lshift || m.rshift, SHIFT),
+        (m.lalt || m.ralt, ALT),
+    ];
+    let mods = held.iter().filter(|h| h.0).fold(0, |a, h| a | h.1);
+    if mods == CTRL && (0x31..=0x39).contains(&k.vk) {
+        return Some(Action::GoToTab((k.vk - 0x31) as u8));
+    }
+    DEFAULT_KEYS
+        .iter()
+        .find(|&&(m, vk, _)| m == mods && vk == k.vk)
+        .map(|&(_, _, a)| a)
+}
+
 /// Unshifted characters of a US layout by set-1 scan code, NUL where the
 /// key types nothing.
 const US_BY_SCAN: &[u8] =
@@ -467,6 +547,50 @@ mod msg_to_key_tests {
             enc(0x26, lp(0x48, true, true, 1), &none, US, &modes(0, true)),
             "\x1b[38;72;0;1;256;1_"
         );
+    }
+
+    fn press(vk: u16, held: &[usize]) -> Option<Action> {
+        let mut t = String::new();
+        let k = msg_to_key(
+            vk,
+            lp(0, false, true, 1),
+            &state(held, &[]),
+            layout(US),
+            &mut t,
+        );
+        action(&k)
+    }
+
+    #[test]
+    fn keymap_default_shortcuts() {
+        const LCTRL: usize = 0xa2;
+        const LSHIFT: usize = 0xa0;
+        const LALT: usize = 0xa4;
+        assert_eq!(press(0x43, &[LCTRL]), Some(Action::Copy));
+        assert_eq!(press(0x56, &[LCTRL, LSHIFT]), Some(Action::Paste));
+        assert_eq!(press(0x2d, &[0xa1]), Some(Action::Paste));
+        assert_eq!(press(0x21, &[LSHIFT]), Some(Action::ScrollPage(1)));
+        assert_eq!(press(0x52, &[LCTRL, LSHIFT]), Some(Action::SplitRight));
+        assert_eq!(press(0x44, &[0xa3, LSHIFT]), Some(Action::SplitDown));
+        assert_eq!(press(0x42, &[LCTRL, LSHIFT]), Some(Action::ToggleSidebar));
+        assert_eq!(press(0x09, &[LCTRL, LSHIFT]), Some(Action::CycleTab(-1)));
+        assert_eq!(press(0x33, &[LCTRL]), Some(Action::GoToTab(2)));
+        assert_eq!(press(0x25, &[LCTRL, LALT]), Some(Action::Focus(Dir::Left)));
+        // Modifiers match exactly.
+        assert_eq!(press(0x52, &[LCTRL]), None);
+        assert_eq!(press(0x43, &[LCTRL, LALT]), None, "AltGr is not Ctrl");
+        assert_eq!(press(0x43, &[LCTRL, 0x5b]), None);
+        assert_eq!(
+            press(0x0d, &[LSHIFT]),
+            None,
+            "Shift+Enter goes to the program"
+        );
+        assert_eq!(press(0x22, &[]), None);
+        // Releases never trigger.
+        let mut t = String::new();
+        let up = lp(0, false, false, 1);
+        let k = msg_to_key(0x43, up, &state(&[LCTRL], &[]), layout(US), &mut t);
+        assert_eq!(action(&k), None);
     }
 
     /// Enter and Space type the same on every layout.
