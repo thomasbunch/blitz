@@ -890,6 +890,13 @@ impl App {
                 self.win.sidebar_expanded = !self.win.sidebar_expanded;
                 self.request_redraw();
             }
+            Action::Focus(dir) => {
+                let (area, active) = (self.tab_area(), self.win.active);
+                if let Some(t) = self.win.tabs.get_mut(active) {
+                    t.focus_dir(dir, area);
+                }
+                self.focus_moved(before);
+            }
             _ => return false,
         }
         true
@@ -1014,6 +1021,37 @@ impl App {
         (col as u16, row as u16)
     }
 
+    /// The part of the window the active tab's panes share: all of it
+    /// but the sidebar or rail, which the chrome shows once there are two
+    /// sessions.
+    fn tab_area(&self) -> Rect {
+        let size = self
+            .window
+            .as_ref()
+            .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
+        let side = match (self.views.len() >= 2, self.win.sidebar_expanded) {
+            (false, _) => 0.0,
+            (true, true) => chrome::SIDEBAR_W,
+            (true, false) => chrome::RAIL_W,
+        };
+        let side = (side * self.scale as f32).round() as i32;
+        Rect {
+            x: side,
+            y: 0,
+            w: (size.width as i32 - side).max(0),
+            h: size.height as i32,
+        }
+    }
+
+    /// The pane of the active tab under a point in the window.
+    fn pane_at(&self, pos: PhysicalPosition<f64>) -> Option<PaneId> {
+        let (x, y) = (pos.x as i32, pos.y as i32);
+        let tab = self.win.tabs.get(self.win.active)?;
+        let hit = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let rects = tab.rects(self.tab_area());
+        rects.into_iter().find(|(_, r)| hit(r)).map(|(id, _)| id)
+    }
+
     /// Whether mouse events go to the program rather than to selection.
     fn mouse_to_program(&self, mods: &Mods) -> Option<InputModes> {
         let m = self.modes();
@@ -1044,6 +1082,19 @@ impl App {
         };
         let mods = mods_now();
         let pressed = state == ElementState::Pressed;
+        // A click on another pane only moves focus there.
+        let before = self.focus_id();
+        if pressed
+            && let Some(id) = self.pane_at(self.mouse.pos)
+            && Some(id) != before
+        {
+            let active = self.win.active;
+            if let Some(t) = self.win.tabs.get_mut(active) {
+                t.focus(id);
+            }
+            self.focus_moved(before);
+            return;
+        }
         // A release goes wherever its press went.
         let reported = self.mouse.reported & 1 << b != 0;
         let to_program = self.mouse_to_program(&mods);
