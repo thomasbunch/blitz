@@ -44,8 +44,20 @@ pub fn run() -> i32 {
 /// The hook's stdout for one Claude Code payload, or `None` when the event
 /// is not one blitz reports.
 pub fn claude_output(token: &str, payload: &str) -> Option<String> {
-    let (state, msg) = claude_state(&Json::parse(payload)?)?;
-    Some(notify_json(token, state, &msg))
+    let ev = Json::parse(payload)?;
+    let (state, msg) = claude_state(&ev)?;
+    let session = ev
+        .get("session_id")
+        .and_then(Json::as_str)
+        .filter(|id| is_session_id(id));
+    Some(notify_json(token, state, session, &msg))
+}
+
+/// Whether `id` looks like a Claude Code session id: 36 hex digits and
+/// dashes. blitz later types the id into a shell, so anything else is
+/// dropped.
+pub fn is_session_id(id: &str) -> bool {
+    id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
 /// Maps a hook payload to a state (`working`, `needs-you`, `done`, `error`,
@@ -110,10 +122,13 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
 }
 
 /// `{"terminalSequence":"ESC]777;notify;blitz:<token>:<state>;<msg>BEL"}`
-/// and a newline. The message is made safe to embed first.
-pub fn notify_json(token: &str, state: &str, msg: &str) -> String {
+/// and a newline, with `:<session>` after the state when there is one. The
+/// message is made safe to embed first; the session must already pass
+/// `is_session_id`.
+pub fn notify_json(token: &str, state: &str, session: Option<&str>, msg: &str) -> String {
+    let session = session.map(|s| format!(":{s}")).unwrap_or_default();
     let seq = format!(
-        "\x1b]777;notify;blitz:{token}:{state};{}\x07",
+        "\x1b]777;notify;blitz:{token}:{state}{session};{}\x07",
         one_line(msg)
     );
     let mut out = String::from("{\"terminalSequence\":\"");
@@ -674,13 +689,19 @@ mod tests {
         for s in ["working", "needs-you", "done", "error", "idle"] {
             let title = format!("blitz:4b1d:{s}");
             assert!(Ev::from_notify(&title, "4b1d").is_some(), "{s}");
+            let title = format!("blitz:4b1d:{s}:{SESSION}");
+            assert_eq!(
+                Ev::from_notify(&title, "4b1d").and_then(|(_, id)| id),
+                Some(SESSION),
+                "{s}"
+            );
         }
     }
 
     #[test]
     fn output_is_one_json_line() {
         assert_eq!(
-            notify_json("4b1d", "done", "All \"good\" \\ ok"),
+            notify_json("4b1d", "done", None, "All \"good\" \\ ok"),
             "{\"terminalSequence\":\"\\u001b]777;notify;blitz:4b1d:done;All \\\"good\\\" \\\\ ok\\u0007\"}\n"
         );
         let out = claude_output("4b1d", r#"{"hook_event_name":"SessionEnd"}"#).unwrap();
@@ -690,6 +711,58 @@ mod tests {
             Some("\x1b]777;notify;blitz:4b1d:idle;\x07")
         );
         assert_eq!(claude_output("4b1d", "not json"), None);
+    }
+
+    const SESSION: &str = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
+
+    #[test]
+    fn output_carries_the_session_id() {
+        let seq = |payload: &str| {
+            let out = claude_output("4b1d", payload).unwrap();
+            let v = Json::parse(&out).unwrap();
+            v.get("terminalSequence")
+                .and_then(Json::as_str)
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            seq(&format!(
+                r#"{{"hook_event_name":"Stop","session_id":"{SESSION}","last_assistant_message":"ok"}}"#
+            )),
+            format!("\x1b]777;notify;blitz:4b1d:done:{SESSION};ok\x07")
+        );
+        // A bad id is dropped; the state still gets through.
+        assert_eq!(
+            seq(r#"{"hook_event_name":"SessionEnd","session_id":"x;rm -rf ~"}"#),
+            "\x1b]777;notify;blitz:4b1d:idle;\x07"
+        );
+        assert_eq!(
+            seq(r#"{"hook_event_name":"SessionEnd","session_id":7}"#),
+            "\x1b]777;notify;blitz:4b1d:idle;\x07"
+        );
+    }
+
+    #[test]
+    fn session_ids() {
+        assert!(is_session_id(SESSION));
+        assert!(is_session_id(&SESSION.to_uppercase()));
+        for bad in [
+            "",
+            &SESSION[1..],
+            &format!("{SESSION}0"),
+            &SESSION.replacen('0', ";", 1),
+            &SESSION.replacen('0', " ", 1),
+            &SESSION.replacen('0', "\"", 1),
+            &SESSION.replacen('0', "'", 1),
+            &SESSION.replacen('0', "`", 1),
+            &SESSION.replacen('0', "\n", 1),
+            &SESSION.replacen('0', "$", 1),
+            &SESSION.replacen('0', "g", 1),
+            // Same byte length, but not ASCII.
+            &SESSION.replacen("0b", "é", 1),
+        ] {
+            assert!(!is_session_id(bad), "{bad:?}");
+        }
     }
 
     #[test]
