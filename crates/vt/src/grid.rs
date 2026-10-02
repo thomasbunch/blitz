@@ -329,6 +329,15 @@ impl Grid {
         self.rows.get(i)
     }
 
+    /// Every cell, scrollback included.
+    pub fn cells(&self) -> impl Iterator<Item = &Cell> {
+        self.rows.iter().flat_map(|r| &r.cells)
+    }
+
+    pub fn cells_mut(&mut self) -> impl Iterator<Item = &mut Cell> {
+        self.rows.iter_mut().flat_map(|r| &mut r.cells)
+    }
+
     fn fresh(&mut self, blank: Cell) -> Row {
         let mut r = self.pool.pop().unwrap_or_default();
         r.reset(self.cols, blank);

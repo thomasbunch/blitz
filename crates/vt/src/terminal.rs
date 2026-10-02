@@ -676,7 +676,38 @@ impl Terminal {
 
     // ---- SGR ----
 
+    /// Shrinks the style table to the styles still stored somewhere and
+    /// renumbers every reference to them.
+    fn compact_styles(&mut self) {
+        let mut live = vec![self.cur.sid, self.cur.blank];
+        for c in [self.screen.saved, self.other.saved].into_iter().flatten() {
+            live.extend([c.sid, c.blank]);
+        }
+        let cells = self.screen.grid.cells().chain(self.other.grid.cells());
+        let map = self
+            .styles
+            .compact(live.into_iter().chain(cells.map(|c| c.style)));
+        let remap = |id: &mut u16| *id = map.get(usize::from(*id)).copied().unwrap_or(0);
+        for g in [&mut self.screen.grid, &mut self.other.grid] {
+            g.cells_mut().for_each(|c| remap(&mut c.style));
+        }
+        let cursors = [
+            Some(&mut self.cur),
+            self.screen.saved.as_mut(),
+            self.other.saved.as_mut(),
+        ];
+        for c in cursors.into_iter().flatten() {
+            remap(&mut c.sid);
+            remap(&mut c.blank);
+            // Link ids were renumbered too.
+            c.style = *self.styles.get(c.sid);
+        }
+    }
+
     fn sgr(&mut self, p: &Params) {
+        if self.styles.is_full() {
+            self.compact_styles();
+        }
         let v = p.as_slice();
         let s = &mut self.cur.style;
         if v.is_empty() {

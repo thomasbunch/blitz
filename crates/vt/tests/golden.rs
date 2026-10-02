@@ -373,3 +373,22 @@ fn resize_keeps_the_cursor_row() {
     feed(&mut t, "\x1b[4;12HZ");
     assert_eq!(t.screen_text(), "c\nd\ne\n           Z");
 }
+
+#[test]
+fn style_table_compacts_when_full() {
+    let mut t = run(10, 2, "\x1b[31mR\x1b[0m");
+    // More distinct colours than style ids, all drawn over one cell.
+    for i in 0..70_000u32 {
+        let (r, g, b) = (i >> 16, (i >> 8) & 255, i & 255);
+        feed(&mut t, &format!("\x1b[1;2H\x1b[38;2;{r};{g};{b}mx"));
+    }
+    feed(&mut t, "\x1b[44my\x1b[K");
+    let s = snap(&mut t);
+    assert_eq!(cell(&s, 0, 0).fg, PAL.ansi[1], "a style still on screen");
+    assert_eq!(cell(&s, 1, 0).fg, 0x01116F);
+    assert_eq!(
+        (cell(&s, 2, 0).fg, cell(&s, 2, 0).bg),
+        (0x01116F, PAL.ansi[4])
+    );
+    assert_eq!(cell(&s, 5, 0).bg, PAL.ansi[4]);
+}
