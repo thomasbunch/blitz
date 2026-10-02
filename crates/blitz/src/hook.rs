@@ -20,15 +20,18 @@ const NOTIFY_TYPES: &str =
 ///
 /// `blitz-hook claude` reads a hook payload on stdin and prints a
 /// `terminalSequence` for Claude Code to write to its own terminal, so the
-/// state lands in the right pane without any IPC. Outside a blitz pane
-/// (`BLITZ_PANE_ID` unset) it prints nothing.
+/// state lands in the right pane without any IPC. The sequence carries the
+/// pane's `BLITZ_PANE_TOKEN`, which program output cannot know. Outside a
+/// blitz pane (no token) it prints nothing.
 pub fn run() -> i32 {
     let claude = std::env::args().nth(1).as_deref() == Some("claude");
-    let in_pane = std::env::var_os("BLITZ_PANE_ID").is_some_and(|v| !v.is_empty());
+    let token = std::env::var("BLITZ_PANE_TOKEN").unwrap_or_default();
+    // It goes into the sequence as is, so nothing in it may end the title.
+    let in_pane = !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric());
     if claude && in_pane {
         let mut input = Vec::new();
         let _ = std::io::stdin().take(MAX_INPUT).read_to_end(&mut input);
-        if let Some(out) = claude_output(&String::from_utf8_lossy(&input)) {
+        if let Some(out) = claude_output(&token, &String::from_utf8_lossy(&input)) {
             let mut stdout = std::io::stdout().lock();
             let _ = stdout
                 .write_all(out.as_bytes())
@@ -40,9 +43,9 @@ pub fn run() -> i32 {
 
 /// The hook's stdout for one Claude Code payload, or `None` when the event
 /// is not one blitz reports.
-pub fn claude_output(payload: &str) -> Option<String> {
+pub fn claude_output(token: &str, payload: &str) -> Option<String> {
     let (state, msg) = claude_state(&Json::parse(payload)?)?;
-    Some(notify_json(state, &msg))
+    Some(notify_json(token, state, &msg))
 }
 
 /// Maps a hook payload to a state (`working`, `needs-you`, `done`, `error`,
@@ -106,10 +109,13 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
     })
 }
 
-/// `{"terminalSequence":"ESC]777;notify;blitz:<state>;<msg>BEL"}` and a
-/// newline. The message is made safe to embed first.
-pub fn notify_json(state: &str, msg: &str) -> String {
-    let seq = format!("\x1b]777;notify;blitz:{state};{}\x07", one_line(msg));
+/// `{"terminalSequence":"ESC]777;notify;blitz:<token>:<state>;<msg>BEL"}`
+/// and a newline. The message is made safe to embed first.
+pub fn notify_json(token: &str, state: &str, msg: &str) -> String {
+    let seq = format!(
+        "\x1b]777;notify;blitz:{token}:{state};{}\x07",
+        one_line(msg)
+    );
     let mut out = String::from("{\"terminalSequence\":\"");
     escape_json(&seq, &mut out);
     out.push_str("\"}\n");
@@ -666,23 +672,24 @@ mod tests {
     #[test]
     fn every_state_is_an_attention_event() {
         for s in ["working", "needs-you", "done", "error", "idle"] {
-            assert!(Ev::from_notify(&format!("blitz:{s}")).is_some(), "{s}");
+            let title = format!("blitz:4b1d:{s}");
+            assert!(Ev::from_notify(&title, "4b1d").is_some(), "{s}");
         }
     }
 
     #[test]
     fn output_is_one_json_line() {
         assert_eq!(
-            notify_json("done", "All \"good\" \\ ok"),
-            "{\"terminalSequence\":\"\\u001b]777;notify;blitz:done;All \\\"good\\\" \\\\ ok\\u0007\"}\n"
+            notify_json("4b1d", "done", "All \"good\" \\ ok"),
+            "{\"terminalSequence\":\"\\u001b]777;notify;blitz:4b1d:done;All \\\"good\\\" \\\\ ok\\u0007\"}\n"
         );
-        let out = claude_output(r#"{"hook_event_name":"SessionEnd"}"#).unwrap();
+        let out = claude_output("4b1d", r#"{"hook_event_name":"SessionEnd"}"#).unwrap();
         let v = Json::parse(&out).unwrap();
         assert_eq!(
             v.get("terminalSequence").and_then(Json::as_str),
-            Some("\x1b]777;notify;blitz:idle;\x07")
+            Some("\x1b]777;notify;blitz:4b1d:idle;\x07")
         );
-        assert_eq!(claude_output("not json"), None);
+        assert_eq!(claude_output("4b1d", "not json"), None);
     }
 
     #[test]

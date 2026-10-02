@@ -1024,7 +1024,7 @@ impl App {
                 self.find_branch(id);
             }
             Event::Notify { title, body } => {
-                if let Some(ev) = Ev::from_notify(&title) {
+                if let Some(ev) = Ev::from_notify(&title, &v.pane.token) {
                     v.pane.msg = body;
                     self.attention(id, ev);
                 }
