@@ -6,6 +6,7 @@ pub mod hook;
 pub mod keymap;
 pub mod layout;
 pub mod render;
+pub mod session;
 pub mod shell;
 pub mod theme;
 
