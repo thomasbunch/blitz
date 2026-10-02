@@ -560,6 +560,13 @@ pub fn encode_paste(text: &str, bracketed: bool, out: &mut Vec<u8>) {
     }
 }
 
+/// Whether a paste should be confirmed first. Without bracketed paste a
+/// shell runs every pasted line the moment it arrives; Windows PowerShell
+/// 5.1's PSReadLine never turns bracketed paste on.
+pub fn needs_paste_confirm(text: &str, bracketed: bool) -> bool {
+    !bracketed && text.contains(['\r', '\n'])
+}
+
 /// Appends a focus report when mode 1004 is set.
 pub fn encode_focus(focused: bool, m: &InputModes, out: &mut Vec<u8>) {
     if m.focus {

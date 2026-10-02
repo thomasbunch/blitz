@@ -611,3 +611,13 @@ fn paste_cannot_break_out_of_the_bracket() {
     assert_eq!(got.matches("\x1b[201~").count(), 1);
     assert!(got.ends_with("\x1b[201~"));
 }
+
+#[test]
+fn paste_confirm_only_for_unbracketed_line_breaks() {
+    use vt::keys::needs_paste_confirm;
+    assert!(!needs_paste_confirm("ls -la", false));
+    assert!(needs_paste_confirm("echo 1\necho 2", false));
+    assert!(needs_paste_confirm("echo 1\r", false));
+    assert!(!needs_paste_confirm("echo 1\necho 2", true));
+    assert!(!needs_paste_confirm("", false));
+}
