@@ -259,6 +259,7 @@ mod gpu {
             let px = |c: usize| x + (c as u32 * cw) as i32;
             let py = |r: usize| y + (r as u32 * ch) as i32;
 
+            let first = self.quads.len();
             self.rect(x, y, cols as u32 * cw, rows as u32 * ch, pal.bg);
             for r in 0..rows {
                 let mut c = 0;
@@ -332,6 +333,11 @@ mod gpu {
                     };
                     self.push_glyph(key, px(c), py(r), fg);
                 }
+            }
+            // A cluster of several glyphs can be far wider than its cells;
+            // keep it inside the grid so it cannot draw over another pane.
+            for q in &mut self.quads[first..] {
+                clip(q, x, y, px(cols), py(rows));
             }
         }
 
@@ -516,6 +522,22 @@ mod gpu {
             style: SHAPE,
             width: 0,
         }
+    }
+
+    /// Cuts `q` down to the part inside `x0..x1` × `y0..y1`, moving its
+    /// atlas position along with its top-left corner.
+    fn clip(q: &mut Quad, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let (x, y) = (i32::from(q.pos[0]), i32::from(q.pos[1]));
+        let (left, top) = (x.max(x0), y.max(y0));
+        let right = (x + i32::from(q.size[0])).min(x1);
+        let bottom = (y + i32::from(q.size[1])).min(y1);
+        if right <= left || bottom <= top {
+            q.size = [0, 0];
+            return;
+        }
+        q.uv = [q.uv[0] + (left - x) as u16, q.uv[1] + (top - y) as u16];
+        q.pos = [left as i16, top as i16];
+        q.size = [(right - left) as u16, (bottom - top) as u16];
     }
 
     /// The colour halfway between two `0xRRGGBB` colours.
@@ -1073,5 +1095,34 @@ mod tests {
             let again = r.draw(&target.rtv, 16, 32, p.bg).expect("draw");
             assert!(!again, "no frame is drawn twice");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_wide_clusters_stay_inside_their_grid() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let mut snap = text_snapshot("ab", 4, 1, &p);
+        // Five leading jamo join into one cluster, each with its own advance.
+        let jamo = "\u{1100}".repeat(5);
+        snap.cells[2].text[..15].copy_from_slice(jamo.as_bytes());
+        snap.cells[2].len = 15;
+        snap.cells[2].width = 2;
+        snap.cells[3].width = 0;
+        let (cw, ch) = r.cell();
+        let (w, h) = (4 * cw + 100, ch);
+        let target = r.gpu.offscreen(w, h).expect("target");
+        r.begin();
+        r.snapshot(&snap, &p, 0, 0);
+        r.draw(&target.rtv, w, h, 0x123456).expect("draw");
+        let px = r.gpu.read(&target).expect("read");
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        let ink = (0..h).any(|y| (2 * cw..4 * cw).any(|x| at(x, y) != p.bg));
+        assert!(ink, "the cluster is drawn");
+        let spill = (0..h).any(|y| (4 * cw..w).any(|x| at(x, y) != 0x123456));
+        assert!(!spill, "nothing is drawn right of the grid");
     }
 }
