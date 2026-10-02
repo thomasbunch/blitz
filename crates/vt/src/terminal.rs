@@ -1,5 +1,6 @@
 //! The terminal: screens, cursor, modes, replies and events.
 
+use std::io::Write;
 use std::time::Instant;
 
 use crate::grid::{Cell, Grid, Row, cf, rf};
@@ -126,6 +127,10 @@ pub struct Terminal {
     viewport: usize,
     changed: bool,
     modes: Modes,
+    /// Dark or light system theme, for `CSI ? 996 n`.
+    dark: bool,
+    /// Cell width and height in pixels, for size reports.
+    cell_px: (u16, u16),
     replies: Vec<u8>,
     events: Vec<Event>,
 }
@@ -160,6 +165,8 @@ impl Terminal {
             viewport: 0,
             changed: true,
             modes: Modes::default(),
+            dark: true,
+            cell_px: (0, 0),
             replies: Vec::new(),
             events: Vec::new(),
         }
@@ -274,10 +281,14 @@ impl Terminal {
     /// behind.
     pub fn on_child_exit(&mut self) {}
 
-    pub fn set_theme(&mut self, _dark: bool) {}
+    pub fn set_theme(&mut self, dark: bool) {
+        self.dark = dark;
+    }
 
     /// Cell size in pixels, for size reports.
-    pub fn set_cell_px(&mut self, _w: u16, _h: u16) {}
+    pub fn set_cell_px(&mut self, w: u16, h: u16) {
+        self.cell_px = (w, h);
+    }
 
     /// The screen as text: rows joined by `\n`, trailing spaces trimmed.
     pub fn screen_text(&self) -> String {
@@ -637,10 +648,12 @@ impl Terminal {
     fn full_reset(&mut self) {
         let replies = std::mem::take(&mut self.replies);
         let events = std::mem::take(&mut self.events);
-        let input = self.modes.input;
+        let (input, dark, cell_px) = (self.modes.input, self.dark, self.cell_px);
         *self = Self::new(self.opts);
         self.replies = replies;
         self.events = events;
+        self.dark = dark;
+        self.cell_px = cell_px;
         // ConPTY turns these on for itself at startup and is not told that
         // a program reset the terminal, so they stay.
         self.modes.input.w32im = input.w32im;
@@ -697,6 +710,67 @@ impl Terminal {
             std::mem::swap(&mut self.screen, &mut self.other);
             self.alt = alt;
             self.viewport = 0;
+        }
+    }
+
+    // ---- replies ----
+
+    fn reply(&mut self, args: std::fmt::Arguments) {
+        // Writing to a Vec cannot fail.
+        let _ = self.replies.write_fmt(args);
+    }
+
+    /// CPR and DECXCPR. Rows count from the top margin in origin mode.
+    fn report_cursor(&mut self, private: &str) {
+        let top = if self.cur.origin { self.top } else { 0 };
+        let (row, col) = (self.cur.y.saturating_sub(top) + 1, self.cur.x + 1);
+        self.reply(format_args!("\x1b[{private}{row};{col}R"));
+    }
+
+    /// DECRPM status of a DEC private mode: 0 not recognized, 1 set,
+    /// 2 reset, 3 permanently set.
+    fn dec_mode_status(&self, m: u16) -> u8 {
+        let on = match m {
+            6 => self.cur.origin,
+            7 => self.autowrap,
+            25 => self.cursor_visible,
+            47 | 1047 | 1049 => self.alt,
+            1048 => false,
+            // Grapheme clusters are always kept together.
+            2027 => return 3,
+            // Everything else, including 1016 (SGR pixel mouse), is
+            // unknown unless the mode table has it.
+            _ => match self.modes.dec(m) {
+                Some(on) => on,
+                None => return 0,
+            },
+        };
+        if on { 1 } else { 2 }
+    }
+
+    fn ansi_mode_status(&self, m: u16) -> u8 {
+        match m {
+            4 => 2 - u8::from(self.insert),
+            20 => 2 - u8::from(self.newline),
+            _ => 0,
+        }
+    }
+
+    /// XTWINOPS reports. Window moves and resizes are ignored.
+    fn window_report(&mut self, op: u16) {
+        let (w, h) = self.cell_px;
+        let (cols, rows) = (self.cols(), self.rows());
+        match op {
+            14 => {
+                let (pw, ph) = (
+                    u32::from(cols) * u32::from(w),
+                    u32::from(rows) * u32::from(h),
+                );
+                self.reply(format_args!("\x1b[4;{ph};{pw}t"));
+            }
+            16 => self.reply(format_args!("\x1b[6;{h};{w}t")),
+            18 => self.reply(format_args!("\x1b[8;{rows};{cols}t")),
+            _ => {}
         }
     }
 
@@ -951,6 +1025,39 @@ impl Handler for Terminal {
                 self.cur.pending_wrap = false;
             }
             ([], b'Z') => self.back_tab(n(0)),
+            // DA1. Never claim 28 (rectangular editing): ConPTY would
+            // start sending DECCRA and DECFRA.
+            ([], b'c') if p.get(0) == 0 => self.replies.extend_from_slice(b"\x1b[?62;22c"),
+            ([b'>'], b'c') if p.get(0) == 0 => self.replies.extend_from_slice(b"\x1b[>1;0;0c"),
+            ([b'>'], b'q') if p.get(0) == 0 => {
+                let v = env!("CARGO_PKG_VERSION");
+                self.reply(format_args!("\x1bP>|blitz {v}\x1b\\"));
+            }
+            ([], b'n') => match p.get(0) {
+                5 => self.replies.extend_from_slice(b"\x1b[0n"),
+                6 => self.report_cursor(""),
+                _ => {}
+            },
+            ([b'?'], b'n') => match p.get(0) {
+                // Two parameters only; no page number.
+                6 => self.report_cursor("?"),
+                996 => {
+                    let theme = if self.dark { 1 } else { 2 };
+                    self.reply(format_args!("\x1b[?997;{theme}n"));
+                }
+                _ => {}
+            },
+            ([b'?', b'$'], b'p') => {
+                let m = p.get(0);
+                let s = self.dec_mode_status(m);
+                self.reply(format_args!("\x1b[?{m};{s}$y"));
+            }
+            ([b'$'], b'p') => {
+                let m = p.get(0);
+                let s = self.ansi_mode_status(m);
+                self.reply(format_args!("\x1b[{m};{s}$y"));
+            }
+            ([], b't') => self.window_report(p.get(0)),
             ([], b'b') => {
                 if let Some(c) = self.rep {
                     let wide = self.width(c) == 2;
@@ -993,6 +1100,10 @@ impl Handler for Terminal {
             ([], b'u') => self.restore_cursor(),
             ([b'!'], b'p') => self.soft_reset(),
             // Kitty keyboard protocol. A bare `CSI u` is SCORC, above.
+            ([b'?'], b'u') => {
+                let f = self.kitty().flags();
+                self.reply(format_args!("\x1b[?{f}u"));
+            }
             ([b'>'], b'u') => self.kitty_mut().push(p.get(0) as u8),
             ([b'<'], b'u') => self.kitty_mut().pop(n(0) as usize),
             ([b'='], b'u') => self.kitty_mut().set(p.get(0) as u8, p.get(1)),
