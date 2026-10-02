@@ -1333,6 +1333,10 @@ impl App {
                     self.counters.first_present_ms =
                         Some(self.started.elapsed().as_secs_f64() * 1000.0);
                 }
+                // Glyphs still waiting for a font lookup come next frame.
+                if self.gfx.as_ref().is_some_and(|g| g.r.pending()) {
+                    self.request_redraw();
+                }
             }
             Err(e) => {
                 eprintln!("blitz: render: {e}");

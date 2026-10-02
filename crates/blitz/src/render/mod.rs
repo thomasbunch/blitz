@@ -146,7 +146,7 @@ mod gpu {
     use super::atlas::{Atlas, GlyphKey, Slot};
     use super::chrome::{Chrome, Prim, branch_mask, shape_mask};
     use super::d3d11::{ATLAS_SIZE, GLYPH, Gpu, MASK, Quad, SOLID, rgba};
-    use super::font::{BOLD, DEFAULT_FAMILIES, Font, ITALIC};
+    use super::font::{BOLD, DEFAULT_FAMILIES, E_PENDING, Font, ITALIC};
     use super::{builtin, text_snapshot, write_bmp};
 
     /// Default font size: 12 pt at 96 DPI.
@@ -159,6 +159,9 @@ mod gpu {
     const SMALL: u8 = 4;
     const SHAPE: u8 = 8;
 
+    /// Fallback font lookups per frame; the rest wait for the next one.
+    const LOOKUPS: u32 = 256;
+
     pub struct Renderer {
         pub gpu: Gpu,
         pub font: Font,
@@ -169,6 +172,8 @@ mod gpu {
         overflowed: bool,
         /// The atlas was cleared when this frame began.
         cleared: bool,
+        /// Glyphs were left out waiting for a font lookup.
+        pending: bool,
     }
 
     impl Renderer {
@@ -185,6 +190,7 @@ mod gpu {
                 quads: Vec::new(),
                 overflowed: false,
                 cleared: false,
+                pending: false,
             })
         }
 
@@ -216,6 +222,15 @@ mod gpu {
                 self.atlas.clear();
             }
             self.overflowed = false;
+            self.pending = false;
+            self.font.lookups = LOOKUPS;
+            self.small.lookups = LOOKUPS;
+        }
+
+        /// Whether the last frame left glyphs out to keep slow font
+        /// lookups from stalling it; draw another frame soon.
+        pub fn pending(&self) -> bool {
+            self.pending
         }
 
         pub fn rect(&mut self, x: i32, y: i32, w: u32, h: u32, rgb: u32) {
@@ -448,6 +463,10 @@ mod gpu {
                 let text = std::str::from_utf8(text).ok()?;
                 match font.raster(text, key.style & (BOLD | ITALIC), key.width) {
                     Ok(Some(r)) => Some((r.w, r.h, r.dx, r.dy, r.alpha)),
+                    Err(e) if e.code() == E_PENDING => {
+                        self.pending = true;
+                        return None;
+                    }
                     _ => None,
                 }
             };
@@ -565,10 +584,10 @@ mod gpu {
             (u32::from(snap.rows) * ch).max(1),
         );
         let target = r.gpu.offscreen(w, h)?;
-        for _ in 0..2 {
+        loop {
             r.begin();
             r.snapshot(snap, pal, 0, 0);
-            if !r.draw(&target.rtv, w, h, pal.bg)? {
+            if !r.draw(&target.rtv, w, h, pal.bg)? && !r.pending() {
                 break;
             }
         }
@@ -780,13 +799,13 @@ mod gpu {
         let chrome = chrome::build(&model);
 
         let target = r.gpu.offscreen(w, h)?;
-        for _ in 0..2 {
+        loop {
             r.begin();
             for (rect, snap) in &snaps {
                 r.snapshot(snap, &pal, rect.x, rect.y);
             }
             r.chrome(&chrome);
-            if !r.draw(&target.rtv, w, h, pal.bg)? {
+            if !r.draw(&target.rtv, w, h, pal.bg)? && !r.pending() {
                 break;
             }
         }
@@ -1124,5 +1143,30 @@ mod tests {
         assert!(ink, "the cluster is drawn");
         let spill = (0..h).any(|y| (4 * cw..w).any(|x| at(x, y) != 0x123456));
         assert!(!spill, "nothing is drawn right of the grid");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_spreads_font_lookups_over_frames() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        // More new fallback characters than one frame looks up.
+        let text: String = (0..300)
+            .filter_map(|i| char::from_u32(0x4e00 + i))
+            .collect();
+        let snap = text_snapshot(&text, 600, 1, &p);
+        r.begin();
+        r.snapshot(&snap, &p, 0, 0);
+        assert!(r.pending(), "some glyphs wait for the next frame");
+        let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert!(!r.pending());
+        let (cw, _) = r.cell();
+        let last = (0..h).any(|y| {
+            (598 * cw..w).any(|x| {
+                let i = ((y * w + x) * 4) as usize;
+                u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]]) != p.bg
+            })
+        });
+        assert!(last, "an offscreen render draws every glyph");
     }
 }
