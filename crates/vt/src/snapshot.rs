@@ -1,5 +1,7 @@
 //! A resolved, render-ready copy of the visible screen.
 
+use crate::style::Color;
+
 /// Colours as `0xRRGGBB`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
@@ -10,7 +12,30 @@ pub struct Palette {
     pub ansi: [u32; 16],
 }
 
-/// [`RenderCell::attrs`] bits.
+impl Palette {
+    /// `c` as `0xRRGGBB`, with `default` for [`Color::Default`]. Indexes
+    /// past 15 use xterm's 6x6x6 cube and grey ramp.
+    pub fn resolve(&self, c: Color, default: u32) -> u32 {
+        let rgb = |r: u32, g: u32, b: u32| r << 16 | g << 8 | b;
+        match c {
+            Color::Default => default,
+            Color::Idx(i @ 0..16) => self.ansi[i as usize],
+            Color::Idx(i @ 16..232) => {
+                let level = |v: u8| if v == 0 { 0 } else { 55 + 40 * u32::from(v) };
+                let i = i - 16;
+                rgb(level(i / 36), level(i / 6 % 6), level(i % 6))
+            }
+            Color::Idx(i) => {
+                let v = 8 + 10 * u32::from(i - 232);
+                rgb(v, v, v)
+            }
+            Color::Rgb(r, g, b) => rgb(r.into(), g.into(), b.into()),
+        }
+    }
+}
+
+/// [`RenderCell::attrs`] bits. Inverse and invisible are already applied
+/// to the cell's colours; `INVERSE` is only informational.
 pub mod attr {
     pub const BOLD: u16 = 1 << 0;
     pub const ITALIC: u16 = 1 << 1;
