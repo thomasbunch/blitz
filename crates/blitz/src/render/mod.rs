@@ -145,6 +145,13 @@ mod gpu {
             })
         }
 
+        /// Reloads the font at a new size, e.g. after a DPI change.
+        pub fn set_font_px(&mut self, px: f32) -> Result<()> {
+            self.font = Font::new(DEFAULT_FAMILIES, px)?;
+            self.atlas.clear();
+            Ok(())
+        }
+
         /// Cell width and height in pixels.
         pub fn cell(&self) -> (u32, u32) {
             (self.font.cell_w, self.font.cell_h)
