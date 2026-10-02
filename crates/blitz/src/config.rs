@@ -30,6 +30,8 @@ pub struct Config {
     /// Whether BEL in an unfocused pane asks for attention.
     pub bell_attention: bool,
     pub command_finish_after_ms: u64,
+    /// Look for a newer release on GitHub at start and once a day.
+    pub check_updates: bool,
     /// Overrides as (chord, action) pairs, e.g. ("ctrl+shift+r", "split_right").
     pub keys: Vec<(String, String)>,
 }
@@ -50,6 +52,7 @@ impl Default for Config {
             flash: true,
             bell_attention: true,
             command_finish_after_ms: 5000,
+            check_updates: true,
             keys: vec![("ctrl+shift+r".into(), "split_right".into())],
         }
     }

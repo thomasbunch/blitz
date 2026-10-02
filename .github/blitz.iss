@@ -41,3 +41,12 @@ Name: "{autodesktop}\blitz"; Filename: "{app}\blitz.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\blitz.exe"; Description: "{cm:LaunchProgram,blitz}"; Flags: nowait postinstall skipifsilent
+; blitz updates itself with /VERYSILENT /relaunch=1 and exits, so start it
+; again, as the user and not elevated.
+Filename: "{app}\blitz.exe"; Flags: nowait runasoriginaluser; Check: Relaunch
+
+[Code]
+function Relaunch: Boolean;
+begin
+  Result := WizardSilent and (ExpandConstant('{param:relaunch|0}') = '1');
+end;

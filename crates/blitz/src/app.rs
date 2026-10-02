@@ -47,6 +47,10 @@ const VK_F4: u16 = 0x73;
 const CONFIRM: Duration = Duration::from_secs(3);
 /// How long the notice about the system ConPTY stays up.
 const NOTICE: Duration = Duration::from_secs(5);
+/// The first look for a newer release waits until startup is done, then
+/// one runs a day.
+const UPDATE_FIRST: Duration = Duration::from_secs(10);
+const UPDATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
 /// Lines scrolled per wheel notch when the program takes no mouse input.
@@ -60,6 +64,10 @@ pub enum UserEvent {
     /// Exit with this code: the self-test finished, or `--exit-after`
     /// ran out.
     Finish(i32),
+    /// A newer release, by version.
+    Update(String),
+    /// The installer started, so blitz exits; or why it did not.
+    Installed(Result<(), String>),
 }
 
 /// Command-line options of the GUI.
@@ -329,6 +337,14 @@ struct App {
     paste: Option<(PaneId, String, Instant)>,
     /// A busy session waiting for a second Ctrl+Shift+W.
     close_confirm: Option<(PaneId, Instant)>,
+    /// A newer release: its version and the banner text.
+    update: Option<(String, String)>,
+    /// Busy sessions, waiting for a second Ctrl+Shift+U.
+    update_confirm: Option<Instant>,
+    /// The installer is downloading; this pane shows that.
+    updating: Option<PaneId>,
+    /// The banner strip in the last frame, for clicks.
+    banner: Option<Rect>,
     /// The release of this key belongs to a shortcut and is not sent.
     eaten: Option<u16>,
     /// Where the IME was last told the cursor is, in client pixels.
@@ -376,6 +392,10 @@ impl App {
             preedit: String::new(),
             paste: None,
             close_confirm: None,
+            update: None,
+            update_confirm: None,
+            updating: None,
+            banner: None,
             eaten: None,
             ime_at: None,
             checked_conpty: false,
@@ -432,6 +452,21 @@ impl App {
             std::thread::spawn(move || {
                 std::thread::sleep(after);
                 let _ = proxy.send_event(UserEvent::Finish(0));
+            });
+        }
+        let scripted = self.args.selftest.is_some() || self.args.exit_after.is_some();
+        if self.config.check_updates && !scripted && !cfg!(debug_assertions) {
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(UPDATE_FIRST);
+                loop {
+                    if let Some(v) = crate::update::check()
+                        && proxy.send_event(UserEvent::Update(v)).is_err()
+                    {
+                        return;
+                    }
+                    std::thread::sleep(UPDATE_EVERY);
+                }
             });
         }
         Ok(())
@@ -626,7 +661,7 @@ impl App {
 
     /// What the chrome needs to lay out `win` in the window as it is now.
     fn model<'a>(
-        &self,
+        &'a self,
         win: &'a layout::Window,
         sessions: &'a [chrome::Session],
         preedit: Option<(u16, u16, &'a str)>,
@@ -645,7 +680,7 @@ impl App {
             text_cell: self.gfx.as_ref().map_or((6, 12), |g| g.r.small_cell()),
             term_cell: self.cell(),
             now: Instant::now(),
-            banner: None,
+            banner: self.update.as_ref().map(|u| u.1.as_str()),
             preedit,
         }
     }
@@ -958,6 +993,44 @@ impl App {
                     self.show(id);
                 }
             }
+            Action::Update => {
+                let (Some((v, _)), Some(id)) = (self.update.clone(), before) else {
+                    return false;
+                };
+                if self.updating.is_some() {
+                    return true;
+                }
+                if !crate::update::installed() {
+                    crate::update::open_page();
+                    return true;
+                }
+                // Updating restarts blitz, which ends every session.
+                let busy = (self.views.iter())
+                    .filter(|v| v.pane.exit_code.is_none())
+                    .filter(|v| matches!(v.pane.attn.state, Attn::Working | Attn::NeedsYou))
+                    .count();
+                let again = (self.update_confirm.take()).is_some_and(|t| Instant::now() < t);
+                if busy > 0 && !again {
+                    let until = Instant::now() + CONFIRM;
+                    self.update_confirm = Some(until);
+                    let what = if busy == 1 {
+                        "A session is"
+                    } else {
+                        "Sessions are"
+                    };
+                    let text = format!(
+                        "{what} busy, and updating restarts blitz. Press Ctrl+Shift+U again within 3 s"
+                    );
+                    self.set_notice(id, text, Some(until), false);
+                    return true;
+                }
+                self.updating = Some(id);
+                self.set_notice(id, format!("Downloading blitz {v}\u{2026}"), None, true);
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    let _ = proxy.send_event(UserEvent::Installed(crate::update::install(&v)));
+                });
+            }
         }
         true
     }
@@ -1112,7 +1185,7 @@ impl App {
 
     /// The part of the window the active tab's panes share: all of it
     /// but the sidebar or rail, which the chrome shows once there are two
-    /// sessions.
+    /// sessions, and the banner strip.
     fn tab_area(&self) -> Rect {
         let size = self
             .window
@@ -1124,11 +1197,13 @@ impl App {
             (true, false) => chrome::RAIL_W,
         };
         let side = (side * self.scale as f32).round() as i32;
+        let banner = self.update.as_ref().map_or(0.0, |_| chrome::BANNER_H);
+        let banner = (banner * self.scale as f32).round() as i32;
         Rect {
             x: side,
             y: 0,
             w: (size.width as i32 - side).max(0),
-            h: size.height as i32,
+            h: (size.height as i32 - banner).max(0),
         }
     }
 
@@ -1179,7 +1254,7 @@ impl App {
         }
     }
 
-    fn on_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+    fn on_mouse_button(&mut self, el: &ActiveEventLoop, state: ElementState, button: MouseButton) {
         let b = match button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
@@ -1188,6 +1263,13 @@ impl App {
         };
         let mods = mods_now();
         let pressed = state == ElementState::Pressed;
+        let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
+        let on_banner = (self.banner)
+            .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        if pressed && b == 0 && on_banner {
+            self.act(el, Action::Update);
+            return;
+        }
         // A click on another pane or in the sidebar only moves focus.
         if pressed {
             let (id, side) = self.hit(self.mouse.pos);
@@ -1311,6 +1393,7 @@ impl App {
             .map(|(c, r, _)| (c, r, self.preedit.as_str()));
         let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
         self.rows = std::mem::take(&mut chrome.rows);
+        self.banner = chrome.banner;
 
         let split = chrome.panes.len() >= 2;
         let mut dimmed = Vec::new();
@@ -1689,7 +1772,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => self.on_mouse_move(position),
-            WindowEvent::MouseInput { state, button, .. } => self.on_mouse_button(state, button),
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.on_mouse_button(el, state, button);
+            }
             WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
             _ => {}
         }
@@ -1706,6 +1791,24 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw();
                 }
                 el.exit();
+            }
+            UserEvent::Update(v) => {
+                let how = if crate::update::installed() {
+                    "update and restart"
+                } else {
+                    "open the download page"
+                };
+                let text = format!("blitz {v} is available \u{b7} Ctrl+Shift+U to {how}");
+                self.update = Some((v, text));
+                self.request_redraw();
+            }
+            UserEvent::Installed(Ok(())) => el.exit(),
+            UserEvent::Installed(Err(e)) => {
+                eprintln!("blitz: update: {e}");
+                if let Some(id) = self.updating.take() {
+                    let text = format!("Update failed: {e}");
+                    self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                }
             }
         }
     }

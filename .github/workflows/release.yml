@@ -2,6 +2,8 @@ name: release
 
 # A v* tag builds the Windows zip and installer and attaches them to a draft
 # release. Running the workflow by hand builds the same files as an artifact.
+# Publishing the draft ships it: blitz offers the latest full release as an
+# update, so the draft is not marked as a prerelease.
 on:
   push:
     tags: ["v*"]
@@ -156,4 +158,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
-            --draft --prerelease --title "blitz ${GITHUB_REF_NAME#v}" --notes ""
+            --draft --title "blitz ${GITHUB_REF_NAME#v}" --notes ""

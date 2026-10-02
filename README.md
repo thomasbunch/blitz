@@ -27,6 +27,13 @@ choose **More info**, then **Run anyway**.
 
 The shell is PowerShell 7 if installed, else Windows PowerShell, else cmd.
 
+blitz asks GitHub for the latest release when it starts and once a day.
+If there is a newer one, a strip under the panes says so. Ctrl+Shift+U
+downloads the installer, checks it against the release's `SHA256SUMS.txt`
+and restarts blitz on the new version. That ends every session, so blitz
+asks you to press it twice if one is busy. A copy run from the zip opens
+the release page instead.
+
 ## Build
 
 Needs [Rust](https://rustup.rs); `rust-toolchain.toml` pins the toolchain.
@@ -67,6 +74,7 @@ or uninstall blitz: Claude Code keeps running whatever is at that path.
 | Ctrl+Alt+Arrows | Move focus between panes |
 | Ctrl+Shift+J | Jump to the next session that needs you |
 | Ctrl+Shift+B | Expand or collapse the sidebar |
+| Ctrl+Shift+U | Update, when a newer release is available |
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |

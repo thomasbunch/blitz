@@ -19,3 +19,5 @@ pub mod debug;
 pub mod pane;
 #[cfg(windows)]
 pub mod pty;
+#[cfg(windows)]
+pub mod update;

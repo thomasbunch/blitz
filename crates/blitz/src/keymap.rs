@@ -25,6 +25,8 @@ pub enum Action {
     Focus(Dir),
     JumpToAttention,
     ToggleSidebar,
+    /// Install the newer release. Without one the key goes to the program.
+    Update,
 }
 
 const CTRL: u8 = 1;
@@ -56,6 +58,7 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | ALT, 0x28, Action::Focus(Dir::Down)),
     (CTRL | SHIFT, b'J' as u16, Action::JumpToAttention),
     (CTRL | SHIFT, b'B' as u16, Action::ToggleSidebar),
+    (CTRL | SHIFT, b'U' as u16, Action::Update),
 ];
 
 /// The shortcut a key press triggers, if any. Modifiers must match
