@@ -563,11 +563,19 @@ mod tests {
 
     #[test]
     fn swapchain_on_a_hidden_window_presents_and_resizes() {
+        use windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled;
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
         };
         use windows::core::w;
 
+        // Flip-model swap chains need desktop composition, which a
+        // service session (some CI runners) does not have.
+        // SAFETY: plain query.
+        if !unsafe { DwmIsCompositionEnabled() }.is_ok_and(|b| b.as_bool()) {
+            eprintln!("skipped: no desktop composition in this session");
+            return;
+        }
         let mut gpu = Gpu::new(true).expect("WARP device");
         // SAFETY: a plain hidden top-level window of a system class.
         let hwnd = unsafe {
