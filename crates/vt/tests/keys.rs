@@ -570,3 +570,16 @@ fn mouse_motion_only_on_cell_change() {
         "\x1b[<35;6;6M\x1b[<0;6;6M\x1b[<32;7;6M\x1b[<0;7;6m\x1b[<0;7;6m"
     );
 }
+
+#[test]
+fn focus_reports_follow_mode_1004() {
+    let on = InputModes {
+        focus: true,
+        ..LEGACY
+    };
+    let mut out = Vec::new();
+    vt::encode_focus(true, &on, &mut out);
+    vt::encode_focus(false, &on, &mut out);
+    vt::encode_focus(true, &LEGACY, &mut out);
+    assert_eq!(out, b"\x1b[I\x1b[O");
+}

@@ -538,4 +538,8 @@ impl MouseTracker {
 pub fn encode_paste(_text: &str, _bracketed: bool, _out: &mut Vec<u8>) {}
 
 /// Appends a focus report when mode 1004 is set.
-pub fn encode_focus(_focused: bool, _m: &InputModes, _out: &mut Vec<u8>) {}
+pub fn encode_focus(focused: bool, m: &InputModes, out: &mut Vec<u8>) {
+    if m.focus {
+        out.extend_from_slice(if focused { b"\x1b[I" } else { b"\x1b[O" });
+    }
+}
