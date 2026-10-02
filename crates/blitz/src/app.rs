@@ -8,6 +8,7 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vt::{Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, Snapshot};
@@ -324,6 +325,8 @@ struct App {
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
     capture_then_exit: bool,
+    /// The terminal a running self-test reads: the focused pane's.
+    watched: Option<Arc<selftest::Focus>>,
     started: Instant,
     counters: Counters,
     code: i32,
@@ -365,6 +368,7 @@ impl App {
             last_flash: None,
             checked_conpty: false,
             capture_then_exit: false,
+            watched: None,
             started: Instant::now(),
             counters: Counters::default(),
             code: 0,
@@ -544,6 +548,9 @@ impl App {
         }
         let title = self.current().map(|v| v.pane.title.clone());
         self.set_title(&title.unwrap_or_default());
+        if let (Some(w), Some(v)) = (&self.watched, self.current()) {
+            *lock(w) = v.pane.term.clone();
+        }
     }
 
     fn set_title(&self, t: &str) {
@@ -571,17 +578,18 @@ impl App {
 
     /// Runs the `--selftest` script on its own thread; the app exits with
     /// its result.
-    fn start_selftest(&self, path: PathBuf) {
+    fn start_selftest(&mut self, path: PathBuf) {
         let (Some(v), proxy, hwnd) = (self.current(), self.proxy.clone(), self.hwnd) else {
             return;
         };
-        let term = v.pane.term.clone();
+        let term = Arc::new(Mutex::new(v.pane.term.clone()));
+        self.watched = Some(term.clone());
         std::thread::spawn(move || {
             let code = match std::fs::read_to_string(&path) {
                 Ok(script) => match selftest::run(&script, hwnd, &term) {
                     Ok(()) => 0,
                     Err(e) => {
-                        let screen = lock(&term).screen_text();
+                        let screen = selftest::screen(&term);
                         println!("selftest FAILED: {e}\n--- screen ---\n{screen}");
                         1
                     }
@@ -1485,7 +1493,7 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 /// The GUI self-test: real key presses through `SendInput`, checked
-/// against the screen.
+/// against the screen of the focused pane.
 ///
 /// - `sendinput CHORD`: press a chord such as `shift+enter` or `ctrl+c`.
 /// - `type TEXT`: type TEXT key by key on the active layout.
@@ -1498,7 +1506,7 @@ impl ApplicationHandler<UserEvent> for App {
 /// - `snap`: print the screen.
 /// - `sleep MS`, `note TEXT`.
 mod selftest {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use windows::Win32::Foundation::HWND;
@@ -1517,7 +1525,15 @@ mod selftest {
     use crate::debug::Regex;
     use crate::pane::lock;
 
-    pub fn run(script: &str, hwnd: isize, term: &Mutex<vt::Terminal>) -> Result<(), String> {
+    /// The terminal of the focused pane, swapped when focus moves.
+    pub type Focus = Mutex<Arc<Mutex<vt::Terminal>>>;
+
+    pub fn screen(term: &Focus) -> String {
+        let t = lock(term).clone();
+        lock(&t).screen_text()
+    }
+
+    pub fn run(script: &str, hwnd: isize, term: &Focus) -> Result<(), String> {
         for (n, line) in script.lines().enumerate() {
             let line = line.trim_end();
             if line.is_empty() || line.starts_with('#') {
@@ -1533,12 +1549,12 @@ mod selftest {
         s.trim().parse().map_err(|_| format!("not a number: {s:?}"))
     }
 
-    fn step(line: &str, hwnd: isize, term: &Mutex<vt::Terminal>) -> Result<(), String> {
+    fn step(line: &str, hwnd: isize, term: &Focus) -> Result<(), String> {
         let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
         let wait = |ms: u64, done: &dyn Fn(&str) -> bool| {
             let end = Instant::now() + Duration::from_millis(ms);
             while Instant::now() < end {
-                if done(&lock(term).screen_text()) {
+                if done(&screen(term)) {
                     return true;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -1598,7 +1614,7 @@ mod selftest {
                 }
                 .map_err(|e| format!("resize: {e}"))?;
             }
-            "snap" => println!("--- screen ---\n{}", lock(term).screen_text()),
+            "snap" => println!("--- screen ---\n{}", screen(term)),
             "sleep" => std::thread::sleep(Duration::from_millis(num(rest)?)),
             "note" => {}
             _ => return Err(format!("unknown command {cmd:?}")),
