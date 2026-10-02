@@ -1,0 +1,17 @@
+# Allowlist. Public repo: code and strictly necessary files only.
+# Everything is ignored unless re-included below. Design docs, notes and specs live outside the repo.
+/*
+*.md
+!/.gitignore
+!/.gitattributes
+!/.github/
+!/Cargo.toml
+!/Cargo.lock
+!/rust-toolchain.toml
+!/LICENSE
+!/README.md
+!/crates/
+Thumbs.db
+desktop.ini
+.DS_Store
+*.log
