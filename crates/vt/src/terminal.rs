@@ -6,7 +6,7 @@ use crate::grid::{Cell, Grid, Row, cf, rf};
 use crate::modes::InputModes;
 use crate::parser::{Handler, Params, Parser};
 use crate::snapshot::{CursorShape, Palette, RenderCell, Snapshot, attr};
-use crate::style::{Style, Styles};
+use crate::style::{Color, Style, Styles};
 use crate::width::cluster_width;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -645,6 +645,113 @@ impl Terminal {
             self.viewport = 0;
         }
     }
+
+    // ---- SGR ----
+
+    fn sgr(&mut self, p: &Params) {
+        let v = p.as_slice();
+        let s = &mut self.cur.style;
+        if v.is_empty() {
+            *s = Style {
+                link: s.link,
+                ..Style::default()
+            };
+        }
+        let mut i = 0;
+        while i < v.len() {
+            let mut subs = 0;
+            while p.is_sub(i + 1 + subs) {
+                subs += 1;
+            }
+            let mut used = 1 + subs;
+            let a = &mut s.attrs;
+            match v[i] {
+                // A hyperlink is not a rendition; SGR 0 leaves it alone.
+                0 => {
+                    *s = Style {
+                        link: s.link,
+                        ..Style::default()
+                    }
+                }
+                1 => *a |= sgr::BOLD,
+                2 => *a |= sgr::FAINT,
+                3 => *a |= sgr::ITALIC,
+                4 => {
+                    let kind = if subs > 0 { v[i + 1].min(5) } else { 1 };
+                    *a = (*a & !sgr::UNDERLINE) | kind << sgr::UNDERLINE_SHIFT;
+                }
+                5 | 6 => *a |= sgr::BLINK,
+                7 => *a |= sgr::INVERSE,
+                8 => *a |= sgr::INVISIBLE,
+                9 => *a |= sgr::STRIKE,
+                21 => *a = (*a & !sgr::UNDERLINE) | 2 << sgr::UNDERLINE_SHIFT,
+                22 => *a &= !(sgr::BOLD | sgr::FAINT),
+                23 => *a &= !sgr::ITALIC,
+                24 => *a &= !sgr::UNDERLINE,
+                25 => *a &= !sgr::BLINK,
+                27 => *a &= !sgr::INVERSE,
+                28 => *a &= !sgr::INVISIBLE,
+                29 => *a &= !sgr::STRIKE,
+                53 => *a |= sgr::OVERLINE,
+                55 => *a &= !sgr::OVERLINE,
+                n @ 30..=37 => s.fg = Color::Idx((n - 30) as u8),
+                n @ 40..=47 => s.bg = Color::Idx((n - 40) as u8),
+                n @ 90..=97 => s.fg = Color::Idx((n - 90 + 8) as u8),
+                n @ 100..=107 => s.bg = Color::Idx((n - 100 + 8) as u8),
+                39 => s.fg = Color::Default,
+                49 => s.bg = Color::Default,
+                59 => s.ul = Color::Default,
+                n @ (38 | 48 | 58) => {
+                    let (c, n_used) = ext_color(v, i, subs);
+                    used = n_used;
+                    if let Some(c) = c {
+                        match n {
+                            38 => s.fg = c,
+                            48 => s.bg = c,
+                            _ => s.ul = c,
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += used;
+        }
+        let bg = s.bg;
+        self.cur.sid = self.styles.intern(self.cur.style);
+        self.cur.blank = match bg {
+            Color::Default => 0,
+            bg => self.styles.intern(Style {
+                bg,
+                ..Style::default()
+            }),
+        };
+    }
+}
+
+/// Parses the colour after SGR 38/48/58 at `v[i]`, in either the colon
+/// form (`38:5:n`, `38:2::r:g:b`, `38:2:r:g:b`) or the semicolon form
+/// (`38;5;n`, `38;2;r;g;b`). Returns the colour and how many parameters it
+/// took, counting `v[i]`.
+fn ext_color(v: &[u16], i: usize, subs: usize) -> (Option<Color>, usize) {
+    let byte = |x: u16| x.min(255) as u8;
+    let rgb = |s: &[u16]| Color::Rgb(byte(s[0]), byte(s[1]), byte(s[2]));
+    if subs > 0 {
+        let s = &v[i + 1..=i + subs];
+        let c = match (s[0], s.len()) {
+            (5, 2..) => Some(Color::Idx(byte(s[1]))),
+            (2, 5..) => Some(rgb(&s[2..])),
+            (2, 4) => Some(rgb(&s[1..])),
+            _ => None,
+        };
+        return (c, 1 + subs);
+    }
+    let rest = &v[i + 1..];
+    match rest {
+        [5, n, ..] => (Some(Color::Idx(byte(*n))), 3),
+        [2, r, g, b, ..] => (Some(rgb(&[*r, *g, *b])), 5),
+        // Malformed: skip everything, as xterm does.
+        _ => (None, v.len() - i),
+    }
 }
 
 impl Handler for Terminal {
@@ -786,6 +893,7 @@ impl Handler for Terminal {
                     self.set_dec_mode(m, fin == b'h');
                 }
             }
+            ([], b'm') => self.sgr(p),
             ([], b'r') => {
                 let top = n(0) - 1;
                 let bottom = match p.get(1) {
