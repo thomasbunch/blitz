@@ -841,6 +841,55 @@ impl App {
                 let page = rows.saturating_sub(1).max(1) as isize;
                 self.scroll(page * isize::from(dir));
             }
+            Action::NewTab => self.add(|win, id, cwd| {
+                win.tabs.push(Tab::new(tab_name(cwd), id));
+                win.active = win.tabs.len() - 1;
+                true
+            }),
+            Action::ClosePane => {
+                if let Some(id) = before {
+                    self.close(el, id);
+                }
+            }
+            Action::CycleTab(step) => {
+                let n = self.win.tabs.len() as isize;
+                if n > 0 {
+                    let i = (self.win.active as isize + isize::from(step)).rem_euclid(n);
+                    self.win.active = i as usize;
+                    self.focus_moved(before);
+                }
+            }
+            Action::GoToTab(i) => {
+                if usize::from(i) < self.win.tabs.len() {
+                    self.win.active = usize::from(i);
+                    self.focus_moved(before);
+                }
+            }
+            Action::SplitRight | Action::SplitDown => {
+                let dir = if a == Action::SplitRight {
+                    Dir::Right
+                } else {
+                    Dir::Down
+                };
+                self.add(|win, id, _| {
+                    // Only the pane minimum matters, and `open` checks that
+                    // against the real window.
+                    let any = Rect {
+                        x: 0,
+                        y: 0,
+                        w: 1 << 16,
+                        h: 1 << 16,
+                    };
+                    let active = win.active;
+                    win.tabs
+                        .get_mut(active)
+                        .is_some_and(|t| t.split(dir, id, any, (0, 0)))
+                });
+            }
+            Action::ToggleSidebar => {
+                self.win.sidebar_expanded = !self.win.sidebar_expanded;
+                self.request_redraw();
+            }
             _ => return false,
         }
         true
@@ -1685,6 +1734,18 @@ mod tests {
         );
         assert_eq!(selection_text(&s, ((0, 1), (3, 1))), "c\u{4e2d}d");
         assert_eq!(selection_text(&s, ((2, 0), (3, 0))), "");
+    }
+
+    #[test]
+    fn app_new_panes_start_in_the_focused_directory() {
+        let here = std::env::temp_dir();
+        assert_eq!(start_dir(&here.display().to_string()), Some(here));
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        assert_eq!(start_dir(r"Z:\gone"), home);
+        assert_eq!(start_dir(""), home);
+        assert_eq!(tab_name(Some(Path::new(r"C:\dev\shop"))), "shop");
+        assert_eq!(tab_name(Some(Path::new(r"C:\"))), r"C:\");
+        assert_eq!(tab_name(None), "shell");
     }
 
     #[test]
