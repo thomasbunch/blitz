@@ -1373,7 +1373,16 @@ impl App {
             .iter()
             .filter_map(|v| v.notice.as_ref()?.until)
             .min();
-        [sync, notice].into_iter().flatten().min()
+        // The sidebar counts how long each session has been working.
+        let sidebar = self.views.len() >= 2 && self.win.sidebar_expanded;
+        let timer = (self.views.iter())
+            .filter(|v| sidebar && v.pane.attn.state == Attn::Working)
+            .map(|v| {
+                let since = v.pane.attn.since;
+                since + Duration::from_secs(now.saturating_duration_since(since).as_secs() + 1)
+            })
+            .min();
+        [sync, notice, timer].into_iter().flatten().min()
     }
 }
 
@@ -1492,7 +1501,8 @@ impl ApplicationHandler<UserEvent> for App {
                     v.notice = None;
                 }
             }
-            // A synchronized update timed out, or a notice expired.
+            // A synchronized update timed out, a notice expired, or a
+            // working timer ticked.
             self.request_redraw();
         }
     }
