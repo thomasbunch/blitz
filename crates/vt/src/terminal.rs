@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::grid::{Cell, Grid, Row, cf, rf};
 use crate::modes::{InputModes, KittyStack, Modes};
+use crate::osc::{self, Osc9};
 use crate::parser::{Handler, Params, Parser};
 use crate::snapshot::{self, CursorShape, Palette, RenderCell, Snapshot};
 use crate::style::{Color, Style, Styles, attr};
@@ -131,9 +132,25 @@ pub struct Terminal {
     dark: bool,
     /// Cell width and height in pixels, for size reports.
     cell_px: (u16, u16),
+    /// Foreground, background and cursor colours the host draws with, for
+    /// OSC 10, 11 and 12 queries.
+    pal: [u32; 3],
+    /// The same colours as set by the program with OSC 10, 11 and 12.
+    colors: [Option<u32>; 3],
     replies: Vec<u8>,
     events: Vec<Event>,
 }
+
+/// Foreground, background and cursor colours of the default dark and
+/// light themes, used for colour queries until a snapshot gives the
+/// host's own palette.
+const DARK: [u32; 3] = [0xD6D7D9, 0x131417, 0xECECEA];
+const LIGHT: [u32; 3] = [0x2F3135, 0xFCFCFB, 0x141518];
+
+/// Longest window title and notification texts kept, in characters.
+const MAX_TITLE: usize = 256;
+const MAX_NOTIFY_TITLE: usize = 64;
+const MAX_NOTIFY_BODY: usize = 256;
 
 impl Terminal {
     pub fn new(o: Options) -> Self {
@@ -167,6 +184,8 @@ impl Terminal {
             modes: Modes::default(),
             dark: true,
             cell_px: (0, 0),
+            pal: DARK,
+            colors: [None; 3],
             replies: Vec::new(),
             events: Vec::new(),
         }
@@ -252,6 +271,14 @@ impl Terminal {
             return false;
         }
         self.changed = false;
+        self.pal = [pal.fg, pal.bg, pal.cursor];
+        let [fg, bg, cursor] = self.colors;
+        let pal = &Palette {
+            fg: fg.unwrap_or(pal.fg),
+            bg: bg.unwrap_or(pal.bg),
+            cursor: cursor.unwrap_or(pal.cursor),
+            ..*pal
+        };
         out.cols = cols;
         out.rows = rows;
         out.alt_screen = self.alt;
@@ -283,6 +310,7 @@ impl Terminal {
 
     pub fn set_theme(&mut self, dark: bool) {
         self.dark = dark;
+        self.pal = if dark { DARK } else { LIGHT };
     }
 
     /// Cell size in pixels, for size reports.
@@ -646,18 +674,53 @@ impl Terminal {
     }
 
     fn full_reset(&mut self) {
-        let replies = std::mem::take(&mut self.replies);
-        let events = std::mem::take(&mut self.events);
-        let (input, dark, cell_px) = (self.modes.input, self.dark, self.cell_px);
-        *self = Self::new(self.opts);
-        self.replies = replies;
-        self.events = events;
-        self.dark = dark;
-        self.cell_px = cell_px;
+        let mut t = Self::new(self.opts);
+        // Queued output and what the host told us survive.
+        std::mem::swap(&mut t.replies, &mut self.replies);
+        std::mem::swap(&mut t.events, &mut self.events);
+        t.dark = self.dark;
+        t.cell_px = self.cell_px;
+        t.pal = self.pal;
         // ConPTY turns these on for itself at startup and is not told that
         // a program reset the terminal, so they stay.
-        self.modes.input.w32im = input.w32im;
-        self.modes.input.focus = input.focus;
+        t.modes.input.w32im = self.modes.input.w32im;
+        t.modes.input.focus = self.modes.input.focus;
+        *self = t;
+    }
+
+    // ---- OSC ----
+
+    fn set_link(&mut self, body: &str) {
+        let Some((params, uri)) = body.split_once(';') else {
+            return;
+        };
+        if self.styles.is_full() {
+            self.compact_styles();
+        }
+        let id = params
+            .split(':')
+            .find_map(|kv| kv.strip_prefix("id="))
+            .unwrap_or("");
+        self.cur.style.link = match uri {
+            "" => 0,
+            uri => self.styles.intern_link(id, uri),
+        };
+        self.cur.sid = self.styles.intern(self.cur.style);
+    }
+
+    /// OSC 10, 11 and 12, starting at colour `first` (0 foreground,
+    /// 1 background, 2 cursor). Each `;` item moves to the next colour, as
+    /// in `OSC 10;?;?`. An item is a query (`?`) or a colour to use.
+    fn dynamic_colors(&mut self, first: usize, body: &str, bel: bool) {
+        for (n, item) in (first..3).zip(body.split(';')) {
+            if item == "?" {
+                let rgb = self.colors[n].unwrap_or(self.pal[n]);
+                osc::color_reply(10 + n, rgb, bel, &mut self.replies);
+            } else if let Some(rgb) = osc::parse_color(item) {
+                self.colors[n] = Some(rgb);
+                self.changed = true;
+            }
+        }
     }
 
     // ---- modes ----
@@ -1121,7 +1184,58 @@ impl Handler for Terminal {
         }
     }
 
-    fn osc(&mut self, _data: &[u8], _bel_terminated: bool) {}
+    fn osc(&mut self, data: &[u8], bel: bool) {
+        let s = String::from_utf8_lossy(data);
+        let (cmd, body) = s.split_once(';').unwrap_or((&s, ""));
+        let ev = match cmd {
+            "0" | "2" => Event::Title(osc::clean(body, MAX_TITLE)),
+            "7" => match osc::file_url_path(body) {
+                Some(p) => Event::Cwd(p),
+                None => return,
+            },
+            "8" => return self.set_link(body),
+            "9" => match osc::classify_osc9(body) {
+                Osc9::Notify(text) => Event::Notify {
+                    title: String::new(),
+                    body: osc::clean(text, MAX_NOTIFY_BODY),
+                },
+                Osc9::Progress { state, pct } => Event::Progress { state, pct },
+                Osc9::Cwd(p) => Event::Cwd(p.to_owned()),
+                Osc9::PromptStart => Event::Prompt(PromptMark::A { blitz: false }),
+                Osc9::Ignore => return,
+            },
+            "10" | "11" | "12" => {
+                let first = usize::from(cmd.as_bytes()[1] - b'0');
+                return self.dynamic_colors(first, body, bel);
+            }
+            "110" | "111" | "112" => {
+                self.colors[usize::from(cmd.as_bytes()[2] - b'0')] = None;
+                self.changed = true;
+                return;
+            }
+            // Resets palette entries set with OSC 4, which is not
+            // supported, so there is nothing to reset.
+            "104" => return,
+            "133" => match osc::prompt_mark(body) {
+                Some(m) => Event::Prompt(m),
+                None => return,
+            },
+            // `notify;title;body`, where the body runs to the end and may
+            // hold `;`.
+            "777" => match body.split_once(';') {
+                Some(("notify", rest)) => {
+                    let (title, text) = rest.split_once(';').unwrap_or((rest, ""));
+                    Event::Notify {
+                        title: osc::clean(title, MAX_NOTIFY_TITLE),
+                        body: osc::clean(text, MAX_NOTIFY_BODY),
+                    }
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        self.events.push(ev);
+    }
 
     fn dcs_hook(&mut self, _p: &Params, _inter: &[u8], _fin: u8) {}
 
