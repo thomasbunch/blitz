@@ -304,3 +304,141 @@ fn kitty_keys_without_disambiguate_stay_legacy() {
     assert_eq!(enc(&k("c", Key::Char('c'), "c"), &kitty(4)), "\x03");
     assert_eq!(enc(&k("", Key::Escape, ""), &kitty(2)), "\x1b");
 }
+
+const W32IM: InputModes = InputModes {
+    w32im: true,
+    ..LEGACY
+};
+
+/// The keys Claude Code relies on, on a US layout: legacy, kitty flags 5
+/// (what Claude Code pushes) and the win32-input-mode key-down record.
+#[test]
+fn keys_claude_code_relies_on() {
+    let mut arrow = key(0x26, 72, 0, "", Key::Up, "");
+    arrow.extended = true;
+    let cases = [
+        (
+            key(0x0d, 28, 13, "s", Key::Enter, ""),
+            "\r",
+            "\x1b[13;2u",
+            "\x1b[13;28;13;1;16;1_",
+        ),
+        (
+            key(0x0d, 28, 10, "c", Key::Enter, ""),
+            "\r",
+            "\x1b[13;5u",
+            "\x1b[13;28;10;1;8;1_",
+        ),
+        (
+            key(0x0d, 28, 13, "a", Key::Enter, ""),
+            "\x1b\r",
+            "\x1b[13;3u",
+            "\x1b[13;28;13;1;2;1_",
+        ),
+        (
+            key(0x1b, 1, 27, "", Key::Escape, ""),
+            "\x1b",
+            "\x1b[27u",
+            "\x1b[27;1;27;1;0;1_",
+        ),
+        (
+            key(0x56, 47, 118, "a", Key::Char('v'), "v"),
+            "\x1bv",
+            "\x1b[118;3u",
+            "\x1b[86;47;118;1;2;1_",
+        ),
+        (
+            key(0x50, 25, 112, "a", Key::Char('p'), "p"),
+            "\x1bp",
+            "\x1b[112;3u",
+            "\x1b[80;25;112;1;2;1_",
+        ),
+        (
+            key(0x54, 20, 116, "a", Key::Char('t'), "t"),
+            "\x1bt",
+            "\x1b[116;3u",
+            "\x1b[84;20;116;1;2;1_",
+        ),
+        (
+            key(0x4f, 24, 111, "a", Key::Char('o'), "o"),
+            "\x1bo",
+            "\x1b[111;3u",
+            "\x1b[79;24;111;1;2;1_",
+        ),
+        (
+            key(0x43, 46, 3, "c", Key::Char('c'), "c"),
+            "\x03",
+            "\x1b[99;5u",
+            "\x1b[67;46;3;1;8;1_",
+        ),
+        (
+            key(0xbd, 12, 31, "cs", Key::Char('-'), "_"),
+            "\x1f",
+            "\x1b[45:95;6u",
+            "\x1b[189;12;31;1;24;1_",
+        ),
+        (
+            key(0x09, 15, 9, "s", Key::Tab, ""),
+            "\x1b[Z",
+            "\x1b[9;2u",
+            "\x1b[9;15;9;1;16;1_",
+        ),
+        (
+            key(0x08, 14, 127, "c", Key::Backspace, ""),
+            "\x08",
+            "\x1b[127;5u",
+            "\x1b[8;14;127;1;8;1_",
+        ),
+        (
+            key(0x08, 14, 8, "", Key::Backspace, ""),
+            "\x7f",
+            "\x7f",
+            "\x1b[8;14;8;1;0;1_",
+        ),
+        (arrow, "\x1b[A", "\x1b[A", "\x1b[38;72;0;1;256;1_"),
+        // Ctrl+J is one vector set: no special case to a bare newline.
+        (
+            key(0x4a, 36, 10, "c", Key::Char('j'), "j"),
+            "\n",
+            "\x1b[106;5u",
+            "\x1b[74;36;10;1;8;1_",
+        ),
+    ];
+    for (input, legacy, kkp, w32) in cases {
+        assert_eq!(enc(&input, &LEGACY), legacy, "legacy {input:?}");
+        assert_eq!(enc(&input, &kitty(5)), kkp, "kitty {input:?}");
+        assert_eq!(enc(&input, &W32IM), w32, "w32im {input:?}");
+        // Pushed kitty flags win over win32-input-mode.
+        let both = InputModes { kitty: 5, ..W32IM };
+        assert_eq!(enc(&input, &both), kkp, "kitty over w32im {input:?}");
+    }
+}
+
+#[test]
+fn win32_input_mode_keys_send_every_transition() {
+    // Shift down, Enter down, Enter up, Shift up.
+    let seq = [
+        key(0x10, 42, 0, "s", Key::Shift, ""),
+        key(0x0d, 28, 13, "s", Key::Enter, ""),
+        up(key(0x0d, 28, 13, "s", Key::Enter, "")),
+        up(key(0x10, 42, 0, "", Key::Shift, "")),
+    ];
+    let got: String = seq.iter().map(|input| enc(input, &W32IM)).collect();
+    assert_eq!(
+        got,
+        "\x1b[16;42;0;1;16;1_\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_\x1b[16;42;0;0;0;1_"
+    );
+
+    // Lock states and a caller-supplied control state are carried over.
+    let mut caps = key(0x41, 30, 65, "", Key::Char('a'), "A");
+    caps.locks = Locks {
+        caps: true,
+        num: true,
+        scroll: false,
+    };
+    assert_eq!(enc(&caps, &W32IM), "\x1b[65;30;65;1;160;1_");
+    let mut given = key(0x41, 30, 97, "", Key::Char('a'), "a");
+    given.cs = 0x20;
+    given.repeat = 3;
+    assert_eq!(enc(&given, &W32IM), "\x1b[65;30;97;1;32;3_");
+}

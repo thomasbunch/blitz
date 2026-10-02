@@ -116,9 +116,38 @@ pub fn encode_key(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     // Without disambiguate or all-keys, kitty flags leave presses legacy.
     if m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0 {
         kitty(k, m.kitty, out);
+    } else if m.w32im {
+        win32(k, out);
     } else {
         legacy(k, m, out);
     }
+}
+
+/// win32-input-mode: one console key record per transition, releases and
+/// bare modifier keys included. Console apps such as PSReadLine need it to
+/// see Shift on Enter.
+fn win32(k: &KeyInput, out: &mut Vec<u8>) {
+    let m = &k.mods;
+    let cs = k.cs
+        | u32::from(m.ralt)
+        | u32::from(m.lalt) << 1
+        | u32::from(m.rctrl) << 2
+        | u32::from(m.lctrl) << 3
+        | u32::from(m.lshift || m.rshift) << 4
+        | u32::from(k.locks.num) << 5
+        | u32::from(k.locks.scroll) << 6
+        | u32::from(k.locks.caps) << 7
+        | u32::from(k.extended) << 8;
+    let _ = write!(
+        out,
+        "\x1b[{};{};{};{};{};{}_",
+        k.vk,
+        k.scan,
+        k.uc,
+        u8::from(k.down),
+        cs,
+        k.repeat.max(1)
+    );
 }
 
 /// xterm modifier bits: shift 1, alt 2, ctrl 4, super 8. Kitty uses the same
