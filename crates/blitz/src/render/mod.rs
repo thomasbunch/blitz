@@ -136,9 +136,12 @@ mod gpu {
 
     impl Renderer {
         pub fn new(warp: bool, px: f32) -> Result<Self> {
+            let font = Font::new(DEFAULT_FAMILIES, px)?;
+            let mut gpu = Gpu::new(warp)?;
+            gpu.set_text_params(font.gamma, font.contrast);
             Ok(Self {
-                gpu: Gpu::new(warp)?,
-                font: Font::new(DEFAULT_FAMILIES, px)?,
+                gpu,
+                font,
                 atlas: Atlas::new(ATLAS_SIZE as u16, ATLAS_SIZE as u16),
                 quads: Vec::new(),
                 overflowed: false,

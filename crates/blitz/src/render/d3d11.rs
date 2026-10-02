@@ -40,10 +40,34 @@ static PS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shader.ps.dxbc"));
 /// Width and height of the glyph atlas texture.
 pub const ATLAS_SIZE: u32 = 2048;
 
-/// Grayscale contrast boost and the gamma 1.8 alpha-correction ratios
-/// DirectWrite uses by default.
-const CONTRAST: f32 = 1.0;
-const GAMMA_RATIOS: [f32; 4] = [0.148_054_42, -0.894_594_55, 1.475_908, -0.324_668_26];
+/// The four alpha-correction constants the shader needs for a text
+/// `gamma`, as DirectWrite computes them for grayscale text.
+///
+/// Adapted from Windows Terminal's dwrite_helpers.cpp (DWrite_GetGammaRatios):
+/// Copyright (c) Microsoft Corporation. Licensed under the MIT License.
+pub fn gamma_ratios(gamma: f32) -> [f32; 4] {
+    // One row per gamma from 1.0 to 2.2 in steps of 0.1.
+    const RATIOS: [[f32; 4]; 13] = [
+        [0.0000, 0.0000, 0.0000, 0.0000],
+        [0.0166, -0.0807, 0.2227, -0.0751],
+        [0.0350, -0.1760, 0.4325, -0.1370],
+        [0.0543, -0.2821, 0.6302, -0.1876],
+        [0.0739, -0.3963, 0.8167, -0.2287],
+        [0.0933, -0.5161, 0.9926, -0.2616],
+        [0.1121, -0.6395, 1.1588, -0.2877],
+        [0.1300, -0.7649, 1.3159, -0.3080],
+        [0.1469, -0.8911, 1.4644, -0.3234],
+        [0.1627, -1.0170, 1.6051, -0.3347],
+        [0.1773, -1.1420, 1.7385, -0.3426],
+        [0.1908, -1.2652, 1.8650, -0.3476],
+        [0.2031, -1.3864, 1.9851, -0.3501],
+    ];
+    let norm13 = (f64::from(0x10000) / (255.0 * 255.0)) as f32;
+    let norm24 = (f64::from(0x100) / 255.0) as f32;
+    let i = ((gamma * 10.0 + 0.5) as i32).clamp(10, 22) as usize - 10;
+    let [a, b, c, d] = RATIOS[i];
+    [norm13 * a, norm24 * b, norm13 * c, norm24 * d]
+}
 
 /// [`Quad::flags`]: a solid rectangle.
 pub const SOLID: u32 = 0;
@@ -90,6 +114,9 @@ pub struct Gpu {
     atlas_srv: ID3D11ShaderResourceView,
     quads: Option<ID3D11Buffer>,
     quad_cap: usize,
+    /// Grayscale contrast boost and [`gamma_ratios`] for glyphs.
+    contrast: f32,
+    gamma: [f32; 4],
 }
 
 /// A render target that lives only on the GPU, for headless rendering.
@@ -213,11 +240,19 @@ impl Gpu {
                         atlas_srv,
                         quads: None,
                         quad_cap: 0,
+                        contrast: 1.0,
+                        gamma: gamma_ratios(1.8),
                     })
                 }
                 _ => Err(E_FAIL.into()),
             }
         }
+    }
+
+    /// Sets the text gamma and grayscale contrast boost used for glyphs.
+    pub fn set_text_params(&mut self, gamma: f32, contrast: f32) {
+        self.gamma = gamma_ratios(gamma);
+        self.contrast = contrast;
     }
 
     /// Copies `alpha` (`w * h` bytes) into the atlas at (`x`, `y`).
@@ -280,11 +315,11 @@ impl Gpu {
             std::ptr::copy_nonoverlapping(quads.as_ptr(), m.pData.cast(), quads.len());
             self.ctx.Unmap(&buf, 0);
 
-            let [g0, g1, g2, g3] = GAMMA_RATIOS;
+            let [g0, g1, g2, g3] = self.gamma;
             let frame = [
                 2.0 / w as f32,
                 2.0 / h as f32,
-                CONTRAST,
+                self.contrast,
                 0.0,
                 g0,
                 g1,
@@ -521,6 +556,22 @@ impl Drop for Swapchain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quad_is_20_bytes() {
+        assert_eq!(size_of::<Quad>(), 20);
+    }
+
+    #[test]
+    fn gamma_ratios_match_directwrite_defaults() {
+        let close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+        // The values DirectWrite uses at its default gamma of 1.8.
+        let default = [0.148_054_42, -0.894_594_55, 1.475_908, -0.324_668_26];
+        assert!(close(gamma_ratios(1.8), default));
+        assert!(close(gamma_ratios(1.84), default));
+        assert_eq!(gamma_ratios(0.5), [0.0; 4]);
+        assert_eq!(gamma_ratios(9.0), gamma_ratios(2.2));
+    }
 
     #[test]
     fn warp_draws_solid_and_masked_quads_offscreen() {

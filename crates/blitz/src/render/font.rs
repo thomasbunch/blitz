@@ -13,7 +13,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_READING_DIRECTION_LEFT_TO_RIGHT, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
     DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, DWRITE_TEXTURE_ALIASED_1x1, DWriteCreateFactory,
     IDWriteFactory2, IDWriteFontCollection, IDWriteFontFace, IDWriteFontFallback,
-    IDWriteTextAnalysisSource,
+    IDWriteRenderingParams1, IDWriteTextAnalysisSource,
 };
 use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, w};
 
@@ -50,6 +50,10 @@ pub struct Font {
     /// Top of the underline, from the top of the cell.
     pub underline_y: i32,
     pub underline_h: u32,
+    /// Text gamma and grayscale contrast boost from the system's
+    /// "Adjust ClearType text" settings, applied by the shader.
+    pub gamma: f32,
+    pub contrast: f32,
     fallbacks: HashMap<(char, u8), Option<IDWriteFontFace>>,
 }
 
@@ -119,6 +123,12 @@ impl Font {
             let underline_h = (f32::from(m.underlineThickness) * scale).round().max(1.0) as u32;
             let underline_y = (baseline - (f32::from(m.underlinePosition) * scale).round() as i32)
                 .min(cell_h as i32 - underline_h as i32);
+            let (gamma, contrast) = factory
+                .CreateRenderingParams()
+                .and_then(|p| p.cast::<IDWriteRenderingParams1>())
+                .map_or((1.8, 1.0), |p| {
+                    (p.GetGamma(), p.GetGrayscaleEnhancedContrast())
+                });
             Ok(Self {
                 factory,
                 collection,
@@ -131,6 +141,8 @@ impl Font {
                 baseline,
                 underline_y,
                 underline_h,
+                gamma,
+                contrast,
                 fallbacks: HashMap::new(),
             })
         }
@@ -434,6 +446,7 @@ mod tests {
         assert!((7..=12).contains(&font.cell_w), "cell_w {}", font.cell_w);
         assert!((15..=24).contains(&font.cell_h), "cell_h {}", font.cell_h);
         assert!(font.baseline > 0 && font.baseline < font.cell_h as i32);
+        assert!((1.0..=3.0).contains(&font.gamma) && font.contrast >= 0.0);
         let a = font.raster("A", 0, 1).expect("raster").expect("ink");
         assert!(ink(&a) > 0);
         // The glyph sits inside its cell, on the baseline.
