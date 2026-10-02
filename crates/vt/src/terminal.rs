@@ -147,6 +147,9 @@ pub struct Terminal {
     events: VecDeque<Event>,
     /// The secret that marks blitz's own shell-integration prompts.
     prompt_token: String,
+    /// Between a blitz prompt mark and the next mark, where the shell
+    /// integration reports its directory.
+    at_prompt: bool,
 }
 
 /// Foreground, background and cursor colours of the default dark and
@@ -209,6 +212,7 @@ impl Terminal {
             reply_credit: REPLY_CREDIT,
             events: VecDeque::new(),
             prompt_token: "1".into(),
+            at_prompt: false,
         }
     }
 
@@ -1304,8 +1308,11 @@ impl Handler for Terminal {
         let (cmd, body) = s.split_once(';').unwrap_or((&s, ""));
         let ev = match cmd {
             "0" | "2" => Event::Title(osc::clean(body, MAX_TITLE)),
+            // Directories count only inside blitz's own prompt. One any
+            // program printed would start new panes in a folder it filled,
+            // where cmd runs a planted git or npm before the real one.
             "7" => match osc::file_url_path(body) {
-                Some(p) if osc::local_dir(&p) => Event::Cwd(p),
+                Some(p) if self.at_prompt && osc::local_dir(&p) => Event::Cwd(p),
                 _ => return,
             },
             "8" => return self.set_link(body),
@@ -1315,9 +1322,12 @@ impl Handler for Terminal {
                     body: osc::clean(text, MAX_NOTIFY_BODY),
                 },
                 Osc9::Progress { state, pct } => Event::Progress { state, pct },
-                Osc9::Cwd(p) if osc::local_dir(p) => Event::Cwd(p.to_owned()),
+                Osc9::Cwd(p) if self.at_prompt && osc::local_dir(p) => Event::Cwd(p.to_owned()),
                 Osc9::Cwd(_) => return,
-                Osc9::PromptStart => Event::Prompt(PromptMark::A { blitz: false }),
+                Osc9::PromptStart => {
+                    self.at_prompt = false;
+                    Event::Prompt(PromptMark::A { blitz: false })
+                }
                 Osc9::Ignore => return,
             },
             "10" | "11" | "12" => {
@@ -1340,9 +1350,13 @@ impl Handler for Terminal {
                 // still wants its kitty keys.
                 Some(m @ PromptMark::A { blitz: true }) => {
                     self.prompt_reset();
+                    self.at_prompt = true;
                     Event::Prompt(m)
                 }
-                Some(m) => Event::Prompt(m),
+                Some(m) => {
+                    self.at_prompt = false;
+                    Event::Prompt(m)
+                }
                 None => return,
             },
             // `notify;title;body`, where the body runs to the end and may
