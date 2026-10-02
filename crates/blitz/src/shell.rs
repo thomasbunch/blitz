@@ -63,7 +63,11 @@ pub enum Kind {
 }
 
 pub fn kind(program: &Path) -> Kind {
-    let stem = program
+    // The program is a Windows path. Take the file name by hand so `\` and
+    // a drive prefix separate it on every host, not only on Windows.
+    let path = program.to_string_lossy();
+    let name = path.rsplit(['\\', '/', ':']).next().unwrap_or_default();
+    let stem = Path::new(name)
         .file_stem()
         .map(|s| s.to_string_lossy().to_ascii_lowercase());
     match stem.as_deref() {
