@@ -66,8 +66,10 @@ static DEGRADED: AtomicBool = AtomicBool::new(false);
 fn conpty() -> Option<&'static Conpty> {
     static API: OnceLock<Option<Conpty>> = OnceLock::new();
     API.get_or_init(|| {
+        // A relative folder would load code from wherever blitz was started.
         let dir = std::env::var_os("BLITZ_CONPTY_DIR")
             .map(PathBuf::from)
+            .filter(|d| d.is_absolute())
             .or_else(|| {
                 std::env::current_exe()
                     .ok()?
