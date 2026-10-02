@@ -764,6 +764,8 @@ impl App {
         if v.pane.exit_code.is_some() {
             if k.down && k.vk == VK_RETURN {
                 let id = v.pane.id;
+                // The release must not reach the pane that takes focus.
+                self.eaten = Some(k.vk);
                 self.close(el, id);
             }
             return;
