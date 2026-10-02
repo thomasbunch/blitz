@@ -481,6 +481,9 @@ const STRIP_PREFIXES: &[&str] = &[
     "CONEMU",
     "VSCODE_",
     "ALACRITTY_",
+    // blitz's own settings, such as BLITZ_CONPTY_DIR and BLITZ_TRACE, are
+    // for the blitz they were set for, not for programs its panes start.
+    "BLITZ_",
 ];
 
 const STRIP: &[&str] = &[
@@ -581,6 +584,8 @@ mod tests {
             ("term_program", "vscode"),
             ("ConEmuPID", "1"),
             ("CLAUDE_CODE_MESSAGING_TOKEN", "secret"),
+            ("BLITZ_CONPTY_DIR", "conpty"),
+            ("blitz_trace", "t.txt"),
             ("CLAUDE_CONFIG_DIR", "c"),
             ("ANTHROPIC_MODEL", "m"),
             ("=C:", r"C:\work"),
