@@ -222,6 +222,17 @@ mod tests {
     }
 
     #[test]
+    fn reset_input_clears_modify_other_keys() {
+        let mut m = Modes {
+            mok: 2,
+            ..Modes::default()
+        };
+        m.kitty[1].push(1);
+        m.reset_input();
+        assert_eq!((m.mok, m.kitty[1].flags()), (0, 0));
+    }
+
+    #[test]
     fn sync_times_out() {
         let mut m = Modes::default();
         m.set_dec(2026, true);

@@ -128,3 +128,72 @@ fn synchronized_output_times_out() {
     t.take_replies(&mut r);
     assert_eq!(r, b"\x1b[?2026;1$y");
 }
+
+/// Modes a crashed full-screen program leaves behind.
+const LEFTOVERS: &str =
+    "\x1b[?1049h\x1b[>5u\x1b[>4;2m\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?2026h\x1b[?1049l\x1b[>1u";
+
+fn assert_clean(t: &Terminal) {
+    let m = t.input_modes();
+    assert_eq!(
+        (t.kitty_stack(false), t.kitty_stack(true)),
+        (&[][..], &[][..])
+    );
+    assert_eq!(
+        (m.mouse, m.mouse_sgr, m.bracketed),
+        (MouseMode::Off, false, false)
+    );
+    assert!(!t.sync_pending(Instant::now()));
+    // Modes the program did not touch, and the ones ConPTY owns, stay.
+    assert!(m.w32im && m.focus && m.decckm);
+}
+
+fn leftovers() -> Terminal {
+    let mut t = term("\x1b[?9001h\x1b[?1004h\x1b[?1h");
+    t.feed(LEFTOVERS.as_bytes());
+    assert_eq!(t.input_modes().kitty, 1);
+    t
+}
+
+#[test]
+fn child_exit_resets_input_modes() {
+    let mut t = leftovers();
+    t.on_child_exit();
+    assert_clean(&t);
+}
+
+#[test]
+fn blitz_prompt_resets_input_modes() {
+    let mut t = leftovers();
+    t.feed(b"\x1b]133;A;blitz=1\x07");
+    assert_clean(&t);
+    let mut t = leftovers();
+    t.feed(b"\x1b]133;A;aid=1;blitz=1\x1b\\");
+    assert_clean(&t);
+}
+
+#[test]
+fn other_prompts_keep_input_modes() {
+    for mark in [
+        "133;A",
+        "133;A;redraw=0",
+        "133;A;blitz=0",
+        "133;B",
+        "133;D;0",
+        "9;12",
+    ] {
+        let mut t = leftovers();
+        t.feed(format!("\x1b]{mark}\x07").as_bytes());
+        let m = t.input_modes();
+        assert_eq!(m.kitty, 1, "{mark}");
+        assert!(m.bracketed && m.mouse_sgr, "{mark}");
+        assert_eq!(t.kitty_stack(true), [5], "{mark}");
+    }
+}
+
+#[test]
+fn ris_resets_input_modes() {
+    let mut t = leftovers();
+    t.feed(b"\x1b[?1h\x1bc\x1b[?1h");
+    assert_clean(&t);
+}

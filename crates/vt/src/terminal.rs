@@ -313,7 +313,10 @@ impl Terminal {
 
     /// Resets keyboard, mouse and paste modes a crashed program may have left
     /// behind.
-    pub fn on_child_exit(&mut self) {}
+    pub fn on_child_exit(&mut self) {
+        self.modes.reset_input();
+        self.changed = true;
+    }
 
     pub fn set_theme(&mut self, dark: bool) {
         self.dark = dark;
@@ -1224,6 +1227,15 @@ impl Handler for Terminal {
             // supported, so there is nothing to reset.
             "104" => return,
             "133" => match osc::prompt_mark(body) {
+                // blitz's own shell integration marks its prompts, so a
+                // program that died in this shell left its modes behind.
+                // Other prompt starts are left alone: in screen-reader mode
+                // Claude Code sends 133;A;redraw=0 every turn while it
+                // still wants its kitty keys.
+                Some(m @ PromptMark::A { blitz: true }) => {
+                    self.modes.reset_input();
+                    Event::Prompt(m)
+                }
                 Some(m) => Event::Prompt(m),
                 None => return,
             },
