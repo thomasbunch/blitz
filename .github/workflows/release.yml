@@ -102,16 +102,16 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path "dist/blitz-${{ steps.v.outputs.version }}-windows-x64" -DestinationPath "out/blitz-${{ steps.v.outputs.version }}-windows-x64.zip"
 
+      # PowerShell, because Git Bash rewrites ISCC's /D switches as paths.
+      # Paths are absolute: ISCC resolves relative ones against the script.
       - name: Installer
+        shell: pwsh
         env:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
-          choco install innosetup --no-progress -y
-          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
-            "/DAppVersion=$VERSION" \
-            "/DSrcDir=$(cygpath -w "dist/blitz-$VERSION-windows-x64")" \
-            "/DOutDir=$(cygpath -w out)" \
-            .github/blitz.iss
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          & $iscc "/DAppVersion=$env:VERSION" "/DSrcDir=$PWD\dist\blitz-$env:VERSION-windows-x64" "/DOutDir=$PWD\out" .github\blitz.iss
 
       - name: Checksums
         working-directory: out
