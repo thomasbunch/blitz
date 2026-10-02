@@ -469,10 +469,29 @@ fn print_text<H: Handler>(h: &mut H, s: &str) {
 }
 
 /// Index of the first C0 control (ESC included) or DEL in `b`, or `b.len()`.
+/// Tests eight bytes per step with word arithmetic.
 fn find_ctl(b: &[u8]) -> usize {
-    b.iter()
-        .position(|&x| x < 0x20 || x == DEL)
-        .unwrap_or(b.len())
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let (words, tail) = b.as_chunks::<8>();
+    for (k, w) in words.iter().enumerate() {
+        let w = u64::from_le_bytes(*w);
+        // High bit of each byte below 0x20, then of each byte equal to DEL.
+        // A borrow only travels towards higher bytes, so the lowest flag in
+        // either mask is exact, which is all trailing_zeros looks at.
+        let lt = w.wrapping_sub(0x20 * LO) & !w & HI;
+        let x = w ^ (u64::from(DEL) * LO);
+        let del = x.wrapping_sub(LO) & !x & HI;
+        let z = lt | del;
+        if z != 0 {
+            return k * 8 + (z.trailing_zeros() / 8) as usize;
+        }
+    }
+    words.len() * 8
+        + tail
+            .iter()
+            .position(|&x| x < 0x20 || x == DEL)
+            .unwrap_or(tail.len())
 }
 
 #[cfg(test)]
@@ -494,5 +513,35 @@ mod tests {
         }
         assert!(!p.push(1, true));
         assert_eq!(p.len(), MAX_PARAMS);
+    }
+
+    #[test]
+    fn find_ctl_matches_a_bytewise_scan() {
+        const BYTES: [u8; 14] = [
+            0x00, 0x07, 0x1B, 0x1F, 0x7F, 0x20, 0x41, 0x7E, 0x80, 0x9F, 0xA0, 0xC2, 0xDF, 0xFF,
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut buf = [0u8; 40];
+        for _ in 0..20_000 {
+            for b in &mut buf {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                // Mostly printable, so matches land at every offset.
+                *b = if seed.is_multiple_of(8) {
+                    BYTES[(seed >> 8) as usize % BYTES.len()]
+                } else {
+                    BYTES[5 + (seed >> 8) as usize % 9]
+                };
+            }
+            for start in 0..buf.len() {
+                let s = &buf[start..];
+                let want = s
+                    .iter()
+                    .position(|&x| x < 0x20 || x == DEL)
+                    .unwrap_or(s.len());
+                assert_eq!(find_ctl(s), want, "{s:02x?}");
+            }
+        }
     }
 }
