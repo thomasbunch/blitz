@@ -27,6 +27,31 @@ pub enum Ev {
     Attended,
 }
 
+impl Ev {
+    /// The event for an OSC 777 notification title such as `blitz:done`,
+    /// as written by `blitz-hook`. Other titles are not attention events.
+    pub fn from_notify(title: &str) -> Option<Ev> {
+        Some(match title.strip_prefix("blitz:")? {
+            "needs-you" => Ev::NeedsYou,
+            "working" => Ev::Working,
+            "done" => Ev::Done,
+            "error" => Ev::Error { sticky: false },
+            "idle" => Ev::Idle,
+            _ => return None,
+        })
+    }
+
+    /// The event for the session's root process exiting with `code`.
+    pub fn from_exit(code: u32) -> Ev {
+        // STATUS_CONTROL_C_EXIT: the user stopped it, which is not a failure.
+        const CTRL_C_EXIT: u32 = 0xC000_013A;
+        match code {
+            0 | CTRL_C_EXIT => Ev::Idle,
+            _ => Ev::Error { sticky: true },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaneAttn {
     pub state: Attn,
@@ -221,5 +246,28 @@ mod tests {
         use Attn::*;
         assert!(Idle < Working && Working < DoneUnseen);
         assert!(DoneUnseen < Error && Error < NeedsYou);
+    }
+
+    #[test]
+    fn notify_titles() {
+        assert_eq!(Ev::from_notify("blitz:needs-you"), Some(Ev::NeedsYou));
+        assert_eq!(Ev::from_notify("blitz:working"), Some(Ev::Working));
+        assert_eq!(Ev::from_notify("blitz:done"), Some(Ev::Done));
+        assert_eq!(
+            Ev::from_notify("blitz:error"),
+            Some(Ev::Error { sticky: false })
+        );
+        assert_eq!(Ev::from_notify("blitz:idle"), Some(Ev::Idle));
+        assert_eq!(Ev::from_notify("blitz:bogus"), None);
+        assert_eq!(Ev::from_notify("Build finished"), None);
+        assert_eq!(Ev::from_notify(""), None);
+    }
+
+    #[test]
+    fn exit_codes() {
+        assert_eq!(Ev::from_exit(0), Ev::Idle);
+        assert_eq!(Ev::from_exit(0xC000_013A), Ev::Idle);
+        assert_eq!(Ev::from_exit(1), Ev::Error { sticky: true });
+        assert_eq!(Ev::from_exit(0xC000_0005), Ev::Error { sticky: true });
     }
 }
