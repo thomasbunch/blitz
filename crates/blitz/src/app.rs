@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -30,8 +30,9 @@ use crate::attention::{Attn, Ev};
 use crate::config::{Config, ThemeMode};
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
-use crate::layout::PaneId;
-use crate::pane::{Note, Pane, Spawn, lock};
+use crate::layout::{self, Dir, PaneId, Rect, Tab};
+use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
+use crate::render::chrome::{self, ChromeModel};
 use crate::render::d3d11::{Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
 
@@ -252,7 +253,7 @@ fn mods_now() -> Mods {
     }
 }
 
-/// A one-row message drawn over the bottom row of the pane.
+/// A one-row message drawn over the bottom row of a pane.
 struct Notice {
     text: String,
     /// Removed at this time; `None` keeps it until something replaces it.
@@ -279,6 +280,18 @@ struct Mouse {
     anchor: Option<(u16, u16)>,
 }
 
+/// A session and what the window keeps to draw it.
+struct View {
+    pane: Pane,
+    snap: Snapshot,
+    /// The terminal's size in cells.
+    grid: (u16, u16),
+    /// Where the grid went in the last frame; `None` while its tab is
+    /// hidden.
+    rect: Option<Rect>,
+    notice: Option<Notice>,
+}
+
 struct App {
     args: Args,
     config: Config,
@@ -290,21 +303,23 @@ struct App {
     dark: bool,
     pal: Palette,
     scale: f64,
-    pane: Option<Pane>,
-    snap: Snapshot,
-    /// The pane's size in cells.
-    grid: (u16, u16),
+    /// Tabs and the split tree in each.
+    win: layout::Window,
+    /// Every session, oldest first, which is the order the sidebar lists.
+    views: Vec<View>,
+    next_id: u32,
     focused: bool,
+    /// A selection in the focused pane.
     selection: Option<((u16, u16), (u16, u16))>,
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
-    notice: Option<Notice>,
     /// A multi-line paste waiting for its confirming Ctrl+V.
     paste: Option<(String, Instant)>,
     /// The release of this key belongs to a shortcut and is not sent.
     eaten: Option<u16>,
-    ime_cell: Option<(u16, u16)>,
+    /// Where the IME was last told the cursor is, in client pixels.
+    ime_at: Option<(i32, i32)>,
     last_flash: Option<Instant>,
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
@@ -337,17 +352,16 @@ impl App {
                 crate::theme::light()
             },
             scale: 1.0,
-            pane: None,
-            snap: Snapshot::default(),
-            grid: (0, 0),
+            win: layout::Window::default(),
+            views: Vec::new(),
+            next_id: 1,
             focused: false,
             selection: None,
             mouse: Mouse::default(),
             preedit: String::new(),
-            notice: None,
             paste: None,
             eaten: None,
-            ime_cell: None,
+            ime_at: None,
             last_flash: None,
             checked_conpty: false,
             capture_then_exit: false,
@@ -384,44 +398,15 @@ impl App {
                 size_of_val(&dark) as u32,
             )
         };
-        let size = window.inner_size();
         self.window = Some(window);
         self.ensure_gfx();
-        let (cw, ch) = self.cell();
-        let (cols, rows) = grid_size(size, (cw, ch), self.pad());
 
-        let launch = match &self.args.cmd {
-            Some(c) => crate::shell::Launch {
-                cmdline: c.clone(),
-                env: Vec::new(),
-            },
-            None => crate::shell::launch(
-                &self.config.shell,
-                &self.config.shell_args,
-                self.config.shell_integration,
-            ),
-        };
-        let proxy = self.proxy.clone();
-        let pane = Pane::spawn(
-            PaneId(1),
-            &Spawn {
-                cmdline: &launch.cmdline,
-                env: &launch.env,
-                cwd: self.args.cwd.as_deref(),
-                cols,
-                rows,
-                scrollback: self.config.scrollback_lines,
-                dark: self.dark,
-                parent: Some(self.hwnd),
-            },
-            move |id, note| {
-                let _ = proxy.send_event(UserEvent::Pane(id, note));
-            },
-        )
-        .map_err(|e| format!("cannot start {}: {e}", launch.cmdline))?;
-        lock(&pane.term).set_cell_px(cw as u16, ch as u16);
-        self.grid = (cols, rows);
-        self.pane = Some(pane);
+        let cwd = (self.args.cwd.clone()).or_else(|| std::env::current_dir().ok());
+        let id = PaneId(self.next_id);
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new(tab_name(cwd.as_deref()), id));
+        let cmd = self.args.cmd.clone();
+        self.open(win, id, cmd.as_deref(), cwd)?;
 
         if let Some(script) = self.args.selftest.clone() {
             self.start_selftest(script);
@@ -436,13 +421,161 @@ impl App {
         Ok(())
     }
 
+    /// Starts a session for pane `id` and shows `win`, a layout that
+    /// already holds it, running `cmd` or else the shell. Once a session
+    /// exists, a layout with a pane below the minimum size is refused.
+    fn open(
+        &mut self,
+        win: layout::Window,
+        id: PaneId,
+        cmd: Option<&str>,
+        cwd: Option<PathBuf>,
+    ) -> Result<(), String> {
+        let grids = self.grids(&win);
+        let small =
+            |&(_, (c, r)): &(PaneId, (i32, i32))| c < layout::MIN_COLS || r < layout::MIN_ROWS;
+        if !self.views.is_empty() && grids.iter().any(small) {
+            return Err("no room for another pane".into());
+        }
+        let fit = |n: i32| n.clamp(1, i32::from(u16::MAX)) as u16;
+        let grid = grids
+            .iter()
+            .find(|g| g.0 == id)
+            .map_or((80, 24), |&(_, (c, r))| (fit(c), fit(r)));
+        let launch = match cmd {
+            Some(c) => crate::shell::Launch {
+                cmdline: c.to_string(),
+                env: Vec::new(),
+            },
+            None => crate::shell::launch(
+                &self.config.shell,
+                &self.config.shell_args,
+                self.config.shell_integration,
+            ),
+        };
+        let proxy = self.proxy.clone();
+        let mut pane = Pane::spawn(
+            id,
+            &Spawn {
+                cmdline: &launch.cmdline,
+                env: &launch.env,
+                cwd: cwd.as_deref(),
+                cols: grid.0,
+                rows: grid.1,
+                scrollback: self.config.scrollback_lines,
+                dark: self.dark,
+                parent: Some(self.hwnd),
+            },
+            move |id, note| {
+                let _ = proxy.send_event(UserEvent::Pane(id, note));
+            },
+        )
+        .map_err(|e| format!("cannot start {}: {e}", launch.cmdline))?;
+        let (cw, ch) = self.cell();
+        lock(&pane.term).set_cell_px(cw as u16, ch as u16);
+        pane.name = program_name(&launch.cmdline);
+        pane.branch = cwd.as_deref().and_then(git_branch);
+        self.views.push(View {
+            pane,
+            snap: Snapshot::default(),
+            grid,
+            rect: None,
+            notice: None,
+        });
+        self.next_id = id.0 + 1;
+        let before = self.focus_id();
+        self.win = win;
+        self.focus_moved(before);
+        Ok(())
+    }
+
+    /// Opens a pane in a copy of the layout that `place` changes; tells the
+    /// user in the focused pane when that fails. New panes start where the
+    /// focused one is.
+    fn add(&mut self, place: impl FnOnce(&mut layout::Window, PaneId, Option<&Path>) -> bool) {
+        let cwd = start_dir(self.current().map_or("", |v| v.pane.cwd.as_str()));
+        let id = PaneId(self.next_id);
+        let mut win = self.win.clone();
+        if !place(&mut win, id, cwd.as_deref()) {
+            return;
+        }
+        if let Err(e) = self.open(win, id, None, cwd)
+            && let Some(id) = self.focus_id()
+        {
+            self.set_notice(id, e, Some(Instant::now() + NOTICE), false);
+        }
+    }
+
+    /// Closes a session and its pane. The window closes with the last one.
+    fn close(&mut self, el: &ActiveEventLoop, id: PaneId) {
+        let before = self.focus_id();
+        self.win.close_pane(id);
+        // Dropping the pane closes its pseudoconsole.
+        self.views.retain(|v| v.pane.id != id);
+        if self.views.is_empty() {
+            el.exit();
+            return;
+        }
+        self.focus_moved(before);
+    }
+
+    /// Catches up after the focused pane may have changed: focus reports,
+    /// attention, the selection and the window title.
+    fn focus_moved(&mut self, before: Option<PaneId>) {
+        self.request_redraw();
+        let now = self.focus_id();
+        if now == before {
+            return;
+        }
+        self.selection = None;
+        self.mouse.anchor = None;
+        self.ime_at = None;
+        if self.focused {
+            for (id, f) in [(before, false), (now, true)] {
+                if let Some(v) = id.and_then(|id| self.view(id)) {
+                    let mut out = Vec::new();
+                    vt::encode_focus(f, &lock(&v.pane.term).input_modes(), &mut out);
+                    v.pane.send(out);
+                }
+            }
+            if let Some(id) = now {
+                self.attention(id, Ev::Attended);
+            }
+        }
+        let title = self.current().map(|v| v.pane.title.clone());
+        self.set_title(&title.unwrap_or_default());
+    }
+
+    fn set_title(&self, t: &str) {
+        if let Some(w) = &self.window {
+            w.set_title(if t.is_empty() { "blitz" } else { t });
+        }
+    }
+
+    /// The pane with keyboard focus: the focused pane of the active tab.
+    fn focus_id(&self) -> Option<PaneId> {
+        self.win.tabs.get(self.win.active).map(|t| t.focus)
+    }
+
+    fn view(&self, id: PaneId) -> Option<&View> {
+        self.views.iter().find(|v| v.pane.id == id)
+    }
+
+    fn view_mut(&mut self, id: PaneId) -> Option<&mut View> {
+        self.views.iter_mut().find(|v| v.pane.id == id)
+    }
+
+    fn current(&self) -> Option<&View> {
+        self.focus_id().and_then(|id| self.view(id))
+    }
+
     /// Runs the `--selftest` script on its own thread; the app exits with
     /// its result.
     fn start_selftest(&self, path: PathBuf) {
-        let (Some(pane), proxy, hwnd) = (&self.pane, self.proxy.clone(), self.hwnd) else {
+        let (Some(v), proxy, hwnd) = (self.current(), self.proxy.clone(), self.hwnd) else {
             return;
         };
-        let term = pane.term.clone();
+        let term = v.pane.term.clone();
         std::thread::spawn(move || {
             let code = match std::fs::read_to_string(&path) {
                 Ok(script) => match selftest::run(&script, hwnd, &term) {
@@ -464,6 +597,67 @@ impl App {
 
     fn cell(&self) -> (u32, u32) {
         self.gfx.as_ref().map_or((8, 16), |g| g.r.cell())
+    }
+
+    /// What the chrome needs to lay out `win` in the window as it is now.
+    fn model<'a>(
+        &self,
+        win: &'a layout::Window,
+        sessions: &'a [chrome::Session],
+        preedit: Option<(u16, u16, &'a str)>,
+    ) -> ChromeModel<'a> {
+        let size = self
+            .window
+            .as_ref()
+            .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
+        ChromeModel {
+            win,
+            sessions,
+            light: !self.dark,
+            accent: self.config.accent.unwrap_or(crate::theme::ACCENT),
+            size: (size.width as i32, size.height as i32),
+            scale: self.scale as f32,
+            text_cell: self.gfx.as_ref().map_or((6, 12), |g| g.r.small_cell()),
+            term_cell: self.cell(),
+            now: Instant::now(),
+            banner: None,
+            preedit,
+        }
+    }
+
+    /// The size in cells of each pane `win` would show now.
+    fn grids(&self, win: &layout::Window) -> Vec<(PaneId, (i32, i32))> {
+        let (cw, ch) = self.cell();
+        let c = chrome::build(&self.model(win, &[], None));
+        c.panes
+            .iter()
+            .map(|&(id, r)| (id, (r.w / cw as i32, r.h / ch as i32)))
+            .collect()
+    }
+
+    /// Every session as the sidebar shows it.
+    fn sessions(&self) -> Vec<chrome::Session> {
+        self.views
+            .iter()
+            .map(|v| {
+                let p = &v.pane;
+                chrome::Session {
+                    id: p.id,
+                    name: p.name.clone(),
+                    cwd: p.cwd.clone(),
+                    branch: p.branch.clone(),
+                    state: p.attn.state,
+                    since: p.attn.since,
+                    msg: if p.msg.is_empty() {
+                        p.title.clone()
+                    } else {
+                        p.msg.clone()
+                    },
+                    progress: None,
+                    exit_code: p.exit_code,
+                }
+            })
+            .collect()
     }
 
     /// Builds the renderer and swap chain if there are none. Never panics:
@@ -494,33 +688,40 @@ impl App {
     }
 
     fn modes(&self) -> InputModes {
-        self.pane
-            .as_ref()
-            .map(|p| lock(&p.term).input_modes())
+        self.current()
+            .map(|v| lock(&v.pane.term).input_modes())
             .unwrap_or_default()
     }
 
     fn send(&self, bytes: impl Into<Vec<u8>>) {
-        if let Some(p) = &self.pane {
-            p.send(bytes);
+        if let Some(v) = self.current() {
+            v.pane.send(bytes);
         }
     }
 
     /// Scrolls the main screen; positive is up into the scrollback.
     fn scroll(&mut self, lines: isize) {
-        if let Some(p) = &self.pane {
-            lock(&p.term).scroll_viewport(lines);
+        if let Some(v) = self.current() {
+            lock(&v.pane.term).scroll_viewport(lines);
             self.selection = None;
             self.request_redraw();
         }
     }
 
-    fn set_notice(&mut self, text: impl Into<String>, until: Option<Instant>, dim: bool) {
-        self.notice = Some(Notice {
-            text: text.into(),
-            until,
-            dim,
-        });
+    fn set_notice(
+        &mut self,
+        id: PaneId,
+        text: impl Into<String>,
+        until: Option<Instant>,
+        dim: bool,
+    ) {
+        if let Some(v) = self.view_mut(id) {
+            v.notice = Some(Notice {
+                text: text.into(),
+                until,
+                dim,
+            });
+        }
         self.request_redraw();
     }
 
@@ -539,23 +740,24 @@ impl App {
     }
 
     fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput) {
-        let Some(pane) = &self.pane else {
-            return;
-        };
-        if pane.exit_code.is_some() {
-            if k.down && k.vk == VK_RETURN {
-                el.exit();
-            }
-            return;
-        }
         if !k.down && self.eaten == Some(k.vk) {
             self.eaten = None;
             return;
         }
         if let Some(a) = keymap::action(k)
-            && self.act(a)
+            && self.act(el, a)
         {
             self.eaten = Some(k.vk);
+            return;
+        }
+        let Some(v) = self.current() else {
+            return;
+        };
+        if v.pane.exit_code.is_some() {
+            if k.down && k.vk == VK_RETURN {
+                let id = v.pane.id;
+                self.close(el, id);
+            }
             return;
         }
         let mut out = Vec::new();
@@ -576,26 +778,27 @@ impl App {
         if self.selection.take().is_some() {
             self.request_redraw();
         }
-        if let Some(p) = &self.pane {
-            lock(&p.term).scroll_viewport(isize::MIN);
-            p.send(bytes);
+        if let Some(v) = self.current() {
+            lock(&v.pane.term).scroll_viewport(isize::MIN);
+            v.pane.send(bytes);
         }
     }
 
     /// Runs a shortcut. Returns false when it does not apply right now, in
     /// which case the key goes to the program.
-    fn act(&mut self, a: Action) -> bool {
+    fn act(&mut self, el: &ActiveEventLoop, a: Action) -> bool {
+        let before = self.focus_id();
         match a {
             Action::Copy => {
-                let Some(sel) = self.selection.take() else {
+                let (Some(sel), Some(v)) = (self.selection, self.current()) else {
                     return false;
                 };
-                let text = selection_text(&self.snap, sel);
+                let text = selection_text(&v.snap, sel);
                 if !crate::clipboard::set_text(Some(HWND(self.hwnd as *mut c_void)), &text) {
                     eprintln!("blitz: could not copy to the clipboard");
                 }
+                self.selection = None;
                 self.request_redraw();
-                true
             }
             Action::Paste => {
                 let Some(text) = crate::clipboard::get_text().filter(|t| !t.is_empty()) else {
@@ -607,77 +810,84 @@ impl App {
                         .paste
                         .take()
                         .is_some_and(|(t, until)| t == text && Instant::now() < until);
+                    let Some(id) = before else {
+                        return false;
+                    };
                     if !confirmed {
                         let lines = text.lines().count();
                         let until = Instant::now() + PASTE_CONFIRM;
                         self.paste = Some((text, until));
                         self.set_notice(
+                            id,
                             format!("Paste {lines} lines? Press Ctrl+V again within 3 s"),
                             Some(until),
                             false,
                         );
                         return true;
                     }
-                    self.notice = None;
+                    if let Some(v) = self.view_mut(id) {
+                        v.notice = None;
+                    }
                 }
                 let mut out = Vec::new();
                 vt::encode_paste(&text, bracketed, &mut out);
                 self.typed(out);
-                true
             }
             Action::ScrollPage(dir) => {
                 if self.modes().alt_screen {
                     return false;
                 }
-                let page = self.grid.1.saturating_sub(1).max(1) as isize;
+                let rows = self.current().map_or(1, |v| v.grid.1);
+                let page = rows.saturating_sub(1).max(1) as isize;
                 self.scroll(page * isize::from(dir));
-                true
             }
-            // Tabs, splits and the sidebar need more than one session.
-            _ => false,
+            _ => return false,
         }
+        true
     }
 
-    fn on_pane(&mut self, el: &ActiveEventLoop, note: Note) {
-        let Some(pane) = &mut self.pane else {
+    fn on_pane(&mut self, el: &ActiveEventLoop, id: PaneId, note: Note) {
+        let Some(v) = self.view_mut(id) else {
             return;
         };
         match note {
             Note::Dirty => {
-                pane.dirty.store(false, Ordering::Release);
+                v.pane.dirty.store(false, Ordering::Release);
                 let mut events = Vec::new();
-                lock(&pane.term).take_events(&mut events);
+                lock(&v.pane.term).take_events(&mut events);
                 for e in events {
-                    self.on_term_event(e);
+                    self.on_term_event(id, e);
                 }
                 if !self.checked_conpty {
                     self.checked_conpty = true;
                     if let Some(text) = crate::pty::inbox_notice() {
                         self.counters.inbox = true;
                         eprintln!("blitz: {text}");
-                        self.set_notice(text, Some(Instant::now() + NOTICE), true);
+                        self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
                     }
                 }
                 self.request_redraw();
             }
             Note::Exit(code) => {
-                pane.exit_code = Some(code);
-                self.attention(Ev::from_exit(code));
+                v.pane.exit_code = Some(code);
+                self.attention(id, Ev::from_exit(code));
                 // A clean exit or Ctrl+C closes the session; anything else
                 // stays up so the output can be read.
                 if matches!(code, 0 | 0xC000_013A) && self.args.selftest.is_none() {
-                    el.exit();
+                    self.close(el, id);
                     return;
                 }
                 self.set_notice(
+                    id,
                     format!("exited with code {code} \u{b7} Enter close"),
                     None,
                     false,
                 );
             }
             Note::Dead => {
-                self.attention(Ev::Error { sticky: true });
+                self.attention(id, Ev::Error { sticky: true });
                 self.set_notice(
+                    id,
                     "this session stopped updating after an internal error",
                     None,
                     false,
@@ -686,44 +896,49 @@ impl App {
         }
     }
 
-    fn on_term_event(&mut self, e: Event) {
+    fn on_term_event(&mut self, id: PaneId, e: Event) {
+        let focus = self.focus_id() == Some(id);
+        let Some(v) = self.view_mut(id) else {
+            return;
+        };
         match e {
             Event::Title(t) => {
-                if let Some(w) = &self.window {
-                    w.set_title(if t.is_empty() { "blitz" } else { &t });
-                }
-                if let Some(p) = &mut self.pane {
-                    p.title = t;
+                v.pane.title = t;
+                if focus {
+                    let t = v.pane.title.clone();
+                    self.set_title(&t);
                 }
             }
             Event::Cwd(dir) => {
-                if let Some(p) = &mut self.pane {
-                    p.cwd = dir;
-                }
+                v.pane.branch = git_branch(Path::new(&dir));
+                v.pane.cwd = dir;
             }
             Event::Notify { title, body } => {
                 if let Some(ev) = Ev::from_notify(&title) {
-                    if let Some(p) = &mut self.pane {
-                        p.msg = body;
-                    }
-                    self.attention(ev);
+                    v.pane.msg = body;
+                    self.attention(id, ev);
                 }
             }
             _ => {}
         }
     }
 
-    /// Feeds the session's attention state; flashes the taskbar button when
+    /// Feeds a session's attention state; flashes the taskbar button when
     /// it changes to something the user should see while looking away.
-    fn attention(&mut self, ev: Ev) {
-        let attended = self.focused;
-        let Some(p) = &mut self.pane else {
+    fn attention(&mut self, id: PaneId, ev: Ev) {
+        let attended = self.focused && self.focus_id() == Some(id);
+        let Some(v) = self.view_mut(id) else {
             return;
         };
-        if !p.attn.apply(ev, attended, Instant::now()) || attended || !self.config.flash {
+        let p = &mut v.pane;
+        let changed = p.attn.apply(ev, attended, Instant::now());
+        let state = p.attn.state;
+        // The sidebar shows the new state.
+        self.request_redraw();
+        if !changed || self.focused || !self.config.flash {
             return;
         }
-        let kind = match p.attn.state {
+        let kind = match state {
             Attn::NeedsYou | Attn::Error => UserAttentionType::Critical,
             Attn::DoneUnseen => UserAttentionType::Informational,
             _ => return,
@@ -738,19 +953,16 @@ impl App {
     }
 
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> (u16, u16) {
+        let Some(v) = self.current() else {
+            return (0, 0);
+        };
+        let r = v.rect.unwrap_or_default();
         let (cw, ch) = self.cell();
-        let (px, py) = self.pad();
-        let x = (pos.x - f64::from(px)).max(0.0) as u32;
-        let y = (pos.y - f64::from(py)).max(0.0) as u32;
-        let col = (x / cw).min(u32::from(self.grid.0.saturating_sub(1)));
-        let row = (y / ch).min(u32::from(self.grid.1.saturating_sub(1)));
+        let x = (pos.x - f64::from(r.x)).max(0.0) as u32;
+        let y = (pos.y - f64::from(r.y)).max(0.0) as u32;
+        let col = (x / cw).min(u32::from(v.grid.0.saturating_sub(1)));
+        let row = (y / ch).min(u32::from(v.grid.1.saturating_sub(1)));
         (col as u16, row as u16)
-    }
-
-    /// Space between the window edge and the cells.
-    fn pad(&self) -> (u32, u32) {
-        let (cw, _) = self.cell();
-        ((cw * 3 / 2).saturating_sub(1), (9.0 * self.scale) as u32)
     }
 
     /// Whether mouse events go to the program rather than to selection.
@@ -854,8 +1066,8 @@ impl App {
         }
     }
 
-    /// Draws a frame. Resizes the session first when the window size or
-    /// the font changed, at most once per frame.
+    /// Draws a frame. Resizes each visible session first when its pane
+    /// changed size, at most once per frame.
     fn redraw(&mut self) {
         let Some(window) = &self.window else {
             return;
@@ -865,44 +1077,69 @@ impl App {
             return;
         }
         self.ensure_gfx();
-        let pad = self.pad();
+        if self.gfx.is_none() {
+            return;
+        }
+        let (cw, ch) = self.cell();
+        let focus = self.focus_id();
+        let cursor = self.current().map(|v| lock(&v.pane.term).cursor());
+        let sessions = self.sessions();
+        let preedit = cursor
+            .filter(|_| !self.preedit.is_empty())
+            .map(|(c, r, _)| (c, r, self.preedit.as_str()));
+        let chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
+
+        let split = chrome.panes.len() >= 2;
+        let mut dimmed = Vec::new();
+        for v in &mut self.views {
+            v.rect = None;
+        }
+        for &(id, rect) in &chrome.panes {
+            let Some(v) = self.views.iter_mut().find(|v| v.pane.id == id) else {
+                continue;
+            };
+            let fit = |n: i32, cell: u32| (n / cell as i32).clamp(1, i32::from(u16::MAX)) as u16;
+            let grid = (fit(rect.w, cw), fit(rect.h, ch));
+            if grid != v.grid {
+                v.grid = grid;
+                v.pane.resize(grid.0, grid.1);
+                lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
+            }
+            v.rect = Some(rect);
+            lock(&v.pane.term).snapshot(&mut v.snap, &self.pal);
+            if Some(id) == focus {
+                v.snap.selection = self.selection;
+            } else if split {
+                let mut s = v.snap.clone();
+                s.selection = None;
+                crate::render::dim(&mut s);
+                dimmed.push((id, s));
+            }
+        }
+
+        let pal = self.pal;
         let Some(g) = &mut self.gfx else {
             return;
         };
-        let (cw, ch) = g.r.cell();
-        let grid = grid_size(size, (cw, ch), pad);
-        let Some(pane) = &self.pane else {
-            return;
-        };
-        if grid != self.grid {
-            self.grid = grid;
-            pane.resize(grid.0, grid.1);
-            lock(&pane.term).set_cell_px(cw as u16, ch as u16);
-        }
-        let cursor = {
-            let mut t = lock(&pane.term);
-            t.snapshot(&mut self.snap, &self.pal);
-            t.cursor()
-        };
-        self.snap.selection = self.selection;
-
         let result = (|| {
             g.chain.resize(&g.r.gpu, size.width, size.height)?;
             g.chain.wait(100);
             for _ in 0..2 {
                 g.r.begin();
-                g.r.snapshot(&self.snap, &self.pal, pad.0 as i32, pad.1 as i32);
-                overlays(
-                    &mut g.r,
-                    &self.pal,
-                    pad,
-                    grid,
-                    cursor,
-                    &self.preedit,
-                    &self.notice,
-                );
+                for v in &self.views {
+                    let Some(at) = v.rect else {
+                        continue;
+                    };
+                    let id = v.pane.id;
+                    let snap = dimmed.iter().find(|d| d.0 == id).map_or(&v.snap, |d| &d.1);
+                    g.r.snapshot(snap, &pal, at.x, at.y);
+                    if let Some(n) = &v.notice {
+                        draw_notice(&mut g.r, &pal, at, v.grid, n);
+                    }
+                }
+                g.r.chrome(&chrome);
                 let rtv = g.chain.rtv(&g.r.gpu)?;
-                if !g.r.draw(&rtv, size.width, size.height, self.pal.bg)? {
+                if !g.r.draw(&rtv, size.width, size.height, pal.bg)? {
                     break;
                 }
             }
@@ -910,7 +1147,7 @@ impl App {
                 && let Some(path) = &self.args.capture
             {
                 let t = g.r.gpu.offscreen(size.width, size.height)?;
-                g.r.draw(&t.rtv, size.width, size.height, self.pal.bg)?;
+                g.r.draw(&t.rtv, size.width, size.height, pal.bg)?;
                 let px = g.r.gpu.read(&t)?;
                 if let Err(e) = write_bmp(path, size.width, size.height, &px) {
                     eprintln!("blitz: {}: {e}", path.display());
@@ -937,17 +1174,17 @@ impl App {
             }
         }
 
-        let cell = (cursor.0, cursor.1);
-        if self.ime_cell != Some(cell) {
-            self.ime_cell = Some(cell);
-            if let Some(w) = &self.window {
-                w.set_ime_cursor_area(
-                    PhysicalPosition::new(
-                        pad.0 + u32::from(cell.0) * cw,
-                        pad.1 + u32::from(cell.1) * ch,
-                    ),
-                    PhysicalSize::new(cw, ch),
-                );
+        let at = self.current().and_then(|v| v.rect).zip(cursor);
+        if let Some((r, (col, row, _))) = at {
+            let at = (
+                r.x + i32::from(col) * cw as i32,
+                r.y + i32::from(row) * ch as i32,
+            );
+            if self.ime_at != Some(at)
+                && let Some(w) = &self.window
+            {
+                self.ime_at = Some(at);
+                w.set_ime_cursor_area(PhysicalPosition::new(at.0, at.1), PhysicalSize::new(cw, ch));
             }
         }
     }
@@ -956,65 +1193,54 @@ impl App {
     fn next_deadline(&self) -> Option<Instant> {
         let now = Instant::now();
         let sync = self
-            .pane
-            .as_ref()
-            .is_some_and(|p| lock(&p.term).sync_pending(now))
+            .views
+            .iter()
+            .any(|v| lock(&v.pane.term).sync_pending(now))
             .then(|| now + vt::modes::SYNC_TIMEOUT);
-        [sync, self.notice.as_ref().and_then(|n| n.until)]
-            .into_iter()
-            .flatten()
-            .min()
+        let notice = self
+            .views
+            .iter()
+            .filter_map(|v| v.notice.as_ref()?.until)
+            .min();
+        [sync, notice].into_iter().flatten().min()
     }
 }
 
-/// Draws the IME composition at the cursor and the notice row.
-fn overlays(
-    r: &mut Renderer,
-    pal: &Palette,
-    pad: (u32, u32),
-    grid: (u16, u16),
-    cursor: (u16, u16, bool),
-    preedit: &str,
-    notice: &Option<Notice>,
-) {
-    let (cw, ch) = r.cell();
-    if !preedit.is_empty() {
-        let cols = preedit
-            .chars()
-            .map(|c| u16::from(vt::cluster_width(c.encode_utf8(&mut [0; 4])).max(1)))
-            .sum::<u16>()
-            .max(1);
-        let mut s = text_snapshot(preedit, cols, 1, pal);
-        for c in &mut s.cells {
-            c.attrs |= vt::snapshot::attr::UNDERLINE;
+/// Draws a notice over the bottom row of the pane whose grid is at `at`.
+fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &Notice) {
+    let (_, ch) = r.cell();
+    let mut s = text_snapshot(&format!(" {}", n.text), grid.0, 1, pal);
+    let bg = if n.dim { pal.bg } else { pal.selection_bg };
+    for c in &mut s.cells {
+        c.bg = bg;
+        if n.dim {
+            c.attrs |= vt::snapshot::attr::DIM;
         }
-        let (x, y) = (
-            pad.0 + u32::from(cursor.0) * cw,
-            pad.1 + u32::from(cursor.1) * ch,
-        );
-        r.snapshot(&s, pal, x as i32, y as i32);
     }
-    if let Some(n) = notice {
-        let mut s = text_snapshot(&format!(" {}", n.text), grid.0, 1, pal);
-        let bg = if n.dim { pal.bg } else { pal.selection_bg };
-        for c in &mut s.cells {
-            c.bg = bg;
-            if n.dim {
-                c.attrs |= vt::snapshot::attr::DIM;
-            }
-        }
-        let banner = Palette { bg, ..*pal };
-        let y = pad.1 + u32::from(grid.1.saturating_sub(1)) * ch;
-        r.snapshot(&s, &banner, pad.0 as i32, y as i32);
-    }
+    let banner = Palette { bg, ..*pal };
+    let y = at.y + i32::from(grid.1.saturating_sub(1)) * ch as i32;
+    r.snapshot(&s, &banner, at.x, y);
 }
 
-/// How many cells fit in a window of `size` pixels.
-fn grid_size(size: PhysicalSize<u32>, (cw, ch): (u32, u32), (px, py): (u32, u32)) -> (u16, u16) {
-    let fit = |len: u32, pad: u32, cell: u32| {
-        (len.saturating_sub(2 * pad) / cell).clamp(1, u32::from(u16::MAX)) as u16
-    };
-    (fit(size.width, px, cw), fit(size.height, py, ch))
+/// Where a new pane starts: `cwd` if it is still a directory, else the
+/// user's profile folder.
+fn start_dir(cwd: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(cwd);
+    if !cwd.is_empty() && dir.is_dir() {
+        return Some(dir);
+    }
+    std::env::var_os("USERPROFILE").map(PathBuf::from)
+}
+
+/// A new tab is named after the folder it starts in.
+fn tab_name(cwd: Option<&Path>) -> String {
+    let name = cwd.map(|p| match p.file_name() {
+        Some(n) => n.to_string_lossy().into_owned(),
+        // A drive root.
+        None => p.display().to_string(),
+    });
+    name.filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "shell".into())
 }
 
 /// The text of the cells between two (column, row) points, inclusive, in
@@ -1070,12 +1296,13 @@ impl ApplicationHandler<UserEvent> for App {
         self.counters.wakeups += 1;
         if let StartCause::ResumeTimeReached { .. } = cause {
             let now = Instant::now();
-            if self
-                .notice
-                .as_ref()
-                .is_some_and(|n| n.until.is_some_and(|t| t <= now))
-            {
-                self.notice = None;
+            for v in &mut self.views {
+                if v.notice
+                    .as_ref()
+                    .is_some_and(|n| n.until.is_some_and(|t| t <= now))
+                {
+                    v.notice = None;
+                }
             }
             // A synchronized update timed out, or a notice expired.
             self.request_redraw();
@@ -1090,7 +1317,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;
                 // The cursor's cell stays, but its pixels move.
-                self.ime_cell = None;
+                self.ime_at = None;
                 let px = self.font_px();
                 if let Some(g) = &mut self.gfx
                     && let Err(e) = g.r.set_font_px(px)
@@ -1104,8 +1331,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut out = Vec::new();
                 vt::encode_focus(f, &self.modes(), &mut out);
                 self.send(out);
-                if f {
-                    self.attention(Ev::Attended);
+                if f && let Some(id) = self.focus_id() {
+                    self.attention(id, Ev::Attended);
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
@@ -1129,7 +1356,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Pane(_, note) => self.on_pane(el, note),
+            UserEvent::Pane(id, note) => self.on_pane(el, id, note),
             UserEvent::Finish(code) => {
                 self.code = code;
                 if self.args.capture.is_some() {
