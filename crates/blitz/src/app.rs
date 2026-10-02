@@ -934,7 +934,16 @@ impl App {
                 }
                 self.focus_moved(before);
             }
-            _ => return false,
+            // The focused session is skipped: the user is already looking
+            // at it, and a session that exited stays red until closed.
+            Action::JumpToAttention => {
+                let waiting = (self.views.iter())
+                    .filter(|v| Some(v.pane.id) != before)
+                    .map(|v| (v.pane.id, v.pane.attn.state, v.pane.attn.since));
+                if let Some(id) = crate::attention::jump_target(waiting) {
+                    self.show(id);
+                }
+            }
         }
         true
     }

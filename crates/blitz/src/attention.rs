@@ -130,6 +130,24 @@ impl PaneAttn {
     }
 }
 
+/// The session to jump to: the one waiting longest among those that need
+/// the user, then those with unseen results, then those that failed.
+pub fn jump_target<T>(sessions: impl IntoIterator<Item = (T, Attn, Instant)>) -> Option<T> {
+    sessions
+        .into_iter()
+        .filter_map(|(id, state, since)| {
+            let rank = match state {
+                Attn::NeedsYou => 0,
+                Attn::DoneUnseen => 1,
+                Attn::Error => 2,
+                Attn::Working | Attn::Idle => return None,
+            };
+            Some((rank, since, id))
+        })
+        .min_by_key(|&(rank, since, _)| (rank, since))
+        .map(|(_, _, id)| id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +279,27 @@ mod tests {
         assert_eq!(Ev::from_notify("blitz:bogus"), None);
         assert_eq!(Ev::from_notify("Build finished"), None);
         assert_eq!(Ev::from_notify(""), None);
+    }
+
+    #[test]
+    fn jump_prefers_needs_you_then_unseen_then_errors_oldest_first() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut s = vec![
+            (1, Attn::Error, at(0)),
+            (2, Attn::DoneUnseen, at(1)),
+            (3, Attn::Working, at(0)),
+            (4, Attn::NeedsYou, at(5)),
+            (5, Attn::NeedsYou, at(3)),
+            (6, Attn::Idle, at(0)),
+        ];
+        assert_eq!(jump_target(s.clone()), Some(5));
+        s.retain(|x| x.1 != Attn::NeedsYou);
+        assert_eq!(jump_target(s.clone()), Some(2));
+        s.retain(|x| x.1 != Attn::DoneUnseen);
+        assert_eq!(jump_target(s.clone()), Some(1));
+        s.retain(|x| x.1 != Attn::Error);
+        assert_eq!(jump_target(s), None);
     }
 
     /// The events a program's output turns into, the way the app reads
