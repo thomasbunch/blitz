@@ -1157,6 +1157,7 @@ impl ApplicationHandler<UserEvent> for App {
 /// - `type TEXT`: type TEXT key by key on the active layout.
 /// - `expect [MS] REGEX`: wait until a screen row matches (3000 ms default).
 /// - `waitfor MS TEXT`: wait until TEXT appears on the screen.
+/// - `clip TEXT`: put TEXT on the clipboard; `\n` is a line break.
 /// - `sleep MS`, `note TEXT`.
 mod selftest {
     use std::sync::Mutex;
@@ -1224,6 +1225,11 @@ mod selftest {
                 let ms = num(ms)?;
                 if !wait(ms, &|s| s.contains(text)) {
                     return Err(format!("{text:?} did not show up in {ms} ms"));
+                }
+            }
+            "clip" => {
+                if !crate::clipboard::set_text(None, &rest.replace(r"\n", "\r\n")) {
+                    return Err("cannot set the clipboard".into());
                 }
             }
             "sleep" => std::thread::sleep(Duration::from_millis(num(rest)?)),
