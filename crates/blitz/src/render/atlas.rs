@@ -2,6 +2,10 @@
 
 use std::collections::HashMap;
 
+/// Empty glyphs remembered before they are all forgotten at once. They
+/// take no room in the texture, so filling it never clears them.
+const MAX_EMPTY: usize = 1 << 14;
+
 /// What a glyph is rasterized from: the cluster text, its style and the
 /// number of cells it spans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -40,6 +44,8 @@ pub struct Atlas {
     h: u16,
     shelves: Vec<Shelf>,
     glyphs: HashMap<GlyphKey, Slot>,
+    /// Empty glyphs in `glyphs`.
+    empty: usize,
 }
 
 impl Atlas {
@@ -49,6 +55,7 @@ impl Atlas {
             h,
             shelves: Vec::new(),
             glyphs: HashMap::new(),
+            empty: 0,
         }
     }
 
@@ -62,6 +69,11 @@ impl Atlas {
 
     /// Records an empty glyph (a space, or one with no ink).
     pub fn insert_empty(&mut self, key: GlyphKey) {
+        if self.empty >= MAX_EMPTY {
+            self.glyphs.retain(|_, s| s.w != 0);
+            self.empty = 0;
+        }
+        self.empty += 1;
         self.glyphs.insert(key, Slot::default());
     }
 
@@ -77,6 +89,7 @@ impl Atlas {
     pub fn clear(&mut self) {
         self.shelves.clear();
         self.glyphs.clear();
+        self.empty = 0;
     }
 
     /// Best-fit shelf: the lowest shelf that is tall enough and has room,
@@ -160,5 +173,18 @@ mod tests {
         atlas.clear();
         assert_eq!(atlas.get(&key(1)), None);
         assert!(atlas.insert(key(5), 32, 32, 0, 0).is_some());
+    }
+
+    #[test]
+    fn empty_glyphs_are_forgotten_in_bulk() {
+        let mut atlas = Atlas::new(32, 32);
+        let inked = atlas.insert(key(1), 8, 8, 0, 0).expect("fits");
+        for n in 0..3 * MAX_EMPTY as u32 {
+            let mut k = key(0);
+            k.text[..4].copy_from_slice(&n.to_le_bytes());
+            atlas.insert_empty(k);
+            assert!(atlas.glyphs.len() <= MAX_EMPTY + 1);
+        }
+        assert_eq!(atlas.get(&key(1)), Some(inked), "inked glyphs stay");
     }
 }
