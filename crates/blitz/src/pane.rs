@@ -1,8 +1,8 @@
 //! A session: one child process on its own pseudoconsole, and its screen.
 
-use std::io;
+use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Component, Path, Prefix};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -193,12 +193,19 @@ pub fn git_branch(dir: &Path) -> Option<String> {
             git.join("HEAD")
         } else if git.is_file() {
             // A worktree or submodule: the file names the real git dir.
-            let link = std::fs::read_to_string(&git).ok()?;
-            d.join(link.strip_prefix("gitdir:")?.trim()).join("HEAD")
+            // A folder from a download can name a share there, and just
+            // reading it makes Windows sign in to that host.
+            let link = read_start(&git)?;
+            let gitdir = d.join(link.strip_prefix("gitdir:")?.trim());
+            match gitdir.components().next() {
+                Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_)) => {}
+                _ => return None,
+            }
+            gitdir.join("HEAD")
         } else {
             continue;
         };
-        let head = std::fs::read_to_string(head).ok()?;
+        let head = read_start(&head)?;
         let head = head.trim();
         return match head.strip_prefix("ref: refs/heads/") {
             Some(branch) => Some(branch.to_string()),
@@ -206,6 +213,14 @@ pub fn git_branch(dir: &Path) -> Option<String> {
         };
     }
     None
+}
+
+/// The first 4 KiB of a file that should hold one short line.
+fn read_start(path: &Path) -> Option<String> {
+    let mut s = String::new();
+    let file = std::fs::File::open(path).ok()?;
+    file.take(4096).read_to_string(&mut s).ok()?;
+    Some(s)
 }
 
 #[cfg(test)]
@@ -246,6 +261,18 @@ mod tests {
         .expect("link");
         std::fs::write(root.join("meta").join("HEAD"), "ref: refs/heads/side\n").expect("head");
         assert_eq!(git_branch(&wt).as_deref(), Some("side"));
+
+        // Only a git dir on a drive is read, not a share or device path.
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: \\\\?\\{}\n", root.join("meta").display()),
+        )
+        .expect("link");
+        assert_eq!(git_branch(&wt), None);
+
+        // A huge HEAD is not read whole.
+        std::fs::write(&head, format!("ref: refs/heads/{}", "x".repeat(10_000))).expect("head");
+        assert!(git_branch(&sub).is_some_and(|b| b.len() < 4096));
 
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(git_branch(&root), None);
