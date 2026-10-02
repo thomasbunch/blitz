@@ -55,6 +55,8 @@ pub struct Styles {
     /// Link `n` is `links[n - 1]`.
     links: Vec<Link>,
     link_map: HashMap<Link, u32>,
+    /// Bytes of id and URI held in `links`.
+    link_bytes: usize,
     /// Styles and links asked for since the last compaction that were not
     /// in the table yet.
     misses: usize,
@@ -74,6 +76,7 @@ impl Styles {
             map: HashMap::from([(d, 0)]),
             links: Vec::new(),
             link_map: HashMap::new(),
+            link_bytes: 0,
             misses: 0,
         }
     }
@@ -101,8 +104,12 @@ impl Styles {
 
     /// Interns an OSC 8 link and returns its id for [`Style::link`].
     /// The same `id` and `uri` always give the same link id. When the
-    /// link table is full the text is left unlinked (0).
+    /// link table is full, or the id or URI is too long, the text is left
+    /// unlinked (0).
     pub fn intern_link(&mut self, id: &str, uri: &str) -> u32 {
+        if uri.len() > MAX_URI || id.len() > MAX_LINK_ID {
+            return 0;
+        }
         let link = Link {
             id: id.to_owned(),
             uri: uri.to_owned(),
@@ -111,9 +118,10 @@ impl Styles {
             return n;
         }
         self.misses += 1;
-        if self.links.len() >= MAX_LINKS {
+        if self.links.len() >= MAX_LINKS || self.link_bytes >= MAX_LINK_BYTES {
             return 0;
         }
+        self.link_bytes += id.len() + uri.len();
         self.links.push(link.clone());
         let n = self.links.len() as u32;
         self.link_map.insert(link, n);
@@ -132,7 +140,9 @@ impl Styles {
     /// compaction frees nothing, and repeating it for each new style would
     /// rescan the whole scrollback every time.
     pub fn wants_compact(&self) -> bool {
-        let full = self.list.len() > usize::from(u16::MAX) || self.links.len() >= MAX_LINKS;
+        let full = self.list.len() > usize::from(u16::MAX)
+            || self.links.len() >= MAX_LINKS
+            || self.link_bytes >= MAX_LINK_BYTES;
         full && self.misses >= COMPACT_MISSES
     }
 
@@ -180,6 +190,14 @@ impl Styles {
 /// Distinct hyperlinks kept between compactions. A program that emits a
 /// fresh URI for every line would otherwise grow the table forever.
 const MAX_LINKS: usize = 1 << 16;
+
+/// Total id and URI bytes kept between compactions. Each link is stored
+/// twice, in the list and as its map key.
+const MAX_LINK_BYTES: usize = 4 << 20;
+
+/// Longest URI and id linked, as in VTE. Longer ones are shown unlinked.
+const MAX_URI: usize = 2083;
+const MAX_LINK_ID: usize = 250;
 
 /// New styles and links that must be asked for between two compactions of
 /// a full table; until then they fall back to the default style or no
@@ -308,5 +326,27 @@ mod tests {
         }
         s.intern(rgb(0, 1));
         assert!(s.wants_compact());
+    }
+
+    #[test]
+    fn link_text_is_bounded() {
+        let mut s = Styles::new();
+        let long = "a".repeat(MAX_URI + 1);
+        assert_eq!(s.intern_link("", &long), 0);
+        assert_eq!(s.intern_link(&long[..MAX_LINK_ID + 1], "u"), 0);
+        assert_eq!(s.intern_link(&long[..MAX_LINK_ID], &long[..MAX_URI]), 1);
+
+        // Unused links fill the byte budget long before the count cap.
+        let mut n = 1;
+        while s.intern_link("", &format!("{n:08}{}", &long[8..MAX_URI])) != 0 {
+            n += 1;
+        }
+        assert!(n * MAX_URI < MAX_LINK_BYTES + 2 * MAX_URI, "{n}");
+        for _ in 0..COMPACT_MISSES {
+            assert_eq!(s.intern_link("", "https://example.com/"), 0);
+        }
+        assert!(s.wants_compact());
+        s.compact([]);
+        assert_eq!(s.intern_link("", "https://example.com/"), 1);
     }
 }
