@@ -292,6 +292,8 @@ struct View {
     /// hidden.
     rect: Option<Rect>,
     notice: Option<Notice>,
+    /// When the taskbar last flashed for this session.
+    flashed: Option<Instant>,
 }
 
 struct App {
@@ -326,7 +328,6 @@ struct App {
     eaten: Option<u16>,
     /// Where the IME was last told the cursor is, in client pixels.
     ime_at: Option<(i32, i32)>,
-    last_flash: Option<Instant>,
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
     capture_then_exit: bool,
@@ -372,7 +373,6 @@ impl App {
             close_confirm: None,
             eaten: None,
             ime_at: None,
-            last_flash: None,
             checked_conpty: false,
             capture_then_exit: false,
             watched: None,
@@ -492,6 +492,7 @@ impl App {
             grid,
             rect: None,
             notice: None,
+            flashed: None,
         });
         self.next_id = id.0 + 1;
         let before = self.focus_id();
@@ -1019,27 +1020,18 @@ impl App {
     /// it changes to something the user should see while looking away.
     fn attention(&mut self, id: PaneId, ev: Ev) {
         let attended = self.focused && self.focus_id() == Some(id);
+        let away = !self.focused && self.config.flash;
         let Some(v) = self.view_mut(id) else {
             return;
         };
-        let p = &mut v.pane;
-        let changed = p.attn.apply(ev, attended, Instant::now());
-        let state = p.attn.state;
+        let now = Instant::now();
+        let changed = v.pane.attn.apply(ev, attended, now);
+        let kind = (changed && away)
+            .then(|| flash_kind(v.pane.attn.state, &mut v.flashed, now))
+            .flatten();
         // The sidebar shows the new state.
         self.request_redraw();
-        if !changed || self.focused || !self.config.flash {
-            return;
-        }
-        let kind = match state {
-            Attn::NeedsYou | Attn::Error => UserAttentionType::Critical,
-            Attn::DoneUnseen => UserAttentionType::Informational,
-            _ => return,
-        };
-        if self.last_flash.is_some_and(|t| t.elapsed() < FLASH_GAP) {
-            return;
-        }
-        self.last_flash = Some(Instant::now());
-        if let Some(w) = &self.window {
+        if let (Some(kind), Some(w)) = (kind, &self.window) {
             w.request_user_attention(Some(kind));
         }
     }
@@ -1374,6 +1366,23 @@ impl App {
             .min();
         [sync, notice].into_iter().flatten().min()
     }
+}
+
+/// How to flash the taskbar for a session that just changed to `state`
+/// while the window is in the background: urgently when it needs the
+/// user or failed, gently when it finished, and at most once per session
+/// every `FLASH_GAP`. `last` is when this session last flashed.
+fn flash_kind(state: Attn, last: &mut Option<Instant>, now: Instant) -> Option<UserAttentionType> {
+    let kind = match state {
+        Attn::NeedsYou | Attn::Error => UserAttentionType::Critical,
+        Attn::DoneUnseen => UserAttentionType::Informational,
+        Attn::Working | Attn::Idle => return None,
+    };
+    if last.is_some_and(|t| now.saturating_duration_since(t) < FLASH_GAP) {
+        return None;
+    }
+    *last = Some(now);
+    Some(kind)
 }
 
 /// Draws a notice over the bottom row of the pane whose grid is at `at`.
@@ -1900,6 +1909,26 @@ mod tests {
         assert_eq!(tab_name(Some(Path::new(r"C:\dev\shop"))), "shop");
         assert_eq!(tab_name(Some(Path::new(r"C:\"))), r"C:\");
         assert_eq!(tab_name(None), "shell");
+    }
+
+    #[test]
+    fn app_taskbar_flashes_once_per_session_every_ten_seconds() {
+        let t0 = Instant::now();
+        let mut last = None;
+        let flash = |state, last: &mut Option<Instant>, s| {
+            flash_kind(state, last, t0 + Duration::from_secs(s))
+        };
+        assert_eq!(flash(Attn::Working, &mut last, 0), None);
+        assert_eq!(flash(Attn::Idle, &mut last, 0), None);
+        assert_eq!(last, None, "only flashes count");
+        let critical = Some(UserAttentionType::Critical);
+        assert_eq!(flash(Attn::NeedsYou, &mut last, 0), critical);
+        assert_eq!(flash(Attn::Error, &mut last, 9), None);
+        assert_eq!(flash(Attn::Error, &mut last, 10), critical);
+        let gentle = Some(UserAttentionType::Informational);
+        assert_eq!(flash(Attn::DoneUnseen, &mut last, 20), gentle);
+        // Another session has its own limit.
+        assert_eq!(flash(Attn::NeedsYou, &mut None, 21), critical);
     }
 
     #[test]
