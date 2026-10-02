@@ -867,7 +867,7 @@ fn plain(b: &[u8]) -> String {
 ///
 /// Matching backtracks, which can be slow on pathological patterns but is
 /// fine for screen rows of a few hundred characters.
-struct Regex(Vec<Re>);
+pub(crate) struct Regex(Vec<Re>);
 
 enum Re {
     Char(char),
@@ -881,7 +881,7 @@ enum Re {
 }
 
 impl Regex {
-    fn new(pattern: &str) -> Result<Regex, String> {
+    pub(crate) fn new(pattern: &str) -> Result<Regex, String> {
         let p: Vec<char> = pattern.chars().collect();
         let mut i = 0;
         let alts = re_alts(&p, &mut i)?;
@@ -896,7 +896,7 @@ impl Regex {
         (0..=s.len()).any(|i| re_seq(&self.0, &s, i, &|_| true))
     }
 
-    fn matches_a_row(&self, screen: &str) -> bool {
+    pub(crate) fn matches_a_row(&self, screen: &str) -> bool {
         screen.lines().any(|row| self.is_match(row))
     }
 }

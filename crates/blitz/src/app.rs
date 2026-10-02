@@ -52,7 +52,8 @@ const WHEEL_LINES: isize = 3;
 #[derive(Debug)]
 pub enum UserEvent {
     Pane(PaneId, Note),
-    /// Exit with this code once `--exit-after` runs out.
+    /// Exit with this code: the self-test finished, or `--exit-after`
+    /// ran out.
     Finish(i32),
 }
 
@@ -62,6 +63,7 @@ struct Args {
     /// Run this command line instead of the shell.
     cmd: Option<String>,
     cwd: Option<PathBuf>,
+    selftest: Option<PathBuf>,
     /// Save the last frame here before exiting.
     capture: Option<PathBuf>,
     exit_after: Option<Duration>,
@@ -76,6 +78,7 @@ impl Args {
             match flag.as_str() {
                 "--cmd" => a.cmd = Some(v.clone()),
                 "--cwd" => a.cwd = Some(v.into()),
+                "--selftest" => a.selftest = Some(v.into()),
                 "--capture" => a.capture = Some(v.into()),
                 "--exit-after" => {
                     let ms = v.parse().map_err(|_| format!("not a number: {v}"))?;
@@ -415,6 +418,9 @@ impl App {
         self.grid = (cols, rows);
         self.pane = Some(pane);
 
+        if let Some(script) = self.args.selftest.clone() {
+            self.start_selftest(script);
+        }
         if let Some(after) = self.args.exit_after {
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {
@@ -423,6 +429,32 @@ impl App {
             });
         }
         Ok(())
+    }
+
+    /// Runs the `--selftest` script on its own thread; the app exits with
+    /// its result.
+    fn start_selftest(&self, path: PathBuf) {
+        let (Some(pane), proxy, hwnd) = (&self.pane, self.proxy.clone(), self.hwnd) else {
+            return;
+        };
+        let term = pane.term.clone();
+        std::thread::spawn(move || {
+            let code = match std::fs::read_to_string(&path) {
+                Ok(script) => match selftest::run(&script, hwnd, &term) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        let screen = lock(&term).screen_text();
+                        println!("selftest FAILED: {e}\n--- screen ---\n{screen}");
+                        1
+                    }
+                },
+                Err(e) => {
+                    println!("selftest: {}: {e}", path.display());
+                    2
+                }
+            };
+            let _ = proxy.send_event(UserEvent::Finish(code));
+        });
     }
 
     fn cell(&self) -> (u32, u32) {
@@ -628,7 +660,7 @@ impl App {
                 self.attention(Ev::from_exit(code));
                 // A clean exit or Ctrl+C closes the session; anything else
                 // stays up so the output can be read.
-                if matches!(code, 0 | 0xC000_013A) {
+                if matches!(code, 0 | 0xC000_013A) && self.args.selftest.is_none() {
                     el.exit();
                     return;
                 }
@@ -1115,6 +1147,223 @@ impl ApplicationHandler<UserEvent> for App {
         if let Err(e) = self.counters.write_trace() {
             eprintln!("blitz: BLITZ_TRACE: {e}");
         }
+    }
+}
+
+/// The GUI self-test: real key presses through `SendInput`, checked
+/// against the screen.
+///
+/// - `sendinput CHORD`: press a chord such as `shift+enter` or `ctrl+c`.
+/// - `type TEXT`: type TEXT key by key on the active layout.
+/// - `expect [MS] REGEX`: wait until a screen row matches (3000 ms default).
+/// - `waitfor MS TEXT`: wait until TEXT appears on the screen.
+/// - `sleep MS`, `note TEXT`.
+mod selftest {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput,
+        VIRTUAL_KEY, VkKeyScanW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+
+    use crate::debug::Regex;
+    use crate::pane::lock;
+
+    pub fn run(script: &str, hwnd: isize, term: &Mutex<vt::Terminal>) -> Result<(), String> {
+        for (n, line) in script.lines().enumerate() {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            println!("selftest: {line}");
+            step(line, hwnd, term).map_err(|e| format!("line {}: {e}", n + 1))?;
+        }
+        Ok(())
+    }
+
+    fn num<T: std::str::FromStr>(s: &str) -> Result<T, String> {
+        s.trim().parse().map_err(|_| format!("not a number: {s:?}"))
+    }
+
+    fn step(line: &str, hwnd: isize, term: &Mutex<vt::Terminal>) -> Result<(), String> {
+        let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let wait = |ms: u64, done: &dyn Fn(&str) -> bool| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end {
+                if done(&lock(term).screen_text()) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        match cmd {
+            "sendinput" => send(hwnd, &chord(rest)?)?,
+            "type" => {
+                for c in rest.chars() {
+                    send(hwnd, &char_keys(c))?;
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            }
+            "expect" => {
+                let (ms, pattern) = match rest.split_once(' ') {
+                    Some((ms, p)) if ms.bytes().all(|b| b.is_ascii_digit()) => (num(ms)?, p),
+                    _ => (3000, rest),
+                };
+                let re = Regex::new(pattern)?;
+                if !wait(ms, &|s| re.matches_a_row(s)) {
+                    return Err(format!("no row matched {pattern:?} within {ms} ms"));
+                }
+            }
+            "waitfor" => {
+                let (ms, text) = rest.split_once(' ').ok_or("waitfor MS TEXT")?;
+                let ms = num(ms)?;
+                if !wait(ms, &|s| s.contains(text)) {
+                    return Err(format!("{text:?} did not show up in {ms} ms"));
+                }
+            }
+            "sleep" => std::thread::sleep(Duration::from_millis(num(rest)?)),
+            "note" => {}
+            _ => return Err(format!("unknown command {cmd:?}")),
+        }
+        Ok(())
+    }
+
+    /// One key transition: a virtual key, or a UTF-16 unit when `vk` is 0.
+    #[derive(Clone, Copy)]
+    struct Stroke {
+        vk: u16,
+        unit: u16,
+        up: bool,
+    }
+
+    fn press(mods: &[u16], vk: u16) -> Vec<Stroke> {
+        let s = |vk, up| Stroke { vk, unit: 0, up };
+        let mut out: Vec<Stroke> = mods.iter().map(|&m| s(m, false)).collect();
+        out.extend([s(vk, false), s(vk, true)]);
+        out.extend(mods.iter().rev().map(|&m| s(m, true)));
+        out
+    }
+
+    fn chord(spec: &str) -> Result<Vec<Stroke>, String> {
+        let spec = spec.trim().to_ascii_lowercase();
+        let (mods, key) = spec.rsplit_once('+').unwrap_or(("", &spec));
+        let mut held = Vec::new();
+        for m in mods.split('+').filter(|m| !m.is_empty()) {
+            held.push(match m {
+                "shift" => 0xa0,
+                "ctrl" => 0xa2,
+                "alt" => 0xa4,
+                _ => return Err(format!("unknown modifier {m:?}")),
+            });
+        }
+        let vk = match key {
+            "enter" => 0x0d,
+            "tab" => 0x09,
+            "esc" => 0x1b,
+            "bs" | "backspace" => 0x08,
+            "space" => 0x20,
+            "pgup" => 0x21,
+            "pgdn" => 0x22,
+            "end" => 0x23,
+            "home" => 0x24,
+            "left" => 0x25,
+            "up" => 0x26,
+            "right" => 0x27,
+            "down" => 0x28,
+            "ins" => 0x2d,
+            "del" => 0x2e,
+            _ => {
+                let mut chars = key.chars();
+                match (chars.next(), chars.next()) {
+                    // SAFETY: a table lookup.
+                    (Some(c), None) => (unsafe { VkKeyScanW(c as u16) } & 0xff) as u16,
+                    _ => return Err(format!("unknown key {key:?}")),
+                }
+            }
+        };
+        Ok(press(&held, vk))
+    }
+
+    /// The keys that type `c` on the active layout, or a Unicode packet
+    /// when no key does.
+    fn char_keys(c: char) -> Vec<Stroke> {
+        // SAFETY: a table lookup.
+        let scan = unsafe { VkKeyScanW(c as u16) };
+        if c.len_utf16() == 1 && scan != -1 && (scan >> 8) & !1 == 0 {
+            let mods: &[u16] = if (scan >> 8) & 1 != 0 { &[0xa0] } else { &[] };
+            return press(mods, (scan & 0xff) as u16);
+        }
+        let mut out = Vec::new();
+        for &unit in c.encode_utf16(&mut [0; 2]).iter() {
+            out.push(Stroke {
+                vk: 0,
+                unit,
+                up: false,
+            });
+            out.push(Stroke {
+                vk: 0,
+                unit,
+                up: true,
+            });
+        }
+        out
+    }
+
+    /// Sends key strokes to the foreground window, which must be blitz:
+    /// anywhere else they would type into another program.
+    fn send(hwnd: isize, strokes: &[Stroke]) -> Result<(), String> {
+        // SAFETY: plain window queries.
+        unsafe {
+            if GetForegroundWindow().0 as isize != hwnd {
+                let _ = SetForegroundWindow(HWND(hwnd as *mut _));
+                std::thread::sleep(Duration::from_millis(200));
+                if GetForegroundWindow().0 as isize != hwnd {
+                    return Err("blitz is not the foreground window".into());
+                }
+            }
+        }
+        let inputs: Vec<INPUT> = strokes
+            .iter()
+            .map(|s| {
+                let mut flags = KEYBD_EVENT_FLAGS(0);
+                if s.up {
+                    flags |= KEYEVENTF_KEYUP;
+                }
+                let scan = if s.vk == 0 {
+                    flags |= KEYEVENTF_UNICODE;
+                    s.unit
+                } else {
+                    if matches!(s.vk, 0x21..=0x28 | 0x2d | 0x2e) {
+                        flags |= KEYEVENTF_EXTENDEDKEY;
+                    }
+                    // SAFETY: a table lookup.
+                    unsafe { MapVirtualKeyW(u32::from(s.vk), MAPVK_VK_TO_VSC) as u16 }
+                };
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(s.vk),
+                            wScan: scan,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                }
+            })
+            .collect();
+        // SAFETY: a valid slice of keyboard inputs.
+        let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+        if sent as usize != inputs.len() {
+            return Err(format!("SendInput sent {sent} of {} inputs", inputs.len()));
+        }
+        Ok(())
     }
 }
 
