@@ -27,7 +27,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{UserAttentionType, Window, WindowId};
 
 use crate::attention::{Attn, Ev};
-use crate::config::Config;
+use crate::config::{Config, ThemeMode};
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
 use crate::layout::PaneId;
@@ -297,7 +297,7 @@ struct App {
     focused: bool,
     selection: Option<((u16, u16), (u16, u16))>,
     mouse: Mouse,
-    /// IME composition text and its cursor.
+    /// IME composition text, drawn at the cursor.
     preedit: String,
     notice: Option<Notice>,
     /// A multi-line paste waiting for its confirming Ctrl+V.
@@ -316,10 +316,15 @@ struct App {
 
 impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
-        let dark = !crate::theme::system_is_light();
+        let config = Config::default();
+        let dark = match config.theme {
+            ThemeMode::System => !crate::theme::system_is_light(),
+            ThemeMode::Dark => true,
+            ThemeMode::Light => false,
+        };
         App {
             args,
-            config: Config::default(),
+            config,
             keys,
             proxy,
             window: None,
