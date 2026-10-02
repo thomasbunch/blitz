@@ -10,12 +10,29 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// [`Style::attrs`] bits.
+pub mod attr {
+    pub const BOLD: u16 = 1 << 0;
+    pub const DIM: u16 = 1 << 1;
+    pub const ITALIC: u16 = 1 << 2;
+    /// Underline kind as in SGR `4:x`: 0 none, 1 single, 2 double,
+    /// 3 curly, 4 dotted, 5 dashed.
+    pub const UNDERLINE: u16 = 0b111 << UNDERLINE_SHIFT;
+    pub const UNDERLINE_SHIFT: u16 = 3;
+    pub const BLINK: u16 = 1 << 6;
+    pub const INVERSE: u16 = 1 << 7;
+    pub const INVISIBLE: u16 = 1 << 8;
+    pub const STRIKE: u16 = 1 << 9;
+    pub const OVERLINE: u16 = 1 << 10;
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     pub fg: Color,
     pub bg: Color,
     /// Underline colour.
     pub ul: Color,
+    /// [`attr`] bits.
     pub attrs: u16,
     /// Hyperlink id, 0 for none.
     pub link: u32,
