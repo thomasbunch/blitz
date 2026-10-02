@@ -46,13 +46,14 @@ type Events = mpsc::Receiver<Result<(Instant, Vec<u8>), u32>>;
 /// Starts `cmdline` and forwards its output and exit code. Answers the
 /// bundled ConPTY's startup DA1 query, which otherwise holds output back
 /// for about 3 s.
-fn spawn(cmdline: &str) -> (Pty, Instant, Events) {
+fn spawn(cmdline: &str, env: &[(String, String)]) -> (Pty, Instant, Events) {
     // A failing test must not leave console hosts running.
     static JOB: Once = Once::new();
     JOB.call_once(|| blitz::pty::kill_children_on_exit().expect("job object"));
     let (tx, rx) = mpsc::channel();
     let opts = SpawnOpts {
         cmdline,
+        env,
         cols: 80,
         rows: 24,
         pane_id: 1,
@@ -76,7 +77,7 @@ fn spawn(cmdline: &str) -> (Pty, Instant, Events) {
 
 /// Runs `cmdline` to completion.
 fn run(cmdline: &str) -> Run {
-    let (_pty, started, rx) = spawn(cmdline);
+    let (_pty, started, rx) = spawn(cmdline, &[]);
     let mut chunks = Vec::new();
     loop {
         match rx
@@ -139,7 +140,7 @@ fn pty_uses_bundled_conpty_when_configured() {
 
 #[test]
 fn pty_close_ends_an_interactive_shell() {
-    let (pty, _, rx) = spawn("cmd");
+    let (pty, _, rx) = spawn("cmd", &[]);
     rx.recv_timeout(Duration::from_secs(30))
         .expect("output")
         .expect("cmd exited by itself");
@@ -154,6 +155,31 @@ fn pty_close_ends_an_interactive_shell() {
         {
             Ok(_) => continue,
             Err(_) => break,
+        }
+    }
+}
+
+#[test]
+fn pty_shells_print_prompt_marks() {
+    // "" is the detected default shell, PowerShell on a stock install.
+    for program in ["cmd.exe", ""] {
+        if program == "cmd.exe" && std::env::var_os("PROMPT").is_some() {
+            continue; // a user's own PROMPT is left alone
+        }
+        let launch = blitz::shell::launch(program, &[], true);
+        let (_pty, _, rx) = spawn(&launch.cmdline, &launch.env);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut out = Vec::new();
+        while find(&out, b"]133;A;blitz=1").is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(Ok((_, chunk))) => out.extend(chunk),
+                _ => panic!(
+                    "{:?}: no prompt mark in {:?}",
+                    launch.cmdline.get(..40),
+                    String::from_utf8_lossy(&out)
+                ),
+            }
         }
     }
 }
