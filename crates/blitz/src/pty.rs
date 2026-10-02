@@ -279,6 +279,14 @@ impl Pty {
             }
         };
         let spawned = Instant::now();
+        // Without its threads nothing would ever close the pane, so a thread
+        // that fails to start takes the child down with it.
+        let fail = |e: io::Error| {
+            // SAFETY: a valid process handle.
+            let _ = unsafe { TerminateProcess(raw(&process), 1) };
+            close_hpc(&hpc);
+            e
+        };
         let h = *lock(&hpc);
         if let (Some(hwnd), Some(reparent)) = (opts.parent, api.reparent) {
             // SAFETY: a live pseudoconsole; a bad window only fails the call.
@@ -301,7 +309,8 @@ impl Pty {
                         // SAFETY: a valid process handle.
                         unsafe { WaitForSingleObject(raw(&process), INFINITE) };
                         close_hpc(&hpc);
-                    })?;
+                    })
+                    .map_err(fail)?;
             }
         }
 
@@ -321,7 +330,8 @@ impl Pty {
                     }
                     pending.fetch_sub(bytes.len(), Ordering::Relaxed);
                 }
-            })?;
+            })
+            .map_err(fail)?;
 
         let (reply, hpc2, process2) = (writer.clone(), hpc.clone(), process.clone());
         let mut output = File::from(out_r);
@@ -347,7 +357,8 @@ impl Pty {
                 // The pipe is closed, so this cannot block on unread output.
                 close_hpc(&hpc2);
                 on_event(PtyEvent::Exit(exit_code(&process2)), &reply);
-            })?;
+            })
+            .map_err(fail)?;
 
         Ok(Pty {
             hpc,
