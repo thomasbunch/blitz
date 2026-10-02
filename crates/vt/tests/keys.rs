@@ -147,6 +147,12 @@ fn legacy_keys_decckm_and_deckpam() {
     // The main Enter key is not on the keypad.
     let enter = key(0x0d, 0x1c, 13, "", Key::Enter, "");
     assert_eq!(enc(&enter, &kpam), "\r");
+
+    // With Num Lock on the keypad types what is printed on it.
+    for (mut input, want) in [(five, "5"), (plus, "+"), (kp_enter, "\r")] {
+        input.locks.num = true;
+        assert_eq!(enc(&input, &kpam), want, "{input:?}");
+    }
 }
 
 #[test]

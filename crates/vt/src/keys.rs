@@ -262,8 +262,10 @@ fn legacy(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
             out.push(ESC);
         }
     };
+    // With Num Lock on the keypad types what is printed on it, as in xterm.
     if m.deckpam
         && bits == 0
+        && !k.locks.num
         && let Some(f) = keypad_app(k)
     {
         out.extend_from_slice(&[ESC, b'O', f]);
