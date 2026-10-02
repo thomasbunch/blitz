@@ -113,12 +113,20 @@ pub fn quote(arg: &str) -> String {
 /// Wraps the user's prompt with OSC 133 marks and reports the directory with
 /// OSC 7. Works on PowerShell 5.1 and 7, so it avoids `` `e ``. The A mark is
 /// tagged `blitz=<token>` with the pane's `BLITZ_PANE_TOKEN` so the terminal
-/// can tell it apart from marks that other programs print.
+/// can tell it apart from marks that other programs print. Each prompt first
+/// leaves an alternate screen a program left on, then sends a soft reset
+/// (DECSTR) and puts back default tab stops, so the console host drops
+/// margins, insert mode and charsets a program left behind, as the terminal
+/// does at the mark. It leaves the screen with `?1049h` then `?1049l`:
+/// conhost restores the saved cursor on `?1049l` even on the main screen, so
+/// there the pair saves and restores the same cursor, and on the alternate
+/// screen the console host and the terminal both restore the cursor saved
+/// when the program switched.
 pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
   $global:__blitz = @{ Orig = $function:prompt; Exec = $false; Token = $env:BLITZ_PANE_TOKEN }
   function global:prompt {
     $ok = $global:?; $code = if ($ok) { 0 } elseif ($global:LASTEXITCODE) { $global:LASTEXITCODE } else { 1 }
-    $e = [char]27; $b = [char]7; $s = ''
+    $e = [char]27; $b = [char]7; $s = "$e[?1049h$e[?1049l$e[!p$e[?5W"
     if ($global:__blitz.Exec) { $s += "$e]133;D;$code$b"; $global:__blitz.Exec = $false }
     $s += "$e]133;A;blitz=$($global:__blitz.Token)$b"
     if ($PWD.Provider.Name -eq 'FileSystem') { $s += "$e]7;" + ([Uri]::new($PWD.ProviderPath).AbsoluteUri) + $b }
@@ -134,10 +142,12 @@ pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
   }
 }"#;
 
-/// cmd's prompt with the same marks. cmd cannot report exit codes, nor
-/// expand variables in its prompt, so the token is written in.
+/// cmd's prompt with the same marks and reset. cmd cannot report exit
+/// codes, nor expand variables in its prompt, so the token is written in.
 pub fn cmd_prompt(token: &str) -> String {
-    format!(r"$e]133;D$e\$e]133;A;blitz={token}$e\$e]9;9;$P$e\$P$G$e]133;B$e\")
+    format!(
+        r"$e[?1049h$e[?1049l$e[!p$e[?5W$e]133;D$e\$e]133;A;blitz={token}$e\$e]9;9;$P$e\$P$G$e]133;B$e\"
+    )
 }
 
 /// A command line ready for `CreateProcessW`, plus variables to add to the
@@ -219,6 +229,25 @@ mod tests {
         assert_eq!(base64(b"foob"), "Zm9vYg==");
         // "hi" as UTF-16LE, the form -EncodedCommand expects.
         assert_eq!(base64(&[b'h', 0, b'i', 0]), "aABpAA==");
+    }
+
+    #[test]
+    fn prompts_leave_the_alternate_screen() {
+        let reset = "$e[?1049h$e[?1049l$e[!p$e[?5W";
+        assert!(POWERSHELL_INTEGRATION.contains(&format!("$s = \"{reset}\"")));
+        assert!(cmd_prompt("1").starts_with(reset));
+        let prompt = cmd_prompt("1").replace("$e", "\x1b");
+        let mut t = vt::Terminal::new(vt::Options::default());
+        // On the main screen the cursor stays where it is.
+        t.feed(b"\x1b[3;5H");
+        t.feed(prompt.as_bytes());
+        assert_eq!(t.cursor().1, 2);
+        // A program left on the alternate screen: back to the main screen
+        // and the cursor saved when it switched.
+        t.feed(b"\x1b[5;1H\x1b[?1049h\x1b[9;9H");
+        t.feed(prompt.as_bytes());
+        assert!(!t.input_modes().alt_screen);
+        assert_eq!(t.cursor().1, 4);
     }
 
     #[test]
