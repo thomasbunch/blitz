@@ -64,7 +64,7 @@ nothing when Claude Code runs outside blitz.
 | Ctrl+Alt+Arrows | Move focus between panes |
 | Ctrl+Shift+J | Jump to the next session that needs you |
 | Ctrl+Shift+B | Expand or collapse the sidebar |
-| Ctrl+C, Ctrl+Shift+C | Copy, when text is selected |
+| Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
 
