@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use crate::grid::{Cell, Grid, Row, cf, rf};
-use crate::modes::InputModes;
+use crate::modes::{InputModes, KittyStack, Modes};
 use crate::parser::{Handler, Params, Parser};
 use crate::snapshot::{self, CursorShape, Palette, RenderCell, Snapshot};
 use crate::style::{Color, Style, Styles, attr};
@@ -125,6 +125,7 @@ pub struct Terminal {
     /// Rows the view is scrolled back into scrollback.
     viewport: usize,
     changed: bool,
+    modes: Modes,
     replies: Vec<u8>,
     events: Vec<Event>,
 }
@@ -158,6 +159,7 @@ impl Terminal {
             cluster: None,
             viewport: 0,
             changed: true,
+            modes: Modes::default(),
             replies: Vec::new(),
             events: Vec::new(),
         }
@@ -213,9 +215,15 @@ impl Terminal {
 
     pub fn input_modes(&self) -> InputModes {
         InputModes {
+            kitty: self.kitty().flags(),
             alt_screen: self.alt,
-            ..InputModes::default()
+            ..self.modes.input
         }
+    }
+
+    /// A screen's kitty keyboard flags stack, bottom entry first.
+    pub fn kitty_stack(&self, alt: bool) -> &[u8] {
+        self.modes.kitty[usize::from(alt)].entries()
     }
 
     /// Column, row and visibility.
@@ -289,6 +297,15 @@ impl Terminal {
 
     fn rows(&self) -> u16 {
         self.opts.rows
+    }
+
+    /// The kitty keyboard stack of the screen being shown.
+    fn kitty(&self) -> &KittyStack {
+        &self.modes.kitty[usize::from(self.alt)]
+    }
+
+    fn kitty_mut(&mut self) -> &mut KittyStack {
+        &mut self.modes.kitty[usize::from(self.alt)]
     }
 
     fn main(&self) -> &Screen {
@@ -605,6 +622,8 @@ impl Terminal {
         self.cursor_visible = true;
         self.insert = false;
         self.autowrap = true;
+        self.modes.input.decckm = false;
+        self.modes.input.deckpam = false;
         self.top = 0;
         self.bottom = self.rows() - 1;
         self.cur = Cursor {
@@ -618,9 +637,14 @@ impl Terminal {
     fn full_reset(&mut self) {
         let replies = std::mem::take(&mut self.replies);
         let events = std::mem::take(&mut self.events);
+        let input = self.modes.input;
         *self = Self::new(self.opts);
         self.replies = replies;
         self.events = events;
+        // ConPTY turns these on for itself at startup and is not told that
+        // a program reset the terminal, so they stay.
+        self.modes.input.w32im = input.w32im;
+        self.modes.input.focus = input.focus;
     }
 
     // ---- modes ----
@@ -662,7 +686,9 @@ impl Terminal {
                 self.switch_screen(false);
                 self.restore_cursor();
             }
-            _ => {}
+            _ => {
+                self.modes.set_dec(m, on);
+            }
         }
     }
 
@@ -863,6 +889,8 @@ impl Handler for Terminal {
             ([], b'H') => self.tabs[self.cur.x as usize] = true,
             ([], b'M') => self.reverse_index(),
             ([], b'c') => self.full_reset(),
+            ([], b'=') => self.modes.input.deckpam = true,
+            ([], b'>') => self.modes.input.deckpam = false,
             ([g @ (b'(' | b')')], f) => {
                 self.cur.charsets[usize::from(*g == b')')] = match f {
                     b'0' => Charset::DecGraphics,
@@ -964,6 +992,13 @@ impl Handler for Terminal {
             ([], b's') => self.save_cursor(),
             ([], b'u') => self.restore_cursor(),
             ([b'!'], b'p') => self.soft_reset(),
+            // Kitty keyboard protocol. A bare `CSI u` is SCORC, above.
+            ([b'>'], b'u') => self.kitty_mut().push(p.get(0) as u8),
+            ([b'<'], b'u') => self.kitty_mut().pop(n(0) as usize),
+            ([b'='], b'u') => self.kitty_mut().set(p.get(0) as u8, p.get(1)),
+            // XTMODKEYS: `CSI > 4 ; n m` sets modifyOtherKeys. Not SGR.
+            ([b'>'], b'm') if p.is_empty() => self.modes.mok = 0,
+            ([b'>'], b'm') if p.get(0) == 4 => self.modes.mok = p.get(1).min(2) as u8,
             ([b' '], b'q') => {
                 self.cursor_shape = match p.get(0) {
                     3 | 4 => CursorShape::Underline,
