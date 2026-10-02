@@ -80,6 +80,8 @@ struct Args {
     /// Save the last frame here before exiting.
     capture: Option<PathBuf>,
     exit_after: Option<Duration>,
+    /// Open a window of its own, even if blitz is already running.
+    new_window: bool,
 }
 
 impl Args {
@@ -87,10 +89,19 @@ impl Args {
         let mut a = Args::default();
         let mut it = args.iter();
         while let Some(flag) = it.next() {
+            if flag == "--new-window" {
+                a.new_window = true;
+                continue;
+            }
             let v = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--cmd" => a.cmd = Some(v.clone()),
-                "--cwd" => a.cwd = Some(v.into()),
+                // Explorer passes a drive root as "C:\", and argv parsing
+                // reads the \" as an escaped quote, so it arrives as C:".
+                "--cwd" => match v.strip_suffix('"') {
+                    Some(root) => a.cwd = Some(format!("{root}\\").into()),
+                    None => a.cwd = Some(v.into()),
+                },
                 "--selftest" => a.selftest = Some(v.into()),
                 "--capture" => a.capture = Some(v.into()),
                 "--exit-after" => {
@@ -2316,5 +2327,22 @@ mod tests {
         assert_eq!(a.exit_after, Some(Duration::from_millis(4000)));
         assert!(Args::parse(&["--bogus".into(), "1".into()]).is_err());
         assert!(Args::parse(&["--cmd".into()]).is_err());
+        assert!(!a.new_window);
+    }
+
+    #[test]
+    fn open_here_options() {
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            Args::parse(&args).expect("parse")
+        };
+        assert_eq!(parse(&["--cwd", "C:\""]).cwd, Some(r"C:\".into()));
+        assert_eq!(parse(&["--cwd", r"C:oo"]).cwd, Some(r"C:oo".into()));
+        let a = parse(&["--new-window", "--cwd", r"C:oo"]);
+        assert!(a.new_window);
+        assert_eq!(a.cwd, Some(r"C:oo".into()));
+        let a = parse(&["--cwd", r"C:oo", "--new-window"]);
+        assert!(a.new_window);
+        assert_eq!(a.cwd, Some(r"C:oo".into()));
     }
 }
