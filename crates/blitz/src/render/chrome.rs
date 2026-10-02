@@ -625,7 +625,7 @@ fn elapsed(d: Duration) -> String {
 }
 
 /// Width of `t` in pixels in a font whose cells are `cw` wide.
-// ponytail: per character, so a combining mark costs a cell; fine for
+// Counted per character, so a combining mark costs a cell; fine for
 // names and paths.
 fn text_w(t: &str, cw: i32) -> i32 {
     t.chars().map(char_cells).sum::<i32>() * cw

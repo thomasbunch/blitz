@@ -1203,7 +1203,7 @@ impl App {
         }
         // Over another pane, the wheel scrolls that pane's history without
         // moving focus.
-        // ponytail: programs in unfocused panes never get wheel reports;
+        // Programs in unfocused panes never get wheel reports;
         // route them by pane if a full-screen app needs them.
         let (under, side) = self.hit(self.mouse.pos);
         if side {

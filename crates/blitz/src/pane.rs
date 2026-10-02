@@ -176,7 +176,7 @@ pub fn program_name(cmdline: &str) -> String {
 
 /// The branch checked out in the repository that holds `dir`, read from
 /// `.git/HEAD` without running git. A detached HEAD gives the short hash.
-// ponytail: a few file reads on the UI thread per prompt; move them off it
+// A few file reads on the UI thread per prompt; move them off it
 // if network drives make that slow.
 pub fn git_branch(dir: &Path) -> Option<String> {
     for d in dir.ancestors() {
