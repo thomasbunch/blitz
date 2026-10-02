@@ -583,3 +583,31 @@ fn focus_reports_follow_mode_1004() {
     vt::encode_focus(true, &LEGACY, &mut out);
     assert_eq!(out, b"\x1b[I\x1b[O");
 }
+
+fn paste(text: &str, bracketed: bool) -> String {
+    let mut out = Vec::new();
+    vt::encode_paste(text, bracketed, &mut out);
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn paste_filters_controls_and_line_breaks() {
+    assert_eq!(paste("a\r\nb\nc\rd\r\n", false), "a\rb\rc\rd\r");
+    assert_eq!(paste("x\x1b[31my\x03\x7f\u{9b}z\tq", false), "x[31myz\tq");
+    assert_eq!(paste("héllo ✳ 日本 🦀", false), "héllo ✳ 日本 🦀");
+    assert_eq!(paste("", false), "");
+}
+
+#[test]
+fn paste_bracketed() {
+    assert_eq!(paste("hi\n", true), "\x1b[200~hi\r\x1b[201~");
+    assert_eq!(paste("", true), "\x1b[200~\x1b[201~");
+}
+
+#[test]
+fn paste_cannot_break_out_of_the_bracket() {
+    let got = paste("\x1b[201~\r\nrm -rf ~\r\n\u{9b}201~", true);
+    assert_eq!(got, "\x1b[200~[201~\rrm -rf ~\r201~\x1b[201~");
+    assert_eq!(got.matches("\x1b[201~").count(), 1);
+    assert!(got.ends_with("\x1b[201~"));
+}

@@ -535,7 +535,30 @@ impl MouseTracker {
 }
 
 /// Appends pasted text, filtered and bracketed when requested.
-pub fn encode_paste(_text: &str, _bracketed: bool, _out: &mut Vec<u8>) {}
+///
+/// The filter is Windows Terminal's: C0 controls other than tab, LF and CR
+/// are dropped, as are DEL and C1, so pasted text can't carry escape
+/// sequences of its own, an early `ESC[201~` included. Line breaks become
+/// CR, which is what Enter sends.
+pub fn encode_paste(text: &str, bracketed: bool, out: &mut Vec<u8>) {
+    if bracketed {
+        out.extend_from_slice(b"\x1b[200~");
+    }
+    let mut prev = '\0';
+    for c in text.chars() {
+        match c {
+            '\n' if prev == '\r' => {}
+            '\n' | '\r' => out.push(b'\r'),
+            '\t' => out.push(b'\t'),
+            '\0'..='\x1f' | '\x7f'..='\u{9f}' => {}
+            _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+        prev = c;
+    }
+    if bracketed {
+        out.extend_from_slice(b"\x1b[201~");
+    }
+}
 
 /// Appends a focus report when mode 1004 is set.
 pub fn encode_focus(focused: bool, m: &InputModes, out: &mut Vec<u8>) {
