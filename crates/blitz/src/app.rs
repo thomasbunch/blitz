@@ -42,8 +42,9 @@ const VK_PACKET: u16 = 0xe7;
 const VK_RETURN: u16 = 0x0d;
 const VK_F4: u16 = 0x73;
 
-/// How long a multi-line paste waits for a second Ctrl+V.
-const PASTE_CONFIRM: Duration = Duration::from_secs(3);
+/// How long a multi-line paste waits for a second Ctrl+V, and closing a
+/// busy session for a second Ctrl+Shift+W.
+const CONFIRM: Duration = Duration::from_secs(3);
 /// How long the notice about the system ConPTY stays up.
 const NOTICE: Duration = Duration::from_secs(5);
 /// Taskbar flashes per session are at least this far apart.
@@ -317,6 +318,8 @@ struct App {
     preedit: String,
     /// A multi-line paste waiting for its confirming Ctrl+V.
     paste: Option<(String, Instant)>,
+    /// A busy session waiting for a second Ctrl+Shift+W.
+    close_confirm: Option<(PaneId, Instant)>,
     /// The release of this key belongs to a shortcut and is not sent.
     eaten: Option<u16>,
     /// Where the IME was last told the cursor is, in client pixels.
@@ -363,6 +366,7 @@ impl App {
             mouse: Mouse::default(),
             preedit: String::new(),
             paste: None,
+            close_confirm: None,
             eaten: None,
             ime_at: None,
             last_flash: None,
@@ -825,7 +829,7 @@ impl App {
                     };
                     if !confirmed {
                         let lines = text.lines().count();
-                        let until = Instant::now() + PASTE_CONFIRM;
+                        let until = Instant::now() + CONFIRM;
                         self.paste = Some((text, until));
                         self.set_notice(
                             id,
@@ -857,8 +861,27 @@ impl App {
                 true
             }),
             Action::ClosePane => {
-                if let Some(id) = before {
-                    self.close(el, id);
+                let Some(v) = self.current() else {
+                    return true;
+                };
+                let id = v.pane.id;
+                let busy = match (v.pane.attn.state, v.pane.exit_code) {
+                    (Attn::Working, None) => Some("working"),
+                    (Attn::NeedsYou, None) => Some("waiting for you"),
+                    _ => None,
+                };
+                let again = (self.close_confirm.take())
+                    .is_some_and(|(p, until)| p == id && Instant::now() < until);
+                match busy {
+                    Some(what) if !again => {
+                        let until = Instant::now() + CONFIRM;
+                        self.close_confirm = Some((id, until));
+                        let text = format!(
+                            "This session is {what}. Press Ctrl+Shift+W again within 3 s to close it"
+                        );
+                        self.set_notice(id, text, Some(until), false);
+                    }
+                    _ => self.close(el, id),
                 }
             }
             Action::CycleTab(step) => {
