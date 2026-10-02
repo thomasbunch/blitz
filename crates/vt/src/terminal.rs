@@ -572,7 +572,8 @@ impl Terminal {
     }
 
     fn tab(&mut self, n: u16) {
-        for _ in 0..n {
+        // Past the width every step lands on the last column.
+        for _ in 0..n.min(self.cols()) {
             let from = self.cur.x as usize + 1;
             self.cur.x = (from..self.tabs.len())
                 .find(|&i| self.tabs[i])
@@ -582,7 +583,7 @@ impl Terminal {
     }
 
     fn back_tab(&mut self, n: u16) {
-        for _ in 0..n {
+        for _ in 0..n.min(self.cols()) {
             let x = self.cur.x as usize;
             self.cur.x = (0..x).rev().find(|&i| self.tabs[i]).unwrap_or(0) as u16;
         }
@@ -1137,8 +1138,10 @@ impl Handler for Terminal {
             ([], b'b') => {
                 if let Some(c) = self.rep {
                     let wide = self.width(c) == 2;
-                    let max = self.cols() as usize * self.rows() as usize;
-                    for _ in 0..(n(0) as usize).min(max) {
+                    // Programs repeat within a line. A larger count lets a
+                    // few bytes keep the parser busy, more so in insert
+                    // mode, where each character shifts the rest of the row.
+                    for _ in 0..n(0).min(self.cols()) {
                         self.put(c, wide);
                     }
                 }

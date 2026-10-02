@@ -277,6 +277,9 @@ fn lines_scrolling_and_repeat() {
     feed(&mut t, "\x1b[r\x1b[4;1HX\x1b[3b");
     assert_eq!(t.screen_text(), "a\n\n\nXXXX\ne");
     assert_eq!(t.scrollback_text(), "");
+    // A repeat count stops at the screen width.
+    feed(&mut t, "\x1b[HY\x1b[99b");
+    assert_eq!(t.screen_text(), "YYYYY\nY\n\nXXXX\ne");
 }
 
 #[test]
