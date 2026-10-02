@@ -1025,8 +1025,12 @@ impl App {
             }
             Event::Notify { title, body } => {
                 if let Some(ev) = Ev::from_notify(&title, &v.pane.token) {
-                    v.pane.msg = body;
-                    self.attention(id, ev);
+                    let changed = self.attention(id, ev);
+                    if relabels(ev, changed)
+                        && let Some(v) = self.view_mut(id)
+                    {
+                        v.pane.msg = body;
+                    }
                 }
             }
             _ => {}
@@ -1067,11 +1071,12 @@ impl App {
 
     /// Feeds a session's attention state; flashes the taskbar button when
     /// it changes to something the user should see while looking away.
-    fn attention(&mut self, id: PaneId, ev: Ev) {
+    /// Returns true when the state changed.
+    fn attention(&mut self, id: PaneId, ev: Ev) -> bool {
         let attended = self.focused && self.focus_id() == Some(id);
         let away = !self.focused && self.config.flash;
         let Some(v) = self.view_mut(id) else {
-            return;
+            return false;
         };
         let now = Instant::now();
         let changed = v.pane.attn.apply(ev, attended, now);
@@ -1083,6 +1088,7 @@ impl App {
         if let (Some(kind), Some(w)) = (kind, &self.window) {
             w.request_user_attention(Some(kind));
         }
+        changed
     }
 
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> (u16, u16) {
@@ -1428,6 +1434,15 @@ impl App {
             .min();
         [sync, notice, timer].into_iter().flatten().min()
     }
+}
+
+/// Whether a notification replaces the session's sidebar message. It is
+/// kept with the state it came with, so a repeat or an ignored event does
+/// not relabel the session. Idle always does: the hook sends it with an
+/// empty body when the session ends, which clears the last reply even
+/// when the session was already idle.
+fn relabels(ev: Ev, changed: bool) -> bool {
+    changed || ev == Ev::Idle
 }
 
 /// How to flash the taskbar for a session that just changed to `state`
@@ -1993,6 +2008,20 @@ mod tests {
         assert_eq!(flash(Attn::DoneUnseen, &mut last, 20), gentle);
         // Another session has its own limit.
         assert_eq!(flash(Attn::NeedsYou, &mut None, 21), critical);
+    }
+
+    #[test]
+    fn app_message_follows_the_state_and_idle_clears_it() {
+        let t0 = Instant::now();
+        let mut a = crate::attention::PaneAttn::new(t0);
+        let mut feed = |ev, attended| relabels(ev, a.apply(ev, attended, t0));
+        assert!(feed(Ev::Working, true));
+        assert!(!feed(Ev::Working, true), "a repeat");
+        assert!(!feed(Ev::NeedsYou, true), "ignored while looking");
+        // Watched to the end: done is seen at once and lands on idle, and
+        // the end of the session still clears the message.
+        assert!(feed(Ev::Done, true));
+        assert!(feed(Ev::Idle, true));
     }
 
     #[test]
