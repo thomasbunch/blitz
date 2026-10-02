@@ -414,10 +414,37 @@ fn keys_claude_code_relies_on() {
         assert_eq!(enc(&input, &LEGACY), legacy, "legacy {input:?}");
         assert_eq!(enc(&input, &kitty(5)), kkp, "kitty {input:?}");
         assert_eq!(enc(&input, &W32IM), w32, "w32im {input:?}");
-        // Pushed kitty flags win over win32-input-mode.
+        // Pushed kitty flags win over win32-input-mode, except on Ctrl+C.
         let both = InputModes { kitty: 5, ..W32IM };
-        assert_eq!(enc(&input, &both), kkp, "kitty over w32im {input:?}");
+        let want = if input.vk == 0x43 { w32 } else { kkp };
+        assert_eq!(enc(&input, &both), want, "kitty over w32im {input:?}");
     }
+}
+
+/// Any output can push kitty flags. Under ConPTY, Ctrl+C and Ctrl+Break
+/// must still reach conhost as keys, or a console program can no longer
+/// be interrupted.
+#[test]
+fn interrupt_keys_stay_console_records() {
+    let ctrl_c = key(0x43, 46, 3, "c", Key::Char('c'), "c");
+    let mut ctrl_break = key(0x03, 70, 3, "c", Key::Other, "");
+    ctrl_break.extended = true;
+    for flags in [1, 5, 1 | 2 | 8] {
+        let m = InputModes {
+            kitty: flags,
+            ..W32IM
+        };
+        assert_eq!(enc(&ctrl_c, &m), "\x1b[67;46;3;1;8;1_", "{flags}");
+        assert_eq!(enc(&up(ctrl_c), &m), "\x1b[67;46;3;0;8;1_", "{flags}");
+        assert_eq!(enc(&ctrl_break, &m), "\x1b[3;70;3;1;264;1_", "{flags}");
+    }
+    // Other chords and plain C keep the kitty encoding.
+    let both = InputModes { kitty: 1, ..W32IM };
+    assert_eq!(enc(&key(0x43, 46, 99, "", Key::Char('c'), "c"), &both), "c");
+    assert_eq!(
+        enc(&key(0x43, 46, 3, "ca", Key::Char('c'), ""), &both),
+        "\x1b[99;7u"
+    );
 }
 
 #[test]

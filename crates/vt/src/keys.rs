@@ -104,6 +104,9 @@ const ESC: u8 = 0x1b;
 /// Windows' "the IME owns this key" virtual key.
 const VK_PROCESSKEY: u16 = 0xe5;
 
+const VK_CANCEL: u16 = 0x03;
+const VK_C: u16 = 0x43;
+
 // Kitty keyboard protocol flags.
 const DISAMBIGUATE: u8 = 1;
 const EVENT_TYPES: u8 = 2;
@@ -116,8 +119,14 @@ pub fn encode_key(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     if k.vk == VK_PROCESSKEY {
         return;
     }
-    // Without disambiguate or all-keys, kitty flags leave presses legacy.
-    if m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0 {
+    // Ctrl+C and Ctrl+Break stay console key records under ConPTY even
+    // when kitty flags are pushed: only then does conhost interrupt a
+    // program that reads keys, and any program can print a push.
+    let interrupt = matches!(k.vk, VK_C | VK_CANCEL) && mod_bits(k) & 6 == 4;
+    if m.w32im && interrupt {
+        win32(k, out);
+    } else if m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0 {
+        // Without disambiguate or all-keys, kitty flags leave presses legacy.
         kitty(k, m.kitty, out);
     } else if m.w32im {
         win32(k, out);
