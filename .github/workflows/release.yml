@@ -28,6 +28,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history, so the Version step can tell whether main has the tag.
+          fetch-depth: 0
       - run: rustup toolchain install
 
       - name: Version
@@ -36,6 +38,10 @@ jobs:
           version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "blitz") | .version')"
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME is not on main"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
