@@ -375,6 +375,15 @@ fn resize_keeps_the_cursor_row() {
 }
 
 #[test]
+fn joiner_after_a_resize_starts_fresh() {
+    // The last cluster sat past the new width on a row that moved up.
+    let mut t = run(10, 4, "\x1b[4;9Hp");
+    t.resize(5, 2);
+    feed(&mut t, "\u{200d}\u{301}x");
+    assert_eq!(t.screen_text(), "\n    x");
+}
+
+#[test]
 fn style_table_compacts_when_full() {
     let mut t = run(10, 2, "\x1b[31mR\x1b[0m");
     // More distinct colours than style ids, all drawn over one cell.

@@ -229,6 +229,9 @@ impl Terminal {
         self.top = 0;
         self.bottom = rows - 1;
         self.viewport = self.viewport.min(self.screen.grid.scrollback_len());
+        // The last cluster's cell may be gone; a mark arriving now must
+        // not reach for it.
+        self.cluster = None;
         self.changed = true;
     }
 
