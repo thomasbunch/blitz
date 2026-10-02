@@ -845,9 +845,14 @@ fn plain(b: &[u8]) -> String {
 /// `*`, `+`, `?`, `{n}`, `{n,}` and `{n,m}`, and the anchors `^` and `$`.
 /// Other characters after `\` stand for themselves.
 ///
-/// Matching backtracks, which can be slow on pathological patterns but is
-/// fine for screen rows of a few hundred characters.
-pub(crate) struct Regex(Vec<Re>);
+/// The pattern compiles to a small program that runs every alternative in
+/// step, so matching takes time linear in the row and constant stack, even
+/// for nested repeats on long rows of untrusted output.
+pub(crate) struct Regex(Vec<Op>);
+
+/// Most atoms and groups a pattern may compile to. Counted repeats are
+/// copied out, so `a{1000}` counts a thousand.
+const MAX_PROG: usize = 5000;
 
 enum Re {
     Char(char),
@@ -860,6 +865,19 @@ enum Re {
     Repeat(Box<Re>, u32, u32),
 }
 
+/// One step of a compiled [`Regex`].
+enum Op {
+    Char(char),
+    Any,
+    Set(Vec<(char, char)>, bool),
+    Start,
+    End,
+    /// Continue at both targets.
+    Split(usize, usize),
+    Jmp(usize),
+    Match,
+}
+
 impl Regex {
     pub(crate) fn new(pattern: &str) -> Result<Regex, String> {
         let p: Vec<char> = pattern.chars().collect();
@@ -868,12 +886,39 @@ impl Regex {
         if i < p.len() {
             return Err(format!("unmatched ) in {pattern:?}"));
         }
-        Ok(Regex(vec![Re::Group(alts)]))
+        let (mut prog, mut left) = (Vec::new(), MAX_PROG);
+        re_emit(&Re::Group(alts), &mut prog, &mut left)?;
+        prog.push(Op::Match);
+        Ok(Regex(prog))
     }
 
     fn is_match(&self, row: &str) -> bool {
         let s: Vec<char> = row.chars().collect();
-        (0..=s.len()).any(|i| re_seq(&self.0, &s, i, &|_| true))
+        // `on[pc]` is the last position a thread at `pc` was added for.
+        let mut on = vec![usize::MAX; self.0.len()];
+        let mut now = Vec::new();
+        for i in 0..=s.len() {
+            // A new thread at every position makes the match unanchored.
+            if re_add(&self.0, &mut now, &mut on, 0, i, s.len()) {
+                return true;
+            }
+            let mut next = Vec::new();
+            for &pc in &now {
+                let hit = match (&self.0[pc], s.get(i)) {
+                    (Op::Char(want), Some(c)) => c == want,
+                    (Op::Any, Some(_)) => true,
+                    (Op::Set(ranges, negated), Some(&c)) => {
+                        ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)) != *negated
+                    }
+                    _ => false,
+                };
+                if hit && re_add(&self.0, &mut next, &mut on, pc + 1, i + 1, s.len()) {
+                    return true;
+                }
+            }
+            now = next;
+        }
+        false
     }
 
     pub(crate) fn matches_a_row(&self, screen: &str) -> bool {
@@ -996,47 +1041,94 @@ fn re_class(e: char) -> Option<(Vec<(char, char)>, bool)> {
     Some((ranges, e.is_ascii_uppercase()))
 }
 
-/// Matches `seq` at `s[i..]`, then hands the end position to `k`.
-fn re_seq(seq: &[Re], s: &[char], i: usize, k: &dyn Fn(usize) -> bool) -> bool {
-    match seq.split_first() {
-        None => k(i),
-        Some((Re::Repeat(r, min, max), rest)) => re_repeat(r, *min, *max, rest, s, i, k),
-        Some((r, rest)) => re_one(r, s, i, &|j| re_seq(rest, s, j, k)),
-    }
-}
-
-fn re_one(r: &Re, s: &[char], i: usize, k: &dyn Fn(usize) -> bool) -> bool {
-    let c = s.get(i).copied();
+/// Appends the program for `r`: one step per char an atom consumes, and
+/// jumps for groups and repeats.
+fn re_emit(r: &Re, prog: &mut Vec<Op>, left: &mut usize) -> Result<(), String> {
+    *left = left.checked_sub(1).ok_or("pattern is too long")?;
     match r {
-        Re::Char(want) => c == Some(*want) && k(i + 1),
-        Re::Any => c.is_some() && k(i + 1),
-        Re::Set(ranges, negated) => {
-            c.is_some_and(|c| ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)) != *negated)
-                && k(i + 1)
+        Re::Char(c) => prog.push(Op::Char(*c)),
+        Re::Any => prog.push(Op::Any),
+        Re::Set(ranges, negated) => prog.push(Op::Set(ranges.clone(), *negated)),
+        Re::Start => prog.push(Op::Start),
+        Re::End => prog.push(Op::End),
+        Re::Group(alts) => {
+            let mut exits = Vec::new();
+            for (n, seq) in alts.iter().enumerate() {
+                let last = n + 1 == alts.len();
+                let split = prog.len();
+                if !last {
+                    prog.push(Op::Split(split + 1, 0));
+                }
+                for r in seq {
+                    re_emit(r, prog, left)?;
+                }
+                if !last {
+                    exits.push(prog.len());
+                    prog.push(Op::Jmp(0));
+                    prog[split] = Op::Split(split + 1, prog.len());
+                }
+            }
+            for e in exits {
+                prog[e] = Op::Jmp(prog.len());
+            }
         }
-        Re::Start => i == 0 && k(i),
-        Re::End => i == s.len() && k(i),
-        Re::Group(alts) => alts.iter().any(|seq| re_seq(seq, s, i, k)),
-        Re::Repeat(r, min, max) => re_repeat(r, *min, *max, &[], s, i, k),
+        Re::Repeat(r, min, max) => {
+            if max < min {
+                return Err(format!("bad repeat {{{min},{max}}}"));
+            }
+            for _ in 0..*min {
+                re_emit(r, prog, left)?;
+            }
+            if *max == u32::MAX {
+                let split = prog.len();
+                prog.push(Op::Split(split + 1, 0));
+                re_emit(r, prog, left)?;
+                prog.push(Op::Jmp(split));
+                prog[split] = Op::Split(split + 1, prog.len());
+            } else {
+                let mut splits = Vec::new();
+                for _ in *min..*max {
+                    splits.push(prog.len());
+                    prog.push(Op::Split(prog.len() + 1, 0));
+                    re_emit(r, prog, left)?;
+                }
+                for s in splits {
+                    prog[s] = Op::Split(s + 1, prog.len());
+                }
+            }
+        }
     }
+    Ok(())
 }
 
-/// Greedy: takes as many repeats as it can, then backs off one at a time.
-fn re_repeat(
-    r: &Re,
-    min: u32,
-    max: u32,
-    rest: &[Re],
-    s: &[char],
+/// Adds the thread at `pc` to `list`, following jumps and anchors at
+/// position `i` of a row `len` chars long. True once a thread reaches
+/// `Match`.
+fn re_add(
+    prog: &[Op],
+    list: &mut Vec<usize>,
+    on: &mut [usize],
+    pc: usize,
     i: usize,
-    k: &dyn Fn(usize) -> bool,
+    len: usize,
 ) -> bool {
-    // A repeat that consumes nothing would loop forever.
-    let more = max > 0
-        && re_one(r, s, i, &|j| {
-            j > i && re_repeat(r, min.saturating_sub(1), max - 1, rest, s, j, k)
-        });
-    more || (min == 0 && re_seq(rest, s, i, k))
+    let mut todo = vec![pc];
+    while let Some(pc) = todo.pop() {
+        if on[pc] == i {
+            continue;
+        }
+        on[pc] = i;
+        match prog[pc] {
+            Op::Match => return true,
+            Op::Jmp(to) => todo.push(to),
+            Op::Split(a, b) => todo.extend([b, a]),
+            Op::Start if i == 0 => todo.push(pc + 1),
+            Op::End if i == len => todo.push(pc + 1),
+            Op::Start | Op::End => {}
+            _ => list.push(pc),
+        }
+    }
+    false
 }
 
 /// `text` the way [`plain`] leaves it.
@@ -1121,9 +1213,34 @@ mod tests {
         assert!(Regex::new("^> a$").unwrap().matches_a_row("x\n> a\ny"));
         assert!(Regex::new("^> a$").unwrap().matches_a_row(">\u{a0}a"));
         assert!(Regex::new(r"^>\s*$").unwrap().matches_a_row(">\u{a0}"));
-        for bad in ["(a", "a)", "*a", "[ab", "a{2", r"a\"] {
+        for bad in [
+            "(a",
+            "a)",
+            "*a",
+            "[ab",
+            "a{2",
+            r"a\",
+            "a{3,2}",
+            "a{9999}",
+            "((){99}){99999}",
+        ] {
             assert!(Regex::new(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn debug_regex_long_rows() {
+        // Rows of untrusted output can be thousands of chars long, and a
+        // pattern may nest repeats. Neither may blow the stack or take
+        // exponential time.
+        let row = "a".repeat(100_000);
+        assert!(!Regex::new("(.)*x").unwrap().is_match(&row));
+        assert!(Regex::new("^(.)*$").unwrap().is_match(&row));
+        let words = "a".repeat(40) + "!";
+        assert!(!Regex::new(r"^(\w+\s?)*$").unwrap().is_match(&words));
+        assert!(Regex::new(r"^(\w+\s?)*!$").unwrap().is_match(&words));
+        assert!(Regex::new("^(a*)*$").unwrap().is_match("aaa"));
+        assert!(Regex::new("^(a|ab)(c|bcd)(d*)$").unwrap().is_match("abcd"));
     }
 
     #[test]
