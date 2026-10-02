@@ -309,6 +309,8 @@ struct App {
     win: layout::Window,
     /// Every session, oldest first, which is the order the sidebar lists.
     views: Vec<View>,
+    /// Each session's sidebar row in the last frame, for clicks.
+    rows: Vec<(PaneId, Rect)>,
     next_id: u32,
     focused: bool,
     /// A selection in the focused pane.
@@ -360,6 +362,7 @@ impl App {
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
+            rows: Vec::new(),
             next_id: 1,
             focused: false,
             selection: None,
@@ -1076,13 +1079,30 @@ impl App {
         }
     }
 
-    /// The pane of the active tab under a point in the window.
-    fn pane_at(&self, pos: PhysicalPosition<f64>) -> Option<PaneId> {
+    /// The session under a point in the window: a pane of the active tab,
+    /// or a row of the sidebar. The second value is true for the sidebar.
+    fn hit(&self, pos: PhysicalPosition<f64>) -> (Option<PaneId>, bool) {
         let (x, y) = (pos.x as i32, pos.y as i32);
-        let tab = self.win.tabs.get(self.win.active)?;
-        let hit = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
-        let rects = tab.rects(self.tab_area());
-        rects.into_iter().find(|(_, r)| hit(r)).map(|(id, _)| id)
+        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let area = self.tab_area();
+        let (rects, side) = match self.win.tabs.get(self.win.active) {
+            Some(_) if x < area.x => (self.rows.clone(), true),
+            Some(t) => (t.rects(area), false),
+            None => (Vec::new(), false),
+        };
+        let id = rects.into_iter().find(|(_, r)| inside(r)).map(|(id, _)| id);
+        (id, side)
+    }
+
+    /// Brings a session to the front: its tab becomes the active one and
+    /// it gets focus.
+    fn show(&mut self, id: PaneId) {
+        let before = self.focus_id();
+        if let Some(i) = self.win.tabs.iter().position(|t| t.root.contains(id)) {
+            self.win.active = i;
+            self.win.tabs[i].focus(id);
+        }
+        self.focus_moved(before);
     }
 
     /// Whether mouse events go to the program rather than to selection.
@@ -1115,18 +1135,15 @@ impl App {
         };
         let mods = mods_now();
         let pressed = state == ElementState::Pressed;
-        // A click on another pane only moves focus there.
-        let before = self.focus_id();
-        if pressed
-            && let Some(id) = self.pane_at(self.mouse.pos)
-            && Some(id) != before
-        {
-            let active = self.win.active;
-            if let Some(t) = self.win.tabs.get_mut(active) {
-                t.focus(id);
+        // A click on another pane or in the sidebar only moves focus.
+        if pressed {
+            let (id, side) = self.hit(self.mouse.pos);
+            if side || id.is_some_and(|id| Some(id) != self.focus_id()) {
+                if let Some(id) = id {
+                    self.show(id);
+                }
+                return;
             }
-            self.focus_moved(before);
-            return;
         }
         // A release goes wherever its press went.
         let reported = self.mouse.reported & 1 << b != 0;
@@ -1220,7 +1237,8 @@ impl App {
         let preedit = cursor
             .filter(|_| !self.preedit.is_empty())
             .map(|(c, r, _)| (c, r, self.preedit.as_str()));
-        let chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
+        let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
+        self.rows = std::mem::take(&mut chrome.rows);
 
         let split = chrome.panes.len() >= 2;
         let mut dimmed = Vec::new();
