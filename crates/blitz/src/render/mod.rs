@@ -120,16 +120,26 @@ mod gpu {
     use windows::core::Result;
 
     use super::atlas::{Atlas, GlyphKey, Slot};
+    use super::chrome::{Chrome, Prim, branch_mask, shape_mask};
     use super::d3d11::{ATLAS_SIZE, GLYPH, Gpu, MASK, Quad, SOLID, rgba};
     use super::font::{BOLD, DEFAULT_FAMILIES, Font, ITALIC};
     use super::{builtin, text_snapshot, write_bmp};
 
     /// Default font size: 12 pt at 96 DPI.
     pub const DEFAULT_PX: f32 = 16.0;
+    /// Sidebar and label text size relative to the terminal font.
+    pub const CHROME_TEXT: f32 = 0.75;
+
+    /// [`GlyphKey::style`] bits beyond bold and italic: the glyph comes
+    /// from the chrome font, or is a shape from [`shape_mask`].
+    const SMALL: u8 = 4;
+    const SHAPE: u8 = 8;
 
     pub struct Renderer {
         pub gpu: Gpu,
         pub font: Font,
+        /// The terminal font at chrome size, for the sidebar and labels.
+        pub small: Font,
         atlas: Atlas,
         quads: Vec<Quad>,
         overflowed: bool,
@@ -138,11 +148,13 @@ mod gpu {
     impl Renderer {
         pub fn new(warp: bool, px: f32) -> Result<Self> {
             let font = Font::new(DEFAULT_FAMILIES, px)?;
+            let small = Font::new(DEFAULT_FAMILIES, px * CHROME_TEXT)?;
             let mut gpu = Gpu::new(warp)?;
             gpu.set_text_params(font.gamma, font.contrast);
             Ok(Self {
                 gpu,
                 font,
+                small,
                 atlas: Atlas::new(ATLAS_SIZE as u16, ATLAS_SIZE as u16),
                 quads: Vec::new(),
                 overflowed: false,
@@ -152,6 +164,7 @@ mod gpu {
         /// Reloads the font at a new size, e.g. after a DPI change.
         pub fn set_font_px(&mut self, px: f32) -> Result<()> {
             self.font = Font::new(DEFAULT_FAMILIES, px)?;
+            self.small = Font::new(DEFAULT_FAMILIES, px * CHROME_TEXT)?;
             self.atlas.clear();
             Ok(())
         }
@@ -159,6 +172,11 @@ mod gpu {
         /// Cell width and height in pixels.
         pub fn cell(&self) -> (u32, u32) {
             (self.font.cell_w, self.font.cell_h)
+        }
+
+        /// Cell width and height of the chrome font.
+        pub fn small_cell(&self) -> (u32, u32) {
+            (self.small.cell_w, self.small.cell_h)
         }
 
         /// Starts collecting a new frame.
@@ -267,61 +285,136 @@ mod gpu {
                     if cl.width == 0 || cl.len == 0 {
                         continue;
                     }
-                    let Some(slot) = self.glyph(&cl) else {
-                        continue;
+                    let style = (if cl.attrs & attr::BOLD != 0 { BOLD } else { 0 })
+                        | (if cl.attrs & attr::ITALIC != 0 {
+                            ITALIC
+                        } else {
+                            0
+                        });
+                    let key = GlyphKey {
+                        text: cl.text,
+                        len: cl.len,
+                        style,
+                        width: cl.width,
                     };
-                    if slot.w == 0 {
-                        continue;
-                    }
-                    let flags = if is_builtin(&cl) { MASK } else { GLYPH };
-                    self.quads.push(Quad {
-                        pos: [
-                            (px(c) + i32::from(slot.dx)) as i16,
-                            (py(r) + i32::from(slot.dy)) as i16,
-                        ],
-                        size: [slot.w, slot.h],
-                        uv: [slot.x, slot.y],
-                        color: rgba(fg),
-                        flags,
-                    });
+                    self.push_glyph(key, px(c), py(r), fg);
                 }
             }
         }
 
-        /// The atlas slot for a cell's glyph, rasterizing it on first use.
-        fn glyph(&mut self, cl: &RenderCell) -> Option<Slot> {
-            let text = std::str::from_utf8(&cl.text[..usize::from(cl.len).min(16)]).ok()?;
-            if text == " " {
+        /// Queues the glyph for `key` with its cell's top-left corner at
+        /// (`x`, `y`).
+        fn push_glyph(&mut self, key: GlyphKey, x: i32, y: i32, rgb: u32) {
+            let Some(slot) = self.glyph(key) else {
+                return;
+            };
+            if slot.w == 0 {
+                return;
+            }
+            let text = &key.text[..usize::from(key.len).min(16)];
+            let exact = key.style & SHAPE != 0 || is_builtin(text);
+            self.quads.push(Quad {
+                pos: [
+                    (x + i32::from(slot.dx)) as i16,
+                    (y + i32::from(slot.dy)) as i16,
+                ],
+                size: [slot.w, slot.h],
+                uv: [slot.x, slot.y],
+                color: rgba(rgb),
+                flags: if exact { MASK } else { GLYPH },
+            });
+        }
+
+        /// Queues the window chrome. Call after the terminal grids so it
+        /// draws over them.
+        pub fn chrome(&mut self, chrome: &Chrome) {
+            for p in &chrome.prims {
+                match p {
+                    Prim::Rect(r, rgb) => {
+                        self.rect(r.x, r.y, r.w.max(0) as u32, r.h.max(0) as u32, *rgb);
+                    }
+                    Prim::Shape {
+                        r,
+                        radius,
+                        stroke,
+                        color,
+                    } => {
+                        let key = shape_key(*r, *radius, *stroke, false);
+                        self.push_glyph(key, r.x, r.y, *color);
+                    }
+                    Prim::Branch(r, color) => {
+                        self.push_glyph(shape_key(*r, 0.0, 0.0, true), r.x, r.y, *color);
+                    }
+                    Prim::Text {
+                        x,
+                        y,
+                        text,
+                        color,
+                        bold,
+                        term,
+                    } => {
+                        let font = if *term { &self.font } else { &self.small };
+                        let cw = font.cell_w;
+                        let style = (if *bold { BOLD } else { 0 }) | if *term { 0 } else { SMALL };
+                        let mut x = *x;
+                        for c in text.chars() {
+                            let mut key = GlyphKey {
+                                text: [0; 16],
+                                len: 0,
+                                style,
+                                width: 1,
+                            };
+                            key.len = c.encode_utf8(&mut key.text).len() as u8;
+                            key.width = vt::cluster_width(c.encode_utf8(&mut [0; 4])).max(1);
+                            if c != ' ' {
+                                self.push_glyph(key, x, *y, *color);
+                            }
+                            x += (u32::from(key.width) * cw) as i32;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The atlas slot for a glyph, rasterizing it on first use.
+        fn glyph(&mut self, key: GlyphKey) -> Option<Slot> {
+            let text = &key.text[..usize::from(key.len).min(16)];
+            if text == b" " {
                 return None;
             }
-            let style = (if cl.attrs & attr::BOLD != 0 { BOLD } else { 0 })
-                | (if cl.attrs & attr::ITALIC != 0 {
-                    ITALIC
-                } else {
-                    0
-                });
-            let key = GlyphKey {
-                text: cl.text,
-                len: cl.len,
-                style,
-                width: cl.width,
-            };
             if let Some(slot) = self.atlas.get(&key) {
                 return Some(slot);
             }
-            let (w, h, dx, dy, alpha) = if is_builtin(cl) {
-                let c = text.chars().next()?;
-                let (cw, ch) = self.cell();
-                let w = cw * u32::from(cl.width.max(1));
-                (w, ch, 0, 0, builtin::draw(c, w as usize, ch as usize)?)
+            let font = if key.style & SMALL != 0 {
+                &mut self.small
             } else {
-                match self.font.raster(text, style, cl.width) {
-                    Ok(Some(r)) => (r.w, r.h, r.dx, r.dy, r.alpha),
-                    _ => {
-                        self.atlas.insert_empty(key);
-                        return None;
-                    }
+                &mut self.font
+            };
+            let raster = if key.style & SHAPE != 0 {
+                let n = |i: usize| u16::from_le_bytes([text[i], text[i + 1]]);
+                let (w, h) = (u32::from(n(0)), u32::from(n(2)));
+                let (r, s) = (f32::from(n(4)) / 4.0, f32::from(n(6)) / 4.0);
+                Some(if text[8] != 0 {
+                    let n = w.min(h);
+                    (n, n, 0, 0, branch_mask(n))
+                } else {
+                    (w, h, 0, 0, shape_mask(w, h, r, s))
+                })
+            } else if is_builtin(text) {
+                let c = std::str::from_utf8(text).ok()?.chars().next()?;
+                let w = font.cell_w * u32::from(key.width.max(1));
+                let h = font.cell_h;
+                builtin::draw(c, w as usize, h as usize).map(|a| (w, h, 0, 0, a))
+            } else {
+                let text = std::str::from_utf8(text).ok()?;
+                match font.raster(text, key.style & (BOLD | ITALIC), key.width) {
+                    Ok(Some(r)) => Some((r.w, r.h, r.dx, r.dy, r.alpha)),
+                    _ => None,
                 }
+            };
+            let Some((w, h, dx, dy, alpha)) = raster.filter(|r| r.0 > 0 && r.1 > 0) else {
+                self.atlas.insert_empty(key);
+                return None;
             };
             let fits =
                 |atlas: &mut Atlas| atlas.insert(key, w as u16, h as u16, dx as i16, dy as i16);
@@ -357,6 +450,25 @@ mod gpu {
         }
     }
 
+    /// Atlas key for a shape: its size, corner radius and stroke in
+    /// quarter pixels, and whether it is the branch icon.
+    fn shape_key(r: crate::layout::Rect, radius: f32, stroke: f32, branch: bool) -> GlyphKey {
+        let (w, h) = (r.w.clamp(0, 2048) as u16, r.h.clamp(0, 2048) as u16);
+        let q = |v: f32| ((v * 4.0).round() as u16).to_le_bytes();
+        let mut text = [0u8; 16];
+        text[..2].copy_from_slice(&w.to_le_bytes());
+        text[2..4].copy_from_slice(&h.to_le_bytes());
+        text[4..6].copy_from_slice(&q(radius));
+        text[6..8].copy_from_slice(&q(stroke));
+        text[8] = u8::from(branch);
+        GlyphKey {
+            text,
+            len: 9,
+            style: SHAPE,
+            width: 0,
+        }
+    }
+
     /// The colour halfway between two `0xRRGGBB` colours.
     fn mix(a: u32, b: u32) -> u32 {
         let [_, ar, ag, ab] = a.to_be_bytes();
@@ -365,8 +477,7 @@ mod gpu {
         m(ar, br) << 16 | m(ag, bg) << 8 | m(ab, bb)
     }
 
-    fn is_builtin(cl: &RenderCell) -> bool {
-        let text = &cl.text[..usize::from(cl.len).min(16)];
+    fn is_builtin(text: &[u8]) -> bool {
         let mut chars = std::str::from_utf8(text).unwrap_or("").chars();
         matches!((chars.next(), chars.next()), (Some(c), None) if builtin::is_builtin(c))
     }
@@ -569,5 +680,57 @@ mod tests {
         // The wide character's ink reaches into its second cell.
         let ink = (0..ch).any(|y| (2 * cw..3 * cw).any(|x| at(x, y) != p.bg));
         assert!(ink, "wide glyph spans two cells");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_chrome_shapes_and_text() {
+        use crate::layout::Rect;
+        use chrome::{Chrome, Prim};
+
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        let c = Chrome {
+            prims: vec![
+                Prim::Shape {
+                    r: rect(0, 0, 10, 10),
+                    radius: 5.0,
+                    stroke: 0.0,
+                    color: 0xf2b84b,
+                },
+                Prim::Shape {
+                    r: rect(20, 0, 30, 10),
+                    radius: 3.0,
+                    stroke: 0.0,
+                    color: 0x00ff00,
+                },
+                Prim::Text {
+                    x: 60,
+                    y: 0,
+                    text: "W".into(),
+                    color: p.fg,
+                    bold: true,
+                    term: false,
+                },
+            ],
+            panes: Vec::new(),
+        };
+        let (w, h) = (80, 20);
+        let target = r.gpu.offscreen(w, h).expect("target");
+        r.begin();
+        r.chrome(&c);
+        r.draw(&target.rtv, w, h, p.bg).expect("draw");
+        let px = r.gpu.read(&target).expect("read");
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        assert_eq!(at(5, 5), 0xf2b84b, "dot centre");
+        assert_eq!(at(0, 0), p.bg, "dot corner is round");
+        assert_eq!(at(45, 5), 0x00ff00, "a wide shape keeps its width");
+        let (sw, sh) = r.small_cell();
+        let ink = (0..sh).any(|y| (60..60 + sw).any(|x| at(x, y) != p.bg));
+        assert!(ink, "chrome text is drawn");
     }
 }
