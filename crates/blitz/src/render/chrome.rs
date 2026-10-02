@@ -398,13 +398,11 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 let focused = ti == m.win.active && x.id == t.focus;
                 let (l1, l2, l3, gap) = (s(18.0).max(th), s(16.0).max(th), s(17.0).max(th), s(2.0));
                 let working = x.state == Attn::Working;
-                let mut rh = s(7.0) + l1 + gap + l2 + s(8.0);
-                if !x.msg.is_empty() {
-                    rh += gap + l3;
-                }
-                if working {
-                    rh += gap + s(5.0) + s(2.0) + s(1.0);
-                }
+                // Every row has room for a message and a progress bar, so
+                // output that changes a title or state cannot move the
+                // rows below it under the pointer.
+                let rh =
+                    s(7.0) + l1 + gap + l2 + gap + l3 + gap + s(5.0) + s(2.0) + s(1.0) + s(8.0);
                 let row = Rect {
                     x: s(8.0),
                     y,
@@ -488,12 +486,12 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 ly += l2;
                 // Line 3: the last message.
+                ly += gap;
                 if !x.msg.is_empty() {
-                    ly += gap;
                     let msg = fit(&x.msg, right - left, tw);
                     text(p, left, ly + (l3 - th) / 2, &msg, c.msg, false);
-                    ly += l3;
                 }
+                ly += l3;
                 if working {
                     let line = Rect {
                         x: left,
@@ -853,6 +851,15 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, Prim::Branch(r, _) if r.w == 10))
         );
+    }
+
+    #[test]
+    fn sidebar_rows_keep_their_height() {
+        let (win, mut sessions, now) = fleet(true);
+        sessions[2].msg = "title".into();
+        let c = build(&model(&win, &sessions, now));
+        // Needs you, working with no message, idle with one.
+        assert!(c.rows.windows(2).all(|w| w[0].1.h == w[1].1.h));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! The terminal: screens, cursor, modes, replies and events.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::time::Instant;
 
@@ -34,7 +35,8 @@ impl Default for Options {
 /// OSC 133 shell-integration marks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptMark {
-    /// Prompt start. `blitz` is set when the mark carries `blitz=1`.
+    /// Prompt start. `blitz` is set when the mark carries `blitz=<token>`
+    /// with the token the host gave [`Terminal::set_prompt_token`].
     A { blitz: bool },
     /// Command input start.
     B,
@@ -126,6 +128,8 @@ pub struct Terminal {
     cluster: Option<Cluster>,
     /// Rows the view is scrolled back into scrollback.
     viewport: usize,
+    /// The main screen's view while the alternate screen is up.
+    other_viewport: usize,
     changed: bool,
     modes: Modes,
     /// Dark or light system theme, for `CSI ? 996 n`.
@@ -138,7 +142,14 @@ pub struct Terminal {
     /// The same colours as set by the program with OSC 10, 11 and 12.
     colors: [Option<u32>; 3],
     replies: Vec<u8>,
-    events: Vec<Event>,
+    /// Output bytes not yet spent on replies; see [`MAX_REPLIES`].
+    reply_credit: usize,
+    events: VecDeque<Event>,
+    /// The secret that marks blitz's own shell-integration prompts.
+    prompt_token: String,
+    /// Between a blitz prompt mark and the next mark, where the shell
+    /// integration reports its directory.
+    at_prompt: bool,
 }
 
 /// Foreground, background and cursor colours of the default dark and
@@ -151,6 +162,16 @@ const LIGHT: [u32; 3] = [0x2F3135, 0xFCFCFB, 0x141518];
 const MAX_TITLE: usize = 256;
 const MAX_NOTIFY_TITLE: usize = 64;
 const MAX_NOTIFY_BODY: usize = 256;
+
+/// Replies may use a sixteenth of the output, plus a reserve of this
+/// many bytes for the questions a program asks at startup; queries past
+/// that go unanswered. Output full of queries would otherwise type an
+/// unbounded stream of answers into the program's input.
+const MAX_REPLIES: usize = 4096;
+const REPLY_CREDIT: usize = 16 * MAX_REPLIES;
+
+/// Most events queued between [`Terminal::take_events`] calls.
+const MAX_EVENTS: usize = 1024;
 
 impl Terminal {
     pub fn new(o: Options) -> Self {
@@ -180,6 +201,7 @@ impl Terminal {
             rep: None,
             cluster: None,
             viewport: 0,
+            other_viewport: 0,
             changed: true,
             modes: Modes::default(),
             dark: true,
@@ -187,12 +209,16 @@ impl Terminal {
             pal: DARK,
             colors: [None; 3],
             replies: Vec::new(),
-            events: Vec::new(),
+            reply_credit: REPLY_CREDIT,
+            events: VecDeque::new(),
+            prompt_token: "1".into(),
+            at_prompt: false,
         }
     }
 
     /// Parses `bytes`, queueing replies and events.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.reply_credit = (self.reply_credit + bytes.len()).min(REPLY_CREDIT);
         // The parser calls back into `self`, so it is moved out meanwhile.
         let mut p = std::mem::take(&mut self.parser);
         p.advance(self, bytes);
@@ -205,7 +231,7 @@ impl Terminal {
     }
 
     pub fn take_events(&mut self, out: &mut Vec<Event>) {
-        out.append(&mut self.events);
+        out.extend(self.events.drain(..));
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -294,11 +320,13 @@ impl Terminal {
         out.alt_screen = self.alt;
         out.cells.clear();
         out.cells.reserve(n);
+        out.wrapped.clear();
         let g = &self.screen.grid;
         let first = g.scrollback_len().saturating_sub(self.viewport);
         let empty = Row::default();
         for i in first..first + rows as usize {
             let row = g.line(i).unwrap_or(&empty);
+            out.wrapped.push(row.flags & rf::WRAPPED != 0);
             for x in 0..cols {
                 let cell = row.cells.get(x as usize).copied().unwrap_or_default();
                 out.cells
@@ -324,6 +352,25 @@ impl Terminal {
     pub fn set_theme(&mut self, dark: bool) {
         self.dark = dark;
         self.pal = if dark { DARK } else { LIGHT };
+    }
+
+    /// The user confirmed a multi-line paste. While bracketed paste stays
+    /// on, later ones go to the program that turned it on unasked.
+    pub fn confirm_paste(&mut self) {
+        self.modes.paste_confirmed = self.modes.input.bracketed;
+    }
+
+    /// Bracketed paste is on and the user has confirmed a paste under it;
+    /// see [`crate::keys::needs_paste_confirm`].
+    pub fn paste_trusted(&self) -> bool {
+        self.modes.input.bracketed && self.modes.paste_confirmed
+    }
+
+    /// The secret blitz's shell integration puts in its prompt marks, as
+    /// `133;A;blitz=<token>`. Only a mark with it resets input modes, so
+    /// program output cannot. Until this is called the token is `1`.
+    pub fn set_prompt_token(&mut self, token: &str) {
+        token.clone_into(&mut self.prompt_token);
     }
 
     /// Cell size in pixels, for size reports.
@@ -572,7 +619,8 @@ impl Terminal {
     }
 
     fn tab(&mut self, n: u16) {
-        for _ in 0..n {
+        // Past the width every step lands on the last column.
+        for _ in 0..n.min(self.cols()) {
             let from = self.cur.x as usize + 1;
             self.cur.x = (from..self.tabs.len())
                 .find(|&i| self.tabs[i])
@@ -582,7 +630,7 @@ impl Terminal {
     }
 
     fn back_tab(&mut self, n: u16) {
-        for _ in 0..n {
+        for _ in 0..n.min(self.cols()) {
             let x = self.cur.x as usize;
             self.cur.x = (0..x).rev().find(|&i| self.tabs[i]).unwrap_or(0) as u16;
         }
@@ -683,14 +731,18 @@ impl Terminal {
             y: self.cur.y,
             ..Cursor::default()
         };
+        // Both screens forget their saved cursor, as in conhost.
         self.screen.saved = None;
+        self.other.saved = None;
     }
 
     fn full_reset(&mut self) {
         let mut t = Self::new(self.opts);
         // Queued output and what the host told us survive.
         std::mem::swap(&mut t.replies, &mut self.replies);
+        t.reply_credit = self.reply_credit;
         std::mem::swap(&mut t.events, &mut self.events);
+        std::mem::swap(&mut t.prompt_token, &mut self.prompt_token);
         t.dark = self.dark;
         t.cell_px = self.cell_px;
         t.pal = self.pal;
@@ -701,13 +753,34 @@ impl Terminal {
         *self = t;
     }
 
+    /// At the shell's own prompt, clears what a program can leave behind
+    /// that would bend or hide everything printed after it: input modes,
+    /// margins, origin, insert and wrap modes, charsets, tab stops and
+    /// colours set with OSC 10, 11 and 12. The cursor stays where the
+    /// prompt is about to be drawn. The screen is left alone: the prompt
+    /// leaves the alternate screen with its own sequences, which conhost
+    /// acts on too.
+    fn prompt_reset(&mut self) {
+        self.modes.reset_input();
+        self.top = 0;
+        self.bottom = self.rows() - 1;
+        self.cur.origin = false;
+        self.cur.charsets = Default::default();
+        self.cur.gl = 0;
+        self.insert = false;
+        self.autowrap = true;
+        self.tabs = default_tabs(self.cols());
+        self.colors = [None; 3];
+        self.changed = true;
+    }
+
     // ---- OSC ----
 
     fn set_link(&mut self, body: &str) {
         let Some((params, uri)) = body.split_once(';') else {
             return;
         };
-        if self.styles.is_full() {
+        if self.styles.wants_compact() {
             self.compact_styles();
         }
         let id = params
@@ -728,7 +801,9 @@ impl Terminal {
         for (n, item) in (first..3).zip(body.split(';')) {
             if item == "?" {
                 let rgb = self.colors[n].unwrap_or(self.pal[n]);
+                let start = self.replies.len();
                 osc::color_reply(10 + n, rgb, bel, &mut self.replies);
+                self.charge_reply(start);
             } else if let Some(rgb) = osc::parse_color(item) {
                 self.colors[n] = Some(rgb);
                 self.changed = true;
@@ -785,15 +860,52 @@ impl Terminal {
         if alt != self.alt {
             std::mem::swap(&mut self.screen, &mut self.other);
             self.alt = alt;
-            self.viewport = 0;
+            // The main screen's view comes back on the text it showed.
+            std::mem::swap(&mut self.viewport, &mut self.other_viewport);
+            self.viewport = self.viewport.min(self.screen.grid.scrollback_len());
         }
     }
 
     // ---- replies ----
 
     fn reply(&mut self, args: std::fmt::Arguments) {
+        let start = self.replies.len();
         // Writing to a Vec cannot fail.
         let _ = self.replies.write_fmt(args);
+        self.charge_reply(start);
+    }
+
+    /// Pays for the reply queued from `start`, or drops it when the output
+    /// so far has not earned it.
+    fn charge_reply(&mut self, start: usize) {
+        let cost = 16 * (self.replies.len() - start);
+        match self.reply_credit.checked_sub(cost) {
+            Some(left) => self.reply_credit = left,
+            None => self.replies.truncate(start),
+        }
+    }
+
+    /// Queues `ev` for the host. Only the newest title and directory
+    /// matter and pending bells ring once, so each replaces the one
+    /// already queued and a flood of them costs the host a single update.
+    /// Past [`MAX_EVENTS`] the oldest event is dropped.
+    fn event(&mut self, ev: Event) {
+        if matches!(ev, Event::Title(_) | Event::Cwd(_) | Event::Bell) {
+            // At most one of each is queued, and in a flood it was the
+            // last one pushed, so searching from the back is quick.
+            let kind = std::mem::discriminant(&ev);
+            if let Some(i) = self
+                .events
+                .iter()
+                .rposition(|e| std::mem::discriminant(e) == kind)
+            {
+                self.events.remove(i);
+            }
+        }
+        if self.events.len() >= MAX_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(ev);
     }
 
     /// CPR and DECXCPR. Rows count from the top margin in origin mode.
@@ -881,7 +993,7 @@ impl Terminal {
     }
 
     fn sgr(&mut self, p: &Params) {
-        if self.styles.is_full() {
+        if self.styles.wants_compact() {
             self.compact_styles();
         }
         let v = p.as_slice();
@@ -1003,7 +1115,7 @@ impl Handler for Terminal {
         self.changed = true;
         self.cluster = None;
         match c0 {
-            0x07 => self.events.push(Event::Bell),
+            0x07 => self.event(Event::Bell),
             0x08 => {
                 self.cur.x = self.cur.x.saturating_sub(1);
                 self.cur.pending_wrap = false;
@@ -1103,14 +1215,14 @@ impl Handler for Terminal {
             ([], b'Z') => self.back_tab(n(0)),
             // DA1. Never claim 28 (rectangular editing): ConPTY would
             // start sending DECCRA and DECFRA.
-            ([], b'c') if p.get(0) == 0 => self.replies.extend_from_slice(b"\x1b[?62;22c"),
-            ([b'>'], b'c') if p.get(0) == 0 => self.replies.extend_from_slice(b"\x1b[>1;0;0c"),
+            ([], b'c') if p.get(0) == 0 => self.reply(format_args!("\x1b[?62;22c")),
+            ([b'>'], b'c') if p.get(0) == 0 => self.reply(format_args!("\x1b[>1;0;0c")),
             ([b'>'], b'q') if p.get(0) == 0 => {
                 let v = env!("CARGO_PKG_VERSION");
                 self.reply(format_args!("\x1bP>|blitz {v}\x1b\\"));
             }
             ([], b'n') => match p.get(0) {
-                5 => self.replies.extend_from_slice(b"\x1b[0n"),
+                5 => self.reply(format_args!("\x1b[0n")),
                 6 => self.report_cursor(""),
                 _ => {}
             },
@@ -1137,8 +1249,10 @@ impl Handler for Terminal {
             ([], b'b') => {
                 if let Some(c) = self.rep {
                     let wide = self.width(c) == 2;
-                    let max = self.cols() as usize * self.rows() as usize;
-                    for _ in 0..(n(0) as usize).min(max) {
+                    // Programs repeat within a line. A larger count lets a
+                    // few bytes keep the parser busy, more so in insert
+                    // mode, where each character shifts the rest of the row.
+                    for _ in 0..n(0).min(self.cols()) {
                         self.put(c, wide);
                     }
                 }
@@ -1149,6 +1263,10 @@ impl Handler for Terminal {
                 3 => self.tabs.fill(false),
                 _ => {}
             },
+            // A `:` has no place in a mode list. ConPTY ignores such a
+            // sequence whole, so acting on any of it would leave the two
+            // out of step.
+            ([] | [b'?'], b'h' | b'l') if (1..p.len()).any(|i| p.is_sub(i)) => {}
             ([], b'h' | b'l') => {
                 for &m in p.as_slice() {
                     self.set_ansi_mode(m, fin == b'h');
@@ -1202,9 +1320,12 @@ impl Handler for Terminal {
         let (cmd, body) = s.split_once(';').unwrap_or((&s, ""));
         let ev = match cmd {
             "0" | "2" => Event::Title(osc::clean(body, MAX_TITLE)),
+            // Directories count only inside blitz's own prompt. One any
+            // program printed would start new panes in a folder it filled,
+            // where cmd runs a planted git or npm before the real one.
             "7" => match osc::file_url_path(body) {
-                Some(p) => Event::Cwd(p),
-                None => return,
+                Some(p) if self.at_prompt && osc::local_dir(&p) => Event::Cwd(p),
+                _ => return,
             },
             "8" => return self.set_link(body),
             "9" => match osc::classify_osc9(body) {
@@ -1213,8 +1334,12 @@ impl Handler for Terminal {
                     body: osc::clean(text, MAX_NOTIFY_BODY),
                 },
                 Osc9::Progress { state, pct } => Event::Progress { state, pct },
-                Osc9::Cwd(p) => Event::Cwd(p.to_owned()),
-                Osc9::PromptStart => Event::Prompt(PromptMark::A { blitz: false }),
+                Osc9::Cwd(p) if self.at_prompt && osc::local_dir(p) => Event::Cwd(p.to_owned()),
+                Osc9::Cwd(_) => return,
+                Osc9::PromptStart => {
+                    self.at_prompt = false;
+                    Event::Prompt(PromptMark::A { blitz: false })
+                }
                 Osc9::Ignore => return,
             },
             "10" | "11" | "12" => {
@@ -1229,17 +1354,21 @@ impl Handler for Terminal {
             // Resets palette entries set with OSC 4, which is not
             // supported, so there is nothing to reset.
             "104" => return,
-            "133" => match osc::prompt_mark(body) {
+            "133" => match osc::prompt_mark(body, &self.prompt_token) {
                 // blitz's own shell integration marks its prompts, so a
                 // program that died in this shell left its modes behind.
                 // Other prompt starts are left alone: in screen-reader mode
                 // Claude Code sends 133;A;redraw=0 every turn while it
                 // still wants its kitty keys.
                 Some(m @ PromptMark::A { blitz: true }) => {
-                    self.modes.reset_input();
+                    self.prompt_reset();
+                    self.at_prompt = true;
                     Event::Prompt(m)
                 }
-                Some(m) => Event::Prompt(m),
+                Some(m) => {
+                    self.at_prompt = false;
+                    Event::Prompt(m)
+                }
                 None => return,
             },
             // `notify;title;body`, where the body runs to the end and may
@@ -1256,7 +1385,7 @@ impl Handler for Terminal {
             },
             _ => return,
         };
-        self.events.push(ev);
+        self.event(ev);
     }
 
     fn dcs_hook(&mut self, _p: &Params, _inter: &[u8], _fin: u8) {}
@@ -1328,7 +1457,9 @@ fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> R
         attrs,
         ..RenderCell::default()
     };
-    if let Some(c) = char::from_u32(cell.cp).filter(|&c| c != '\0') {
+    // Text drawn in its own background, concealed or not, is left out, so
+    // a selection cannot copy characters the screen never showed.
+    if let Some(c) = char::from_u32(cell.cp).filter(|&c| c != '\0' && fg != bg) {
         let mut len = c.encode_utf8(&mut rc.text).len();
         if cell.flags & cf::GRAPHEME != 0 {
             for c in row.grapheme(x).unwrap_or_default().chars() {

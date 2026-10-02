@@ -6,11 +6,12 @@ use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HMODULE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::System::Console::COORD;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -38,6 +39,8 @@ const PIPE_BYTES: u32 = 128 * 1024;
 /// The first bytes the bundled ConPTY writes. The inbox one starts with
 /// `ESC[?9001h` instead.
 const BUNDLED_PRELUDE: &[u8] = b"\x1b[1t";
+/// Bytes queued for the child's input beyond which replies are dropped.
+const MAX_PENDING: usize = 1 << 20;
 
 /// What `GetProcAddress` returns before it is cast.
 type Proc = unsafe extern "system" fn() -> isize;
@@ -66,8 +69,10 @@ static DEGRADED: AtomicBool = AtomicBool::new(false);
 fn conpty() -> Option<&'static Conpty> {
     static API: OnceLock<Option<Conpty>> = OnceLock::new();
     API.get_or_init(|| {
+        // A relative folder would load code from wherever blitz was started.
         let dir = std::env::var_os("BLITZ_CONPTY_DIR")
             .map(PathBuf::from)
+            .filter(|d| d.is_absolute())
             .or_else(|| {
                 std::env::current_exe()
                     .ok()?
@@ -137,6 +142,18 @@ pub fn inbox_notice() -> Option<&'static str> {
     )
 }
 
+/// A new secret for one pane: 128 bits from the system's random number
+/// generator, in hex. The pane's child gets it as `BLITZ_PANE_TOKEN`, and
+/// blitz-hook and the shell integration put it in the sequences they print,
+/// so the pane can tell them apart from program output, which cannot read
+/// the environment.
+pub fn pane_token() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    // SAFETY: a valid buffer; this flag takes no algorithm handle.
+    unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }.ok()?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// What the reader thread reports.
 pub enum PtyEvent<'a> {
     /// Output from the child, in order. Replies to queries go through the
@@ -150,12 +167,27 @@ pub enum PtyEvent<'a> {
 /// Sends bytes to the child's input. Cheap to clone; writes happen on the
 /// pane's writer thread, in the order they are sent.
 #[derive(Clone)]
-pub struct Writer(mpsc::Sender<Vec<u8>>);
+pub struct Writer {
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Bytes sent but not yet written.
+    pending: Arc<AtomicUsize>,
+}
 
 impl Writer {
     pub fn send(&self, bytes: impl Into<Vec<u8>>) {
+        let bytes = bytes.into();
+        self.pending.fetch_add(bytes.len(), Ordering::Relaxed);
         // An error only means the child has gone.
-        let _ = self.0.send(bytes.into());
+        let _ = self.tx.send(bytes);
+    }
+
+    /// [`Writer::send`] for answers to the child's queries. They are dropped
+    /// while its input is backed up, so a program that floods queries
+    /// cannot make blitz queue replies without limit.
+    pub fn reply(&self, bytes: impl Into<Vec<u8>>) {
+        if self.pending.load(Ordering::Relaxed) < MAX_PENDING {
+            self.send(bytes);
+        }
     }
 }
 
@@ -260,6 +292,14 @@ impl Pty {
             }
         };
         let spawned = Instant::now();
+        // Without its threads nothing would ever close the pane, so a thread
+        // that fails to start takes the child down with it.
+        let fail = |e: io::Error| {
+            // SAFETY: a valid process handle.
+            let _ = unsafe { TerminateProcess(raw(&process), 1) };
+            close_hpc(&hpc);
+            e
+        };
         let h = *lock(&hpc);
         if let (Some(hwnd), Some(reparent)) = (opts.parent, api.reparent) {
             // SAFETY: a live pseudoconsole; a bad window only fails the call.
@@ -282,13 +322,18 @@ impl Pty {
                         // SAFETY: a valid process handle.
                         unsafe { WaitForSingleObject(raw(&process), INFINITE) };
                         close_hpc(&hpc);
-                    })?;
+                    })
+                    .map_err(fail)?;
             }
         }
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let writer = Writer(tx);
+        let writer = Writer {
+            tx,
+            pending: Arc::default(),
+        };
         let mut input = File::from(in_w);
+        let pending = writer.pending.clone();
         std::thread::Builder::new()
             .name("pty-write".into())
             .spawn(move || {
@@ -296,8 +341,10 @@ impl Pty {
                     if input.write_all(&bytes).is_err() {
                         break;
                     }
+                    pending.fetch_sub(bytes.len(), Ordering::Relaxed);
                 }
-            })?;
+            })
+            .map_err(fail)?;
 
         let (reply, hpc2, process2) = (writer.clone(), hpc.clone(), process.clone());
         let mut output = File::from(out_r);
@@ -323,7 +370,8 @@ impl Pty {
                 // The pipe is closed, so this cannot block on unread output.
                 close_hpc(&hpc2);
                 on_event(PtyEvent::Exit(exit_code(&process2)), &reply);
-            })?;
+            })
+            .map_err(fail)?;
 
         Ok(Pty {
             hpc,
@@ -479,6 +527,9 @@ const STRIP_PREFIXES: &[&str] = &[
     "CONEMU",
     "VSCODE_",
     "ALACRITTY_",
+    // blitz's own settings, such as BLITZ_CONPTY_DIR and BLITZ_TRACE, are
+    // for the blitz they were set for, not for programs its panes start.
+    "BLITZ_",
 ];
 
 const STRIP: &[&str] = &[
@@ -579,6 +630,8 @@ mod tests {
             ("term_program", "vscode"),
             ("ConEmuPID", "1"),
             ("CLAUDE_CODE_MESSAGING_TOKEN", "secret"),
+            ("BLITZ_CONPTY_DIR", "conpty"),
+            ("blitz_trace", "t.txt"),
             ("CLAUDE_CONFIG_DIR", "c"),
             ("ANTHROPIC_MODEL", "m"),
             ("=C:", r"C:\work"),
@@ -612,5 +665,29 @@ mod tests {
 
         let block = env_block(&env[..1]);
         assert_eq!(String::from_utf16(&block).unwrap(), "=C:=C:\\work\0\0");
+    }
+
+    #[test]
+    fn replies_wait_for_backed_up_input() {
+        let (tx, rx) = mpsc::channel();
+        let w = Writer {
+            tx,
+            pending: Arc::default(),
+        };
+        w.reply(&b"1"[..]);
+        w.send(vec![0; MAX_PENDING]);
+        w.reply(&b"2"[..]);
+        w.send(&b"typed"[..]);
+        let got: Vec<Vec<u8>> = rx.try_iter().collect();
+        assert_eq!(got.len(), 3);
+        assert_eq!((&got[0][..], &got[2][..]), (&b"1"[..], &b"typed"[..]));
+    }
+
+    #[test]
+    fn pane_tokens_are_random_hex() {
+        let (a, b) = (pane_token().unwrap(), pane_token().unwrap());
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b);
     }
 }

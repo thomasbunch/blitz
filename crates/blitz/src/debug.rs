@@ -34,6 +34,9 @@
 //! - `sleep MS`, `note TEXT`.
 //!
 //! A failed wait prints the screen and ends the run with exit code 1.
+//!
+//! `--trace FILE` logs every byte sent and received, pasted files
+//! included, so keep it out of folders other users can read.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -49,6 +52,9 @@ use crate::pty::{Pty, PtyEvent, SpawnOpts, Writer};
 
 const USAGE: &str = "usage: blitz debug run --script FILE [--cmd CMD] [--cwd DIR] \
 [--cols N --rows N] [--trace FILE] [--setenv K=V]... [--timeout MS]";
+
+/// Output kept for `waitfor` and `latency`; older output is dropped.
+const MAX_OUT: usize = 16 << 20;
 
 /// What the console host writes before any output of the child.
 const PRELUDE: [&[u8]; 4] = [b"\x1b[1t", b"\x1b[c", b"\x1b[?1004h", b"\x1b[?9001h"];
@@ -198,7 +204,8 @@ impl Counters {
     /// Writes the counters to the file named by `BLITZ_TRACE`, if it is set.
     pub fn write_trace(&self) -> io::Result<()> {
         match std::env::var_os("BLITZ_TRACE") {
-            Some(path) => std::fs::write(path, self.to_json() + "\n"),
+            Some(path) => crate::render::create_fresh(Path::new(&path))?
+                .write_all((self.to_json() + "\n").as_bytes()),
             None => Ok(()),
         }
     }
@@ -214,7 +221,11 @@ struct Shared {
 
 struct State {
     term: Terminal,
+    /// The most recent output, at most `MAX_OUT` bytes.
     out: Vec<u8>,
+    /// Bytes dropped from the front of `out`. Offsets into the output
+    /// count them, so they stay valid when `out` is trimmed.
+    dropped: usize,
     chunks: u64,
     /// When the last output arrived, in ms since start.
     last_ms: f64,
@@ -225,6 +236,25 @@ struct State {
 }
 
 impl State {
+    fn push_out(&mut self, d: &[u8]) {
+        self.out.extend_from_slice(d);
+        if self.out.len() > MAX_OUT {
+            let cut = self.out.len() - MAX_OUT / 2;
+            self.out.drain(..cut);
+            self.dropped += cut;
+        }
+    }
+
+    /// Output from offset `at` on, or what is left of it.
+    fn out_from(&self, at: usize) -> &[u8] {
+        &self.out[at.saturating_sub(self.dropped).min(self.out.len())..]
+    }
+
+    /// Offset of the end of the output.
+    fn out_end(&self) -> usize {
+        self.dropped + self.out.len()
+    }
+
     fn log(&mut self, ms: f64, kind: &str, text: &str) {
         if let Some(f) = &mut self.log {
             let _ = f.write_all(format!("{ms:.1}\t{kind}\t{text}\n").as_bytes());
@@ -306,7 +336,7 @@ impl Shared {
                     eprintln!("[{ms:.0}] event {e}");
                     st.log(ms, "event", &e);
                 }
-                st.out.extend_from_slice(d);
+                st.push_out(d);
                 st.chunks += 1;
                 st.last_ms = ms;
             }
@@ -331,27 +361,33 @@ struct Runner {
 
 impl Runner {
     fn start(o: &Opts) -> Result<Runner, String> {
+        let token = crate::pty::pane_token().map_err(|e| e.to_string())?;
         let (cmdline, mut env) = match &o.cmd {
             Some(c) => (c.clone(), Vec::new()),
             None => {
-                let l = crate::shell::launch("", &[], true);
+                let l = crate::shell::launch("", &[], true, &token);
                 (l.cmdline, l.env)
             }
         };
+        env.push(("BLITZ_PANE_TOKEN".into(), token.clone()));
         env.extend(o.setenv.iter().cloned());
         let log = match &o.trace {
-            Some(path) => Some(File::create(path).map_err(|e| format!("{path}: {e}"))?),
+            Some(path) => Some(
+                crate::render::create_fresh(Path::new(path)).map_err(|e| format!("{path}: {e}"))?,
+            ),
             None => None,
         };
-        let term = Terminal::new(vt::Options {
+        let mut term = Terminal::new(vt::Options {
             cols: o.cols,
             rows: o.rows,
             ..Default::default()
         });
+        term.set_prompt_token(&token);
         let s = Arc::new(Shared {
             state: Mutex::new(State {
                 term,
                 out: Vec::new(),
+                dropped: 0,
                 chunks: 0,
                 last_ms: 0.0,
                 counters: Counters::default(),
@@ -486,14 +522,14 @@ impl Runner {
                 let mut from = seen;
                 let mut hit = None;
                 self.s.wait(num(ms)?, |st| {
-                    let hay = plain(&st.out[from..]);
+                    let hay = plain(st.out_from(from));
                     // Rescan a little of the old output in case a match
                     // straddles two chunks.
-                    from = st.out.len().saturating_sub(4096).max(seen);
+                    from = st.out_end().saturating_sub(4096).max(seen);
                     hit = squashed
                         .iter()
                         .position(|w| hay.contains(w.as_str()))
-                        .map(|i| (i, st.out.len()));
+                        .map(|i| (i, st.out_end()));
                     hit.is_some()
                 });
                 let (i, end) = hit.ok_or_else(|| format!("{text:?} did not show up in {ms} ms"))?;
@@ -541,11 +577,11 @@ impl Runner {
                 let echo = unesc(text);
                 let mut times = Vec::new();
                 for _ in 0..num::<u32>(n)? {
-                    let from = self.s.lock().out.len();
+                    let from = self.s.lock().out_end();
                     let t = Instant::now();
                     self.pty.writer().send(echo.as_slice());
                     self.s
-                        .wait(2000, |st| find(&st.out[from..], &echo).is_some());
+                        .wait(2000, |st| find(st.out_from(from), &echo).is_some());
                     times.push(t.elapsed().as_secs_f64() * 1000.0);
                     std::thread::sleep(Duration::from_millis(30));
                 }
@@ -613,7 +649,7 @@ impl Runner {
             format!(
                 "exit={:?} out_bytes={} chunks={} first_pty_byte_ms={} first_post_prelude_ms={} conpty={}",
                 st.exit,
-                st.out.len(),
+                st.out_end(),
                 st.chunks,
                 ms(c.first_pty_byte_ms),
                 ms(c.first_post_prelude_ms),
@@ -845,9 +881,14 @@ fn plain(b: &[u8]) -> String {
 /// `*`, `+`, `?`, `{n}`, `{n,}` and `{n,m}`, and the anchors `^` and `$`.
 /// Other characters after `\` stand for themselves.
 ///
-/// Matching backtracks, which can be slow on pathological patterns but is
-/// fine for screen rows of a few hundred characters.
-pub(crate) struct Regex(Vec<Re>);
+/// The pattern compiles to a small program that runs every alternative in
+/// step, so matching takes time linear in the row and constant stack, even
+/// for nested repeats on long rows of untrusted output.
+pub(crate) struct Regex(Vec<Op>);
+
+/// Most atoms and groups a pattern may compile to. Counted repeats are
+/// copied out, so `a{1000}` counts a thousand.
+const MAX_PROG: usize = 5000;
 
 enum Re {
     Char(char),
@@ -860,6 +901,19 @@ enum Re {
     Repeat(Box<Re>, u32, u32),
 }
 
+/// One step of a compiled [`Regex`].
+enum Op {
+    Char(char),
+    Any,
+    Set(Vec<(char, char)>, bool),
+    Start,
+    End,
+    /// Continue at both targets.
+    Split(usize, usize),
+    Jmp(usize),
+    Match,
+}
+
 impl Regex {
     pub(crate) fn new(pattern: &str) -> Result<Regex, String> {
         let p: Vec<char> = pattern.chars().collect();
@@ -868,12 +922,39 @@ impl Regex {
         if i < p.len() {
             return Err(format!("unmatched ) in {pattern:?}"));
         }
-        Ok(Regex(vec![Re::Group(alts)]))
+        let (mut prog, mut left) = (Vec::new(), MAX_PROG);
+        re_emit(&Re::Group(alts), &mut prog, &mut left)?;
+        prog.push(Op::Match);
+        Ok(Regex(prog))
     }
 
     fn is_match(&self, row: &str) -> bool {
         let s: Vec<char> = row.chars().collect();
-        (0..=s.len()).any(|i| re_seq(&self.0, &s, i, &|_| true))
+        // `on[pc]` is the last position a thread at `pc` was added for.
+        let mut on = vec![usize::MAX; self.0.len()];
+        let mut now = Vec::new();
+        for i in 0..=s.len() {
+            // A new thread at every position makes the match unanchored.
+            if re_add(&self.0, &mut now, &mut on, 0, i, s.len()) {
+                return true;
+            }
+            let mut next = Vec::new();
+            for &pc in &now {
+                let hit = match (&self.0[pc], s.get(i)) {
+                    (Op::Char(want), Some(c)) => c == want,
+                    (Op::Any, Some(_)) => true,
+                    (Op::Set(ranges, negated), Some(&c)) => {
+                        ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)) != *negated
+                    }
+                    _ => false,
+                };
+                if hit && re_add(&self.0, &mut next, &mut on, pc + 1, i + 1, s.len()) {
+                    return true;
+                }
+            }
+            now = next;
+        }
+        false
     }
 
     pub(crate) fn matches_a_row(&self, screen: &str) -> bool {
@@ -996,47 +1077,94 @@ fn re_class(e: char) -> Option<(Vec<(char, char)>, bool)> {
     Some((ranges, e.is_ascii_uppercase()))
 }
 
-/// Matches `seq` at `s[i..]`, then hands the end position to `k`.
-fn re_seq(seq: &[Re], s: &[char], i: usize, k: &dyn Fn(usize) -> bool) -> bool {
-    match seq.split_first() {
-        None => k(i),
-        Some((Re::Repeat(r, min, max), rest)) => re_repeat(r, *min, *max, rest, s, i, k),
-        Some((r, rest)) => re_one(r, s, i, &|j| re_seq(rest, s, j, k)),
-    }
-}
-
-fn re_one(r: &Re, s: &[char], i: usize, k: &dyn Fn(usize) -> bool) -> bool {
-    let c = s.get(i).copied();
+/// Appends the program for `r`: one step per char an atom consumes, and
+/// jumps for groups and repeats.
+fn re_emit(r: &Re, prog: &mut Vec<Op>, left: &mut usize) -> Result<(), String> {
+    *left = left.checked_sub(1).ok_or("pattern is too long")?;
     match r {
-        Re::Char(want) => c == Some(*want) && k(i + 1),
-        Re::Any => c.is_some() && k(i + 1),
-        Re::Set(ranges, negated) => {
-            c.is_some_and(|c| ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)) != *negated)
-                && k(i + 1)
+        Re::Char(c) => prog.push(Op::Char(*c)),
+        Re::Any => prog.push(Op::Any),
+        Re::Set(ranges, negated) => prog.push(Op::Set(ranges.clone(), *negated)),
+        Re::Start => prog.push(Op::Start),
+        Re::End => prog.push(Op::End),
+        Re::Group(alts) => {
+            let mut exits = Vec::new();
+            for (n, seq) in alts.iter().enumerate() {
+                let last = n + 1 == alts.len();
+                let split = prog.len();
+                if !last {
+                    prog.push(Op::Split(split + 1, 0));
+                }
+                for r in seq {
+                    re_emit(r, prog, left)?;
+                }
+                if !last {
+                    exits.push(prog.len());
+                    prog.push(Op::Jmp(0));
+                    prog[split] = Op::Split(split + 1, prog.len());
+                }
+            }
+            for e in exits {
+                prog[e] = Op::Jmp(prog.len());
+            }
         }
-        Re::Start => i == 0 && k(i),
-        Re::End => i == s.len() && k(i),
-        Re::Group(alts) => alts.iter().any(|seq| re_seq(seq, s, i, k)),
-        Re::Repeat(r, min, max) => re_repeat(r, *min, *max, &[], s, i, k),
+        Re::Repeat(r, min, max) => {
+            if max < min {
+                return Err(format!("bad repeat {{{min},{max}}}"));
+            }
+            for _ in 0..*min {
+                re_emit(r, prog, left)?;
+            }
+            if *max == u32::MAX {
+                let split = prog.len();
+                prog.push(Op::Split(split + 1, 0));
+                re_emit(r, prog, left)?;
+                prog.push(Op::Jmp(split));
+                prog[split] = Op::Split(split + 1, prog.len());
+            } else {
+                let mut splits = Vec::new();
+                for _ in *min..*max {
+                    splits.push(prog.len());
+                    prog.push(Op::Split(prog.len() + 1, 0));
+                    re_emit(r, prog, left)?;
+                }
+                for s in splits {
+                    prog[s] = Op::Split(s + 1, prog.len());
+                }
+            }
+        }
     }
+    Ok(())
 }
 
-/// Greedy: takes as many repeats as it can, then backs off one at a time.
-fn re_repeat(
-    r: &Re,
-    min: u32,
-    max: u32,
-    rest: &[Re],
-    s: &[char],
+/// Adds the thread at `pc` to `list`, following jumps and anchors at
+/// position `i` of a row `len` chars long. True once a thread reaches
+/// `Match`.
+fn re_add(
+    prog: &[Op],
+    list: &mut Vec<usize>,
+    on: &mut [usize],
+    pc: usize,
     i: usize,
-    k: &dyn Fn(usize) -> bool,
+    len: usize,
 ) -> bool {
-    // A repeat that consumes nothing would loop forever.
-    let more = max > 0
-        && re_one(r, s, i, &|j| {
-            j > i && re_repeat(r, min.saturating_sub(1), max - 1, rest, s, j, k)
-        });
-    more || (min == 0 && re_seq(rest, s, i, k))
+    let mut todo = vec![pc];
+    while let Some(pc) = todo.pop() {
+        if on[pc] == i {
+            continue;
+        }
+        on[pc] = i;
+        match prog[pc] {
+            Op::Match => return true,
+            Op::Jmp(to) => todo.push(to),
+            Op::Split(a, b) => todo.extend([b, a]),
+            Op::Start if i == 0 => todo.push(pc + 1),
+            Op::End if i == len => todo.push(pc + 1),
+            Op::Start | Op::End => {}
+            _ => list.push(pc),
+        }
+    }
+    false
 }
 
 /// `text` the way [`plain`] leaves it.
@@ -1121,9 +1249,34 @@ mod tests {
         assert!(Regex::new("^> a$").unwrap().matches_a_row("x\n> a\ny"));
         assert!(Regex::new("^> a$").unwrap().matches_a_row(">\u{a0}a"));
         assert!(Regex::new(r"^>\s*$").unwrap().matches_a_row(">\u{a0}"));
-        for bad in ["(a", "a)", "*a", "[ab", "a{2", r"a\"] {
+        for bad in [
+            "(a",
+            "a)",
+            "*a",
+            "[ab",
+            "a{2",
+            r"a\",
+            "a{3,2}",
+            "a{9999}",
+            "((){99}){99999}",
+        ] {
             assert!(Regex::new(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn debug_regex_long_rows() {
+        // Rows of untrusted output can be thousands of chars long, and a
+        // pattern may nest repeats. Neither may blow the stack or take
+        // exponential time.
+        let row = "a".repeat(100_000);
+        assert!(!Regex::new("(.)*x").unwrap().is_match(&row));
+        assert!(Regex::new("^(.)*$").unwrap().is_match(&row));
+        let words = "a".repeat(40) + "!";
+        assert!(!Regex::new(r"^(\w+\s?)*$").unwrap().is_match(&words));
+        assert!(Regex::new(r"^(\w+\s?)*!$").unwrap().is_match(&words));
+        assert!(Regex::new("^(a*)*$").unwrap().is_match("aaa"));
+        assert!(Regex::new("^(a|ab)(c|bcd)(d*)$").unwrap().is_match("abcd"));
     }
 
     #[test]
@@ -1203,6 +1356,29 @@ mod tests {
             "{\"first_pty_byte_ms\":13.0,\"first_post_prelude_ms\":40.0,\"first_present_ms\":null,\
              \"frames\":3,\"wakeups\":0,\"inbox\":false}"
         );
+    }
+
+    #[test]
+    fn debug_output_is_bounded() {
+        let mut st = State {
+            term: Terminal::new(vt::Options::default()),
+            out: Vec::new(),
+            dropped: 0,
+            chunks: 0,
+            last_ms: 0.0,
+            counters: Counters::default(),
+            exit: None,
+            log: None,
+        };
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..40 {
+            st.push_out(&chunk);
+        }
+        st.push_out(b"end");
+        assert!(st.out.len() <= MAX_OUT);
+        assert_eq!(st.out_end(), (40 << 20) + 3);
+        assert_eq!(st.out_from(st.out_end() - 3), b"end");
+        assert_eq!(st.out_from(0).len(), st.out.len());
     }
 
     #[test]

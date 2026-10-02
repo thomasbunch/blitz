@@ -21,6 +21,9 @@ use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, w}
 pub const BOLD: u8 = 1;
 pub const ITALIC: u8 = 2;
 
+/// What [`Font::raster`] fails with when it has no fallback lookups left.
+pub const E_PENDING: HRESULT = HRESULT(0x8000_000A_u32 as i32);
+
 /// Families tried in order; Consolas ships with every Windows.
 pub const DEFAULT_FAMILIES: &[&str] = &["Cascadia Mono", "Consolas", "Courier New"];
 
@@ -55,6 +58,10 @@ pub struct Font {
     pub gamma: f32,
     pub contrast: f32,
     fallbacks: HashMap<(char, u8), Option<IDWriteFontFace>>,
+    /// Fallback lookups [`Font::raster`] may still make before it fails
+    /// with `E_PENDING`. Each new character takes about a tenth of a
+    /// millisecond, so a renderer allows a few per frame.
+    pub lookups: u32,
 }
 
 fn weight_style(style: u8) -> (DWRITE_FONT_WEIGHT, DWRITE_FONT_STYLE) {
@@ -144,6 +151,7 @@ impl Font {
                 gamma,
                 contrast,
                 fallbacks: HashMap::new(),
+                lookups: u32::MAX,
             })
         }
     }
@@ -266,6 +274,10 @@ impl Font {
         if let Some(f) = self.fallbacks.get(&(c, style)) {
             return Ok(f.clone());
         }
+        if self.lookups == 0 {
+            return Err(E_PENDING.into());
+        }
+        self.lookups -= 1;
         let mut text = [0u16; 2];
         let len = c.encode_utf16(&mut text).len() as u32;
         let source = Source {
@@ -475,5 +487,18 @@ mod tests {
             assert!(r.dx >= -1 && r.dx + r.w as i32 <= cells + 1, "{s} spills");
             assert!(2 * r.w as i32 >= cells, "{s} is shrunk to {} px", r.w);
         }
+    }
+
+    #[test]
+    fn fallback_lookups_wait_when_none_are_left() {
+        let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        font.lookups = 1;
+        assert!(font.raster("中", 0, 2).expect("raster").is_some());
+        assert!(font.raster("中", 0, 2).is_ok(), "a known character is free");
+        assert!(font.raster("A", 0, 1).is_ok(), "so is the font's own");
+        let e = font.raster("日", 0, 2).err().expect("no lookups left");
+        assert_eq!(e.code(), E_PENDING);
+        font.lookups = 1;
+        assert!(font.raster("日", 0, 2).expect("raster").is_some());
     }
 }

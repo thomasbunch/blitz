@@ -9,6 +9,9 @@ AppPublisher=blitz contributors
 AppPublisherURL=https://github.com/thomasbunch/blitz
 AppSupportURL=https://github.com/thomasbunch/blitz/issues
 DefaultDirName={autopf}\blitz
+; A folder picked by hand may be writable by every user, who could then
+; replace the hook that Claude Code runs. Both defaults are not.
+DisableDirPage=yes
 DisableProgramGroupPage=yes
 ; No admin rights needed: installs under %LOCALAPPDATA%\Programs unless the
 ; user picks an all-users install.

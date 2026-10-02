@@ -4,8 +4,10 @@
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 
-/// Claude Code's payloads are a few KB; anything this big is not one.
-const MAX_INPUT: u64 = 1 << 20;
+/// Most payloads are a few KB, but a Write or Edit request carries the
+/// whole file, so the cap only stops a runaway stream. A payload cut at the
+/// cap does not parse and reports nothing.
+const MAX_INPUT: u64 = 64 << 20;
 /// Longest message carried in a notification, in chars.
 const MAX_MSG: usize = 120;
 /// Notification types that mean Claude Code is waiting on the user.
@@ -18,15 +20,18 @@ const NOTIFY_TYPES: &str =
 ///
 /// `blitz-hook claude` reads a hook payload on stdin and prints a
 /// `terminalSequence` for Claude Code to write to its own terminal, so the
-/// state lands in the right pane without any IPC. Outside a blitz pane
-/// (`BLITZ_PANE_ID` unset) it prints nothing.
+/// state lands in the right pane without any IPC. The sequence carries the
+/// pane's `BLITZ_PANE_TOKEN`, which program output cannot know. Outside a
+/// blitz pane (no token) it prints nothing.
 pub fn run() -> i32 {
     let claude = std::env::args().nth(1).as_deref() == Some("claude");
-    let in_pane = std::env::var_os("BLITZ_PANE_ID").is_some_and(|v| !v.is_empty());
+    let token = std::env::var("BLITZ_PANE_TOKEN").unwrap_or_default();
+    // It goes into the sequence as is, so nothing in it may end the title.
+    let in_pane = !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric());
     if claude && in_pane {
         let mut input = Vec::new();
         let _ = std::io::stdin().take(MAX_INPUT).read_to_end(&mut input);
-        if let Some(out) = claude_output(&String::from_utf8_lossy(&input)) {
+        if let Some(out) = claude_output(&token, &String::from_utf8_lossy(&input)) {
             let mut stdout = std::io::stdout().lock();
             let _ = stdout
                 .write_all(out.as_bytes())
@@ -38,9 +43,9 @@ pub fn run() -> i32 {
 
 /// The hook's stdout for one Claude Code payload, or `None` when the event
 /// is not one blitz reports.
-pub fn claude_output(payload: &str) -> Option<String> {
+pub fn claude_output(token: &str, payload: &str) -> Option<String> {
     let (state, msg) = claude_state(&Json::parse(payload)?)?;
-    Some(notify_json(state, &msg))
+    Some(notify_json(token, state, &msg))
 }
 
 /// Maps a hook payload to a state (`working`, `needs-you`, `done`, `error`,
@@ -104,10 +109,13 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
     })
 }
 
-/// `{"terminalSequence":"ESC]777;notify;blitz:<state>;<msg>BEL"}` and a
-/// newline. The message is made safe to embed first.
-pub fn notify_json(state: &str, msg: &str) -> String {
-    let seq = format!("\x1b]777;notify;blitz:{state};{}\x07", one_line(msg));
+/// `{"terminalSequence":"ESC]777;notify;blitz:<token>:<state>;<msg>BEL"}`
+/// and a newline. The message is made safe to embed first.
+pub fn notify_json(token: &str, state: &str, msg: &str) -> String {
+    let seq = format!(
+        "\x1b]777;notify;blitz:{token}:{state};{}\x07",
+        one_line(msg)
+    );
     let mut out = String::from("{\"terminalSequence\":\"");
     escape_json(&seq, &mut out);
     out.push_str("\"}\n");
@@ -166,6 +174,19 @@ pub fn setup(args: &[String]) -> i32 {
             hook.display()
         );
     }
+    #[cfg(windows)]
+    if [hook.parent(), Some(hook.as_path())]
+        .into_iter()
+        .flatten()
+        .any(others_can_write)
+    {
+        eprintln!(
+            "warning: other users can replace {}, and Claude Code would run their \
+             program in every session. Keep blitz in a folder only you can change, \
+             such as where the installer puts it.",
+            hook.display()
+        );
+    }
     let settings = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::home_dir().map(|h| h.join(".claude")))
@@ -178,6 +199,114 @@ pub fn setup(args: &[String]) -> i32 {
     );
     print!("{}", claude_settings(&hook.to_string_lossy()));
     0
+}
+
+/// Whether anyone but this user, SYSTEM, Administrators or TrustedInstaller
+/// may change `path`, or add and remove files in it if it is a folder. Deny
+/// entries are not weighed against the grants, so it errs towards yes.
+#[cfg(windows)]
+fn others_can_write(path: &std::path::Path) -> bool {
+    use windows::Win32::Foundation::{
+        CloseHandle, GENERIC_ALL, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree,
+    };
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, GetTokenInformation,
+        INHERIT_ONLY_ACE, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_DELETE_CHILD, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::{HSTRING, PWSTR};
+
+    // For a folder, FILE_WRITE_DATA is the right to add files.
+    const WRITE: u32 = FILE_WRITE_DATA.0
+        | FILE_DELETE_CHILD.0
+        | DELETE.0
+        | WRITE_DAC.0
+        | WRITE_OWNER.0
+        | GENERIC_WRITE.0
+        | GENERIC_ALL.0;
+    // SYSTEM, Administrators and TrustedInstaller.
+    const TRUSTED: [&str; 3] = [
+        "S-1-5-18",
+        "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    ];
+    let sid_string = |sid: PSID| {
+        let mut s = PWSTR::null();
+        // SAFETY: a valid SID; the string is copied, then freed.
+        unsafe {
+            ConvertSidToStringSidW(sid, &mut s).ok()?;
+            let out = s.to_string().ok();
+            LocalFree(Some(HLOCAL(s.0.cast())));
+            out
+        }
+    };
+    // SAFETY: the buffer is as large as the call is told; the token is
+    // closed after use.
+    let me = unsafe {
+        let mut token = HANDLE::default();
+        let mut user = [0u64; 64];
+        let mut len = 0;
+        let ok = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok()
+            && GetTokenInformation(
+                token,
+                TokenUser,
+                Some(user.as_mut_ptr().cast()),
+                size_of_val(&user) as u32,
+                &mut len,
+            )
+            .is_ok();
+        let _ = CloseHandle(token);
+        ok.then(|| sid_string((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid))
+            .flatten()
+    };
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: valid out pointers. The DACL and its entries live inside `sd`,
+    // which is freed after the last use of them.
+    unsafe {
+        let err = GetNamedSecurityInfoW(
+            &HSTRING::from(path),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        );
+        if err.is_err() {
+            return false;
+        }
+        // Without a DACL everyone may do anything.
+        let mut open = dacl.is_null();
+        for i in 0..if open { 0 } else { (*dacl).AceCount } {
+            let mut ace = std::ptr::null_mut();
+            if GetAce(dacl, i.into(), &mut ace).is_err() {
+                continue;
+            }
+            let ace = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+            // Type 0 grants access; an inherit-only entry is for children.
+            if ace.Header.AceType != 0
+                || u32::from(ace.Header.AceFlags) & INHERIT_ONLY_ACE.0 != 0
+                || ace.Mask & WRITE == 0
+            {
+                continue;
+            }
+            let who = sid_string(PSID((&raw const ace.SidStart).cast_mut().cast()));
+            if !who.is_some_and(|w| TRUSTED.contains(&w.as_str()) || Some(&w) == me.as_ref()) {
+                open = true;
+                break;
+            }
+        }
+        LocalFree(Some(HLOCAL(sd.0)));
+        open
+    }
 }
 
 /// The Claude Code settings fragment that runs `hook_exe claude` on every
@@ -543,23 +672,24 @@ mod tests {
     #[test]
     fn every_state_is_an_attention_event() {
         for s in ["working", "needs-you", "done", "error", "idle"] {
-            assert!(Ev::from_notify(&format!("blitz:{s}")).is_some(), "{s}");
+            let title = format!("blitz:4b1d:{s}");
+            assert!(Ev::from_notify(&title, "4b1d").is_some(), "{s}");
         }
     }
 
     #[test]
     fn output_is_one_json_line() {
         assert_eq!(
-            notify_json("done", "All \"good\" \\ ok"),
-            "{\"terminalSequence\":\"\\u001b]777;notify;blitz:done;All \\\"good\\\" \\\\ ok\\u0007\"}\n"
+            notify_json("4b1d", "done", "All \"good\" \\ ok"),
+            "{\"terminalSequence\":\"\\u001b]777;notify;blitz:4b1d:done;All \\\"good\\\" \\\\ ok\\u0007\"}\n"
         );
-        let out = claude_output(r#"{"hook_event_name":"SessionEnd"}"#).unwrap();
+        let out = claude_output("4b1d", r#"{"hook_event_name":"SessionEnd"}"#).unwrap();
         let v = Json::parse(&out).unwrap();
         assert_eq!(
             v.get("terminalSequence").and_then(Json::as_str),
-            Some("\x1b]777;notify;blitz:idle;\x07")
+            Some("\x1b]777;notify;blitz:4b1d:idle;\x07")
         );
-        assert_eq!(claude_output("not json"), None);
+        assert_eq!(claude_output("4b1d", "not json"), None);
     }
 
     #[test]
@@ -673,5 +803,29 @@ mod tests {
         lit.push('"');
         assert!(lit.contains("\\u001b") && lit.contains("\\u0007") && lit.contains("\\u009b"));
         assert_eq!(Json::parse(&lit).unwrap().as_str(), Some(s));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn setup_notices_folders_others_can_change() {
+        let dir = std::env::temp_dir().join(format!("blitz-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let icacls = |args: &[&str]| {
+            let out = std::process::Command::new("icacls")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("icacls");
+            assert!(out.status.success(), "icacls {args:?}");
+        };
+        // Only SYSTEM; as the owner this process can still read and change
+        // the list.
+        icacls(&["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F"]);
+        assert!(!others_can_write(&dir));
+        icacls(&["/grant", "*S-1-1-0:(OI)(CI)RX"]);
+        assert!(!others_can_write(&dir));
+        icacls(&["/grant", "*S-1-1-0:(OI)(CI)M"]);
+        assert!(others_can_write(&dir));
+        let _ = std::fs::remove_dir(&dir);
     }
 }

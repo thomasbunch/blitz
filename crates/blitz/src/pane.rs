@@ -1,8 +1,8 @@
 //! A session: one child process on its own pseudoconsole, and its screen.
 
-use std::io;
+use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Component, Path, Prefix};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -31,6 +31,9 @@ pub struct Pane {
     pub branch: Option<String>,
     /// Latest one-line message from a hook notification.
     pub msg: String,
+    /// The pane's `BLITZ_PANE_TOKEN`. Only hook notifications and prompt
+    /// marks that carry it are believed.
+    pub token: String,
     /// Set once the child has exited.
     pub exit_code: Option<u32>,
     /// Set by the reader thread when there is new output to draw.
@@ -65,6 +68,8 @@ pub struct Spawn<'a> {
     pub dark: bool,
     /// The window, which becomes the owner of the console's hidden window.
     pub parent: Option<isize>,
+    /// From [`crate::pty::pane_token`]; exported as `BLITZ_PANE_TOKEN`.
+    pub token: &'a str,
 }
 
 impl Pane {
@@ -81,6 +86,7 @@ impl Pane {
             ..Default::default()
         });
         term.set_theme(s.dark);
+        term.set_prompt_token(s.token);
         let term = Arc::new(Mutex::new(term));
         let dirty = Arc::new(AtomicBool::new(false));
         let (t, d) = (term.clone(), dirty.clone());
@@ -99,7 +105,7 @@ impl Pane {
                         drop(term);
                         // Replies go out in the order the queries came in.
                         if !replies.is_empty() {
-                            w.send(std::mem::take(&mut replies));
+                            w.reply(std::mem::take(&mut replies));
                         }
                     }
                     if !d.swap(true, Ordering::AcqRel) {
@@ -113,14 +119,24 @@ impl Pane {
             }));
             if r.is_err() {
                 dead = true;
+                // The panic may have left the screen half updated, and the UI
+                // thread reads it every frame. A blank one takes its place,
+                // 1x1 until the next resize so it never draws past the pane.
+                *lock(&t) = vt::Terminal::new(vt::Options {
+                    cols: 1,
+                    rows: 1,
+                    ..Default::default()
+                });
                 notify(id, Note::Dead);
             }
         };
+        let mut env = s.env.to_vec();
+        env.push(("BLITZ_PANE_TOKEN".into(), s.token.into()));
         let pty = Pty::spawn(
             &SpawnOpts {
                 cmdline: s.cmdline,
                 cwd: s.cwd,
-                env: s.env,
+                env: &env,
                 cols: s.cols,
                 rows: s.rows,
                 pane_id: id.0,
@@ -138,6 +154,7 @@ impl Pane {
             cwd: s.cwd.map(|p| p.display().to_string()).unwrap_or_default(),
             branch: None,
             msg: String::new(),
+            token: s.token.into(),
             exit_code: None,
             dirty,
         })
@@ -176,8 +193,7 @@ pub fn program_name(cmdline: &str) -> String {
 
 /// The branch checked out in the repository that holds `dir`, read from
 /// `.git/HEAD` without running git. A detached HEAD gives the short hash.
-// A few file reads on the UI thread per prompt; move them off it
-// if network drives make that slow.
+/// Blocks on the drive, so the app calls it off the UI thread.
 pub fn git_branch(dir: &Path) -> Option<String> {
     for d in dir.ancestors() {
         let git = d.join(".git");
@@ -185,12 +201,19 @@ pub fn git_branch(dir: &Path) -> Option<String> {
             git.join("HEAD")
         } else if git.is_file() {
             // A worktree or submodule: the file names the real git dir.
-            let link = std::fs::read_to_string(&git).ok()?;
-            d.join(link.strip_prefix("gitdir:")?.trim()).join("HEAD")
+            // A folder from a download can name a share there, and just
+            // reading it makes Windows sign in to that host.
+            let link = read_start(&git)?;
+            let gitdir = d.join(link.strip_prefix("gitdir:")?.trim());
+            match gitdir.components().next() {
+                Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_)) => {}
+                _ => return None,
+            }
+            gitdir.join("HEAD")
         } else {
             continue;
         };
-        let head = std::fs::read_to_string(head).ok()?;
+        let head = read_start(&head)?;
         let head = head.trim();
         return match head.strip_prefix("ref: refs/heads/") {
             Some(branch) => Some(branch.to_string()),
@@ -198,6 +221,14 @@ pub fn git_branch(dir: &Path) -> Option<String> {
         };
     }
     None
+}
+
+/// The first 4 KiB of a file that should hold one short line.
+fn read_start(path: &Path) -> Option<String> {
+    let mut s = String::new();
+    let file = std::fs::File::open(path).ok()?;
+    file.take(4096).read_to_string(&mut s).ok()?;
+    Some(s)
 }
 
 #[cfg(test)]
@@ -239,6 +270,18 @@ mod tests {
         std::fs::write(root.join("meta").join("HEAD"), "ref: refs/heads/side\n").expect("head");
         assert_eq!(git_branch(&wt).as_deref(), Some("side"));
 
+        // Only a git dir on a drive is read, not a share or device path.
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: \\\\?\\{}\n", root.join("meta").display()),
+        )
+        .expect("link");
+        assert_eq!(git_branch(&wt), None);
+
+        // A huge HEAD is not read whole.
+        std::fs::write(&head, format!("ref: refs/heads/{}", "x".repeat(10_000))).expect("head");
+        assert!(git_branch(&sub).is_some_and(|b| b.len() < 4096));
+
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(git_branch(&root), None);
     }
@@ -259,6 +302,7 @@ mod tests {
                 scrollback: 100,
                 dark: true,
                 parent: None,
+                token: "t",
             },
             move |id, n| {
                 let _ = tx.send((id, n));
@@ -279,5 +323,37 @@ mod tests {
         assert_eq!(exit, Some(0));
         let text = lock(&pane.term).screen_text();
         assert!(text.contains("pane-7"), "screen: {text:?}");
+    }
+
+    /// After a panic on the reader thread the UI never sees the screen it
+    /// was updating.
+    #[test]
+    fn pane_drops_its_screen_after_a_panic() {
+        let (tx, rx) = mpsc::channel();
+        let pane = Pane::spawn(
+            PaneId(8),
+            &Spawn {
+                cmdline: "cmd.exe /d /c echo pane-output",
+                env: &[],
+                cwd: None,
+                cols: 40,
+                rows: 5,
+                scrollback: 100,
+                dark: true,
+                parent: None,
+                token: "t",
+            },
+            move |_, n| {
+                // Stands in for a parser panic, once all output is on screen.
+                assert!(!matches!(n, Note::Exit(_)), "test panic at exit");
+                let _ = tx.send(n);
+            },
+        )
+        .expect("spawn");
+        let dead = std::iter::from_fn(|| rx.recv_timeout(Duration::from_secs(20)).ok())
+            .any(|n| n == Note::Dead);
+        assert!(dead);
+        let text = lock(&pane.term).screen_text();
+        assert!(!text.contains("pane-output"), "screen: {text:?}");
     }
 }

@@ -28,10 +28,19 @@ pub enum Ev {
 }
 
 impl Ev {
-    /// The event for an OSC 777 notification title such as `blitz:done`,
-    /// as written by `blitz-hook`. Other titles are not attention events.
-    pub fn from_notify(title: &str) -> Option<Ev> {
-        Some(match title.strip_prefix("blitz:")? {
+    /// The event for an OSC 777 notification title such as
+    /// `blitz:<token>:done`, as written by `blitz-hook` with the pane's
+    /// token. Other titles, and any without that token, are not attention
+    /// events: program output can print them too.
+    pub fn from_notify(title: &str, token: &str) -> Option<Ev> {
+        let state = title
+            .strip_prefix("blitz:")?
+            .strip_prefix(token)?
+            .strip_prefix(':')?;
+        if token.is_empty() {
+            return None;
+        }
+        Some(match state {
             "needs-you" => Ev::NeedsYou,
             "working" => Ev::Working,
             "done" => Ev::Done,
@@ -266,19 +275,40 @@ mod tests {
         assert!(DoneUnseen < Error && Error < NeedsYou);
     }
 
+    const TOKEN: &str = "0f1e2d3c";
+
     #[test]
     fn notify_titles() {
-        assert_eq!(Ev::from_notify("blitz:needs-you"), Some(Ev::NeedsYou));
-        assert_eq!(Ev::from_notify("blitz:working"), Some(Ev::Working));
-        assert_eq!(Ev::from_notify("blitz:done"), Some(Ev::Done));
+        let ev = |s: &str| Ev::from_notify(s, TOKEN);
+        assert_eq!(ev("blitz:0f1e2d3c:needs-you"), Some(Ev::NeedsYou));
+        assert_eq!(ev("blitz:0f1e2d3c:working"), Some(Ev::Working));
+        assert_eq!(ev("blitz:0f1e2d3c:done"), Some(Ev::Done));
         assert_eq!(
-            Ev::from_notify("blitz:error"),
+            ev("blitz:0f1e2d3c:error"),
             Some(Ev::Error { sticky: false })
         );
-        assert_eq!(Ev::from_notify("blitz:idle"), Some(Ev::Idle));
-        assert_eq!(Ev::from_notify("blitz:bogus"), None);
-        assert_eq!(Ev::from_notify("Build finished"), None);
-        assert_eq!(Ev::from_notify(""), None);
+        assert_eq!(ev("blitz:0f1e2d3c:idle"), Some(Ev::Idle));
+        assert_eq!(ev("blitz:0f1e2d3c:bogus"), None);
+        assert_eq!(ev("Build finished"), None);
+        assert_eq!(ev(""), None);
+    }
+
+    /// Output can print the hook's sequence, but not the pane's token.
+    #[test]
+    fn notify_titles_need_the_token() {
+        for title in [
+            "blitz:needs-you",
+            "blitz:working",
+            "blitz::done",
+            "blitz:0f1e2d3:done",
+            "blitz:0f1e2d3c0:done",
+            "blitz:0F1E2D3C:done",
+            "blitz:0f1e2d3cdone",
+        ] {
+            assert_eq!(Ev::from_notify(title, TOKEN), None, "{title}");
+        }
+        assert_eq!(Ev::from_notify("blitz::done", ""), None);
+        assert_eq!(events("\x1b]777;notify;blitz:needs-you;Bash: x\x07"), []);
     }
 
     #[test]
@@ -315,14 +345,14 @@ mod tests {
         t.take_events(&mut evs);
         evs.into_iter()
             .filter_map(|e| match e {
-                vt::Event::Notify { title, .. } => Ev::from_notify(&title),
+                vt::Event::Notify { title, .. } => Ev::from_notify(&title, TOKEN),
                 _ => None,
             })
             .collect()
     }
 
     fn notify(state: &str) -> String {
-        format!("\x1b]777;notify;blitz:{state};msg\x07")
+        format!("\x1b]777;notify;blitz:{TOKEN}:{state};msg\x07")
     }
 
     /// Each attention rule, driven by hook notifications as a program

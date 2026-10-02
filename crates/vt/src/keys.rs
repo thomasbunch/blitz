@@ -104,6 +104,9 @@ const ESC: u8 = 0x1b;
 /// Windows' "the IME owns this key" virtual key.
 const VK_PROCESSKEY: u16 = 0xe5;
 
+const VK_CANCEL: u16 = 0x03;
+const VK_C: u16 = 0x43;
+
 // Kitty keyboard protocol flags.
 const DISAMBIGUATE: u8 = 1;
 const EVENT_TYPES: u8 = 2;
@@ -116,8 +119,14 @@ pub fn encode_key(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     if k.vk == VK_PROCESSKEY {
         return;
     }
-    // Without disambiguate or all-keys, kitty flags leave presses legacy.
-    if m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0 {
+    // Ctrl+C and Ctrl+Break stay console key records under ConPTY even
+    // when kitty flags are pushed: only then does conhost interrupt a
+    // program that reads keys, and any program can print a push.
+    let interrupt = matches!(k.vk, VK_C | VK_CANCEL) && mod_bits(k) & 6 == 4;
+    if m.w32im && interrupt {
+        win32(k, out);
+    } else if m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0 {
+        // Without disambiguate or all-keys, kitty flags leave presses legacy.
         kitty(k, m.kitty, out);
     } else if m.w32im {
         win32(k, out);
@@ -564,9 +573,13 @@ pub fn encode_paste(text: &str, bracketed: bool, out: &mut Vec<u8>) {
 
 /// Whether a paste should be confirmed first. Without bracketed paste a
 /// shell runs every pasted line the moment it arrives; Windows PowerShell
-/// 5.1's PSReadLine never turns bracketed paste on.
-pub fn needs_paste_confirm(text: &str, bracketed: bool) -> bool {
-    !bracketed && text.contains(['\r', '\n'])
+/// 5.1's PSReadLine never turns bracketed paste on. Nor does cmd, but
+/// `type` on a file can turn the mode on while cmd or another program
+/// that knows nothing of it reads the keys, and conhost then runs every
+/// line. So `trusted` is [`crate::Terminal::paste_trusted`]: bracketed
+/// paste on, and a paste under it already confirmed by the user.
+pub fn needs_paste_confirm(text: &str, trusted: bool) -> bool {
+    !trusted && text.contains(['\r', '\n'])
 }
 
 /// Appends a focus report when mode 1004 is set.

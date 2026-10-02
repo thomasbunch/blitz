@@ -35,7 +35,8 @@ impl Palette {
 }
 
 /// [`RenderCell::attrs`] bits. Inverse and invisible are already applied
-/// to the cell's colours; `INVERSE` is only informational.
+/// to the cell's colours, and a cell whose text would not show has none;
+/// `INVERSE` is only informational.
 pub mod attr {
     pub const BOLD: u16 = 1 << 0;
     pub const ITALIC: u16 = 1 << 1;
@@ -70,6 +71,8 @@ pub struct Snapshot {
     pub rows: u16,
     /// `rows * cols` cells, row-major, viewport only.
     pub cells: Vec<RenderCell>,
+    /// Per row: its text continues on the next row.
+    pub wrapped: Vec<bool>,
     /// Column, row and shape; `None` when hidden or scrolled out of view.
     pub cursor: Option<(u16, u16, CursorShape)>,
     pub alt_screen: bool,

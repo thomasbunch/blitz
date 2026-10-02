@@ -55,6 +55,8 @@ const WHEEL_LINES: isize = 3;
 #[derive(Debug)]
 pub enum UserEvent {
     Pane(PaneId, Note),
+    /// The git branch of a pane's directory, read on another thread.
+    Branch(PaneId, String, Option<String>),
     /// Exit with this code: the self-test finished, or `--exit-after`
     /// ran out.
     Finish(i32),
@@ -294,6 +296,8 @@ struct View {
     notice: Option<Notice>,
     /// When the taskbar last flashed for this session.
     flashed: Option<Instant>,
+    /// A thread is reading the git branch of the session's directory.
+    finding_branch: bool,
 }
 
 struct App {
@@ -320,8 +324,9 @@ struct App {
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
-    /// A multi-line paste waiting for its confirming Ctrl+V.
-    paste: Option<(String, Instant)>,
+    /// A multi-line paste waiting for its confirming Ctrl+V in the pane
+    /// that asked.
+    paste: Option<(PaneId, String, Instant)>,
     /// A busy session waiting for a second Ctrl+Shift+W.
     close_confirm: Option<(PaneId, Instant)>,
     /// The release of this key belongs to a shortcut and is not sent.
@@ -453,6 +458,7 @@ impl App {
             .iter()
             .find(|g| g.0 == id)
             .map_or((80, 24), |&(_, (c, r))| (fit(c), fit(r)));
+        let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         let launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
@@ -462,6 +468,7 @@ impl App {
                 &self.config.shell,
                 &self.config.shell_args,
                 self.config.shell_integration,
+                &token,
             ),
         };
         let proxy = self.proxy.clone();
@@ -476,6 +483,7 @@ impl App {
                 scrollback: self.config.scrollback_lines,
                 dark: self.dark,
                 parent: Some(self.hwnd),
+                token: &token,
             },
             move |id, note| {
                 let _ = proxy.send_event(UserEvent::Pane(id, note));
@@ -485,7 +493,6 @@ impl App {
         let (cw, ch) = self.cell();
         lock(&pane.term).set_cell_px(cw as u16, ch as u16);
         pane.name = program_name(&launch.cmdline);
-        pane.branch = cwd.as_deref().and_then(git_branch);
         self.views.push(View {
             pane,
             snap: Snapshot::default(),
@@ -493,7 +500,9 @@ impl App {
             rect: None,
             notice: None,
             flashed: None,
+            finding_branch: false,
         });
+        self.find_branch(id);
         self.next_id = id.0 + 1;
         let before = self.focus_id();
         self.win = win;
@@ -659,7 +668,9 @@ impl App {
                 let p = &v.pane;
                 chrome::Session {
                     id: p.id,
-                    name: p.name.clone(),
+                    // Programs set the rest of the row, so the session's
+                    // number is what tells two look-alike sessions apart.
+                    name: format!("{} {}", p.name, p.id.0),
                     cwd: p.cwd.clone(),
                     branch: p.branch.clone(),
                     state: p.attn.state,
@@ -823,18 +834,20 @@ impl App {
                     return false;
                 };
                 let bracketed = self.modes().bracketed;
-                if vt::keys::needs_paste_confirm(&text, bracketed) {
-                    let confirmed = self
-                        .paste
-                        .take()
-                        .is_some_and(|(t, until)| t == text && Instant::now() < until);
+                let trusted = self
+                    .current()
+                    .is_some_and(|v| lock(&v.pane.term).paste_trusted());
+                if vt::keys::needs_paste_confirm(&text, trusted) {
                     let Some(id) = before else {
                         return false;
                     };
+                    let confirmed = self.paste.take().is_some_and(|(p, t, until)| {
+                        p == id && t == text && Instant::now() < until
+                    });
                     if !confirmed {
                         let lines = text.lines().count();
                         let until = Instant::now() + CONFIRM;
-                        self.paste = Some((text, until));
+                        self.paste = Some((id, text, until));
                         self.set_notice(
                             id,
                             format!("Paste {lines} lines? Press Ctrl+V again within 3 s"),
@@ -845,6 +858,7 @@ impl App {
                     }
                     if let Some(v) = self.view_mut(id) {
                         v.notice = None;
+                        lock(&v.pane.term).confirm_paste();
                     }
                 }
                 let mut out = Vec::new();
@@ -1012,26 +1026,63 @@ impl App {
                 }
             }
             Event::Cwd(dir) => {
-                v.pane.branch = git_branch(Path::new(&dir));
                 v.pane.cwd = dir;
+                self.find_branch(id);
             }
             Event::Notify { title, body } => {
-                if let Some(ev) = Ev::from_notify(&title) {
-                    v.pane.msg = body;
-                    self.attention(id, ev);
+                if let Some(ev) = Ev::from_notify(&title, &v.pane.token) {
+                    let changed = self.attention(id, ev);
+                    if relabels(ev, changed)
+                        && let Some(v) = self.view_mut(id)
+                    {
+                        v.pane.msg = body;
+                    }
                 }
             }
             _ => {}
         }
     }
 
+    /// Reads the git branch of session `id`'s directory on another thread,
+    /// so a slow drive never stalls every session. One read per session
+    /// runs at a time; a directory reported meanwhile is read after it.
+    fn find_branch(&mut self, id: PaneId) {
+        let proxy = self.proxy.clone();
+        let Some(v) = self.view_mut(id) else {
+            return;
+        };
+        if v.finding_branch || v.pane.cwd.is_empty() {
+            return;
+        }
+        v.finding_branch = true;
+        let dir = v.pane.cwd.clone();
+        std::thread::spawn(move || {
+            let branch = git_branch(Path::new(&dir));
+            let _ = proxy.send_event(UserEvent::Branch(id, dir, branch));
+        });
+    }
+
+    fn on_branch(&mut self, id: PaneId, dir: String, branch: Option<String>) {
+        let Some(v) = self.view_mut(id) else {
+            return;
+        };
+        v.finding_branch = false;
+        if v.pane.cwd == dir {
+            v.pane.branch = branch;
+            self.request_redraw();
+        } else {
+            self.find_branch(id);
+        }
+    }
+
     /// Feeds a session's attention state; flashes the taskbar button when
     /// it changes to something the user should see while looking away.
-    fn attention(&mut self, id: PaneId, ev: Ev) {
+    /// Returns true when the state changed.
+    fn attention(&mut self, id: PaneId, ev: Ev) -> bool {
         let attended = self.focused && self.focus_id() == Some(id);
         let away = !self.focused && self.config.flash;
         let Some(v) = self.view_mut(id) else {
-            return;
+            return false;
         };
         let now = Instant::now();
         let changed = v.pane.attn.apply(ev, attended, now);
@@ -1043,6 +1094,7 @@ impl App {
         if let (Some(kind), Some(w)) = (kind, &self.window) {
             w.request_user_attention(Some(kind));
         }
+        changed
     }
 
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> (u16, u16) {
@@ -1277,7 +1329,10 @@ impl App {
                 lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
             }
             v.rect = Some(rect);
-            lock(&v.pane.term).snapshot(&mut v.snap, &self.pal);
+            let sel = self.selection.filter(|_| Some(id) == focus);
+            if !refresh(&mut lock(&v.pane.term), &mut v.snap, &self.pal, sel) {
+                self.selection = None;
+            }
             if Some(id) == focus {
                 v.snap.selection = self.selection;
             } else if split {
@@ -1333,6 +1388,10 @@ impl App {
                     self.counters.first_present_ms =
                         Some(self.started.elapsed().as_secs_f64() * 1000.0);
                 }
+                // Glyphs still waiting for a font lookup come next frame.
+                if self.gfx.as_ref().is_some_and(|g| g.r.pending()) {
+                    self.request_redraw();
+                }
             }
             Err(e) => {
                 eprintln!("blitz: render: {e}");
@@ -1384,6 +1443,15 @@ impl App {
             .min();
         [sync, notice, timer].into_iter().flatten().min()
     }
+}
+
+/// Whether a notification replaces the session's sidebar message. It is
+/// kept with the state it came with, so a repeat or an ignored event does
+/// not relabel the session. Idle always does: the hook sends it with an
+/// empty body when the session ends, which clears the last reply even
+/// when the session was already idle.
+fn relabels(ev: Ev, changed: bool) -> bool {
+    changed || ev == Ev::Idle
 }
 
 /// How to flash the taskbar for a session that just changed to `state`
@@ -1440,8 +1508,23 @@ fn tab_name(cwd: Option<&Path>) -> String {
         .unwrap_or_else(|| "shell".into())
 }
 
+/// Takes a fresh snapshot of `term` into `snap`. Returns false when that
+/// changed the text under `sel`: output that scrolls or rewrites selected
+/// text ends the selection, so a copy never takes text the user did not
+/// pick.
+fn refresh(
+    term: &mut vt::Terminal,
+    snap: &mut Snapshot,
+    pal: &Palette,
+    sel: Option<((u16, u16), (u16, u16))>,
+) -> bool {
+    let before = sel.map(|s| selection_text(snap, s));
+    !term.snapshot(snap, pal) || sel.map(|s| selection_text(snap, s)) == before
+}
+
 /// The text of the cells between two (column, row) points, inclusive, in
-/// reading order: trailing blanks trimmed, rows joined by CRLF.
+/// reading order: trailing blanks trimmed, rows joined by CRLF unless one
+/// wraps into the next.
 pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String {
     let (a, b) = sel;
     let (a, b) = if (a.1, a.0) <= (b.1, b.0) {
@@ -1450,8 +1533,9 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
         (b, a)
     };
     let cols = usize::from(snap.cols);
-    let mut lines = Vec::new();
-    for row in a.1..=b.1.min(snap.rows.saturating_sub(1)) {
+    let last = b.1.min(snap.rows.saturating_sub(1));
+    let mut out = String::new();
+    for row in a.1..=last {
         let from = if row == a.1 { usize::from(a.0) } else { 0 };
         let to = if row == b.1 {
             usize::from(b.0).min(cols.saturating_sub(1))
@@ -1459,6 +1543,7 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
             cols.saturating_sub(1)
         };
         let mut line = String::new();
+        let mut text_end = 0;
         for c in from..=to {
             let Some(cell) = snap.cells.get(usize::from(row) * cols + c) else {
                 break;
@@ -1466,15 +1551,70 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
             match cell.len {
                 // The right half of a wide character.
                 0 if cell.width == 0 => {}
-                0 => line.push(' '),
+                // A blank, or hidden text: a space for each column.
+                0 => line.extend(std::iter::repeat_n(' ', usize::from(cell.width))),
                 n => {
-                    line.push_str(std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" "))
+                    let text = std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" ");
+                    push_drawn(&mut line, text, cell.width);
+                    text_end = line.len();
                 }
             }
         }
-        lines.push(line.trim_end().to_owned());
+        // A row that wraps runs on into the next one: no line break, and
+        // only the empty cells at its end are dropped.
+        if row < last && snap.wrapped.get(usize::from(row)) == Some(&true) {
+            line.truncate(text_end);
+            out.push_str(&line);
+        } else {
+            out.push_str(line.trim_end());
+            if row < last {
+                out.push_str("\r\n");
+            }
+        }
     }
-    lines.join("\r\n")
+    out
+}
+
+/// Adds a cell's text as the screen shows it, so a copy carries nothing
+/// the user could not see. Characters that draw nothing (joiners,
+/// variation selectors, tags, invisible format characters) are left out,
+/// except a VS16 right after an emoji and a joiner right before one. So is
+/// everything after the first character of a joined cluster that is not an
+/// emoji sequence, since only that character is drawn. Fillers and other
+/// invisible characters that take a cell become spaces.
+fn push_drawn(line: &mut String, text: &str, width: u8) {
+    use vt::width::{char_width, is_emoji, is_ignorable};
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return;
+    };
+    if matches!(first, '\u{A0}' | '\u{2800}') || is_ignorable(first) {
+        line.extend(std::iter::repeat_n(' ', usize::from(width.max(1))));
+        return;
+    }
+    line.push(first);
+    let rest = chars.as_str();
+    let shows = |c| char_width(c) > 0;
+    let emoji = rest.chars().any(shows)
+        && rest
+            .chars()
+            .all(|c| matches!(c, '\u{200D}' | '\u{FE0F}') || shows(c));
+    if rest.contains('\u{200D}') && !emoji {
+        return;
+    }
+    let mut prev = first;
+    let mut rest = rest.chars().peekable();
+    while let Some(c) = rest.next() {
+        let keep = match c {
+            '\u{FE0F}' => is_emoji(prev),
+            '\u{200D}' => rest.peek().is_some_and(|&n| is_emoji(n)),
+            c => !is_ignorable(c),
+        };
+        if keep {
+            line.push(c);
+        }
+        prev = c;
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -1533,8 +1673,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.attention(id, Ev::Attended);
                 }
             }
-            WindowEvent::Ime(Ime::Commit(text)) => {
+            WindowEvent::Ime(Ime::Commit(mut text)) => {
                 self.preedit.clear();
+                // Like typed characters, committed text carries no controls
+                // that could run or escape anything.
+                text.retain(|c| !c.is_control());
                 self.typed(text.into_bytes());
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
@@ -1555,6 +1698,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Pane(id, note) => self.on_pane(el, id, note),
+            UserEvent::Branch(id, dir, branch) => self.on_branch(id, dir, branch),
             UserEvent::Finish(code) => {
                 self.code = code;
                 if self.args.capture.is_some() {
@@ -1918,6 +2062,101 @@ mod tests {
         assert_eq!(selection_text(&s, ((2, 0), (3, 0))), "");
     }
 
+    /// A snapshot of a `cols` x `rows` terminal fed `bytes`.
+    fn fed(cols: u16, rows: u16, bytes: &str) -> Snapshot {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols,
+            rows,
+            ..vt::Options::default()
+        });
+        t.feed(bytes.as_bytes());
+        let mut s = Snapshot::default();
+        t.snapshot(&mut s, &crate::theme::dark());
+        s
+    }
+
+    #[test]
+    fn app_selection_leaves_out_hidden_text() {
+        let s = fed(
+            30,
+            2,
+            "git status\x1b[8m; iwr x|iex\x1b[28m!\r\n\x1b[38;2;19;20;23mcalc\x1b[0m",
+        );
+        assert_eq!(
+            selection_text(&s, ((0, 0), (29, 1))),
+            "git status           !\r\n"
+        );
+        let s = fed(4, 1, "\x1b[8m\u{4e2d}\x1b[0mx");
+        assert_eq!(selection_text(&s, ((0, 0), (3, 0))), "  x");
+    }
+
+    #[test]
+    fn app_selection_joins_wrapped_rows() {
+        let two = ((0, 0), (3, 1));
+        assert_eq!(selection_text(&fed(4, 3, "ab  cd"), two), "ab  cd");
+        assert_eq!(selection_text(&fed(4, 3, "ab\r\ncd"), two), "ab\r\ncd");
+        // A wide character that did not fit leaves an empty cell behind.
+        assert_eq!(selection_text(&fed(3, 3, "ab\u{4e2d}"), two), "ab\u{4e2d}");
+    }
+
+    #[test]
+    fn app_selection_copies_only_what_is_drawn() {
+        let copy = |bytes: &str| selection_text(&fed(40, 1, bytes), ((0, 0), (39, 0)));
+        assert_eq!(copy("ls\u{E0069}\u{E0067}\u{E006E}x"), "lsx", "tags");
+        assert_eq!(copy("a\u{E0100}\u{FE00}b"), "ab", "variation selectors");
+        assert_eq!(
+            copy("a\u{200D}\u{301}\u{302}b"),
+            "ab",
+            "marks after a joiner"
+        );
+        assert_eq!(copy("a\u{200D}b"), "ab", "a lone joiner");
+        assert_eq!(copy("x\u{3164}y\u{2800}z\u{A0}w"), "x  y z w", "fillers");
+        assert_eq!(copy("x\u{AD}y"), "x y", "soft hyphen");
+        for s in [
+            "a\u{200C}\u{200C}\u{200C}b",
+            "a\u{34F}b",
+            "a\u{180B}\u{180F}b",
+            "a\u{17B4}\u{17B5}b",
+            "a\u{FE0E}\u{FE0F}b",
+            "a\u{2060}\u{FEFF}b",
+        ] {
+            assert_eq!(copy(s), "ab", "{s:?}");
+        }
+        assert_eq!(copy("\u{2764}\u{FE0F}\u{FE0F}"), "\u{2764}\u{FE0F}");
+        // Text that draws keeps everything.
+        for s in [
+            "e\u{301}",
+            "\u{2764}\u{FE0F}",
+            "1\u{FE0F}\u{20E3}",
+            "\u{1F44D}\u{1F3FD}",
+            "\u{1F468}\u{200D}\u{1F469}",
+            "\u{4e2d}",
+        ] {
+            assert_eq!(copy(s), s);
+        }
+    }
+
+    #[test]
+    fn app_output_that_moves_selected_text_ends_the_selection() {
+        let pal = crate::theme::dark();
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 10,
+            rows: 3,
+            ..vt::Options::default()
+        });
+        t.feed(b"a\r\nb\r\nc");
+        let mut s = Snapshot::default();
+        let sel = Some(((0, 1), (9, 1)));
+        assert!(refresh(&mut t, &mut s, &pal, None));
+        assert!(refresh(&mut t, &mut s, &pal, sel), "nothing new");
+        t.feed(b"\x1b[1;5Hx");
+        assert!(refresh(&mut t, &mut s, &pal, sel), "another row changed");
+        t.feed(b"\x1b[3;1H\r\nd");
+        assert!(!refresh(&mut t, &mut s, &pal, sel), "scrolled");
+        t.feed(b"\x1b[2;1Hz");
+        assert!(!refresh(&mut t, &mut s, &pal, sel), "rewritten");
+    }
+
     #[test]
     fn app_new_panes_start_in_the_focused_directory() {
         let here = std::env::temp_dir();
@@ -1948,6 +2187,20 @@ mod tests {
         assert_eq!(flash(Attn::DoneUnseen, &mut last, 20), gentle);
         // Another session has its own limit.
         assert_eq!(flash(Attn::NeedsYou, &mut None, 21), critical);
+    }
+
+    #[test]
+    fn app_message_follows_the_state_and_idle_clears_it() {
+        let t0 = Instant::now();
+        let mut a = crate::attention::PaneAttn::new(t0);
+        let mut feed = |ev, attended| relabels(ev, a.apply(ev, attended, t0));
+        assert!(feed(Ev::Working, true));
+        assert!(!feed(Ev::Working, true), "a repeat");
+        assert!(!feed(Ev::NeedsYou, true), "ignored while looking");
+        // Watched to the end: done is seen at once and lands on idle, and
+        // the end of the session still clears the message.
+        assert!(feed(Ev::Done, true));
+        assert!(feed(Ev::Idle, true));
     }
 
     #[test]

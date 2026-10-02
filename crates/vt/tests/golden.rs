@@ -107,6 +107,27 @@ fn sgr_colours() {
 }
 
 #[test]
+fn hidden_text_has_no_characters() {
+    // Concealed, drawn in the background colour, and inverse with both
+    // colours equal.
+    let mut t = run(
+        20,
+        1,
+        "a\x1b[8mb\x1b[28mc\x1b[38;2;16;16;16md\x1b[0;7;38;2;16;16;16me\x1b[0mf",
+    );
+    let s = snap(&mut t);
+    let texts: Vec<&str> = (0..6).map(|x| text(&s.cells[x])).collect();
+    assert_eq!(texts, ["a", "", "c", "", "", "f"]);
+    assert_eq!(t.screen_text(), "abcdef", "the screen model keeps it");
+}
+
+#[test]
+fn snapshot_marks_wrapped_rows() {
+    let mut t = run(4, 3, "abcdef\r\ngh");
+    assert_eq!(snap(&mut t).wrapped, [true, false, false]);
+}
+
+#[test]
 fn wide_cjk_at_the_last_column() {
     let mut t = run(10, 3, "abcdefghi中x");
     assert_eq!(t.screen_text(), "abcdefghi\n中x\n");
@@ -277,6 +298,9 @@ fn lines_scrolling_and_repeat() {
     feed(&mut t, "\x1b[r\x1b[4;1HX\x1b[3b");
     assert_eq!(t.screen_text(), "a\n\n\nXXXX\ne");
     assert_eq!(t.scrollback_text(), "");
+    // A repeat count stops at the screen width.
+    feed(&mut t, "\x1b[HY\x1b[99b");
+    assert_eq!(t.screen_text(), "YYYYY\nY\n\nXXXX\ne");
 }
 
 #[test]
@@ -292,6 +316,14 @@ fn save_restore_and_resets() {
     feed(&mut t, "\x1b[?25l\x1bc");
     assert_eq!(t.screen_text(), "\n\n");
     assert_eq!(t.scrollback_text(), "");
+    assert_eq!(t.cursor(), (0, 0, true));
+}
+
+/// DECSTR on the alternate screen also drops the cursor saved on entry,
+/// as conhost does, so leaving restores the same cursor on both sides.
+#[test]
+fn decstr_forgets_both_saved_cursors() {
+    let t = run(10, 3, "\x1b[2;3H\x1b[?1049h\x1b[!p\x1b[3;5H\x1b[?1049l");
     assert_eq!(t.cursor(), (0, 0, true));
 }
 
@@ -347,6 +379,14 @@ fn viewport_follows_its_text() {
     assert_eq!(s.cursor, None);
     feed(&mut t, "x\r\n");
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "6");
+    // A trip to the alternate screen, as at each blitz prompt, comes back
+    // to the same text.
+    feed(&mut t, "\x1b[?1049h\x1b[?1049l");
+    assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "6");
+    // Unless the scrollback went meanwhile.
+    feed(&mut t, "\x1b[?1049h\x1b[3J\x1b[?1049l");
+    assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "9");
+    t.scroll_viewport(2);
     t.scroll_viewport(-100);
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "9");
 }

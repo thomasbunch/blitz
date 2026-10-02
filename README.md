@@ -19,8 +19,11 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 Windows 10 1809 or later, x64. From
 [Releases](https://github.com/thomasbunch/blitz/releases), run the
 `-setup.exe` (installs for the current user, no admin rights needed) or
-unzip the `.zip` anywhere. Builds are not code-signed yet: if SmartScreen
-says "Windows protected your PC", choose **More info**, then **Run anyway**.
+unzip the `.zip` into a folder only you can change, such as one in your
+user profile. Avoid a new folder directly under a drive like `C:\`: every
+local user can write to it and could replace blitz's files. Builds are
+not code-signed yet: if SmartScreen says "Windows protected your PC",
+choose **More info**, then **Run anyway**.
 
 The shell is PowerShell 7 if installed, else Windows PowerShell, else cmd.
 
@@ -36,9 +39,9 @@ This produces `target\release\blitz.exe` and `blitz-hook.exe`; keep them
 together. Releases also ship Microsoft's `conpty.dll` and `OpenConsole.exe`
 (NuGet `Microsoft.Windows.Console.ConPTY` 1.25 or later, from
 `runtimes\win-x64` and `build\native\runtimes\x64`). Put them next to
-`blitz.exe` or set `BLITZ_CONPTY_DIR` to their folder. Without them blitz
-uses the slower console host built into Windows, which drops some
-features such as synchronized output.
+`blitz.exe` or set `BLITZ_CONPTY_DIR` to the full path of their folder.
+Without them blitz uses the slower console host built into Windows, which
+drops some features such as synchronized output.
 
 ## Claude Code
 
@@ -48,7 +51,8 @@ blitz setup claude
 
 prints the hook settings to add to `~/.claude/settings.json`; blitz never
 edits that file itself. The hooks run `blitz-hook.exe`, which does
-nothing when Claude Code runs outside blitz.
+nothing when Claude Code runs outside blitz. Remove them before you move
+or uninstall blitz: Claude Code keeps running whatever is at that path.
 
 ## Default keys
 

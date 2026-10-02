@@ -16,6 +16,11 @@ pub fn detect_with(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     // directory, and spawning where.exe would flash a console window.
     if let Some(path) = var("PATH") {
         for dir in std::env::split_paths(&path) {
+            // An empty or relative entry is the current directory again,
+            // and a bare result would be looked up there by CreateProcessW.
+            if !dir.is_absolute() {
+                continue;
+            }
             let exe = dir.join("pwsh.exe");
             if exe.is_file() {
                 return exe;
@@ -107,15 +112,23 @@ pub fn quote(arg: &str) -> String {
 
 /// Wraps the user's prompt with OSC 133 marks and reports the directory with
 /// OSC 7. Works on PowerShell 5.1 and 7, so it avoids `` `e ``. The A mark is
-/// tagged `blitz=1` so the terminal can tell it apart from marks that other
-/// programs print.
+/// tagged `blitz=<token>` with the pane's `BLITZ_PANE_TOKEN` so the terminal
+/// can tell it apart from marks that other programs print. Each prompt first
+/// leaves an alternate screen a program left on, then sends a soft reset
+/// (DECSTR) and puts back default tab stops, so the console host drops
+/// margins, insert mode and charsets a program left behind, as the terminal
+/// does at the mark. It leaves the screen with `?1049h` then `?1049l`:
+/// conhost restores the saved cursor on `?1049l` even on the main screen, so
+/// there the pair saves and restores the same cursor, and on the alternate
+/// screen the console host and the terminal both restore the cursor saved
+/// when the program switched.
 pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
-  $global:__blitz = @{ Orig = $function:prompt; Exec = $false }
+  $global:__blitz = @{ Orig = $function:prompt; Exec = $false; Token = $env:BLITZ_PANE_TOKEN }
   function global:prompt {
     $ok = $global:?; $code = if ($ok) { 0 } elseif ($global:LASTEXITCODE) { $global:LASTEXITCODE } else { 1 }
-    $e = [char]27; $b = [char]7; $s = ''
+    $e = [char]27; $b = [char]7; $s = "$e[?1049h$e[?1049l$e[!p$e[?5W"
     if ($global:__blitz.Exec) { $s += "$e]133;D;$code$b"; $global:__blitz.Exec = $false }
-    $s += "$e]133;A;blitz=1$b"
+    $s += "$e]133;A;blitz=$($global:__blitz.Token)$b"
     if ($PWD.Provider.Name -eq 'FileSystem') { $s += "$e]7;" + ([Uri]::new($PWD.ProviderPath).AbsoluteUri) + $b }
     if (-not $ok) { Write-Error 'x' -ErrorAction Ignore }
     $s + (& $global:__blitz.Orig) + "$e]133;B$b"
@@ -129,8 +142,13 @@ pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
   }
 }"#;
 
-/// cmd's prompt with the same marks. cmd cannot report exit codes.
-pub const CMD_PROMPT: &str = r"$e]133;D$e\$e]133;A;blitz=1$e\$e]9;9;$P$e\$P$G$e]133;B$e\";
+/// cmd's prompt with the same marks and reset. cmd cannot report exit
+/// codes, nor expand variables in its prompt, so the token is written in.
+pub fn cmd_prompt(token: &str) -> String {
+    format!(
+        r"$e[?1049h$e[?1049l$e[!p$e[?5W$e]133;D$e\$e]133;A;blitz={token}$e\$e]9;9;$P$e\$P$G$e]133;B$e\"
+    )
+}
 
 /// A command line ready for `CreateProcessW`, plus variables to add to the
 /// child's environment.
@@ -142,8 +160,9 @@ pub struct Launch {
 
 /// Builds the command line for `program` (empty means [`detect`]). Shell
 /// integration is added only when `integrate` is set and there are no user
-/// arguments; otherwise the command runs exactly as configured.
-pub fn launch(program: &str, args: &[String], integrate: bool) -> Launch {
+/// arguments; otherwise the command runs exactly as configured. `token` is
+/// the pane's `BLITZ_PANE_TOKEN`.
+pub fn launch(program: &str, args: &[String], integrate: bool, token: &str) -> Launch {
     let program = if program.is_empty() {
         detect()
     } else {
@@ -166,7 +185,7 @@ pub fn launch(program: &str, args: &[String], integrate: bool) -> Launch {
                 out.cmdline += &base64(&utf16);
             }
             Kind::Cmd if std::env::var_os("PROMPT").is_none() => {
-                out.env.push(("PROMPT".into(), CMD_PROMPT.into()));
+                out.env.push(("PROMPT".into(), cmd_prompt(token)));
             }
             _ => {}
         }
@@ -213,6 +232,25 @@ mod tests {
     }
 
     #[test]
+    fn prompts_leave_the_alternate_screen() {
+        let reset = "$e[?1049h$e[?1049l$e[!p$e[?5W";
+        assert!(POWERSHELL_INTEGRATION.contains(&format!("$s = \"{reset}\"")));
+        assert!(cmd_prompt("1").starts_with(reset));
+        let prompt = cmd_prompt("1").replace("$e", "\x1b");
+        let mut t = vt::Terminal::new(vt::Options::default());
+        // On the main screen the cursor stays where it is.
+        t.feed(b"\x1b[3;5H");
+        t.feed(prompt.as_bytes());
+        assert_eq!(t.cursor().1, 2);
+        // A program left on the alternate screen: back to the main screen
+        // and the cursor saved when it switched.
+        t.feed(b"\x1b[5;1H\x1b[?1049h\x1b[9;9H");
+        t.feed(prompt.as_bytes());
+        assert!(!t.input_modes().alt_screen);
+        assert_eq!(t.cursor().1, 4);
+    }
+
+    #[test]
     fn quote_round_trips_msvc_rules() {
         assert_eq!(quote("plain"), "plain");
         assert_eq!(quote(""), "\"\"");
@@ -231,7 +269,7 @@ mod tests {
 
     #[test]
     fn launch_integration() {
-        let ps = launch(r"C:\Program Files\PowerShell\7\pwsh.exe", &[], true);
+        let ps = launch(r"C:\Program Files\PowerShell\7\pwsh.exe", &[], true, "t");
         let (head, b64) = ps.cmdline.rsplit_once(' ').unwrap();
         assert_eq!(
             head,
@@ -241,10 +279,10 @@ mod tests {
         // User arguments turn integration off.
         let args = ["-NoProfile".to_owned(), "a b".to_owned()];
         assert_eq!(
-            launch("pwsh.exe", &args, true).cmdline,
+            launch("pwsh.exe", &args, true, "t").cmdline,
             r#"pwsh.exe -NoProfile "a b""#
         );
-        assert_eq!(launch("pwsh.exe", &[], false).cmdline, "pwsh.exe");
+        assert_eq!(launch("pwsh.exe", &[], false, "t").cmdline, "pwsh.exe");
     }
 
     #[test]
@@ -281,6 +319,17 @@ mod tests {
             detect_with(env),
             pf.join("PowerShell").join("7").join("pwsh.exe")
         );
+        // A relative entry is resolved against the current directory, so it
+        // is never used.
+        let rel = PathBuf::from(format!("blitz-shell-{}", std::process::id()));
+        touch(rel.join("pwsh.exe"));
+        let with_rel = |k: &str| match k {
+            "PATH" => Some(std::env::join_paths([&rel, &on_path]).unwrap()),
+            _ => env(k),
+        };
+        let got = detect_with(with_rel);
+        let _ = std::fs::remove_dir_all(&rel);
+        assert_eq!(got, pf.join("PowerShell").join("7").join("pwsh.exe"));
         touch(on_path.join("pwsh.exe"));
         assert_eq!(detect_with(env), on_path.join("pwsh.exe"));
 

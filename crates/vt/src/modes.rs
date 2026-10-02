@@ -106,6 +106,10 @@ pub struct Modes {
     pub mok: u8,
     /// When the open synchronized update began.
     pub sync: Option<Instant>,
+    /// The user confirmed a multi-line paste since bracketed paste was last
+    /// set. Any program's output can set it, so until then it does not show
+    /// that a program reading pastes safely is listening.
+    pub paste_confirmed: bool,
 }
 
 impl Modes {
@@ -128,7 +132,10 @@ impl Modes {
             }
             1004 => i.focus = on,
             1006 => i.mouse_sgr = on,
-            2004 => i.bracketed = on,
+            2004 => {
+                i.bracketed = on;
+                self.paste_confirmed = false;
+            }
             // A repeated begin keeps the first start time, so a program
             // that never ends its update is still shown every timeout.
             2026 if on => {
@@ -169,6 +176,7 @@ impl Modes {
         self.input.mouse = MouseMode::Off;
         self.input.mouse_sgr = false;
         self.input.bracketed = false;
+        self.paste_confirmed = false;
         self.sync = None;
     }
 

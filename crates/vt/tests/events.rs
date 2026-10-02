@@ -24,6 +24,14 @@ fn one(s: &str) -> Event {
     ev.into_iter().next().unwrap()
 }
 
+/// Events from `s` printed inside blitz's own prompt, where the shell
+/// integration reports directories.
+fn prompt_events(s: &str) -> Vec<Event> {
+    let mut ev = events(&format!("\x1b]133;A;blitz=1\x07{s}"));
+    assert_eq!(ev.remove(0), Event::Prompt(PromptMark::A { blitz: true }));
+    ev
+}
+
 fn notify(title: &str, body: &str) -> Event {
     Event::Notify {
         title: title.into(),
@@ -97,8 +105,8 @@ fn osc9_classify() {
         }
     );
     assert_eq!(
-        one("\x1b]9;9;\"C:\\Users\\x y\"\x07"),
-        Event::Cwd("C:\\Users\\x y".into())
+        prompt_events("\x1b]9;9;\"C:\\Users\\x y\"\x07"),
+        [Event::Cwd("C:\\Users\\x y".into())]
     );
     assert_eq!(
         one("\x1b]9;12\x07"),
@@ -113,10 +121,50 @@ fn osc9_classify() {
 #[test]
 fn cwd_from_osc7() {
     assert_eq!(
-        one("\x1b]7;file:///C:/Users/me/My%20Dir\x1b\\"),
-        Event::Cwd("C:\\Users\\me\\My Dir".into())
+        prompt_events("\x1b]7;file:///C:/Users/me/My%20Dir\x1b\\"),
+        [Event::Cwd("C:\\Users\\me\\My Dir".into())]
     );
-    assert_eq!(events("\x1b]7;kitty-shell-cwd://h/x\x07"), []);
+    assert_eq!(prompt_events("\x1b]7;kitty-shell-cwd://h/x\x07"), []);
+}
+
+/// A directory a program prints would start new panes wherever it says.
+#[test]
+fn cwd_only_from_blitz_prompts() {
+    let cwd = "\x1b]7;file:///C:/x\x07\x1b]9;9;C:\\y\x07";
+    assert_eq!(events(cwd), []);
+    for mark in [
+        "133;B",
+        "133;C",
+        "133;D;0",
+        "133;A",
+        "133;A;blitz=2",
+        "9;12",
+    ] {
+        let after = format!("\x1b]{mark}\x07{cwd}");
+        let ev = prompt_events(&after);
+        assert!(!ev.iter().any(|e| matches!(e, Event::Cwd(_))), "{mark}");
+    }
+    assert_eq!(prompt_events(cwd), [Event::Cwd("C:\\y".into())]);
+}
+
+#[test]
+fn cwd_must_be_local() {
+    // Looking at a share makes Windows sign in to its host, and a long
+    // path is slow to search for a git branch.
+    let long = format!("\x1b]9;9;C:{}\x07", "\\a".repeat(5000));
+    for s in [
+        "\x1b]9;9;\\\\192.0.2.1\\s\x07",
+        "\x1b]9;9;\"//192.0.2.1/s\"\x07",
+        "\x1b]9;9;\\\\?\\UNC\\192.0.2.1\\s\x07",
+        "\x1b]9;9;work\\x\x07",
+        "\x1b]7;file:///C:/a%1Bb\x07",
+        &long,
+    ] {
+        assert_eq!(prompt_events(s), []);
+    }
+    if cfg!(windows) {
+        assert_eq!(prompt_events("\x1b]7;file://192.0.2.1/s/x\x07"), []);
+    }
 }
 
 #[test]
@@ -216,4 +264,31 @@ fn programs_can_set_and_reset_colours() {
         replies(&mut t, "\x1b]11;?\x07"),
         "\x1b]11;rgb:2222/2222/2222\x07"
     );
+}
+
+#[test]
+fn floods_are_coalesced_and_bounded() {
+    let mut t = Terminal::new(Options::default());
+    t.feed(b"\x1b]133;A;blitz=1\x07");
+    for i in 0..5000 {
+        t.feed(format!("\x07\x1b]0;t{i}\x07\x1b]7;file:///C:/d{i}\x07").as_bytes());
+    }
+    let mut out = Vec::new();
+    t.take_events(&mut out);
+    assert_eq!(
+        out,
+        [
+            Event::Prompt(PromptMark::A { blitz: true }),
+            Event::Bell,
+            Event::Title("t4999".into()),
+            Event::Cwd("C:\\d4999".into())
+        ]
+    );
+
+    for i in 0..5000 {
+        t.feed(format!("\x1b]9;n{i}\x07").as_bytes());
+    }
+    t.take_events(&mut out);
+    assert_eq!(out.len(), 4 + 1024);
+    assert_eq!(out.last(), Some(&notify("", "n4999")));
 }

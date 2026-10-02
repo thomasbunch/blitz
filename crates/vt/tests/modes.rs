@@ -55,6 +55,17 @@ fn kitty_stacks_are_per_screen() {
 }
 
 #[test]
+fn colon_in_a_mode_list_ignores_it() {
+    let mut t = term("\x1b[?9001h\x1b[?1004h\x1b[?1:9001l\x1b[?1:1004l\x1b[?1:7l\x1b[4:1h");
+    let m = t.input_modes();
+    assert!(m.w32im && m.focus);
+    t.feed(b"\x1b[?7$p\x1b[4$p");
+    let mut r = Vec::new();
+    t.take_replies(&mut r);
+    assert_eq!(r, b"\x1b[?7;1$y\x1b[4;2$y");
+}
+
+#[test]
 fn modify_other_keys_is_not_sgr() {
     let mut t = term("x\x1b[>4;2my");
     t.feed(b"\x1b[>4m");
@@ -172,6 +183,38 @@ fn blitz_prompt_resets_input_modes() {
     assert_clean(&t);
 }
 
+/// Display state a program can leave behind that would garble or hide
+/// whatever the shell and later programs print.
+#[test]
+fn blitz_prompt_resets_display_state() {
+    let mut t = Terminal::new(Options {
+        cols: 20,
+        rows: 4,
+        ..Options::default()
+    });
+    // Colours, margins, origin, insert mode, no wrap, line drawing in G0
+    // and G1 with G1 shifted in, no tab stops.
+    t.feed(b"\x1b]10;#123456\x07\x1b]11;#123456\x07\x1b[2;3r\x1b[?6h\x1b[4h\x1b[?7l");
+    t.feed(b"\x1b(0\x1b)0\x0e\x1b[3g");
+    t.feed(b"\x1b]133;A;blitz=1\x07");
+    t.feed(b"\x1b[H\tq\rx\r\n\n\n\n");
+    t.feed("a".repeat(25).as_bytes());
+    assert_eq!(t.scrollback_text(), "x       q\n");
+    assert_eq!(t.screen_text(), "\n\naaaaaaaaaaaaaaaaaaaa\naaaaa");
+    let mut s = vt::Snapshot::default();
+    t.snapshot(&mut s, &PAL);
+    assert_eq!((s.cells[0].fg, s.cells[0].bg), (PAL.fg, PAL.bg));
+}
+
+/// The prompt mark leaves the screen alone. conhost stays on its
+/// alternate screen at the mark, so leaving ours would part the two.
+#[test]
+fn blitz_prompt_keeps_the_screen() {
+    let mut t = term("\x1b[?1049h");
+    t.feed(b"\x1b]133;A;blitz=1\x07");
+    assert!(t.input_modes().alt_screen);
+}
+
 #[test]
 fn other_prompts_keep_input_modes() {
     for mark in [
@@ -189,6 +232,24 @@ fn other_prompts_keep_input_modes() {
         assert!(m.bracketed && m.mouse_sgr, "{mark}");
         assert_eq!(t.kitty_stack(true), [5], "{mark}");
     }
+}
+
+#[test]
+fn only_the_hosts_token_marks_a_blitz_prompt() {
+    let mut t = leftovers();
+    t.set_prompt_token("9c1e");
+    for mark in ["133;A;blitz=1", "133;A;blitz=9c1", "133;A;blitz=9c1e0"] {
+        t.feed(format!("\x1b]{mark}\x07").as_bytes());
+        let m = t.input_modes();
+        assert!(m.bracketed && m.kitty == 1, "{mark}");
+    }
+    t.feed(b"\x1b]133;A;blitz=9c1e\x07");
+    assert_clean(&t);
+    // A program's reset does not bring back the default token.
+    t.feed(b"\x1bc");
+    t.feed(LEFTOVERS.as_bytes());
+    t.feed(b"\x1b]133;A;blitz=1\x07");
+    assert!(t.input_modes().bracketed);
 }
 
 #[test]

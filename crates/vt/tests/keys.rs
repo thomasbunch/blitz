@@ -414,10 +414,37 @@ fn keys_claude_code_relies_on() {
         assert_eq!(enc(&input, &LEGACY), legacy, "legacy {input:?}");
         assert_eq!(enc(&input, &kitty(5)), kkp, "kitty {input:?}");
         assert_eq!(enc(&input, &W32IM), w32, "w32im {input:?}");
-        // Pushed kitty flags win over win32-input-mode.
+        // Pushed kitty flags win over win32-input-mode, except on Ctrl+C.
         let both = InputModes { kitty: 5, ..W32IM };
-        assert_eq!(enc(&input, &both), kkp, "kitty over w32im {input:?}");
+        let want = if input.vk == 0x43 { w32 } else { kkp };
+        assert_eq!(enc(&input, &both), want, "kitty over w32im {input:?}");
     }
+}
+
+/// Any output can push kitty flags. Under ConPTY, Ctrl+C and Ctrl+Break
+/// must still reach conhost as keys, or a console program can no longer
+/// be interrupted.
+#[test]
+fn interrupt_keys_stay_console_records() {
+    let ctrl_c = key(0x43, 46, 3, "c", Key::Char('c'), "c");
+    let mut ctrl_break = key(0x03, 70, 3, "c", Key::Other, "");
+    ctrl_break.extended = true;
+    for flags in [1, 5, 1 | 2 | 8] {
+        let m = InputModes {
+            kitty: flags,
+            ..W32IM
+        };
+        assert_eq!(enc(&ctrl_c, &m), "\x1b[67;46;3;1;8;1_", "{flags}");
+        assert_eq!(enc(&up(ctrl_c), &m), "\x1b[67;46;3;0;8;1_", "{flags}");
+        assert_eq!(enc(&ctrl_break, &m), "\x1b[3;70;3;1;264;1_", "{flags}");
+    }
+    // Other chords and plain C keep the kitty encoding.
+    let both = InputModes { kitty: 1, ..W32IM };
+    assert_eq!(enc(&key(0x43, 46, 99, "", Key::Char('c'), "c"), &both), "c");
+    assert_eq!(
+        enc(&key(0x43, 46, 3, "ca", Key::Char('c'), ""), &both),
+        "\x1b[99;7u"
+    );
 }
 
 #[test]
@@ -619,11 +646,32 @@ fn paste_cannot_break_out_of_the_bracket() {
 }
 
 #[test]
-fn paste_confirm_only_for_unbracketed_line_breaks() {
+fn paste_confirm_only_for_untrusted_line_breaks() {
     use vt::keys::needs_paste_confirm;
     assert!(!needs_paste_confirm("ls -la", false));
     assert!(needs_paste_confirm("echo 1\necho 2", false));
     assert!(needs_paste_confirm("echo 1\r", false));
     assert!(!needs_paste_confirm("echo 1\necho 2", true));
     assert!(!needs_paste_confirm("", false));
+}
+
+/// Any output can turn bracketed paste on, also for a program that does
+/// not read it, so a paste under it is trusted only once the user has
+/// confirmed one.
+#[test]
+fn bracketed_paste_is_trusted_once_confirmed() {
+    let mut t = vt::Terminal::new(vt::Options::default());
+    t.confirm_paste();
+    t.feed(b"\x1b]133;A;blitz=1\x07\x1b]133;C\x07\x1b[?2004h");
+    assert!(!t.paste_trusted(), "set by output after a command started");
+    t.confirm_paste();
+    assert!(t.paste_trusted());
+    t.feed(b"\x1b[?2004h");
+    assert!(!t.paste_trusted(), "set again");
+    for reset in ["\x1b]133;A;blitz=1\x07", "\x1bc", "\x1b[?2004l"] {
+        t.confirm_paste();
+        t.feed(reset.as_bytes());
+        t.feed(b"\x1b[?2004h");
+        assert!(!t.paste_trusted(), "{reset:?}");
+    }
 }

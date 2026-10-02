@@ -47,13 +47,13 @@ pub fn classify_osc9(body: &str) -> Osc9<'_> {
 }
 
 /// Parses the text after `133;`. Extra `key=value` options are ignored,
-/// except that a prompt start tagged `blitz=1` comes from blitz's own
-/// shell integration.
-pub fn prompt_mark(body: &str) -> Option<PromptMark> {
+/// except that a prompt start tagged `blitz=<token>` comes from blitz's own
+/// shell integration. An empty token matches nothing.
+pub fn prompt_mark(body: &str, token: &str) -> Option<PromptMark> {
     let mut it = body.split(';');
     Some(match it.next()? {
         "A" => PromptMark::A {
-            blitz: it.any(|o| o == "blitz=1"),
+            blitz: !token.is_empty() && it.any(|o| o.strip_prefix("blitz=") == Some(token)),
         },
         "B" => PromptMark::B,
         "C" => PromptMark::C,
@@ -63,8 +63,8 @@ pub fn prompt_mark(body: &str) -> Option<PromptMark> {
 }
 
 /// The local path in an OSC 7 `file://host/path` URL, percent-decoded.
-/// `file:///C:/x` gives `C:\x`; on Windows `file://srv/share/x` gives the
-/// UNC path `\\srv\share\x`.
+/// `file:///C:/x` gives `C:\x`. On Windows a URL naming another host gives
+/// nothing: its path is not on this machine.
 pub fn file_url_path(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
     let (host, path) = rest.split_at(rest.find('/')?);
@@ -74,9 +74,26 @@ pub fn file_url_path(url: &str) -> Option<String> {
         return Some(path[1..].replace('/', "\\"));
     }
     if cfg!(windows) && !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
-        return Some(format!("\\\\{host}{}", path.replace('/', "\\")));
+        return None;
     }
     Some(path)
+}
+
+/// Longest working directory kept, in bytes.
+const MAX_CWD: usize = 4096;
+
+/// Whether a reported working directory is a plain local path: a drive
+/// path such as `C:\x`, or outside Windows a path from a single `/`. Any
+/// program can report one, and the host looks in it for a git branch and
+/// starts new shells there, so UNC, device and relative paths are
+/// refused: just looking at `\\host\share` makes Windows sign in to that
+/// host.
+pub fn local_dir(p: &str) -> bool {
+    let b = p.as_bytes();
+    let drive =
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    let root = !cfg!(windows) && b.first() == Some(&b'/') && b.get(1) != Some(&b'/');
+    (drive || root) && p.len() <= MAX_CWD && !p.chars().any(char::is_control)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -103,9 +120,26 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// `s` without control characters, cut to `max` characters. The parser
-/// already drops C0 controls inside an OSC; this catches C1.
+/// already drops C0 controls inside an OSC; this catches C1. Format
+/// characters and line separators go too: bidi overrides would let a
+/// window title read reversed, and invisible ones would let two labels
+/// that look the same differ.
 pub fn clean(s: &str, max: usize) -> String {
-    s.chars().filter(|c| !c.is_control()).take(max).collect()
+    s.chars()
+        .filter(|&c| !c.is_control() && !is_format(c))
+        .take(max)
+        .collect()
+}
+
+/// Unicode format characters (Cf) and the line and paragraph separators.
+fn is_format(c: char) -> bool {
+    matches!(c,
+        '\u{AD}' | '\u{600}'..='\u{605}' | '\u{61C}' | '\u{6DD}' | '\u{70F}'
+        | '\u{890}'..='\u{891}' | '\u{8E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
 }
 
 /// Parses an X11 colour spec: `#rgb`, `#rrggbb`, `#rrrgggbbb`,
@@ -197,31 +231,47 @@ mod tests {
 
     #[test]
     fn prompt_marks() {
-        assert_eq!(prompt_mark("A"), Some(PromptMark::A { blitz: false }));
+        assert_eq!(prompt_mark("A", "1"), Some(PromptMark::A { blitz: false }));
         assert_eq!(
-            prompt_mark("A;blitz=1"),
+            prompt_mark("A;blitz=1", "1"),
             Some(PromptMark::A { blitz: true })
         );
         assert_eq!(
-            prompt_mark("A;redraw=0"),
+            prompt_mark("A;redraw=0", "1"),
             Some(PromptMark::A { blitz: false })
         );
         assert_eq!(
-            prompt_mark("A;aid=7;blitz=1"),
+            prompt_mark("A;aid=7;blitz=1", "1"),
             Some(PromptMark::A { blitz: true })
         );
         assert_eq!(
-            prompt_mark("A;blitz=10"),
+            prompt_mark("A;blitz=10", "1"),
             Some(PromptMark::A { blitz: false })
         );
-        assert_eq!(prompt_mark("B"), Some(PromptMark::B));
-        assert_eq!(prompt_mark("C"), Some(PromptMark::C));
-        assert_eq!(prompt_mark("D"), Some(PromptMark::D(None)));
-        assert_eq!(prompt_mark("D;0"), Some(PromptMark::D(Some(0))));
-        assert_eq!(prompt_mark("D;-1;aid=3"), Some(PromptMark::D(Some(-1))));
-        assert_eq!(prompt_mark("D;x"), Some(PromptMark::D(None)));
-        assert_eq!(prompt_mark("Z"), None);
-        assert_eq!(prompt_mark(""), None);
+        assert_eq!(prompt_mark("B", "1"), Some(PromptMark::B));
+        assert_eq!(prompt_mark("C", "1"), Some(PromptMark::C));
+        assert_eq!(prompt_mark("D", "1"), Some(PromptMark::D(None)));
+        assert_eq!(prompt_mark("D;0", "1"), Some(PromptMark::D(Some(0))));
+        assert_eq!(
+            prompt_mark("D;-1;aid=3", "1"),
+            Some(PromptMark::D(Some(-1)))
+        );
+        assert_eq!(prompt_mark("D;x", "1"), Some(PromptMark::D(None)));
+        assert_eq!(
+            prompt_mark("A;blitz=7f3a", "7f3a"),
+            Some(PromptMark::A { blitz: true })
+        );
+        // Only the host's token marks blitz's own prompt.
+        assert_eq!(
+            prompt_mark("A;blitz=1", "7f3a"),
+            Some(PromptMark::A { blitz: false })
+        );
+        assert_eq!(
+            prompt_mark("A;blitz=", ""),
+            Some(PromptMark::A { blitz: false })
+        );
+        assert_eq!(prompt_mark("Z", "1"), None);
+        assert_eq!(prompt_mark("", "1"), None);
     }
 
     #[test]
@@ -239,13 +289,33 @@ mod tests {
         );
         assert_eq!(p("file:///bad%zz%4").as_deref(), Some("/bad%zz%4"));
         if cfg!(windows) {
-            assert_eq!(
-                p("file://srv/share/x%20y").as_deref(),
-                Some("\\\\srv\\share\\x y")
-            );
+            assert_eq!(p("file://srv/share/x%20y"), None);
         }
         assert_eq!(p("http://x/y"), None);
         assert_eq!(p("file://host-only"), None);
+    }
+
+    #[test]
+    fn local_dirs() {
+        assert!(local_dir(r"C:\Users\me"));
+        assert!(local_dir("d:/x"));
+        assert!(local_dir(r"C:\"));
+        assert_eq!(local_dir("/home/me"), !cfg!(windows));
+        for p in [
+            r"\\srv\share",
+            "//srv/share",
+            r"\\?\UNC\srv\share",
+            r"\??\UNC\srv\share",
+            r"\\.\pipe\x",
+            "C:x",
+            r"..\x",
+            "",
+            "C:\\a\u{1b}b",
+        ] {
+            assert!(!local_dir(p), "{p:?}");
+        }
+        assert!(local_dir(&format!("C:{}", r"\a".repeat(2000))));
+        assert!(!local_dir(&format!("C:{}", r"\a".repeat(3000))));
     }
 
     #[test]
@@ -274,5 +344,7 @@ mod tests {
     fn clean_drops_controls_and_caps() {
         assert_eq!(clean("a\u{9b}b\u{85}c", 10), "abc");
         assert_eq!(clean("ééééé", 3), "ééé");
+        let spoof = "\u{202E}gpj\u{2028}x\u{200B}y\u{E0041}";
+        assert_eq!(clean(spoof, 10), "gpjxy", "format characters");
     }
 }

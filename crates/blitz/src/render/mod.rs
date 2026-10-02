@@ -16,6 +16,14 @@ use std::path::Path;
 
 use vt::{Palette, RenderCell, Snapshot};
 
+/// Creates `path` as a new file for a capture or log. Whatever is there is
+/// removed first rather than opened, so a link planted at the path cannot
+/// send the write to another file.
+pub fn create_fresh(path: &Path) -> std::io::Result<std::fs::File> {
+    let _ = std::fs::remove_file(path);
+    std::fs::File::create_new(path)
+}
+
 /// Writes `w * h` BGRA pixels (top row first) as a 24-bit BMP.
 pub fn write_bmp(path: &Path, w: u32, h: u32, bgra: &[u8]) -> std::io::Result<()> {
     let (w, h) = (w as usize, h as usize);
@@ -41,7 +49,7 @@ pub fn write_bmp(path: &Path, w: u32, h: u32, bgra: &[u8]) -> std::io::Result<()
         }
         out.resize(out.len() + row - w * 3, 0);
     }
-    std::fs::File::create(path)?.write_all(&out)
+    create_fresh(path)?.write_all(&out)
 }
 
 /// A snapshot of plain text with no escape sequences: one line per row,
@@ -138,7 +146,7 @@ mod gpu {
     use super::atlas::{Atlas, GlyphKey, Slot};
     use super::chrome::{Chrome, Prim, branch_mask, shape_mask};
     use super::d3d11::{ATLAS_SIZE, GLYPH, Gpu, MASK, Quad, SOLID, rgba};
-    use super::font::{BOLD, DEFAULT_FAMILIES, Font, ITALIC};
+    use super::font::{BOLD, DEFAULT_FAMILIES, E_PENDING, Font, ITALIC};
     use super::{builtin, text_snapshot, write_bmp};
 
     /// Default font size: 12 pt at 96 DPI.
@@ -151,6 +159,9 @@ mod gpu {
     const SMALL: u8 = 4;
     const SHAPE: u8 = 8;
 
+    /// Fallback font lookups per frame; the rest wait for the next one.
+    const LOOKUPS: u32 = 256;
+
     pub struct Renderer {
         pub gpu: Gpu,
         pub font: Font,
@@ -159,6 +170,10 @@ mod gpu {
         atlas: Atlas,
         quads: Vec<Quad>,
         overflowed: bool,
+        /// The atlas was cleared when this frame began.
+        cleared: bool,
+        /// Glyphs were left out waiting for a font lookup.
+        pending: bool,
     }
 
     impl Renderer {
@@ -174,6 +189,8 @@ mod gpu {
                 atlas: Atlas::new(ATLAS_SIZE as u16, ATLAS_SIZE as u16),
                 quads: Vec::new(),
                 overflowed: false,
+                cleared: false,
+                pending: false,
             })
         }
 
@@ -198,7 +215,22 @@ mod gpu {
         /// Starts collecting a new frame.
         pub fn begin(&mut self) {
             self.quads.clear();
+            // A full atlas is cleared between frames, never during one:
+            // glyphs already queued point into it.
+            self.cleared = self.overflowed;
+            if self.overflowed {
+                self.atlas.clear();
+            }
             self.overflowed = false;
+            self.pending = false;
+            self.font.lookups = LOOKUPS;
+            self.small.lookups = LOOKUPS;
+        }
+
+        /// Whether the last frame left glyphs out to keep slow font
+        /// lookups from stalling it; draw another frame soon.
+        pub fn pending(&self) -> bool {
+            self.pending
         }
 
         pub fn rect(&mut self, x: i32, y: i32, w: u32, h: u32, rgb: u32) {
@@ -242,6 +274,7 @@ mod gpu {
             let px = |c: usize| x + (c as u32 * cw) as i32;
             let py = |r: usize| y + (r as u32 * ch) as i32;
 
+            let first = self.quads.len();
             self.rect(x, y, cols as u32 * cw, rows as u32 * ch, pal.bg);
             for r in 0..rows {
                 let mut c = 0;
@@ -286,8 +319,13 @@ mod gpu {
                     let under_block = cursor.is_some_and(|(cc, cr, s)| {
                         (usize::from(cc), usize::from(cr)) == (c, r) && s == CursorShape::Block
                     });
+                    // Selected text is drawn in the theme's colour, so
+                    // text close to its background shows before it is
+                    // copied.
                     let fg = if under_block {
                         pal.bg
+                    } else if selected(c, r) {
+                        pal.fg
                     } else if cl.attrs & attr::DIM != 0 {
                         mix(cl.fg, cl.bg)
                     } else {
@@ -315,6 +353,11 @@ mod gpu {
                     };
                     self.push_glyph(key, px(c), py(r), fg);
                 }
+            }
+            // A cluster of several glyphs can be far wider than its cells;
+            // keep it inside the grid so it cannot draw over another pane.
+            for q in &mut self.quads[first..] {
+                clip(q, x, y, px(cols), py(rows));
             }
         }
 
@@ -425,6 +468,10 @@ mod gpu {
                 let text = std::str::from_utf8(text).ok()?;
                 match font.raster(text, key.style & (BOLD | ITALIC), key.width) {
                     Ok(Some(r)) => Some((r.w, r.h, r.dx, r.dy, r.alpha)),
+                    Err(e) if e.code() == E_PENDING => {
+                        self.pending = true;
+                        return None;
+                    }
                     _ => None,
                 }
             };
@@ -432,19 +479,29 @@ mod gpu {
                 self.atlas.insert_empty(key);
                 return None;
             };
-            let fits =
-                |atlas: &mut Atlas| atlas.insert(key, w as u16, h as u16, dx as i16, dy as i16);
-            let slot = match fits(&mut self.atlas) {
-                Some(slot) => slot,
-                None => {
-                    // A full atlas is wiped mid-frame, so glyphs
-                    // already queued this frame may show stale pixels; the
-                    // caller redraws when `draw` reports it. Fine unless one
-                    // frame needs more glyphs than the whole atlas holds.
-                    self.overflowed = true;
-                    self.atlas.clear();
-                    fits(&mut self.atlas)?
-                }
+            // Terminal text may not fill the last eighth of the atlas, so
+            // the window chrome still fits when a pane shows more distinct
+            // glyphs than the atlas holds.
+            let (aw, ah) = self.atlas.size();
+            let bottom = if key.style & (SMALL | SHAPE) != 0 {
+                ah
+            } else {
+                ah - ah / 8
+            };
+            if w > u32::from(aw) || h > u32::from(bottom) {
+                // It would never fit; leave it out for good.
+                self.atlas.insert_empty(key);
+                return None;
+            }
+            let (w16, h16) = (w as u16, h as u16);
+            let Some(slot) = self
+                .atlas
+                .insert_above(bottom, key, w16, h16, dx as i16, dy as i16)
+            else {
+                // Left out of this frame; `begin` clears the full atlas
+                // and the caller draws again when `draw` reports it.
+                self.overflowed = true;
+                return None;
             };
             self.gpu
                 .upload(u32::from(slot.x), u32::from(slot.y), w, h, &alpha);
@@ -452,8 +509,9 @@ mod gpu {
         }
 
         /// Clears `rtv` to `bg` and draws the frame. Returns true when the
-        /// glyph atlas overflowed while building it, in which case the
-        /// caller should build and draw the frame again.
+        /// glyph atlas filled up and left glyphs out, and an empty atlas
+        /// may hold them, in which case the caller should build and draw
+        /// the frame again.
         pub fn draw(
             &mut self,
             rtv: &ID3D11RenderTargetView,
@@ -462,7 +520,12 @@ mod gpu {
             bg: u32,
         ) -> Result<bool> {
             self.gpu.draw(rtv, w, h, bg, &self.quads)?;
-            Ok(self.overflowed)
+            Ok(self.overflowed && !self.cleared)
+        }
+
+        #[cfg(test)]
+        pub fn set_atlas_size(&mut self, w: u16, h: u16) {
+            self.atlas = Atlas::new(w, h);
         }
     }
 
@@ -483,6 +546,22 @@ mod gpu {
             style: SHAPE,
             width: 0,
         }
+    }
+
+    /// Cuts `q` down to the part inside `x0..x1` × `y0..y1`, moving its
+    /// atlas position along with its top-left corner.
+    fn clip(q: &mut Quad, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let (x, y) = (i32::from(q.pos[0]), i32::from(q.pos[1]));
+        let (left, top) = (x.max(x0), y.max(y0));
+        let right = (x + i32::from(q.size[0])).min(x1);
+        let bottom = (y + i32::from(q.size[1])).min(y1);
+        if right <= left || bottom <= top {
+            q.size = [0, 0];
+            return;
+        }
+        q.uv = [q.uv[0] + (left - x) as u16, q.uv[1] + (top - y) as u16];
+        q.pos = [left as i16, top as i16];
+        q.size = [(right - left) as u16, (bottom - top) as u16];
     }
 
     /// The colour halfway between two `0xRRGGBB` colours.
@@ -510,10 +589,10 @@ mod gpu {
             (u32::from(snap.rows) * ch).max(1),
         );
         let target = r.gpu.offscreen(w, h)?;
-        for _ in 0..2 {
+        loop {
             r.begin();
             r.snapshot(snap, pal, 0, 0);
-            if !r.draw(&target.rtv, w, h, pal.bg)? {
+            if !r.draw(&target.rtv, w, h, pal.bg)? && !r.pending() {
                 break;
             }
         }
@@ -725,13 +804,13 @@ mod gpu {
         let chrome = chrome::build(&model);
 
         let target = r.gpu.offscreen(w, h)?;
-        for _ in 0..2 {
+        loop {
             r.begin();
             for (rect, snap) in &snaps {
                 r.snapshot(snap, &pal, rect.x, rect.y);
             }
             r.chrome(&chrome);
-            if !r.draw(&target.rtv, w, h, pal.bg)? {
+            if !r.draw(&target.rtv, w, h, pal.bg)? && !r.pending() {
                 break;
             }
         }
@@ -872,6 +951,21 @@ mod tests {
         assert_eq!(b[54 + 12], 0);
     }
 
+    #[test]
+    fn bmp_replaces_a_link_at_the_path() {
+        let dir = std::env::temp_dir().join(format!("blitz-bmp-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (other, path) = (dir.join("other.txt"), dir.join("t.bmp"));
+        std::fs::write(&other, "keep").expect("write");
+        std::fs::hard_link(&other, &path).expect("link");
+        write_bmp(&path, 1, 1, &[0; 4]).expect("write");
+        let kept = std::fs::read_to_string(&other).expect("read");
+        let bmp = std::fs::read(&path).expect("read");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(kept, "keep");
+        assert_eq!(&bmp[..2], b"BM");
+    }
+
     #[cfg(windows)]
     #[test]
     fn render_warp_snapshot_draws_glyphs_and_cursor() {
@@ -947,6 +1041,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn render_warp_selection_shows_text_close_to_its_background() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("\u{2588}", 1, 1, &p);
+        snap.cells[0].fg = p.bg + 1;
+        snap.selection = Some(((0, 0), (0, 0)));
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let i = ((ch / 2 * w + cw / 2) * 4) as usize;
+        let at = u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]]);
+        assert_eq!(at, p.fg);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn render_warp_chrome_shapes_and_text() {
         use crate::layout::Rect;
         use chrome::{Chrome, Prim};
@@ -995,5 +1104,89 @@ mod tests {
         let (sw, sh) = r.small_cell();
         let ink = (0..sh).any(|y| (60..60 + sw).any(|x| at(x, y) != p.bg));
         assert!(ink, "chrome text is drawn");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_full_atlas_leaves_earlier_glyphs_alone() {
+        let p = pal();
+        let snap = text_snapshot("HELLO\nabcdefghijklmnopqrstuvwxyz0123456789", 36, 2, &p);
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let (_, _, want) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        r.set_atlas_size(64, 64);
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let row = (w * r.cell().1 * 4) as usize;
+        assert!(px[..row] == want[..row], "the first row is drawn as usual");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_glyph_too_big_for_the_atlas_is_left_out() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        r.set_atlas_size(8, 8);
+        let snap = text_snapshot("M", 1, 1, &p);
+        let target = r.gpu.offscreen(16, 32).expect("target");
+        for _ in 0..2 {
+            r.begin();
+            r.snapshot(&snap, &p, 0, 0);
+            let again = r.draw(&target.rtv, 16, 32, p.bg).expect("draw");
+            assert!(!again, "no frame is drawn twice");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_wide_clusters_stay_inside_their_grid() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let mut snap = text_snapshot("ab", 4, 1, &p);
+        // Five leading jamo join into one cluster, each with its own advance.
+        let jamo = "\u{1100}".repeat(5);
+        snap.cells[2].text[..15].copy_from_slice(jamo.as_bytes());
+        snap.cells[2].len = 15;
+        snap.cells[2].width = 2;
+        snap.cells[3].width = 0;
+        let (cw, ch) = r.cell();
+        let (w, h) = (4 * cw + 100, ch);
+        let target = r.gpu.offscreen(w, h).expect("target");
+        r.begin();
+        r.snapshot(&snap, &p, 0, 0);
+        r.draw(&target.rtv, w, h, 0x123456).expect("draw");
+        let px = r.gpu.read(&target).expect("read");
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        let ink = (0..h).any(|y| (2 * cw..4 * cw).any(|x| at(x, y) != p.bg));
+        assert!(ink, "the cluster is drawn");
+        let spill = (0..h).any(|y| (4 * cw..w).any(|x| at(x, y) != 0x123456));
+        assert!(!spill, "nothing is drawn right of the grid");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_spreads_font_lookups_over_frames() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        // More new fallback characters than one frame looks up.
+        let text: String = (0..300)
+            .filter_map(|i| char::from_u32(0x4e00 + i))
+            .collect();
+        let snap = text_snapshot(&text, 600, 1, &p);
+        r.begin();
+        r.snapshot(&snap, &p, 0, 0);
+        assert!(r.pending(), "some glyphs wait for the next frame");
+        let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert!(!r.pending());
+        let (cw, _) = r.cell();
+        let last = (0..h).any(|y| {
+            (598 * cw..w).any(|x| {
+                let i = ((y * w + x) * 4) as usize;
+                u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]]) != p.bg
+            })
+        });
+        assert!(last, "an offscreen render draws every glyph");
     }
 }
