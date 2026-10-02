@@ -612,22 +612,19 @@ mod tests {
         assert_eq!(at(15, 7), [128, 0, 0]);
     }
 
-    #[test]
-    fn swapchain_on_a_hidden_window_presents_and_resizes() {
+    /// A hidden 64x48 popup window, or `None` without desktop
+    /// composition: flip-model swap chains need it, and a service session
+    /// (some CI runners) does not have it.
+    fn hidden_window() -> Option<HWND> {
         use windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WINDOW_EX_STYLE, WS_POPUP};
         use windows::core::w;
 
-        // Flip-model swap chains need desktop composition, which a
-        // service session (some CI runners) does not have.
         // SAFETY: plain query.
         if !unsafe { DwmIsCompositionEnabled() }.is_ok_and(|b| b.as_bool()) {
             eprintln!("skipped: no desktop composition in this session");
-            return;
+            return None;
         }
-        let mut gpu = Gpu::new(true).expect("WARP device");
         // SAFETY: a plain hidden top-level window of a system class.
         let hwnd = unsafe {
             CreateWindowExW(
@@ -644,25 +641,63 @@ mod tests {
                 None,
                 None,
             )
-        }
-        .expect("window");
+        };
+        Some(hwnd.expect("window"))
+    }
+
+    fn destroy(hwnd: HWND) {
+        // SAFETY: the window was created on this thread.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd) }.expect("destroy");
+    }
+
+    fn present_one(gpu: &mut Gpu, chain: &mut Swapchain) {
+        chain.wait(100);
+        let rtv = chain.rtv(gpu).expect("back buffer");
+        let quad = Quad {
+            size: [8, 8],
+            color: rgba(0xffffff),
+            ..Default::default()
+        };
+        gpu.draw(&rtv, chain.w, chain.h, 0x101010, &[quad])
+            .expect("draw");
+        chain.present().expect("present");
+    }
+
+    #[test]
+    fn swapchain_on_a_hidden_window_presents_and_resizes() {
+        let Some(hwnd) = hidden_window() else {
+            return;
+        };
+        let mut gpu = Gpu::new(true).expect("WARP device");
         let mut chain = Swapchain::new(&gpu, hwnd, 64, 48).expect("swap chain");
         for (w, h) in [(64, 48), (32, 20), (0, 0)] {
             chain.resize(&gpu, w, h).expect("resize");
-            chain.wait(100);
-            let rtv = chain.rtv(&gpu).expect("back buffer");
-            let quad = Quad {
-                size: [8, 8],
-                color: rgba(0xffffff),
-                ..Default::default()
-            };
-            gpu.draw(&rtv, chain.w, chain.h, 0x101010, &[quad])
-                .expect("draw");
-            chain.present().expect("present");
+            present_one(&mut gpu, &mut chain);
         }
         assert_eq!((chain.w, chain.h), (1, 1));
         drop(chain);
-        // SAFETY: the window was created above on this thread.
-        unsafe { DestroyWindow(hwnd) }.expect("destroy");
+        destroy(hwnd);
+    }
+
+    /// What the app does after a lost device: drop the device and swap
+    /// chain, then build both again on the same window.
+    #[test]
+    fn swapchain_can_be_rebuilt_on_the_same_window() {
+        let Some(hwnd) = hidden_window() else {
+            return;
+        };
+        for _ in 0..3 {
+            let mut gpu = Gpu::new(true).expect("WARP device");
+            let mut chain = Swapchain::new(&gpu, hwnd, 64, 48).expect("swap chain");
+            present_one(&mut gpu, &mut chain);
+        }
+        // A new swap chain on a device whose context still has the old
+        // back buffer bound.
+        let mut gpu = Gpu::new(true).expect("WARP device");
+        for _ in 0..3 {
+            let mut chain = Swapchain::new(&gpu, hwnd, 64, 48).expect("swap chain again");
+            present_one(&mut gpu, &mut chain);
+        }
+        destroy(hwnd);
     }
 }
