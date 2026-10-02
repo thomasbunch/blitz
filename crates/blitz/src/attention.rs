@@ -263,6 +263,96 @@ mod tests {
         assert_eq!(Ev::from_notify(""), None);
     }
 
+    /// The events a program's output turns into, the way the app reads
+    /// them: notifications through the terminal, then the exit code.
+    fn events(out: &str) -> Vec<Ev> {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 40,
+            rows: 5,
+            ..Default::default()
+        });
+        t.feed(out.as_bytes());
+        let mut evs = Vec::new();
+        t.take_events(&mut evs);
+        evs.into_iter()
+            .filter_map(|e| match e {
+                vt::Event::Notify { title, .. } => Ev::from_notify(&title),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn notify(state: &str) -> String {
+        format!("\x1b]777;notify;blitz:{state};msg\x07")
+    }
+
+    /// Each attention rule, driven by hook notifications as a program
+    /// prints them and by exit codes.
+    #[test]
+    fn rules_from_terminal_output() {
+        let run = |start: Attn, steps: &[(&str, bool, Attn)]| {
+            let mut p = pane(start);
+            for &(input, attended, want) in steps {
+                let evs = match input {
+                    "seen" => vec![Ev::Attended],
+                    "exit 0" => vec![Ev::from_exit(0)],
+                    "exit 1" => vec![Ev::from_exit(1)],
+                    s => events(&notify(s)),
+                };
+                assert_eq!(evs.len(), 1, "{input}");
+                p.apply(evs[0], attended, Instant::now());
+                assert_eq!(p.state, want, "{start:?} after {input}");
+            }
+        };
+        use Attn::*;
+        // Asked while away, then seen: back to working.
+        run(
+            Working,
+            &[("needs-you", AWAY, NeedsYou), ("seen", HERE, Working)],
+        );
+        // Asked while watched: nothing to show.
+        run(Idle, &[("needs-you", HERE, Idle)]);
+        // Finished while away, then seen.
+        run(Working, &[("done", AWAY, DoneUnseen), ("seen", HERE, Idle)]);
+        // The user answered in the session.
+        run(NeedsYou, &[("working", AWAY, Working)]);
+        // A failed exit stays red whatever comes next.
+        run(
+            Working,
+            &[
+                ("exit 1", AWAY, Error),
+                ("working", AWAY, Error),
+                ("idle", HERE, Error),
+                ("seen", HERE, Error),
+            ],
+        );
+        // A clean exit is not a failure.
+        run(Working, &[("exit 0", AWAY, Idle)]);
+        // A needs-you over an unseen result gives the result back once
+        // answered, and that is seen at once.
+        run(
+            DoneUnseen,
+            &[("needs-you", AWAY, NeedsYou), ("seen", HERE, Idle)],
+        );
+        // A hook error while away, cleared when seen; idle is idle.
+        run(
+            Working,
+            &[
+                ("error", AWAY, Error),
+                ("seen", HERE, Idle),
+                ("working", AWAY, Working),
+                ("idle", AWAY, Idle),
+            ],
+        );
+    }
+
+    #[test]
+    fn other_notifications_are_not_attention() {
+        assert!(events("\x1b]777;notify;Build;done\x07").is_empty());
+        assert!(events("\x1b]9;build done\x07").is_empty());
+        assert_eq!(events(&notify("done")), [Ev::Done]);
+    }
+
     #[test]
     fn exit_codes() {
         assert_eq!(Ev::from_exit(0), Ev::Idle);
