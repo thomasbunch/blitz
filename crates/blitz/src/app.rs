@@ -16,14 +16,14 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState};
 use windows::Win32::UI::WindowsAndMessaging::{
-    MSG, TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    MSG, SetForegroundWindow, TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP,
+    WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::platform::windows::EventLoopBuilderExtWindows;
+use winit::platform::windows::{EventLoopBuilderExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{UserAttentionType, Window, WindowId};
 
@@ -68,6 +68,8 @@ pub enum UserEvent {
     Update(String),
     /// The installer started, so blitz exits; or why it did not.
     Installed(Result<(), String>),
+    /// Another launch handed this folder over to open in a new tab.
+    OpenHere(PathBuf),
 }
 
 /// Command-line options of the GUI.
@@ -124,6 +126,19 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // A folder opens as a tab in the blitz already running. Scripted and
+    // test launches always get a window of their own.
+    let scripted = args.cmd.is_some()
+        || args.selftest.is_some()
+        || args.exit_after.is_some()
+        || args.capture.is_some();
+    if let Some(dir) = &args.cwd
+        && !args.new_window
+        && !scripted
+        && crate::handoff::send(dir)
+    {
+        return 0;
+    }
     let keys = Rc::new(RefCell::new(Keys::default()));
     let hook_keys = keys.clone();
     let mut builder = EventLoop::<UserEvent>::with_user_event();
@@ -424,9 +439,13 @@ impl App {
 
     /// Creates the window and starts the first session.
     fn start(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("blitz")
             .with_inner_size(LogicalSize::new(980.0, 620.0));
+        // Only the main window takes folders from other launches.
+        if !self.args.new_window {
+            attrs = attrs.with_class_name(crate::handoff::CLASS);
+        }
         let window = el.create_window(attrs).map_err(|e| e.to_string())?;
         window.set_ime_allowed(true);
         self.scale = window.scale_factor();
@@ -434,6 +453,9 @@ impl App {
             && let RawWindowHandle::Win32(h) = h.as_raw()
         {
             self.hwnd = h.hwnd.get();
+        }
+        if !self.args.new_window {
+            crate::handoff::install(self.hwnd, self.proxy.clone());
         }
         let dark = windows::core::BOOL::from(self.dark);
         // SAFETY: a live window and a BOOL-sized value.
@@ -560,10 +582,14 @@ impl App {
     }
 
     /// Opens a pane in a copy of the layout that `place` changes; tells the
-    /// user in the focused pane when that fails. New panes start where the
-    /// focused one is.
-    fn add(&mut self, place: impl FnOnce(&mut layout::Window, PaneId, Option<&Path>) -> bool) {
-        let cwd = start_dir(self.current().map_or("", |v| v.pane.cwd.as_str()));
+    /// user in the focused pane when that fails. The pane starts in `dir`,
+    /// or else where the focused one is.
+    fn add(
+        &mut self,
+        dir: Option<PathBuf>,
+        place: impl FnOnce(&mut layout::Window, PaneId, Option<&Path>) -> bool,
+    ) {
+        let cwd = dir.or_else(|| start_dir(self.current().map_or("", |v| v.pane.cwd.as_str())));
         let id = PaneId(self.next_id);
         let mut win = self.win.clone();
         if !place(&mut win, id, cwd.as_deref()) {
@@ -922,11 +948,7 @@ impl App {
                 let page = rows.saturating_sub(1).max(1) as isize;
                 self.scroll(page * isize::from(dir));
             }
-            Action::NewTab => self.add(|win, id, cwd| {
-                win.tabs.push(Tab::new(tab_name(cwd), id));
-                win.active = win.tabs.len() - 1;
-                true
-            }),
+            Action::NewTab => self.add(None, new_tab),
             Action::ClosePane => {
                 let Some(v) = self.current() else {
                     return true;
@@ -971,7 +993,7 @@ impl App {
                 } else {
                     Dir::Down
                 };
-                self.add(|win, id, _| {
+                self.add(None, |win, id, _| {
                     // Only the pane minimum matters, and `open` checks that
                     // against the real window.
                     let any = Rect {
@@ -1594,6 +1616,13 @@ fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
 
+/// Puts pane `id` in a new tab after the others and shows that tab.
+fn new_tab(win: &mut layout::Window, id: PaneId, cwd: Option<&Path>) -> bool {
+    win.tabs.push(Tab::new(tab_name(cwd), id));
+    win.active = win.tabs.len() - 1;
+    true
+}
+
 /// A new tab is named after the folder it starts in.
 fn tab_name(cwd: Option<&Path>) -> String {
     let name = cwd.map(|p| match p.file_name() {
@@ -1823,6 +1852,16 @@ impl ApplicationHandler<UserEvent> for App {
                     let text = format!("Update failed: {e}");
                     self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
                 }
+            }
+            UserEvent::OpenHere(dir) => {
+                // First, since a minimized window has no room for a pane.
+                if let Some(w) = &self.window {
+                    w.set_minimized(false);
+                }
+                // SAFETY: our own window; the launch that sent the folder
+                // allowed this process to take the foreground.
+                let _ = unsafe { SetForegroundWindow(HWND(self.hwnd as *mut c_void)) };
+                self.add(Some(dir), new_tab);
             }
         }
     }
