@@ -60,3 +60,39 @@ pub fn system_is_light() -> bool {
 pub fn system() -> Palette {
     if system_is_light() { light() } else { dark() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG 2 contrast ratio between two `0xRRGGBB` colours.
+    fn contrast(a: u32, b: u32) -> f64 {
+        let lum = |rgb: u32| {
+            let [_, r, g, b] = rgb.to_be_bytes();
+            let lin = |c: u8| {
+                let c = f64::from(c) / 255.0;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        };
+        let (a, b) = (lum(a), lum(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn text_meets_wcag_aa_contrast() {
+        assert!((contrast(0xffffff, 0x000000) - 21.0).abs() < 1e-9);
+        for (name, p) in [("dark", dark()), ("light", light())] {
+            let text = contrast(p.fg, p.bg);
+            assert!(text >= 4.5, "{name}: text contrast {text:.2}");
+            let sel = contrast(p.fg, p.selection_bg);
+            assert!(sel >= 4.5, "{name}: selected text contrast {sel:.2}");
+            let cursor = contrast(p.cursor, p.bg);
+            assert!(cursor >= 3.0, "{name}: cursor contrast {cursor:.2}");
+        }
+    }
+}
