@@ -462,3 +462,111 @@ fn altgr_keys_send_their_text() {
         assert_eq!(enc(&chord, &kitty(5)), "\x1b[97;7u");
     }
 }
+
+fn mouse(kind: vt::MouseKind, button: u8, col: u16, row: u16, m: &str) -> vt::MouseEv {
+    vt::MouseEv {
+        kind,
+        button,
+        col,
+        row,
+        mods: mods(m),
+    }
+}
+
+fn tracking(mode: vt::MouseMode) -> InputModes {
+    InputModes {
+        mouse: mode,
+        mouse_sgr: true,
+        ..LEGACY
+    }
+}
+
+fn enc_mouse(ev: vt::MouseEv, m: &InputModes) -> Option<String> {
+    let mut out = Vec::new();
+    let sent = vt::encode_mouse(ev, m, &mut out);
+    assert_eq!(sent, !out.is_empty(), "{ev:?}");
+    sent.then(|| String::from_utf8(out).unwrap())
+}
+
+#[test]
+fn mouse_sgr_reports() {
+    use vt::MouseKind::*;
+    use vt::MouseMode::*;
+    let click = tracking(Click);
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(
+        enc_mouse(mouse(Press, 0, 0, 0, ""), &click),
+        s("\x1b[<0;1;1M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Release, 0, 0, 0, ""), &click),
+        s("\x1b[<0;1;1m")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Press, 2, 9, 4, ""), &click),
+        s("\x1b[<2;10;5M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Press, 1, 299, 99, ""), &click),
+        s("\x1b[<1;300;100M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(WheelUp, 0, 4, 2, ""), &click),
+        s("\x1b[<64;5;3M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(WheelDown, 0, 4, 2, "c"), &click),
+        s("\x1b[<81;5;3M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Press, 0, 0, 0, "sa"), &click),
+        s("\x1b[<12;1;1M")
+    );
+    assert_eq!(enc_mouse(mouse(Move, 0, 1, 1, ""), &click), None);
+    assert_eq!(enc_mouse(mouse(Press, 4, 0, 0, ""), &click), None);
+
+    let drag = tracking(Drag);
+    assert_eq!(
+        enc_mouse(mouse(Move, 0, 1, 1, ""), &drag),
+        s("\x1b[<32;2;2M")
+    );
+    assert_eq!(enc_mouse(mouse(Move, 3, 1, 1, ""), &drag), None);
+
+    let any = tracking(Any);
+    assert_eq!(
+        enc_mouse(mouse(Move, 3, 1, 1, ""), &any),
+        s("\x1b[<35;2;2M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Move, 2, 1, 1, ""), &any),
+        s("\x1b[<34;2;2M")
+    );
+
+    // Nothing without tracking, or without SGR encoding.
+    assert_eq!(enc_mouse(mouse(Press, 0, 0, 0, ""), &tracking(Off)), None);
+    let x10 = InputModes {
+        mouse_sgr: false,
+        ..click
+    };
+    assert_eq!(enc_mouse(mouse(Press, 0, 0, 0, ""), &x10), None);
+}
+
+#[test]
+fn mouse_motion_only_on_cell_change() {
+    use vt::MouseKind::*;
+    let m = tracking(vt::MouseMode::Any);
+    let mut tracker = vt::keys::MouseTracker::default();
+    let mut out = Vec::new();
+    let mut sends = |ev| tracker.encode(ev, &m, &mut out);
+    assert!(sends(mouse(Move, 3, 5, 5, "")));
+    assert!(!sends(mouse(Move, 3, 5, 5, "")));
+    assert!(sends(mouse(Press, 0, 5, 5, "")));
+    assert!(!sends(mouse(Move, 0, 5, 5, "")));
+    assert!(sends(mouse(Move, 0, 6, 5, "")));
+    assert!(sends(mouse(Release, 0, 6, 5, "")));
+    assert!(sends(mouse(Release, 0, 6, 5, "")));
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "\x1b[<35;6;6M\x1b[<0;6;6M\x1b[<32;7;6M\x1b[<0;7;6m\x1b[<0;7;6m"
+    );
+}

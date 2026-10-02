@@ -2,7 +2,7 @@
 
 use std::io::Write as _;
 
-use crate::modes::InputModes;
+use crate::modes::{InputModes, MouseMode};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Mods {
@@ -90,7 +90,10 @@ pub enum MouseKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MouseEv {
     pub kind: MouseKind,
+    /// 0 left, 1 middle, 2 right. On `Move` it is the held button, or 3
+    /// when none is.
     pub button: u8,
+    /// 0-based cell.
     pub col: u16,
     pub row: u16,
     pub mods: Mods,
@@ -478,10 +481,57 @@ fn modifier_code(k: &KeyInput) -> Option<u32> {
     })
 }
 
-/// Appends a mouse report. Returns false when the modes don't ask for this
-/// event and nothing was written.
-pub fn encode_mouse(_ev: MouseEv, _m: &InputModes, _out: &mut Vec<u8>) -> bool {
-    false
+/// Appends an SGR (mode 1006) mouse report. Returns false when the modes
+/// don't ask for this event and nothing was written.
+pub fn encode_mouse(ev: MouseEv, m: &InputModes, out: &mut Vec<u8>) -> bool {
+    // SGR only. ConPTY asks for 1006 itself; add the X10 byte form if an
+    // app ever enables 1000 without 1006 and expects it.
+    if m.mouse == MouseMode::Off || !m.mouse_sgr {
+        return false;
+    }
+    let cb = match ev.kind {
+        MouseKind::Press | MouseKind::Release if ev.button < 3 => u32::from(ev.button),
+        MouseKind::Move => match (m.mouse, ev.button) {
+            (MouseMode::Any, 0..=3) | (MouseMode::Drag, 0..=2) => 32 + u32::from(ev.button),
+            _ => return false,
+        },
+        MouseKind::WheelUp => 64,
+        MouseKind::WheelDown => 65,
+        _ => return false,
+    };
+    let mo = &ev.mods;
+    let cb = cb
+        | u32::from(mo.lshift || mo.rshift) << 2
+        | u32::from(mo.lalt || mo.ralt) << 3
+        | u32::from(mo.lctrl || mo.rctrl) << 4;
+    let fin = if ev.kind == MouseKind::Release {
+        'm'
+    } else {
+        'M'
+    };
+    let (x, y) = (u32::from(ev.col) + 1, u32::from(ev.row) + 1);
+    let _ = write!(out, "\x1b[<{cb};{x};{y}{fin}");
+    true
+}
+
+/// Drops pointer motion that stays inside one cell, so the app gets one
+/// report per cell crossed instead of one per pixel.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MouseTracker {
+    last: Option<(u16, u16)>,
+}
+
+impl MouseTracker {
+    /// [`encode_mouse`], except that a move within the cell of the previous
+    /// event writes nothing and returns false.
+    pub fn encode(&mut self, ev: MouseEv, m: &InputModes, out: &mut Vec<u8>) -> bool {
+        let cell = Some((ev.col, ev.row));
+        if ev.kind == MouseKind::Move && self.last == cell {
+            return false;
+        }
+        self.last = cell;
+        encode_mouse(ev, m, out)
+    }
 }
 
 /// Appends pasted text, filtered and bracketed when requested.
