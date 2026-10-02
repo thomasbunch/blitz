@@ -2,6 +2,9 @@
 
 use vt::Palette;
 
+/// Attention accent for both themes; text on it is near-black.
+pub const ACCENT: u32 = 0xf2b84b;
+
 pub fn dark() -> Palette {
     Palette {
         fg: 0xd6d7d9,

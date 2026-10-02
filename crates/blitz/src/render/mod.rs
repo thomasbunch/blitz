@@ -5,6 +5,7 @@
 
 pub mod atlas;
 pub mod builtin;
+pub mod chrome;
 #[cfg(windows)]
 pub mod d3d11;
 #[cfg(windows)]
