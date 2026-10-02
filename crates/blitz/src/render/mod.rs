@@ -167,6 +167,8 @@ mod gpu {
         atlas: Atlas,
         quads: Vec<Quad>,
         overflowed: bool,
+        /// The atlas was cleared when this frame began.
+        cleared: bool,
     }
 
     impl Renderer {
@@ -182,6 +184,7 @@ mod gpu {
                 atlas: Atlas::new(ATLAS_SIZE as u16, ATLAS_SIZE as u16),
                 quads: Vec::new(),
                 overflowed: false,
+                cleared: false,
             })
         }
 
@@ -206,6 +209,12 @@ mod gpu {
         /// Starts collecting a new frame.
         pub fn begin(&mut self) {
             self.quads.clear();
+            // A full atlas is cleared between frames, never during one:
+            // glyphs already queued point into it.
+            self.cleared = self.overflowed;
+            if self.overflowed {
+                self.atlas.clear();
+            }
             self.overflowed = false;
         }
 
@@ -440,19 +449,29 @@ mod gpu {
                 self.atlas.insert_empty(key);
                 return None;
             };
-            let fits =
-                |atlas: &mut Atlas| atlas.insert(key, w as u16, h as u16, dx as i16, dy as i16);
-            let slot = match fits(&mut self.atlas) {
-                Some(slot) => slot,
-                None => {
-                    // A full atlas is wiped mid-frame, so glyphs
-                    // already queued this frame may show stale pixels; the
-                    // caller redraws when `draw` reports it. Fine unless one
-                    // frame needs more glyphs than the whole atlas holds.
-                    self.overflowed = true;
-                    self.atlas.clear();
-                    fits(&mut self.atlas)?
-                }
+            // Terminal text may not fill the last eighth of the atlas, so
+            // the window chrome still fits when a pane shows more distinct
+            // glyphs than the atlas holds.
+            let (aw, ah) = self.atlas.size();
+            let bottom = if key.style & (SMALL | SHAPE) != 0 {
+                ah
+            } else {
+                ah - ah / 8
+            };
+            if w > u32::from(aw) || h > u32::from(bottom) {
+                // It would never fit; leave it out for good.
+                self.atlas.insert_empty(key);
+                return None;
+            }
+            let (w16, h16) = (w as u16, h as u16);
+            let Some(slot) = self
+                .atlas
+                .insert_above(bottom, key, w16, h16, dx as i16, dy as i16)
+            else {
+                // Left out of this frame; `begin` clears the full atlas
+                // and the caller draws again when `draw` reports it.
+                self.overflowed = true;
+                return None;
             };
             self.gpu
                 .upload(u32::from(slot.x), u32::from(slot.y), w, h, &alpha);
@@ -460,8 +479,9 @@ mod gpu {
         }
 
         /// Clears `rtv` to `bg` and draws the frame. Returns true when the
-        /// glyph atlas overflowed while building it, in which case the
-        /// caller should build and draw the frame again.
+        /// glyph atlas filled up and left glyphs out, and an empty atlas
+        /// may hold them, in which case the caller should build and draw
+        /// the frame again.
         pub fn draw(
             &mut self,
             rtv: &ID3D11RenderTargetView,
@@ -470,7 +490,12 @@ mod gpu {
             bg: u32,
         ) -> Result<bool> {
             self.gpu.draw(rtv, w, h, bg, &self.quads)?;
-            Ok(self.overflowed)
+            Ok(self.overflowed && !self.cleared)
+        }
+
+        #[cfg(test)]
+        pub fn set_atlas_size(&mut self, w: u16, h: u16) {
+            self.atlas = Atlas::new(w, h);
         }
     }
 
@@ -1018,5 +1043,35 @@ mod tests {
         let (sw, sh) = r.small_cell();
         let ink = (0..sh).any(|y| (60..60 + sw).any(|x| at(x, y) != p.bg));
         assert!(ink, "chrome text is drawn");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_full_atlas_leaves_earlier_glyphs_alone() {
+        let p = pal();
+        let snap = text_snapshot("HELLO\nabcdefghijklmnopqrstuvwxyz0123456789", 36, 2, &p);
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let (_, _, want) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        r.set_atlas_size(64, 64);
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let row = (w * r.cell().1 * 4) as usize;
+        assert!(px[..row] == want[..row], "the first row is drawn as usual");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_glyph_too_big_for_the_atlas_is_left_out() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        r.set_atlas_size(8, 8);
+        let snap = text_snapshot("M", 1, 1, &p);
+        let target = r.gpu.offscreen(16, 32).expect("target");
+        for _ in 0..2 {
+            r.begin();
+            r.snapshot(&snap, &p, 0, 0);
+            let again = r.draw(&target.rtv, 16, 32, p.bg).expect("draw");
+            assert!(!again, "no frame is drawn twice");
+        }
     }
 }

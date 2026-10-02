@@ -80,7 +80,21 @@ impl Atlas {
     /// Reserves a `w`×`h` area for `key`. Returns `None` when the atlas is
     /// full; the caller then clears it and starts the frame over.
     pub fn insert(&mut self, key: GlyphKey, w: u16, h: u16, dx: i16, dy: i16) -> Option<Slot> {
-        let (x, y) = self.alloc(w, h)?;
+        self.insert_above(self.h, key, w, h, dx, dy)
+    }
+
+    /// Like [`Atlas::insert`], but only uses rows above `bottom`, so the
+    /// rest stays free for other glyphs.
+    pub fn insert_above(
+        &mut self,
+        bottom: u16,
+        key: GlyphKey,
+        w: u16,
+        h: u16,
+        dx: i16,
+        dy: i16,
+    ) -> Option<Slot> {
+        let (x, y) = self.alloc(w, h, bottom.min(self.h))?;
         let slot = Slot { x, y, w, h, dx, dy };
         self.glyphs.insert(key, slot);
         Some(slot)
@@ -94,15 +108,16 @@ impl Atlas {
 
     /// Best-fit shelf: the lowest shelf that is tall enough and has room,
     /// else a new shelf below the last one. New shelves are rounded up to a
-    /// multiple of 8 px so glyphs of similar height share them.
-    fn alloc(&mut self, w: u16, h: u16) -> Option<(u16, u16)> {
-        if w > self.w || h > self.h {
+    /// multiple of 8 px so glyphs of similar height share them. Shelves
+    /// reaching below `bottom` are not used.
+    fn alloc(&mut self, w: u16, h: u16, bottom: u16) -> Option<(u16, u16)> {
+        if w > self.w || h > bottom {
             return None;
         }
         let best = self
             .shelves
             .iter_mut()
-            .filter(|s| s.h >= h && self.w - s.x >= w)
+            .filter(|s| s.h >= h && self.w - s.x >= w && s.y + s.h <= bottom)
             .min_by_key(|s| s.h);
         if let Some(s) = best {
             let x = s.x;
@@ -110,10 +125,10 @@ impl Atlas {
             return Some((x, s.y));
         }
         let y = self.shelves.last().map_or(0, |s| s.y + s.h);
-        if self.h - y < h {
+        if bottom.saturating_sub(y) < h {
             return None;
         }
-        let h = h.next_multiple_of(8).min(self.h - y);
+        let h = h.next_multiple_of(8).min(bottom - y);
         self.shelves.push(Shelf { y, h, x: w });
         Some((0, y))
     }
@@ -173,6 +188,14 @@ mod tests {
         atlas.clear();
         assert_eq!(atlas.get(&key(1)), None);
         assert!(atlas.insert(key(5), 32, 32, 0, 0).is_some());
+    }
+
+    #[test]
+    fn rows_below_a_limit_stay_free() {
+        let mut atlas = Atlas::new(32, 32);
+        atlas.insert_above(16, key(1), 32, 16, 0, 0).expect("fits");
+        assert!(atlas.insert_above(16, key(2), 1, 1, 0, 0).is_none());
+        assert!(atlas.insert(key(2), 1, 1, 0, 0).is_some());
     }
 
     #[test]
