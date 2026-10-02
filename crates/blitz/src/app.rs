@@ -36,6 +36,7 @@ use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
 use crate::render::chrome::{self, ChromeModel};
 use crate::render::d3d11::{Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
+use crate::session::{self, Geometry, PaneMeta};
 
 const VK_PROCESSKEY: u16 = 0xe5;
 const VK_PACKET: u16 = 0xe7;
@@ -363,6 +364,13 @@ struct App {
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
     capture_then_exit: bool,
+    /// This is the main window, whose layout is saved for the next start.
+    /// Separate windows and scripted runs leave the saved one alone.
+    persist: bool,
+    /// The session as last saved.
+    saved: Option<session::State>,
+    /// Where the window last was while neither minimized nor maximized.
+    placed: Geometry,
     /// The terminal a running self-test reads: the focused pane's.
     watched: Option<Arc<selftest::Focus>>,
     started: Instant,
@@ -378,6 +386,12 @@ impl App {
             ThemeMode::Dark => true,
             ThemeMode::Light => false,
         };
+        let a = &args;
+        let persist = !a.new_window
+            && a.cmd.is_none()
+            && a.selftest.is_none()
+            && a.exit_after.is_none()
+            && a.capture.is_none();
         App {
             args,
             config,
@@ -411,6 +425,9 @@ impl App {
             ime_at: None,
             checked_conpty: false,
             capture_then_exit: false,
+            persist,
+            saved: None,
+            placed: Geometry::default(),
             watched: None,
             started: Instant::now(),
             counters: Counters::default(),
@@ -424,9 +441,24 @@ impl App {
 
     /// Creates the window and starts the first session.
     fn start(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("blitz")
             .with_inner_size(LogicalSize::new(980.0, 620.0));
+        let saved = (self.persist && self.config.restore_session)
+            .then(session::load)
+            .flatten();
+        if let Some(g) = saved
+            .as_ref()
+            .map(|s| s.window)
+            .filter(|g| g.w > 0 && g.h > 0)
+        {
+            let g = on_screen(el, g);
+            self.placed = g;
+            attrs = attrs
+                .with_position(PhysicalPosition::new(g.x, g.y))
+                .with_inner_size(PhysicalSize::new(g.w, g.h))
+                .with_maximized(g.maximized);
+        }
         let window = el.create_window(attrs).map_err(|e| e.to_string())?;
         window.set_ime_allowed(true);
         self.scale = window.scale_factor();
@@ -448,15 +480,25 @@ impl App {
         self.window = Some(window);
         self.ensure_gfx();
 
-        let cwd = match &self.args.cwd {
-            Some(dir) => start_dir(dir),
-            None => std::env::current_dir().ok(),
-        };
-        let id = PaneId(self.next_id);
         let mut win = layout::Window::default();
-        win.tabs.push(Tab::new(tab_name(cwd.as_deref()), id));
-        let cmd = self.args.cmd.clone();
-        self.open(win, id, cmd.as_deref(), cwd)?;
+        if let Some(s) = &saved {
+            match self.restore(s) {
+                Ok(()) => win = self.win.clone(),
+                Err(e) => eprintln!("blitz: restoring the last session: {e}"),
+            }
+        }
+        // A folder from Explorer gets a tab of its own after the restored ones.
+        if self.views.is_empty() || self.args.cwd.is_some() {
+            let cwd = match &self.args.cwd {
+                Some(dir) => start_dir(dir),
+                None => std::env::current_dir().ok(),
+            };
+            let id = PaneId(self.next_id);
+            win.tabs.push(Tab::new(tab_name(cwd.as_deref()), id));
+            win.active = win.tabs.len() - 1;
+            let cmd = self.args.cmd.clone();
+            self.open(win, id, cmd.as_deref(), cwd)?;
+        }
 
         if let Some(script) = self.args.selftest.clone() {
             self.start_selftest(script);
@@ -502,6 +544,35 @@ impl App {
         if !self.views.is_empty() && grids.iter().any(small) {
             return Err("no room for another pane".into());
         }
+        self.spawn(id, &grids, cmd, cwd)?;
+        self.install(win);
+        Ok(())
+    }
+
+    /// Starts every pane of a saved session, each in its folder, and shows
+    /// its layout. Starts none if one fails.
+    fn restore(&mut self, s: &session::State) -> Result<(), String> {
+        let (win, panes) = s.layout(self.next_id);
+        let grids = self.grids(&win);
+        for (id, meta) in panes {
+            if let Err(e) = self.spawn(id, &grids, None, start_dir(&meta.cwd)) {
+                self.views.clear();
+                return Err(e);
+            }
+        }
+        self.install(win);
+        Ok(())
+    }
+
+    /// Starts a session for pane `id`, sized as `grids` lays it out (or
+    /// 80x24 while hidden), running `cmd` or else the shell.
+    fn spawn(
+        &mut self,
+        id: PaneId,
+        grids: &[(PaneId, (i32, i32))],
+        cmd: Option<&str>,
+        cwd: Option<PathBuf>,
+    ) -> Result<(), String> {
         let fit = |n: i32| n.clamp(1, i32::from(u16::MAX)) as u16;
         let grid = grids
             .iter()
@@ -553,10 +624,14 @@ impl App {
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
+        Ok(())
+    }
+
+    /// Shows `win`, a layout whose panes all have sessions.
+    fn install(&mut self, win: layout::Window) {
         let before = self.focus_id();
         self.win = win;
         self.focus_moved(before);
-        Ok(())
     }
 
     /// Opens a pane in a copy of the layout that `place` changes; tells the
@@ -583,6 +658,11 @@ impl App {
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
         if self.views.is_empty() {
+            // Nothing is left open, so there is nothing to restore.
+            if self.persist {
+                session::clear();
+                self.persist = false;
+            }
             el.exit();
             return;
         }
@@ -1516,6 +1596,54 @@ impl App {
         }
     }
 
+    /// Saves the session when its tabs, splits or folders changed since
+    /// the last save, or always with `force`. The window's place alone
+    /// does not count, so dragging the window writes nothing until exit.
+    fn save_session(&mut self, force: bool) {
+        if !self.persist || self.views.is_empty() {
+            return;
+        }
+        let meta = |id| PaneMeta {
+            cwd: self
+                .view(id)
+                .map(|v| v.pane.cwd.clone())
+                .unwrap_or_default(),
+            claude: None,
+        };
+        let mut s = session::State::capture(&self.win, self.placed, meta);
+        let same = self.saved.as_ref().is_some_and(|old| {
+            (old.sidebar_expanded, old.active, &old.tabs) == (s.sidebar_expanded, s.active, &s.tabs)
+        });
+        if same && !force {
+            return;
+        }
+        if let Some(w) = &self.window {
+            let maximized = w.is_maximized();
+            if !maximized
+                && w.is_minimized() != Some(true)
+                && let Ok(p) = w.outer_position()
+            {
+                let size = w.inner_size();
+                self.placed = Geometry {
+                    x: p.x,
+                    y: p.y,
+                    w: size.width,
+                    h: size.height,
+                    maximized: false,
+                };
+            }
+            s.window = Geometry {
+                maximized,
+                ..self.placed
+            };
+        }
+        if let Err(e) = session::save(&s) {
+            eprintln!("blitz: saving the session: {e}");
+        }
+        // Kept even when the write failed, so it is not retried every turn.
+        self.saved = Some(s);
+    }
+
     /// The soonest time something on screen changes by itself.
     fn next_deadline(&self) -> Option<Instant> {
         let now = Instant::now();
@@ -1582,6 +1710,21 @@ fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &
     let banner = Palette { bg, ..*pal };
     let y = at.y + i32::from(grid.1.saturating_sub(1)) * ch as i32;
     r.snapshot(&s, &banner, at.x, y);
+}
+
+/// `g`, moved onto the primary monitor when no monitor shows enough of it.
+fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
+    let rect = |m: winit::monitor::MonitorHandle| Rect {
+        x: m.position().x,
+        y: m.position().y,
+        w: m.size().width as i32,
+        h: m.size().height as i32,
+    };
+    let monitors: Vec<Rect> = el.available_monitors().map(rect).collect();
+    match el.primary_monitor().map(rect).or(monitors.first().copied()) {
+        Some(primary) => session::on_screen(g, &monitors, primary),
+        None => g,
+    }
 }
 
 /// Where a new pane starts: `cwd` if it is still a directory, else the
@@ -1829,6 +1972,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.drain_keys(el);
+        self.save_session(false);
         let flow = match self.next_deadline() {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,
@@ -1837,6 +1981,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
+        // Closing the window, Alt+F4 and an update all keep the layout.
+        self.save_session(true);
         if let Err(e) = self.counters.write_trace() {
             eprintln!("blitz: BLITZ_TRACE: {e}");
         }
