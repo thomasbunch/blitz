@@ -379,6 +379,14 @@ fn viewport_follows_its_text() {
     assert_eq!(s.cursor, None);
     feed(&mut t, "x\r\n");
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "6");
+    // A trip to the alternate screen, as at each blitz prompt, comes back
+    // to the same text.
+    feed(&mut t, "\x1b[?1049h\x1b[?1049l");
+    assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "6");
+    // Unless the scrollback went meanwhile.
+    feed(&mut t, "\x1b[?1049h\x1b[3J\x1b[?1049l");
+    assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "9");
+    t.scroll_viewport(2);
     t.scroll_viewport(-100);
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "9");
 }

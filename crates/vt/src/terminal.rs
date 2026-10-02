@@ -128,6 +128,8 @@ pub struct Terminal {
     cluster: Option<Cluster>,
     /// Rows the view is scrolled back into scrollback.
     viewport: usize,
+    /// The main screen's view while the alternate screen is up.
+    other_viewport: usize,
     changed: bool,
     modes: Modes,
     /// Dark or light system theme, for `CSI ? 996 n`.
@@ -196,6 +198,7 @@ impl Terminal {
             rep: None,
             cluster: None,
             viewport: 0,
+            other_viewport: 0,
             changed: true,
             modes: Modes::default(),
             dark: true,
@@ -841,7 +844,9 @@ impl Terminal {
         if alt != self.alt {
             std::mem::swap(&mut self.screen, &mut self.other);
             self.alt = alt;
-            self.viewport = 0;
+            // The main screen's view comes back on the text it showed.
+            std::mem::swap(&mut self.viewport, &mut self.other_viewport);
+            self.viewport = self.viewport.min(self.screen.grid.scrollback_len());
         }
     }
 
