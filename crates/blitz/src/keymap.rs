@@ -121,6 +121,19 @@ fn printable(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(char::is_control)
 }
 
+/// The calling thread's keyboard layout, as the `layout` of [`msg_to_key`].
+#[cfg(windows)]
+pub fn system_layout(vk: u16, scan: u16, keystate: &[u8; 256]) -> String {
+    use windows::Win32::UI::Input::KeyboardAndMouse::ToUnicode;
+    let mut buf = [0u16; 8];
+    // Flag 4 leaves the dead key state alone, so the WM_CHAR that
+    // TranslateMessage makes for this key still composes. A dead key
+    // returns a negative count.
+    let n = unsafe { ToUnicode(vk.into(), scan.into(), Some(keystate), &mut buf, 4) };
+    let n = usize::try_from(n).unwrap_or(0).min(buf.len());
+    String::from_utf16_lossy(&buf[..n])
+}
+
 #[cfg(test)]
 mod msg_to_key_tests {
     use super::*;
@@ -454,5 +467,29 @@ mod msg_to_key_tests {
             enc(0x26, lp(0x48, true, true, 1), &none, US, &modes(0, true)),
             "\x1b[38;72;0;1;256;1_"
         );
+    }
+
+    /// Enter and Space type the same on every layout.
+    #[cfg(windows)]
+    #[test]
+    fn keymap_system_layout() {
+        let mut t = String::new();
+        let shift = state(&[0xa0], &[]);
+        let k = msg_to_key(
+            0x0d,
+            lp(0x1c, false, true, 1),
+            &shift,
+            system_layout,
+            &mut t,
+        );
+        assert_eq!((k.key, k.uc, k.text), (Key::Enter, 13, ""));
+        let k = msg_to_key(
+            0x20,
+            lp(0x39, false, true, 1),
+            &shift,
+            system_layout,
+            &mut t,
+        );
+        assert_eq!((k.key, k.uc, k.text), (Key::Char(' '), 32, " "));
     }
 }
