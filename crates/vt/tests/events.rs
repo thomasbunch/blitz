@@ -217,3 +217,28 @@ fn programs_can_set_and_reset_colours() {
         "\x1b]11;rgb:2222/2222/2222\x07"
     );
 }
+
+#[test]
+fn floods_are_coalesced_and_bounded() {
+    let mut t = Terminal::new(Options::default());
+    for i in 0..5000 {
+        t.feed(format!("\x07\x1b]0;t{i}\x07\x1b]7;file:///C:/d{i}\x07").as_bytes());
+    }
+    let mut out = Vec::new();
+    t.take_events(&mut out);
+    assert_eq!(
+        out,
+        [
+            Event::Bell,
+            Event::Title("t4999".into()),
+            Event::Cwd("C:\\d4999".into())
+        ]
+    );
+
+    for i in 0..5000 {
+        t.feed(format!("\x1b]9;n{i}\x07").as_bytes());
+    }
+    t.take_events(&mut out);
+    assert_eq!(out.len(), 3 + 1024);
+    assert_eq!(out.last(), Some(&notify("", "n4999")));
+}

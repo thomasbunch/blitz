@@ -210,6 +210,24 @@ fn state(t: &mut Terminal) -> State {
     )
 }
 
+/// A queued title, directory or bell replaces the pending one, so events
+/// drained more often keep earlier ones too. Only the last of each counts.
+fn latest_only(mut events: Vec<Event>) -> Vec<Event> {
+    let mut seen = Vec::new();
+    events.reverse();
+    events.retain(|e| {
+        if !matches!(e, Event::Title(_) | Event::Cwd(_) | Event::Bell) {
+            return true;
+        }
+        let kind = std::mem::discriminant(e);
+        let last = !seen.contains(&kind);
+        seen.push(kind);
+        last
+    });
+    events.reverse();
+    events
+}
+
 #[test]
 fn chunking_never_changes_the_result() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -234,7 +252,7 @@ fn chunking_never_changes_the_result() {
         replies.append(&mut b.3);
         events.append(&mut b.4);
         b.3 = replies;
-        b.4 = events;
+        b.4 = latest_only(events);
         assert_eq!(a, b, "round {round}, seed {seed:#x}");
         check(&mut whole);
     }

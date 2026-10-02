@@ -1,5 +1,6 @@
 //! The terminal: screens, cursor, modes, replies and events.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::time::Instant;
 
@@ -140,7 +141,7 @@ pub struct Terminal {
     replies: Vec<u8>,
     /// Output bytes not yet spent on replies; see [`MAX_REPLIES`].
     reply_credit: usize,
-    events: Vec<Event>,
+    events: VecDeque<Event>,
 }
 
 /// Foreground, background and cursor colours of the default dark and
@@ -160,6 +161,9 @@ const MAX_NOTIFY_BODY: usize = 256;
 /// unbounded stream of answers into the program's input.
 const MAX_REPLIES: usize = 4096;
 const REPLY_CREDIT: usize = 16 * MAX_REPLIES;
+
+/// Most events queued between [`Terminal::take_events`] calls.
+const MAX_EVENTS: usize = 1024;
 
 impl Terminal {
     pub fn new(o: Options) -> Self {
@@ -197,7 +201,7 @@ impl Terminal {
             colors: [None; 3],
             replies: Vec::new(),
             reply_credit: REPLY_CREDIT,
-            events: Vec::new(),
+            events: VecDeque::new(),
         }
     }
 
@@ -216,7 +220,7 @@ impl Terminal {
     }
 
     pub fn take_events(&mut self, out: &mut Vec<Event>) {
-        out.append(&mut self.events);
+        out.extend(self.events.drain(..));
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -823,6 +827,29 @@ impl Terminal {
         }
     }
 
+    /// Queues `ev` for the host. Only the newest title and directory
+    /// matter and pending bells ring once, so each replaces the one
+    /// already queued and a flood of them costs the host a single update.
+    /// Past [`MAX_EVENTS`] the oldest event is dropped.
+    fn event(&mut self, ev: Event) {
+        if matches!(ev, Event::Title(_) | Event::Cwd(_) | Event::Bell) {
+            // At most one of each is queued, and in a flood it was the
+            // last one pushed, so searching from the back is quick.
+            let kind = std::mem::discriminant(&ev);
+            if let Some(i) = self
+                .events
+                .iter()
+                .rposition(|e| std::mem::discriminant(e) == kind)
+            {
+                self.events.remove(i);
+            }
+        }
+        if self.events.len() >= MAX_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(ev);
+    }
+
     /// CPR and DECXCPR. Rows count from the top margin in origin mode.
     fn report_cursor(&mut self, private: &str) {
         let top = if self.cur.origin { self.top } else { 0 };
@@ -1030,7 +1057,7 @@ impl Handler for Terminal {
         self.changed = true;
         self.cluster = None;
         match c0 {
-            0x07 => self.events.push(Event::Bell),
+            0x07 => self.event(Event::Bell),
             0x08 => {
                 self.cur.x = self.cur.x.saturating_sub(1);
                 self.cur.pending_wrap = false;
@@ -1285,7 +1312,7 @@ impl Handler for Terminal {
             },
             _ => return,
         };
-        self.events.push(ev);
+        self.event(ev);
     }
 
     fn dcs_hook(&mut self, _p: &Params, _inter: &[u8], _fin: u8) {}
