@@ -63,8 +63,8 @@ pub fn prompt_mark(body: &str) -> Option<PromptMark> {
 }
 
 /// The local path in an OSC 7 `file://host/path` URL, percent-decoded.
-/// `file:///C:/x` gives `C:\x`; on Windows `file://srv/share/x` gives the
-/// UNC path `\\srv\share\x`.
+/// `file:///C:/x` gives `C:\x`. On Windows a URL naming another host gives
+/// nothing: its path is not on this machine.
 pub fn file_url_path(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
     let (host, path) = rest.split_at(rest.find('/')?);
@@ -74,9 +74,26 @@ pub fn file_url_path(url: &str) -> Option<String> {
         return Some(path[1..].replace('/', "\\"));
     }
     if cfg!(windows) && !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
-        return Some(format!("\\\\{host}{}", path.replace('/', "\\")));
+        return None;
     }
     Some(path)
+}
+
+/// Longest working directory kept, in bytes.
+const MAX_CWD: usize = 4096;
+
+/// Whether a reported working directory is a plain local path: a drive
+/// path such as `C:\x`, or outside Windows a path from a single `/`. Any
+/// program can report one, and the host looks in it for a git branch and
+/// starts new shells there, so UNC, device and relative paths are
+/// refused: just looking at `\\host\share` makes Windows sign in to that
+/// host.
+pub fn local_dir(p: &str) -> bool {
+    let b = p.as_bytes();
+    let drive =
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    let root = !cfg!(windows) && b.first() == Some(&b'/') && b.get(1) != Some(&b'/');
+    (drive || root) && p.len() <= MAX_CWD && !p.chars().any(char::is_control)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -239,13 +256,33 @@ mod tests {
         );
         assert_eq!(p("file:///bad%zz%4").as_deref(), Some("/bad%zz%4"));
         if cfg!(windows) {
-            assert_eq!(
-                p("file://srv/share/x%20y").as_deref(),
-                Some("\\\\srv\\share\\x y")
-            );
+            assert_eq!(p("file://srv/share/x%20y"), None);
         }
         assert_eq!(p("http://x/y"), None);
         assert_eq!(p("file://host-only"), None);
+    }
+
+    #[test]
+    fn local_dirs() {
+        assert!(local_dir(r"C:\Users\me"));
+        assert!(local_dir("d:/x"));
+        assert!(local_dir(r"C:\"));
+        assert_eq!(local_dir("/home/me"), !cfg!(windows));
+        for p in [
+            r"\\srv\share",
+            "//srv/share",
+            r"\\?\UNC\srv\share",
+            r"\??\UNC\srv\share",
+            r"\\.\pipe\x",
+            "C:x",
+            r"..\x",
+            "",
+            "C:\\a\u{1b}b",
+        ] {
+            assert!(!local_dir(p), "{p:?}");
+        }
+        assert!(local_dir(&format!("C:{}", r"\a".repeat(2000))));
+        assert!(!local_dir(&format!("C:{}", r"\a".repeat(3000))));
     }
 
     #[test]

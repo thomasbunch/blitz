@@ -120,6 +120,26 @@ fn cwd_from_osc7() {
 }
 
 #[test]
+fn cwd_must_be_local() {
+    // Looking at a share makes Windows sign in to its host, and a long
+    // path is slow to search for a git branch.
+    let long = format!("\x1b]9;9;C:{}\x07", "\\a".repeat(5000));
+    for s in [
+        "\x1b]9;9;\\\\192.0.2.1\\s\x07",
+        "\x1b]9;9;\"//192.0.2.1/s\"\x07",
+        "\x1b]9;9;\\\\?\\UNC\\192.0.2.1\\s\x07",
+        "\x1b]9;9;work\\x\x07",
+        "\x1b]7;file:///C:/a%1Bb\x07",
+        &long,
+    ] {
+        assert_eq!(events(s), []);
+    }
+    if cfg!(windows) {
+        assert_eq!(events("\x1b]7;file://192.0.2.1/s/x\x07"), []);
+    }
+}
+
+#[test]
 fn prompt_marks() {
     let ev = events(concat!(
         "\x1b]133;D;1\x07\x1b]133;A;blitz=1\x07$ \x1b]133;B\x07ls\r\n",

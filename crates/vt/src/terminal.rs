@@ -1259,8 +1259,8 @@ impl Handler for Terminal {
         let ev = match cmd {
             "0" | "2" => Event::Title(osc::clean(body, MAX_TITLE)),
             "7" => match osc::file_url_path(body) {
-                Some(p) => Event::Cwd(p),
-                None => return,
+                Some(p) if osc::local_dir(&p) => Event::Cwd(p),
+                _ => return,
             },
             "8" => return self.set_link(body),
             "9" => match osc::classify_osc9(body) {
@@ -1269,7 +1269,8 @@ impl Handler for Terminal {
                     body: osc::clean(text, MAX_NOTIFY_BODY),
                 },
                 Osc9::Progress { state, pct } => Event::Progress { state, pct },
-                Osc9::Cwd(p) => Event::Cwd(p.to_owned()),
+                Osc9::Cwd(p) if osc::local_dir(p) => Event::Cwd(p.to_owned()),
+                Osc9::Cwd(_) => return,
                 Osc9::PromptStart => Event::Prompt(PromptMark::A { blitz: false }),
                 Osc9::Ignore => return,
             },
