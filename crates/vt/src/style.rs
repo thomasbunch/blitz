@@ -55,6 +55,9 @@ pub struct Styles {
     /// Link `n` is `links[n - 1]`.
     links: Vec<Link>,
     link_map: HashMap<Link, u32>,
+    /// Styles and links asked for since the last compaction that were not
+    /// in the table yet.
+    misses: usize,
 }
 
 impl Default for Styles {
@@ -71,16 +74,18 @@ impl Styles {
             map: HashMap::from([(d, 0)]),
             links: Vec::new(),
             link_map: HashMap::new(),
+            misses: 0,
         }
     }
 
     /// Returns the id for `s`, adding it if needed. When the table is full
-    /// a new style falls back to id 0; check [`Styles::is_full`] and
+    /// a new style falls back to id 0; check [`Styles::wants_compact`] and
     /// [`Styles::compact`] first.
     pub fn intern(&mut self, s: Style) -> u16 {
         if let Some(&id) = self.map.get(&s) {
             return id;
         }
+        self.misses += 1;
         let Ok(id) = u16::try_from(self.list.len()) else {
             return 0;
         };
@@ -105,6 +110,7 @@ impl Styles {
         if let Some(&n) = self.link_map.get(&link) {
             return n;
         }
+        self.misses += 1;
         if self.links.len() >= MAX_LINKS {
             return 0;
         }
@@ -119,10 +125,15 @@ impl Styles {
         self.links.get((n as usize).checked_sub(1)?)
     }
 
-    /// True once a new style or link might not fit. The terminal should
-    /// then call [`Styles::compact`] before interning more.
-    pub fn is_full(&self) -> bool {
-        self.list.len() > usize::from(u16::MAX) || self.links.len() >= MAX_LINKS
+    /// True once a new style or link might not fit and enough new ones
+    /// were asked for since the last compaction to make another worth its
+    /// cost. The terminal should then call [`Styles::compact`] before
+    /// interning more. When every stored style is still in use a
+    /// compaction frees nothing, and repeating it for each new style would
+    /// rescan the whole scrollback every time.
+    pub fn wants_compact(&self) -> bool {
+        let full = self.list.len() > usize::from(u16::MAX) || self.links.len() >= MAX_LINKS;
+        full && self.misses >= COMPACT_MISSES
     }
 
     /// Drops every style not in `live` and every link no kept style uses,
@@ -144,7 +155,8 @@ impl Styles {
         let old = std::mem::take(&mut self.list);
         let old_links = std::mem::take(&mut self.links);
         *self = Self::new();
-        old.into_iter()
+        let map = old
+            .into_iter()
             .zip(keep)
             .map(|(mut s, keep)| {
                 if !keep {
@@ -159,13 +171,20 @@ impl Styles {
                 };
                 self.intern(s)
             })
-            .collect()
+            .collect();
+        self.misses = 0;
+        map
     }
 }
 
 /// Distinct hyperlinks kept between compactions. A program that emits a
 /// fresh URI for every line would otherwise grow the table forever.
 const MAX_LINKS: usize = 1 << 16;
+
+/// New styles and links that must be asked for between two compactions of
+/// a full table; until then they fall back to the default style or no
+/// link.
+const COMPACT_MISSES: usize = 4096;
 
 #[cfg(test)]
 mod tests {
@@ -253,7 +272,7 @@ mod tests {
                 ..Style::default()
             });
         }
-        assert!(s.is_full());
+        assert!(s.wants_compact());
         assert_eq!(s.intern(fg(1)), 0);
 
         let keep = s.intern(Style {
@@ -261,8 +280,33 @@ mod tests {
             ..Style::default()
         });
         let map = s.compact([keep]);
-        assert!(!s.is_full());
+        assert!(!s.wants_compact());
         assert_eq!(map[keep as usize], 1);
         assert_eq!(s.intern(fg(1)), 2);
+    }
+
+    #[test]
+    fn compaction_that_frees_nothing_is_not_repeated_at_once() {
+        let mut s = Styles::new();
+        let rgb = |i: u16, b| {
+            let [hi, lo] = i.to_be_bytes();
+            Style {
+                fg: Color::Rgb(hi, lo, b),
+                ..Style::default()
+            }
+        };
+        let live: Vec<u16> = (0..u16::MAX).map(|i| s.intern(rgb(i, 0))).collect();
+        assert!(s.wants_compact());
+        s.compact(live);
+        // Still full, but scanning again right away would free nothing.
+        assert!(!s.wants_compact());
+        assert_eq!(s.intern(Style::default()), 0);
+        assert_eq!(s.intern(rgb(5, 0)), 6);
+        for i in 1..COMPACT_MISSES as u16 {
+            assert_eq!(s.intern(rgb(i, 1)), 0);
+            assert!(!s.wants_compact());
+        }
+        s.intern(rgb(0, 1));
+        assert!(s.wants_compact());
     }
 }

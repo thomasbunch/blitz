@@ -707,7 +707,7 @@ impl Terminal {
         let Some((params, uri)) = body.split_once(';') else {
             return;
         };
-        if self.styles.is_full() {
+        if self.styles.wants_compact() {
             self.compact_styles();
         }
         let id = params
@@ -881,7 +881,7 @@ impl Terminal {
     }
 
     fn sgr(&mut self, p: &Params) {
-        if self.styles.is_full() {
+        if self.styles.wants_compact() {
             self.compact_styles();
         }
         let v = p.as_slice();
