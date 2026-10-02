@@ -86,6 +86,22 @@ pub fn text_snapshot(text: &str, cols: u16, rows: u16, pal: &Palette) -> Snapsho
     }
 }
 
+/// Draws a pane without focus at reduced contrast: each cell's text moves a
+/// quarter of the way to its background. The cursor is hidden.
+pub fn dim(snap: &mut Snapshot) {
+    let toward = |fg: u32, bg: u32| {
+        let ch = |s: u32| {
+            let (f, b) = ((fg >> s & 0xff) as i32, (bg >> s & 0xff) as i32);
+            ((b + (f - b) * 3 / 4) as u32) << s
+        };
+        ch(16) | ch(8) | ch(0)
+    };
+    for c in &mut snap.cells {
+        c.fg = toward(c.fg, c.bg);
+    }
+    snap.cursor = None;
+}
+
 /// `blitz debug render`: renders a terminal screen offscreen and writes it
 /// to a BMP. Returns the process exit code.
 pub fn debug_render(args: &[String]) -> i32 {
@@ -701,6 +717,9 @@ mod gpu {
             }
             let mut snap = Snapshot::default();
             term.snapshot(&mut snap, &pal);
+            if id != web {
+                super::dim(&mut snap);
+            }
             snaps.push((rect, snap));
         }
         let chrome = chrome::build(&model);
@@ -822,6 +841,19 @@ mod tests {
         assert_eq!(t(3), b"b");
         assert_eq!(t(5), "\u{2500}".as_bytes());
         assert_eq!(s.cells[14].len, 0);
+    }
+
+    #[test]
+    fn dim_keeps_three_quarters_of_the_contrast() {
+        let mut s = text_snapshot("ab", 2, 1, &pal());
+        s.cells[0].fg = 0xffffff;
+        s.cells[0].bg = 0x000000;
+        s.cells[1].fg = 0x000000;
+        s.cells[1].bg = 0xffffff;
+        s.cursor = Some((0, 0, vt::CursorShape::Block));
+        dim(&mut s);
+        assert_eq!((s.cells[0].fg, s.cells[1].fg), (0xbfbfbf, 0x404040));
+        assert_eq!(s.cursor, None);
     }
 
     #[test]
