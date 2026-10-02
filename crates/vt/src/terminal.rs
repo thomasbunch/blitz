@@ -5,8 +5,8 @@ use std::time::Instant;
 use crate::grid::{Cell, Grid, Row, cf, rf};
 use crate::modes::InputModes;
 use crate::parser::{Handler, Params, Parser};
-use crate::snapshot::{CursorShape, Palette, RenderCell, Snapshot, attr};
-use crate::style::{Color, Style, Styles};
+use crate::snapshot::{self, CursorShape, Palette, RenderCell, Snapshot};
+use crate::style::{Color, Style, Styles, attr};
 use crate::width::cluster_width;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,22 +52,6 @@ pub enum Event {
     Progress { state: u8, pct: Option<u8> },
     Prompt(PromptMark),
     Hyperlink,
-}
-
-/// [`Style::attrs`] bits, as set by SGR.
-pub mod sgr {
-    pub const BOLD: u16 = 1 << 0;
-    pub const FAINT: u16 = 1 << 1;
-    pub const ITALIC: u16 = 1 << 2;
-    /// Underline kind, 3 bits: 0 none, 1 single, 2 double, 3 curly,
-    /// 4 dotted, 5 dashed.
-    pub const UNDERLINE: u16 = 0b111 << UNDERLINE_SHIFT;
-    pub const UNDERLINE_SHIFT: u16 = 3;
-    pub const BLINK: u16 = 1 << 6;
-    pub const INVERSE: u16 = 1 << 7;
-    pub const INVISIBLE: u16 = 1 << 8;
-    pub const STRIKE: u16 = 1 << 9;
-    pub const OVERLINE: u16 = 1 << 10;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -673,27 +657,27 @@ impl Terminal {
                         ..Style::default()
                     }
                 }
-                1 => *a |= sgr::BOLD,
-                2 => *a |= sgr::FAINT,
-                3 => *a |= sgr::ITALIC,
+                1 => *a |= attr::BOLD,
+                2 => *a |= attr::DIM,
+                3 => *a |= attr::ITALIC,
                 4 => {
                     let kind = if subs > 0 { v[i + 1].min(5) } else { 1 };
-                    *a = (*a & !sgr::UNDERLINE) | kind << sgr::UNDERLINE_SHIFT;
+                    *a = (*a & !attr::UNDERLINE) | kind << attr::UNDERLINE_SHIFT;
                 }
-                5 | 6 => *a |= sgr::BLINK,
-                7 => *a |= sgr::INVERSE,
-                8 => *a |= sgr::INVISIBLE,
-                9 => *a |= sgr::STRIKE,
-                21 => *a = (*a & !sgr::UNDERLINE) | 2 << sgr::UNDERLINE_SHIFT,
-                22 => *a &= !(sgr::BOLD | sgr::FAINT),
-                23 => *a &= !sgr::ITALIC,
-                24 => *a &= !sgr::UNDERLINE,
-                25 => *a &= !sgr::BLINK,
-                27 => *a &= !sgr::INVERSE,
-                28 => *a &= !sgr::INVISIBLE,
-                29 => *a &= !sgr::STRIKE,
-                53 => *a |= sgr::OVERLINE,
-                55 => *a &= !sgr::OVERLINE,
+                5 | 6 => *a |= attr::BLINK,
+                7 => *a |= attr::INVERSE,
+                8 => *a |= attr::INVISIBLE,
+                9 => *a |= attr::STRIKE,
+                21 => *a = (*a & !attr::UNDERLINE) | 2 << attr::UNDERLINE_SHIFT,
+                22 => *a &= !(attr::BOLD | attr::DIM),
+                23 => *a &= !attr::ITALIC,
+                24 => *a &= !attr::UNDERLINE,
+                25 => *a &= !attr::BLINK,
+                27 => *a &= !attr::INVERSE,
+                28 => *a &= !attr::INVISIBLE,
+                29 => *a &= !attr::STRIKE,
+                53 => *a |= attr::OVERLINE,
+                55 => *a &= !attr::OVERLINE,
                 n @ 30..=37 => s.fg = Color::Idx((n - 30) as u8),
                 n @ 40..=47 => s.bg = Color::Idx((n - 40) as u8),
                 n @ 90..=97 => s.fg = Color::Idx((n - 90 + 8) as u8),
@@ -978,19 +962,19 @@ fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> R
     let a = style.attrs;
     let mut fg = pal.resolve(style.fg, pal.fg);
     let mut bg = pal.resolve(style.bg, pal.bg);
-    if a & sgr::INVERSE != 0 {
+    if a & attr::INVERSE != 0 {
         std::mem::swap(&mut fg, &mut bg);
     }
-    if a & sgr::INVISIBLE != 0 {
+    if a & attr::INVISIBLE != 0 {
         fg = bg;
     }
     let mut attrs = 0;
     for (from, to) in [
-        (sgr::BOLD, attr::BOLD),
-        (sgr::ITALIC, attr::ITALIC),
-        (sgr::UNDERLINE, attr::UNDERLINE),
-        (sgr::INVERSE, attr::INVERSE),
-        (sgr::FAINT, attr::DIM),
+        (attr::BOLD, snapshot::attr::BOLD),
+        (attr::ITALIC, snapshot::attr::ITALIC),
+        (attr::UNDERLINE, snapshot::attr::UNDERLINE),
+        (attr::INVERSE, snapshot::attr::INVERSE),
+        (attr::DIM, snapshot::attr::DIM),
     ] {
         if a & from != 0 {
             attrs |= to;
