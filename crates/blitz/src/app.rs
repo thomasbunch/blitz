@@ -1546,6 +1546,7 @@ impl ApplicationHandler<UserEvent> for App {
 /// - `resize W H`: resize the window to W by H pixels.
 /// - `wheel N X Y`: turn the wheel N notches (up is positive) over the
 ///   client pixel X, Y.
+/// - `click X Y`: click the left button at the client pixel X, Y.
 /// - `snap`: print the screen.
 /// - `sleep MS`, `note TEXT`.
 mod selftest {
@@ -1558,7 +1559,8 @@ mod selftest {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
         KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
-        MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY, VkKeyScanW,
+        MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+        MapVirtualKeyW, SendInput, VIRTUAL_KEY, VkKeyScanW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, SWP_NOMOVE, SWP_NOZORDER, SetCursorPos, SetForegroundWindow,
@@ -1639,7 +1641,18 @@ mod selftest {
                 let [n, x, y] = v[..] else {
                     return Err("wheel N X Y".into());
                 };
-                wheel(hwnd, num(n)?, num(x)?, num(y)?)?;
+                let notches: i32 = num(n)?;
+                mouse(
+                    hwnd,
+                    num(x)?,
+                    num(y)?,
+                    &[(MOUSEEVENTF_WHEEL, notches * 120)],
+                )?;
+            }
+            "click" => {
+                let (x, y) = rest.trim().split_once(' ').ok_or("click X Y")?;
+                let press = [(MOUSEEVENTF_LEFTDOWN, 0), (MOUSEEVENTF_LEFTUP, 0)];
+                mouse(hwnd, num(x)?, num(y)?, &press)?;
             }
             "resize" => {
                 let (w, h) = rest.trim().split_once(' ').ok_or("resize W H")?;
@@ -1762,24 +1775,36 @@ mod selftest {
         Ok(())
     }
 
-    fn wheel(hwnd: isize, notches: i32, x: i32, y: i32) -> Result<(), String> {
+    /// Moves the pointer to the client pixel (`x`, `y`) and sends mouse
+    /// events there, each a flag and its data.
+    fn mouse(
+        hwnd: isize,
+        x: i32,
+        y: i32,
+        events: &[(MOUSE_EVENT_FLAGS, i32)],
+    ) -> Result<(), String> {
         to_front(hwnd)?;
         let mut pt = POINT { x, y };
-        let input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    mouseData: (notches * 120) as u32,
-                    dwFlags: MOUSEEVENTF_WHEEL,
-                    ..Default::default()
+        let inputs: Vec<INPUT> = events
+            .iter()
+            .map(|&(flags, data)| INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        mouseData: data as u32,
+                        dwFlags: flags,
+                        ..Default::default()
+                    },
                 },
-            },
-        };
-        // SAFETY: a live window, a valid point and one mouse input.
+            })
+            .collect();
+        // SAFETY: a live window, a valid point and valid mouse inputs.
         unsafe {
             let _ = ClientToScreen(HWND(hwnd as *mut _), &mut pt);
             SetCursorPos(pt.x, pt.y).map_err(|e| format!("cursor: {e}"))?;
-            if SendInput(&[input], size_of::<INPUT>() as i32) != 1 {
+            // Let the window see the pointer arrive first.
+            std::thread::sleep(Duration::from_millis(50));
+            if SendInput(&inputs, size_of::<INPUT>() as i32) as usize != inputs.len() {
                 return Err("SendInput failed".into());
             }
         }
