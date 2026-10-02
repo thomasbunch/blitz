@@ -1,6 +1,5 @@
 //! Screen goldens: synthetic byte streams and the screen they must leave.
 
-use vt::parser::{Handler, Params};
 use vt::snapshot::attr;
 use vt::{Options, Palette, RenderCell, Snapshot, Terminal};
 
@@ -15,75 +14,26 @@ const PAL: Palette = Palette {
     ],
 };
 
-/// Splits `s` into the `Handler` calls the parser makes: printable runs, C0
-/// controls, `ESC <inter> <final>` and `CSI [marker] <params> <inter>
-/// <final>` with `;` and `:` separators.
-fn drive(t: &mut Terminal, s: &str) {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            0x1b if b.get(i + 1) == Some(&b'[') => {
-                i += 2;
-                let mut inter = Vec::new();
-                if matches!(b[i], b'?' | b'>' | b'<' | b'=') {
-                    inter.push(b[i]);
-                    i += 1;
-                }
-                let mut p = Params::default();
-                let (mut cur, mut colon, mut any) = (0u16, false, false);
-                while matches!(b[i], b'0'..=b'9' | b';' | b':') {
-                    any = true;
-                    if b[i].is_ascii_digit() {
-                        cur = cur * 10 + u16::from(b[i] - b'0');
-                    } else {
-                        p.push(cur, colon);
-                        (cur, colon) = (0, b[i] == b':');
-                    }
-                    i += 1;
-                }
-                if any {
-                    p.push(cur, colon);
-                }
-                while (0x20..=0x2f).contains(&b[i]) {
-                    inter.push(b[i]);
-                    i += 1;
-                }
-                t.csi(&p, &inter, b[i]);
-                i += 1;
-            }
-            0x1b => {
-                i += 1;
-                let start = i;
-                while (0x20..=0x2f).contains(&b[i]) {
-                    i += 1;
-                }
-                t.esc(&b[start..i], b[i]);
-                i += 1;
-            }
-            c if c < 0x20 => {
-                t.execute(c);
-                i += 1;
-            }
-            _ => {
-                let end = b[i..]
-                    .iter()
-                    .position(|&c| c < 0x20)
-                    .map_or(b.len(), |k| i + k);
-                t.print(&s[i..end]);
-                i = end;
-            }
-        }
-    }
+fn feed(t: &mut Terminal, s: &str) {
+    t.feed(s.as_bytes());
 }
 
+/// A terminal fed `s` in one piece, after checking that feeding it a byte
+/// at a time leaves the same screen.
 fn run(cols: u16, rows: u16, s: &str) -> Terminal {
-    let mut t = Terminal::new(Options {
+    let o = Options {
         cols,
         rows,
         ..Options::default()
-    });
-    drive(&mut t, s);
+    };
+    let (mut t, mut bytewise) = (Terminal::new(o), Terminal::new(o));
+    t.feed(s.as_bytes());
+    for b in s.as_bytes() {
+        bytewise.feed(std::slice::from_ref(b));
+    }
+    assert_eq!(t.screen_text(), bytewise.screen_text());
+    assert_eq!(t.scrollback_text(), bytewise.scrollback_text());
+    assert_eq!(t.cursor(), bytewise.cursor());
     t
 }
 
@@ -167,7 +117,7 @@ fn wide_cjk_at_the_last_column() {
     assert_eq!(cell(&s, 1, 1).width, 0);
 
     // Overwriting the right half blanks the left half.
-    drive(&mut t, "\x1b[2;2HZ");
+    feed(&mut t, "\x1b[2;2HZ");
     assert_eq!(t.screen_text(), "abcdefghi\n Zx\n");
 
     // A wide character that just fits sets pending wrap like any other.
@@ -180,7 +130,7 @@ fn region_pump_pushes_into_scrollback() {
     // A transcript scrolled inside rows 1-7 above a fixed status line.
     let mut t = run(20, 10, "\x1b[10;1Hstatus\x1b[1;7r");
     for i in 1..=50 {
-        drive(&mut t, &format!("line {i}\r\n"));
+        feed(&mut t, &format!("line {i}\r\n"));
     }
     assert_eq!(t.screen_text(), format!("{}\n\n\n\nstatus", lines(45..=50)));
     assert_eq!(t.scrollback_text(), lines(1..=44));
@@ -188,7 +138,7 @@ fn region_pump_pushes_into_scrollback() {
     // A region that does not start at the top keeps nothing.
     let mut t = run(20, 10, "\x1b[2;7r");
     for i in 1..=50 {
-        drive(&mut t, &format!("line {i}\r\n"));
+        feed(&mut t, &format!("line {i}\r\n"));
     }
     assert_eq!(t.scrollback_text(), "");
 }
@@ -202,7 +152,7 @@ fn scrollback_is_capped() {
         ambiguous_wide: false,
     });
     for i in 1..=500 {
-        drive(&mut t, &format!("line {i}\r\n"));
+        feed(&mut t, &format!("line {i}\r\n"));
     }
     assert_eq!(t.scrollback_text(), lines(397..=496));
 }
@@ -210,21 +160,21 @@ fn scrollback_is_capped() {
 #[test]
 fn alt_screen_round_trip() {
     let mut t = run(20, 5, "hello\r\nworld\x1b[31m");
-    drive(&mut t, "\x1b[?1049h");
+    feed(&mut t, "\x1b[?1049h");
     assert!(t.input_modes().alt_screen);
     assert_eq!(t.screen_text(), "\n\n\n\n");
-    drive(&mut t, "\x1b[HALT\x1b[0m");
+    feed(&mut t, "\x1b[HALT\x1b[0m");
     for _ in 0..10 {
-        drive(&mut t, "x\n");
+        feed(&mut t, "x\n");
     }
     assert_eq!(t.scrollback_text(), "", "the alt screen has no scrollback");
-    drive(&mut t, "\x1b[?1049l");
+    feed(&mut t, "\x1b[?1049l");
     assert!(!t.input_modes().alt_screen);
     assert_eq!(t.screen_text(), "hello\nworld\n\n\n");
     assert_eq!(t.cursor(), (5, 1, true));
-    drive(&mut t, "!");
+    feed(&mut t, "!");
     assert_eq!(cell(&snap(&mut t), 5, 1).fg, PAL.ansi[1], "SGR restored");
-    drive(&mut t, "\x1b[?1049h");
+    feed(&mut t, "\x1b[?1049h");
     assert_eq!(t.screen_text(), "\n\n\n\n", "entering clears");
 }
 
@@ -233,11 +183,11 @@ fn modes_47_1047_1048() {
     let mut t = run(10, 3, "main\x1b[?47hALT\x1b[?47l");
     assert_eq!(t.screen_text(), "main\n\n");
     assert_eq!(t.cursor(), (7, 0, true), "47 does not move the cursor");
-    drive(&mut t, "\x1b[?47h");
+    feed(&mut t, "\x1b[?47h");
     assert_eq!(t.screen_text(), "    ALT\n\n", "47 does not clear");
-    drive(&mut t, "\x1b[?1047l\x1b[?1047h");
+    feed(&mut t, "\x1b[?1047l\x1b[?1047h");
     assert_eq!(t.screen_text(), "\n\n", "leaving 1047 clears");
-    drive(
+    feed(
         &mut t,
         "\x1b[?1047l\x1b[1;2H\x1b[?1048h\x1b[3;5H\x1b[?1048l",
     );
@@ -248,18 +198,18 @@ fn modes_47_1047_1048() {
 fn erase_scrollback_with_csi_3_j() {
     let mut t = run(10, 3, "");
     for i in 0..20 {
-        drive(&mut t, &format!("{i}\r\n"));
+        feed(&mut t, &format!("{i}\r\n"));
     }
     assert!(!t.scrollback_text().is_empty());
     let screen = t.screen_text();
-    drive(&mut t, "\x1b[3J");
+    feed(&mut t, "\x1b[3J");
     assert_eq!(t.scrollback_text(), "");
     assert_eq!(t.screen_text(), screen);
 
     // How full-screen programs redraw after a resize.
-    drive(&mut t, "\x1b[r\x1b[2J\x1b[3J\x1b[H");
+    feed(&mut t, "\x1b[r\x1b[2J\x1b[3J\x1b[H");
     for i in 0..5 {
-        drive(&mut t, &format!("{i}\r\n"));
+        feed(&mut t, &format!("{i}\r\n"));
     }
     assert_eq!(t.scrollback_text(), "0\n1\n2");
     assert_eq!(t.screen_text(), "3\n4\n");
@@ -269,7 +219,7 @@ fn erase_scrollback_with_csi_3_j() {
 fn pending_wrap_and_autowrap() {
     let mut t = run(5, 3, "abcde");
     assert_eq!(t.cursor(), (4, 0, true));
-    drive(&mut t, "\rX");
+    feed(&mut t, "\rX");
     assert_eq!(t.screen_text(), "Xbcde\n\n");
     assert_eq!(run(5, 3, "abcdefg").screen_text(), "abcde\nfg\n");
     assert_eq!(run(5, 3, "\x1b[?7labcdefg").screen_text(), "abcdg\n\n");
@@ -294,13 +244,13 @@ fn cursor_movement() {
 #[test]
 fn erase_and_edit_in_line() {
     let mut t = run(10, 3, "0123456789\r\nabcdefghij\r\nABCDEFGHIJ");
-    drive(&mut t, "\x1b[1;3H\x1b[K\x1b[2;3H\x1b[1K\x1b[3;5H\x1b[2X");
+    feed(&mut t, "\x1b[1;3H\x1b[K\x1b[2;3H\x1b[1K\x1b[3;5H\x1b[2X");
     assert_eq!(t.screen_text(), "01\n   defghij\nABCD  GHIJ");
-    drive(&mut t, "\x1b[2@");
+    feed(&mut t, "\x1b[2@");
     assert_eq!(t.screen_text(), "01\n   defghij\nABCD    GH");
-    drive(&mut t, "\x1b[3P");
+    feed(&mut t, "\x1b[3P");
     assert_eq!(t.screen_text(), "01\n   defghij\nABCD GH");
-    drive(&mut t, "\x1b[2;5H\x1b[J\x1b[1;2H\x1b[1J");
+    feed(&mut t, "\x1b[2;5H\x1b[J\x1b[1;2H\x1b[1J");
     assert_eq!(t.screen_text(), "\n   d\n");
 }
 
@@ -314,17 +264,17 @@ fn erase_uses_the_current_background() {
 #[test]
 fn lines_scrolling_and_repeat() {
     let mut t = run(5, 5, "a\r\nb\r\nc\r\nd\r\ne\x1b[2;4r");
-    drive(&mut t, "\x1b[3;1H\x1b[L");
+    feed(&mut t, "\x1b[3;1H\x1b[L");
     assert_eq!(t.screen_text(), "a\nb\n\nc\ne");
-    drive(&mut t, "\x1b[M");
+    feed(&mut t, "\x1b[M");
     assert_eq!(t.screen_text(), "a\nb\nc\n\ne");
-    drive(&mut t, "\x1b[S");
+    feed(&mut t, "\x1b[S");
     assert_eq!(t.screen_text(), "a\nc\n\n\ne");
-    drive(&mut t, "\x1b[T");
+    feed(&mut t, "\x1b[T");
     assert_eq!(t.screen_text(), "a\n\nc\n\ne");
-    drive(&mut t, "\x1b[2;1H\x1bM");
+    feed(&mut t, "\x1b[2;1H\x1bM");
     assert_eq!(t.screen_text(), "a\n\n\nc\ne");
-    drive(&mut t, "\x1b[r\x1b[4;1HX\x1b[3b");
+    feed(&mut t, "\x1b[r\x1b[4;1HX\x1b[3b");
     assert_eq!(t.screen_text(), "a\n\n\nXXXX\ne");
     assert_eq!(t.scrollback_text(), "");
 }
@@ -335,11 +285,11 @@ fn save_restore_and_resets() {
     assert_eq!(t.cursor(), (3, 1, true));
     assert_eq!(cell(&snap(&mut t), 2, 1).fg, PAL.ansi[1]);
 
-    drive(&mut t, "\x1b[2;3r\x1b[!p\x1b[3;1HZ\n");
+    feed(&mut t, "\x1b[2;3r\x1b[!p\x1b[3;1HZ\n");
     assert_eq!(cell(&snap(&mut t), 0, 1).fg, PAL.fg, "DECSTR resets SGR");
     assert_eq!(t.scrollback_text(), "X", "DECSTR resets the margins");
 
-    drive(&mut t, "\x1b[?25l\x1bc");
+    feed(&mut t, "\x1b[?25l\x1bc");
     assert_eq!(t.screen_text(), "\n\n");
     assert_eq!(t.scrollback_text(), "");
     assert_eq!(t.cursor(), (0, 0, true));
@@ -381,7 +331,7 @@ fn clusters_that_change_width() {
 fn insert_mode() {
     let mut t = run(6, 1, "abc\x1b[4h\x1b[1GXY");
     assert_eq!(t.screen_text(), "XYabc");
-    drive(&mut t, "\x1b[4lZ");
+    feed(&mut t, "\x1b[4lZ");
     assert_eq!(t.screen_text(), "XYZbc");
 }
 
@@ -389,13 +339,13 @@ fn insert_mode() {
 fn viewport_follows_its_text() {
     let mut t = run(10, 3, "");
     for i in 0..10 {
-        drive(&mut t, &format!("{i}\r\n"));
+        feed(&mut t, &format!("{i}\r\n"));
     }
     t.scroll_viewport(2);
     let s = snap(&mut t);
     assert_eq!(text(&cell(&s, 0, 0)), "6");
     assert_eq!(s.cursor, None);
-    drive(&mut t, "x\r\n");
+    feed(&mut t, "x\r\n");
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "6");
     t.scroll_viewport(-100);
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "9");
@@ -407,7 +357,7 @@ fn snapshot_reports_changes() {
     let mut s = Snapshot::default();
     assert!(t.snapshot(&mut s, &PAL));
     assert!(!t.snapshot(&mut s, &PAL));
-    drive(&mut t, "!");
+    feed(&mut t, "!");
     assert!(t.snapshot(&mut s, &PAL));
 }
 
@@ -420,6 +370,6 @@ fn resize_keeps_the_cursor_row() {
     assert_eq!(t.cursor(), (1, 2, true));
     t.resize(12, 4);
     assert_eq!(t.screen_text(), "c\nd\ne\n");
-    drive(&mut t, "\x1b[4;12HZ");
+    feed(&mut t, "\x1b[4;12HZ");
     assert_eq!(t.screen_text(), "c\nd\ne\n           Z");
 }
