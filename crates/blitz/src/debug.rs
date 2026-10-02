@@ -25,6 +25,7 @@
 //!   Claude Code draws one after its `>` prompt.
 //! - `save NAME`: store the cursor row; later lines expand `${NAME}`.
 //! - `snap LABEL`: print the screen.
+//! - `history LABEL`: print the scrollback, then the screen.
 //! - `resize COLS ROWS`: resize the pseudoconsole and the screen.
 //! - `latency N TEXT`: send TEXT N times and time how long each takes to
 //!   come back.
@@ -550,6 +551,14 @@ impl Runner {
                 let screen = self.s.lock().term.screen_text();
                 println!("--- snap {rest} ---\n{screen}");
                 self.s.note(&format!("snap {rest}"));
+            }
+            "history" => {
+                let text = {
+                    let st = self.s.lock();
+                    st.term.scrollback_text() + "\n" + &st.term.screen_text()
+                };
+                println!("--- history {rest} ---\n{text}");
+                self.s.note(&format!("history {rest}"));
             }
             "resize" => {
                 let (cols, rows) = two(rest)?;
