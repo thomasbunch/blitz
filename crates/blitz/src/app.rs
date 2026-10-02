@@ -59,6 +59,8 @@ const FLASH_GAP: Duration = Duration::from_secs(10);
 /// How long a restored pane waits for its shell's first prompt before it
 /// types the Claude Code resume command anyway.
 const RESUME_AFTER: Duration = Duration::from_secs(3);
+/// Lines of output saved per pane when `restore_scrollback` is on.
+const SAVED_LINES: usize = 1000;
 /// Lines scrolled per wheel notch when the program takes no mouse input.
 const WHEEL_LINES: isize = 3;
 
@@ -574,7 +576,7 @@ impl App {
         if !self.views.is_empty() && grids.iter().any(small) {
             return Err("no room for another pane".into());
         }
-        self.spawn(id, &grids, cmd, cwd)?;
+        self.spawn(id, &grids, cmd, cwd, None)?;
         self.install(win);
         Ok(())
     }
@@ -584,8 +586,13 @@ impl App {
     fn restore(&mut self, s: &session::State) -> Result<(), String> {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
+        let keys = leaf_keys(&win);
         for (id, meta) in panes {
-            if let Err(e) = self.spawn(id, &grids, None, start_dir(&meta.cwd)) {
+            let old = (self.config.restore_scrollback)
+                .then(|| keys.iter().find(|k| k.0 == id))
+                .flatten()
+                .and_then(|&(_, tab, leaf)| session::load_output(tab, leaf));
+            if let Err(e) = self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()) {
                 self.views.clear();
                 return Err(e);
             }
@@ -603,19 +610,26 @@ impl App {
     }
 
     /// Starts a session for pane `id`, sized as `grids` lays it out (or
-    /// 80x24 while hidden), running `cmd` or else the shell.
+    /// 80x24 while hidden), running `cmd` or else the shell, below `old`,
+    /// output saved by [`session::save_output`].
     fn spawn(
         &mut self,
         id: PaneId,
         grids: &[(PaneId, (i32, i32))],
         cmd: Option<&str>,
         cwd: Option<PathBuf>,
+        old: Option<&str>,
     ) -> Result<(), String> {
         let fit = |n: i32| n.clamp(1, i32::from(u16::MAX)) as u16;
         let grid = grids
             .iter()
             .find(|g| g.0 == id)
             .map_or((80, 24), |&(_, (c, r))| (fit(c), fit(r)));
+        // The first line of saved output says when it was saved.
+        let restored = old.map_or_else(Vec::new, |o| {
+            let (stamp, text) = o.split_once('\n').unwrap_or(("", o));
+            crate::pane::restored(text, stamp, grid.1)
+        });
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         let launch = match cmd {
             Some(c) => crate::shell::Launch {
@@ -642,6 +656,7 @@ impl App {
                 dark: self.dark,
                 parent: Some(self.hwnd),
                 token: &token,
+                restored: &restored,
             },
             move |id, note| {
                 let _ = proxy.send_event(UserEvent::Pane(id, note));
@@ -1663,6 +1678,10 @@ impl App {
             }
         };
         let mut s = session::State::capture(&self.win, self.placed, meta);
+        // Output changes all the time, so it is saved only at exit.
+        if force {
+            self.save_output();
+        }
         let same = self.saved.as_ref().is_some_and(|old| {
             (old.sidebar_expanded, old.active, &old.tabs) == (s.sidebar_expanded, s.active, &s.tabs)
         });
@@ -1694,6 +1713,33 @@ impl App {
         }
         // Kept even when the write failed, so it is not retried every turn.
         self.saved = Some(s);
+    }
+
+    /// Saves each pane's recent output when `restore_scrollback` is on, and
+    /// deletes what an earlier run saved when it is off.
+    fn save_output(&self) {
+        let stamp = local_stamp();
+        let keys = if self.config.restore_scrollback {
+            leaf_keys(&self.win)
+        } else {
+            Vec::new()
+        };
+        let panes: Vec<_> = (keys.into_iter())
+            .filter_map(|(id, tab, leaf)| {
+                let term = lock(&self.view(id)?.pane.term);
+                let mut text = term.scrollback_text();
+                // A full-screen program's screen is not output.
+                if !term.input_modes().alt_screen {
+                    text.push('\n');
+                    text += &term.screen_text();
+                }
+                let text = last_lines(&text, SAVED_LINES);
+                (!text.is_empty()).then(|| (tab, leaf, format!("{stamp}\n{text}")))
+            })
+            .collect();
+        if let Err(e) = session::save_output(&panes) {
+            eprintln!("blitz: saving output: {e}");
+        }
     }
 
     /// The soonest time something on screen changes by itself.
@@ -1788,6 +1834,30 @@ fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
 fn resume_line(enabled: bool, claude: Option<&str>) -> Option<String> {
     let id = claude.filter(|id| enabled && crate::hook::is_session_id(id))?;
     Some(format!("claude --resume {id}\r"))
+}
+
+/// Every pane of `win` with its tab and leaf index, which its saved output
+/// is filed under.
+fn leaf_keys(win: &layout::Window) -> Vec<(PaneId, usize, usize)> {
+    (win.tabs.iter().enumerate())
+        .flat_map(|(t, tab)| (tab.panes().into_iter().enumerate()).map(move |(l, id)| (id, t, l)))
+        .collect()
+}
+
+/// The last `n` lines of `text`, without blank lines at either end.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.trim_matches('\n').lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// The local time as `2026-10-02 14:32`.
+fn local_stamp() -> String {
+    // SAFETY: plain Win32 call with no arguments.
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute
+    )
 }
 
 /// Where a new pane starts: `cwd` if it is still a directory, else the
@@ -2595,5 +2665,33 @@ mod tests {
         ] {
             assert_eq!(resume_line(true, Some(bad)), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn saved_output_keeps_the_last_lines() {
+        assert_eq!(last_lines("\n\na\nb\nc\n\n\n", 2), "b\nc");
+        assert_eq!(last_lines("a\n\nb", 10), "a\n\nb");
+        assert_eq!(last_lines("  a\n", 10), "  a");
+        assert_eq!(last_lines("\n\n", 10), "");
+    }
+
+    #[test]
+    fn leaf_keys_follow_tabs_and_tree_order() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut a = Tab::new("a".into(), PaneId(1));
+        assert!(a.split(layout::Dir::Right, PaneId(2), area, (1, 1)));
+        let win = layout::Window {
+            tabs: vec![a, Tab::new("b".into(), PaneId(3))],
+            ..Default::default()
+        };
+        assert_eq!(
+            leaf_keys(&win),
+            [(PaneId(1), 0, 0), (PaneId(2), 0, 1), (PaneId(3), 1, 0)]
+        );
     }
 }

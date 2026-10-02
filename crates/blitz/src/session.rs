@@ -180,11 +180,43 @@ pub fn save(s: &State) -> io::Result<()> {
     std::fs::rename(tmp, dir.join("session.json"))
 }
 
-/// Forgets the session, so the next start is fresh.
+/// Forgets the session and its saved output, so the next start is fresh.
 pub fn clear() {
     if let Some(f) = file() {
         let _ = std::fs::remove_file(f);
     }
+    let _ = save_output(&[]);
+}
+
+/// Where each pane's saved output goes: `<tab>-<leaf>.txt`, by the same
+/// indexes as the session.
+fn output_dir() -> Option<PathBuf> {
+    dir().map(|d| d.join("scrollback"))
+}
+
+/// The saved output of leaf `leaf` of tab `tab`.
+pub fn load_output(tab: usize, leaf: usize) -> Option<String> {
+    std::fs::read_to_string(output_dir()?.join(format!("{tab}-{leaf}.txt"))).ok()
+}
+
+/// Replaces every pane's saved output with `panes`, as (tab, leaf, text).
+/// None deletes it all.
+pub fn save_output(panes: &[(usize, usize, String)]) -> io::Result<()> {
+    let dir =
+        output_dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
+    // Panes that closed since the last save must not come back.
+    match std::fs::remove_dir_all(&dir) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    if panes.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir)?;
+    for (tab, leaf, text) in panes {
+        std::fs::write(dir.join(format!("{tab}-{leaf}.txt")), text)?;
+    }
+    Ok(())
 }
 
 pub fn to_json(s: &State) -> String {

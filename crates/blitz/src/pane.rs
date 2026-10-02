@@ -74,6 +74,8 @@ pub struct Spawn<'a> {
     pub parent: Option<isize>,
     /// From [`crate::pty::pane_token`]; exported as `BLITZ_PANE_TOKEN`.
     pub token: &'a str,
+    /// Fed to the screen before the child starts: [`restored`] output.
+    pub restored: &'a [u8],
 }
 
 impl Pane {
@@ -91,6 +93,7 @@ impl Pane {
         });
         term.set_theme(s.dark);
         term.set_prompt_token(s.token);
+        term.feed(s.restored);
         let term = Arc::new(Mutex::new(term));
         let dirty = Arc::new(AtomicBool::new(false));
         let (t, d) = (term.clone(), dirty.clone());
@@ -358,6 +361,7 @@ mod tests {
                 dark: true,
                 parent: None,
                 token: "t",
+                restored: &[],
             },
             move |id, n| {
                 let _ = tx.send((id, n));
@@ -397,6 +401,7 @@ mod tests {
                 dark: true,
                 parent: None,
                 token: "t",
+                restored: &[],
             },
             move |_, n| {
                 // Stands in for a parser panic, once all output is on screen.
