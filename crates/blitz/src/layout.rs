@@ -172,6 +172,52 @@ impl Node {
         Some(panes)
     }
 
+    /// How many panes sit side by side along `axis` on the busiest line
+    /// through this node.
+    fn span(&self, axis: Axis) -> i32 {
+        match self {
+            Node::Leaf(_) => 1,
+            Node::Split(s) => {
+                let (a, b) = (s.a.span(axis), s.b.span(axis));
+                if s.axis == axis { a + b } else { a.max(b) }
+            }
+        }
+    }
+
+    /// Moves the divider of the innermost split along `axis` above `p` by
+    /// `delta` pixels, stopping where a pane on either side would drop
+    /// below `min`. Returns whether there is such a split.
+    fn resize(&mut self, p: PaneId, axis: Axis, delta: i32, area: Rect, min: (i32, i32)) -> bool {
+        let Node::Split(s) = self else {
+            return false;
+        };
+        let (ra, _, rb) = area.cut(s.axis, s.ratio);
+        let inner = if s.a.contains(p) {
+            s.a.resize(p, axis, delta, ra, min)
+        } else if s.b.contains(p) {
+            s.b.resize(p, axis, delta, rb, min)
+        } else {
+            return false;
+        };
+        if inner || s.axis != axis {
+            return inner;
+        }
+        let (free, unit) = match axis {
+            Axis::Row => (area.w - DIVIDER, min.0),
+            Axis::Column => (area.h - DIVIDER, min.1),
+        };
+        let least = |n: &Node| {
+            let k = n.span(axis);
+            k * unit + (k - 1) * DIVIDER
+        };
+        let (lo, hi) = (least(&s.a), free - least(&s.b));
+        if free > 0 && lo <= hi {
+            let now = (free as f32 * s.ratio).round() as i32;
+            s.ratio = (now + delta).clamp(lo, hi) as f32 / free as f32;
+        }
+        true
+    }
+
     fn walk(&self, area: Rect, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Rect>) {
         match self {
             Node::Leaf(p) => panes.push((*p, area)),
@@ -312,6 +358,21 @@ impl Tab {
         };
         self.focus(p);
         true
+    }
+
+    /// Moves the nearest divider above the focused pane that runs across
+    /// `dir`, by `px` pixels toward `dir`. No pane is squeezed below `min`.
+    /// Returns false if no split above the focused pane has that axis.
+    pub fn resize(&mut self, dir: Dir, px: i32, area: Rect, min: (i32, i32)) -> bool {
+        let delta = match dir {
+            Dir::Right | Dir::Down => px,
+            Dir::Left | Dir::Up => -px,
+        };
+        let found = self.root.resize(self.focus, dir.axis(), delta, area, min);
+        if found {
+            self.zoom = None;
+        }
+        found
     }
 
     /// Removes `p` and gives its space to its sibling. If `p` had focus, the
@@ -492,6 +553,42 @@ mod tests {
         t.focus(PaneId(1));
         assert!(t.focus_dir(Dir::Right, AREA));
         assert_eq!(t.focus, PaneId(2));
+    }
+
+    #[test]
+    fn resize_moves_the_nearest_matching_divider() {
+        let mut t = four();
+        // Above 4, the nearest row split is 3 | 4; the root is untouched.
+        assert!(t.resize(Dir::Left, 10, AREA, MIN));
+        let rects = t.rects(AREA);
+        assert_eq!(rects[0].1, r(0, 0, 500, 601));
+        assert_eq!(rects[2].1, r(501, 301, 240, 300));
+        assert_eq!(rects[3].1, r(742, 301, 259, 300));
+        // The nearest column split is 2 over (3 | 4).
+        assert!(t.resize(Dir::Up, 100, AREA, MIN));
+        assert_eq!(t.rects(AREA)[1].1, r(501, 0, 500, 200));
+        // From 2, the nearest row split is the root.
+        t.focus(PaneId(2));
+        assert!(t.resize(Dir::Right, 50, AREA, MIN));
+        assert_eq!(t.rects(AREA)[0].1, r(0, 0, 550, 601));
+    }
+
+    #[test]
+    fn resize_keeps_every_pane_above_the_minimum() {
+        let mut t = four();
+        t.focus(PaneId(1));
+        // 3 and 4 sit side by side on the right, which therefore needs
+        // 80 + 1 + 80 px.
+        assert!(t.resize(Dir::Right, 10_000, AREA, MIN));
+        let rects = t.rects(AREA);
+        assert_eq!(rects[0].1.w, 1000 - 161);
+        assert_eq!((rects[2].1.w, rects[3].1.w), (80, 80));
+        assert!(t.resize(Dir::Left, 10_000, AREA, MIN));
+        assert_eq!(t.rects(AREA)[0].1.w, 80);
+        // Nothing is stacked above or below pane 1.
+        let before = t.clone();
+        assert!(!t.resize(Dir::Up, 10, AREA, MIN));
+        assert_eq!(t, before);
     }
 
     #[test]
