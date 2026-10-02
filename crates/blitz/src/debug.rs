@@ -361,13 +361,15 @@ struct Runner {
 
 impl Runner {
     fn start(o: &Opts) -> Result<Runner, String> {
+        let token = crate::pty::pane_token().map_err(|e| e.to_string())?;
         let (cmdline, mut env) = match &o.cmd {
             Some(c) => (c.clone(), Vec::new()),
             None => {
-                let l = crate::shell::launch("", &[], true);
+                let l = crate::shell::launch("", &[], true, &token);
                 (l.cmdline, l.env)
             }
         };
+        env.push(("BLITZ_PANE_TOKEN".into(), token.clone()));
         env.extend(o.setenv.iter().cloned());
         let log = match &o.trace {
             Some(path) => Some(
@@ -375,11 +377,12 @@ impl Runner {
             ),
             None => None,
         };
-        let term = Terminal::new(vt::Options {
+        let mut term = Terminal::new(vt::Options {
             cols: o.cols,
             rows: o.rows,
             ..Default::default()
         });
+        term.set_prompt_token(&token);
         let s = Arc::new(Shared {
             state: Mutex::new(State {
                 term,

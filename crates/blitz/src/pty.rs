@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HMODULE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::System::Console::COORD;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -139,6 +140,18 @@ pub fn inbox_notice() -> Option<&'static str> {
     (!bundled).then_some(
         "Using the Windows console host. Put conpty.dll and OpenConsole.exe next to blitz.exe for full support.",
     )
+}
+
+/// A new secret for one pane: 128 bits from the system's random number
+/// generator, in hex. The pane's child gets it as `BLITZ_PANE_TOKEN`, and
+/// blitz-hook and the shell integration put it in the sequences they print,
+/// so the pane can tell them apart from program output, which cannot read
+/// the environment.
+pub fn pane_token() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    // SAFETY: a valid buffer; this flag takes no algorithm handle.
+    unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }.ok()?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// What the reader thread reports.
@@ -668,5 +681,13 @@ mod tests {
         let got: Vec<Vec<u8>> = rx.try_iter().collect();
         assert_eq!(got.len(), 3);
         assert_eq!((&got[0][..], &got[2][..]), (&b"1"[..], &b"typed"[..]));
+    }
+
+    #[test]
+    fn pane_tokens_are_random_hex() {
+        let (a, b) = (pane_token().unwrap(), pane_token().unwrap());
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b);
     }
 }

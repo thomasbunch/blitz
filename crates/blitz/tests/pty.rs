@@ -166,11 +166,13 @@ fn pty_shells_print_prompt_marks() {
         if program == "cmd.exe" && std::env::var_os("PROMPT").is_some() {
             continue; // a user's own PROMPT is left alone
         }
-        let launch = blitz::shell::launch(program, &[], true);
-        let (_pty, _, rx) = spawn(&launch.cmdline, &launch.env);
+        let launch = blitz::shell::launch(program, &[], true, "5eed");
+        let mut env = launch.env.clone();
+        env.push(("BLITZ_PANE_TOKEN".into(), "5eed".into()));
+        let (_pty, _, rx) = spawn(&launch.cmdline, &env);
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut out = Vec::new();
-        while find(&out, b"]133;A;blitz=1").is_none() {
+        while find(&out, b"]133;A;blitz=5eed").is_none() {
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
                 Ok(Ok((_, chunk))) => out.extend(chunk),

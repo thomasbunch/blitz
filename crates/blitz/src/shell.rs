@@ -112,15 +112,15 @@ pub fn quote(arg: &str) -> String {
 
 /// Wraps the user's prompt with OSC 133 marks and reports the directory with
 /// OSC 7. Works on PowerShell 5.1 and 7, so it avoids `` `e ``. The A mark is
-/// tagged `blitz=1` so the terminal can tell it apart from marks that other
-/// programs print.
+/// tagged `blitz=<token>` with the pane's `BLITZ_PANE_TOKEN` so the terminal
+/// can tell it apart from marks that other programs print.
 pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
-  $global:__blitz = @{ Orig = $function:prompt; Exec = $false }
+  $global:__blitz = @{ Orig = $function:prompt; Exec = $false; Token = $env:BLITZ_PANE_TOKEN }
   function global:prompt {
     $ok = $global:?; $code = if ($ok) { 0 } elseif ($global:LASTEXITCODE) { $global:LASTEXITCODE } else { 1 }
     $e = [char]27; $b = [char]7; $s = ''
     if ($global:__blitz.Exec) { $s += "$e]133;D;$code$b"; $global:__blitz.Exec = $false }
-    $s += "$e]133;A;blitz=1$b"
+    $s += "$e]133;A;blitz=$($global:__blitz.Token)$b"
     if ($PWD.Provider.Name -eq 'FileSystem') { $s += "$e]7;" + ([Uri]::new($PWD.ProviderPath).AbsoluteUri) + $b }
     if (-not $ok) { Write-Error 'x' -ErrorAction Ignore }
     $s + (& $global:__blitz.Orig) + "$e]133;B$b"
@@ -134,8 +134,11 @@ pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
   }
 }"#;
 
-/// cmd's prompt with the same marks. cmd cannot report exit codes.
-pub const CMD_PROMPT: &str = r"$e]133;D$e\$e]133;A;blitz=1$e\$e]9;9;$P$e\$P$G$e]133;B$e\";
+/// cmd's prompt with the same marks. cmd cannot report exit codes, nor
+/// expand variables in its prompt, so the token is written in.
+pub fn cmd_prompt(token: &str) -> String {
+    format!(r"$e]133;D$e\$e]133;A;blitz={token}$e\$e]9;9;$P$e\$P$G$e]133;B$e\")
+}
 
 /// A command line ready for `CreateProcessW`, plus variables to add to the
 /// child's environment.
@@ -147,8 +150,9 @@ pub struct Launch {
 
 /// Builds the command line for `program` (empty means [`detect`]). Shell
 /// integration is added only when `integrate` is set and there are no user
-/// arguments; otherwise the command runs exactly as configured.
-pub fn launch(program: &str, args: &[String], integrate: bool) -> Launch {
+/// arguments; otherwise the command runs exactly as configured. `token` is
+/// the pane's `BLITZ_PANE_TOKEN`.
+pub fn launch(program: &str, args: &[String], integrate: bool, token: &str) -> Launch {
     let program = if program.is_empty() {
         detect()
     } else {
@@ -171,7 +175,7 @@ pub fn launch(program: &str, args: &[String], integrate: bool) -> Launch {
                 out.cmdline += &base64(&utf16);
             }
             Kind::Cmd if std::env::var_os("PROMPT").is_none() => {
-                out.env.push(("PROMPT".into(), CMD_PROMPT.into()));
+                out.env.push(("PROMPT".into(), cmd_prompt(token)));
             }
             _ => {}
         }
@@ -236,7 +240,7 @@ mod tests {
 
     #[test]
     fn launch_integration() {
-        let ps = launch(r"C:\Program Files\PowerShell\7\pwsh.exe", &[], true);
+        let ps = launch(r"C:\Program Files\PowerShell\7\pwsh.exe", &[], true, "t");
         let (head, b64) = ps.cmdline.rsplit_once(' ').unwrap();
         assert_eq!(
             head,
@@ -246,10 +250,10 @@ mod tests {
         // User arguments turn integration off.
         let args = ["-NoProfile".to_owned(), "a b".to_owned()];
         assert_eq!(
-            launch("pwsh.exe", &args, true).cmdline,
+            launch("pwsh.exe", &args, true, "t").cmdline,
             r#"pwsh.exe -NoProfile "a b""#
         );
-        assert_eq!(launch("pwsh.exe", &[], false).cmdline, "pwsh.exe");
+        assert_eq!(launch("pwsh.exe", &[], false, "t").cmdline, "pwsh.exe");
     }
 
     #[test]

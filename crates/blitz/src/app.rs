@@ -457,6 +457,7 @@ impl App {
             .iter()
             .find(|g| g.0 == id)
             .map_or((80, 24), |&(_, (c, r))| (fit(c), fit(r)));
+        let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         let launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
@@ -466,6 +467,7 @@ impl App {
                 &self.config.shell,
                 &self.config.shell_args,
                 self.config.shell_integration,
+                &token,
             ),
         };
         let proxy = self.proxy.clone();
@@ -480,6 +482,7 @@ impl App {
                 scrollback: self.config.scrollback_lines,
                 dark: self.dark,
                 parent: Some(self.hwnd),
+                token: &token,
             },
             move |id, note| {
                 let _ = proxy.send_event(UserEvent::Pane(id, note));

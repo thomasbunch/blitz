@@ -31,6 +31,9 @@ pub struct Pane {
     pub branch: Option<String>,
     /// Latest one-line message from a hook notification.
     pub msg: String,
+    /// The pane's `BLITZ_PANE_TOKEN`. Only hook notifications and prompt
+    /// marks that carry it are believed.
+    pub token: String,
     /// Set once the child has exited.
     pub exit_code: Option<u32>,
     /// Set by the reader thread when there is new output to draw.
@@ -65,6 +68,8 @@ pub struct Spawn<'a> {
     pub dark: bool,
     /// The window, which becomes the owner of the console's hidden window.
     pub parent: Option<isize>,
+    /// From [`crate::pty::pane_token`]; exported as `BLITZ_PANE_TOKEN`.
+    pub token: &'a str,
 }
 
 impl Pane {
@@ -81,6 +86,7 @@ impl Pane {
             ..Default::default()
         });
         term.set_theme(s.dark);
+        term.set_prompt_token(s.token);
         let term = Arc::new(Mutex::new(term));
         let dirty = Arc::new(AtomicBool::new(false));
         let (t, d) = (term.clone(), dirty.clone());
@@ -124,11 +130,13 @@ impl Pane {
                 notify(id, Note::Dead);
             }
         };
+        let mut env = s.env.to_vec();
+        env.push(("BLITZ_PANE_TOKEN".into(), s.token.into()));
         let pty = Pty::spawn(
             &SpawnOpts {
                 cmdline: s.cmdline,
                 cwd: s.cwd,
-                env: s.env,
+                env: &env,
                 cols: s.cols,
                 rows: s.rows,
                 pane_id: id.0,
@@ -146,6 +154,7 @@ impl Pane {
             cwd: s.cwd.map(|p| p.display().to_string()).unwrap_or_default(),
             branch: None,
             msg: String::new(),
+            token: s.token.into(),
             exit_code: None,
             dirty,
         })
@@ -293,6 +302,7 @@ mod tests {
                 scrollback: 100,
                 dark: true,
                 parent: None,
+                token: "t",
             },
             move |id, n| {
                 let _ = tx.send((id, n));
@@ -331,6 +341,7 @@ mod tests {
                 scrollback: 100,
                 dark: true,
                 parent: None,
+                token: "t",
             },
             move |_, n| {
                 // Stands in for a parser panic, once all output is on screen.
