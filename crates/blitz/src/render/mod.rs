@@ -1,5 +1,8 @@
 //! Turns terminal snapshots and window chrome into quads and draws them.
 
+// One process hosts every session, so a failed HRESULT must never panic.
+#![deny(clippy::unwrap_used)]
+
 pub mod atlas;
 pub mod builtin;
 #[cfg(windows)]
