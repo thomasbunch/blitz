@@ -177,8 +177,9 @@ mod gpu {
         }
 
         /// Adds `snap` with its top-left corner at (`x`, `y`). Cell colours
-        /// are used as given: the snapshot has already applied inverse,
-        /// dim and the palette.
+        /// are used as given (the snapshot has already applied inverse and
+        /// the palette), except that dim text is drawn halfway to its
+        /// background.
         pub fn snapshot(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
             let (cw, ch) = self.cell();
             let (cols, rows) = (usize::from(snap.cols), usize::from(snap.rows));
@@ -247,7 +248,13 @@ mod gpu {
                     let under_block = cursor.is_some_and(|(cc, cr, s)| {
                         (usize::from(cc), usize::from(cr)) == (c, r) && s == CursorShape::Block
                     });
-                    let fg = if under_block { pal.bg } else { cl.fg };
+                    let fg = if under_block {
+                        pal.bg
+                    } else if cl.attrs & attr::DIM != 0 {
+                        mix(cl.fg, cl.bg)
+                    } else {
+                        cl.fg
+                    };
                     if cl.attrs & attr::UNDERLINE != 0 {
                         let w = u32::from(cl.width.max(1)) * cw;
                         let uy = py(r) + self.font.underline_y;
@@ -344,6 +351,14 @@ mod gpu {
             self.gpu.draw(rtv, w, h, bg, &self.quads)?;
             Ok(self.overflowed)
         }
+    }
+
+    /// The colour halfway between two `0xRRGGBB` colours.
+    fn mix(a: u32, b: u32) -> u32 {
+        let [_, ar, ag, ab] = a.to_be_bytes();
+        let [_, br, bg, bb] = b.to_be_bytes();
+        let m = |x: u8, y: u8| u32::from(x.midpoint(y));
+        m(ar, br) << 16 | m(ag, bg) << 8 | m(ab, bb)
     }
 
     fn is_builtin(cl: &RenderCell) -> bool {
@@ -504,6 +519,21 @@ mod tests {
             .collect();
         assert!(first.iter().any(|&c| c != p.bg));
         assert_eq!(at(0, 0), p.bg);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_dim_text_is_halfway_to_its_background() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("\u{2588}\u{2588}", 2, 1, &p);
+        snap.cells[1].attrs = vt::snapshot::attr::DIM;
+        snap.cells[1].bg = 0x000000;
+        snap.cells[1].fg = 0xff8040;
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let i = ((ch / 2 * w + cw + cw / 2) * 4) as usize;
+        assert_eq!(&px[i..i + 3], &[0x20, 0x40, 0x7f], "BGR of #7f4020");
     }
 
     #[cfg(windows)]
