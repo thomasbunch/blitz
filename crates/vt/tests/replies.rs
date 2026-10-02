@@ -53,8 +53,9 @@ fn da2() {
 
 #[test]
 fn xtversion() {
-    assert_eq!(ask("\x1b[>0q"), "\x1bP>|blitz 0.1.0\x1b\\");
-    assert_eq!(ask("\x1b[>q"), "\x1bP>|blitz 0.1.0\x1b\\");
+    let want = format!("\x1bP>|blitz {}\x1b\\", env!("CARGO_PKG_VERSION"));
+    assert_eq!(ask("\x1b[>0q"), want);
+    assert_eq!(ask("\x1b[>q"), want);
 }
 
 #[test]
@@ -150,7 +151,13 @@ fn kitty_graphics_probe_is_swallowed() {
 #[test]
 fn claude_probe_batches_in_order() {
     let first = ask("\x1b[>0q\x1b[?u\x1b[c");
-    assert_eq!(first, "\x1bP>|blitz 0.1.0\x1b\\\x1b[?0u\x1b[?62;22c");
+    assert_eq!(
+        first,
+        format!(
+            "\x1bP>|blitz {}\x1b\\\x1b[?0u\x1b[?62;22c",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
     let second =
         ask("\x1b[?2026$p\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[?1016$p\x1b[c");
     assert_eq!(
