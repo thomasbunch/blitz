@@ -319,8 +319,13 @@ mod gpu {
                     let under_block = cursor.is_some_and(|(cc, cr, s)| {
                         (usize::from(cc), usize::from(cr)) == (c, r) && s == CursorShape::Block
                     });
+                    // Selected text is drawn in the theme's colour, so
+                    // text close to its background shows before it is
+                    // copied.
                     let fg = if under_block {
                         pal.bg
+                    } else if selected(c, r) {
+                        pal.fg
                     } else if cl.attrs & attr::DIM != 0 {
                         mix(cl.fg, cl.bg)
                     } else {
@@ -1032,6 +1037,21 @@ mod tests {
         // The wide character's ink reaches into its second cell.
         let ink = (0..ch).any(|y| (2 * cw..3 * cw).any(|x| at(x, y) != p.bg));
         assert!(ink, "wide glyph spans two cells");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_selection_shows_text_close_to_its_background() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("\u{2588}", 1, 1, &p);
+        snap.cells[0].fg = p.bg + 1;
+        snap.selection = Some(((0, 0), (0, 0)));
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let i = ((ch / 2 * w + cw / 2) * 4) as usize;
+        let at = u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]]);
+        assert_eq!(at, p.fg);
     }
 
     #[cfg(windows)]
