@@ -1,4 +1,5 @@
-//! Display width of grapheme clusters.
+//! Display width of grapheme clusters and the rules that join code points
+//! into one cluster.
 //!
 //! Widths follow what Claude Code measures with (`string-width` with
 //! ambiguous characters narrow): East Asian Wide and Fullwidth take two
@@ -14,8 +15,22 @@ const WIDTH_MASK: u8 = 0b11;
 const W_ZERO: u8 = 0;
 const W_WIDE: u8 = 2;
 const W_AMBIGUOUS: u8 = 3;
+const GCB_SHIFT: u8 = 2;
 const EXT_PICT: u8 = 1 << 6;
 const EMOJI: u8 = 1 << 7;
+
+// Grapheme cluster break classes.
+const EXTEND: u8 = 1;
+const ZWJ: u8 = 2;
+const SPACING_MARK: u8 = 3;
+const PREPEND: u8 = 4;
+const RI: u8 = 5;
+const L: u8 = 6;
+const V: u8 = 7;
+const T: u8 = 8;
+const LV: u8 = 9;
+const LVT: u8 = 10;
+const CONTROL: u8 = 11;
 
 const VS16: char = '\u{FE0F}';
 
@@ -23,6 +38,10 @@ fn props(c: char) -> u8 {
     let cp = c as usize;
     let block = usize::from(tables::STAGE1[cp >> tables::SHIFT]);
     tables::STAGE2[(block << tables::SHIFT) | (cp & ((1 << tables::SHIFT) - 1))]
+}
+
+fn gcb(c: char) -> u8 {
+    (props(c) >> GCB_SHIFT) & 0xF
 }
 
 fn is_emoji_modifier(c: char) -> bool {
@@ -77,9 +96,50 @@ pub fn chars_width(cluster: impl IntoIterator<Item = char>, ambiguous_wide: bool
     if cps.any(widens) { 2 } else { w }
 }
 
+/// Whether `c` continues the grapheme cluster that starts with `first`,
+/// ends with `last` and holds `len` code points.
+///
+/// These are the UAX #29 pair rules plus regional-indicator pairs, which
+/// covers combining marks, emoji sequences, flags and Hangul jamo. It is
+/// not full UAX #29: the emoji ZWJ rule only checks the first code point,
+/// and Indic conjuncts (GB9c) split. Move to the full state machine if a
+/// script needs those.
+pub fn joins(first: char, last: char, len: usize, c: char) -> bool {
+    match (gcb(last), gcb(c)) {
+        (CONTROL, _) | (_, CONTROL) => false,
+        (_, EXTEND | ZWJ | SPACING_MARK) | (PREPEND, _) => true,
+        (L, L | V | LV | LVT) | (LV | V, V | T) | (LVT | T, T) => true,
+        (ZWJ, _) => props(first) & EXT_PICT != 0 && props(c) & EXT_PICT != 0,
+        (RI, RI) => len == 1,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Splits `s` into clusters with [`joins`].
+    fn clusters(s: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        let (mut first, mut last, mut len) = ('\0', '\0', 0);
+        for (i, c) in s.char_indices() {
+            if len > 0 && joins(first, last, len, c) {
+                last = c;
+                len += 1;
+                continue;
+            }
+            if len > 0 {
+                out.push(&s[start..i]);
+            }
+            (start, first, last, len) = (i, c, c, 1);
+        }
+        if len > 0 {
+            out.push(&s[start..]);
+        }
+        out
+    }
 
     #[test]
     fn width_basics() {
@@ -143,5 +203,27 @@ mod tests {
         assert_eq!(char_width('中'), 2);
         assert_eq!(char_width('★'), 1);
         assert_eq!(char_width('\u{1F3FB}'), 2, "modifier on its own");
+    }
+
+    #[test]
+    fn width_joins_clusters() {
+        assert_eq!(clusters("abc"), ["a", "b", "c"]);
+        assert_eq!(clusters("e\u{0301}x"), ["e\u{0301}", "x"]);
+        assert_eq!(clusters("❤\u{FE0F}!"), ["❤\u{FE0F}", "!"]);
+        assert_eq!(
+            clusters("👨\u{200D}👩\u{200D}👧👍\u{1F3FD}"),
+            ["👨\u{200D}👩\u{200D}👧", "👍\u{1F3FD}"]
+        );
+        assert_eq!(clusters("🇺🇸🇬🇧🇫"), ["🇺🇸", "🇬🇧", "🇫"]);
+        // A joiner after plain text does not glue the next emoji on.
+        assert_eq!(clusters("a\u{200D}😀"), ["a\u{200D}", "😀"]);
+        // Conjoining jamo: L V T builds one syllable.
+        assert_eq!(
+            clusters("\u{1100}\u{1161}\u{11A8}가"),
+            ["\u{1100}\u{1161}\u{11A8}", "가"]
+        );
+        assert_eq!(clusters("a\u{1B}\u{0301}"), ["a", "\u{1B}", "\u{0301}"]);
+        assert_eq!(clusters("\u{0600}1"), ["\u{0600}1"], "prepend");
+        assert_eq!(clusters("क\u{093E}"), ["क\u{093E}"], "spacing mark");
     }
 }
