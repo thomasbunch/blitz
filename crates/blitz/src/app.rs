@@ -1545,13 +1545,56 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
                 // A blank, or hidden text: a space for each column.
                 0 => line.extend(std::iter::repeat_n(' ', usize::from(cell.width))),
                 n => {
-                    line.push_str(std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" "))
+                    let text = std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" ");
+                    push_drawn(&mut line, text, cell.width);
                 }
             }
         }
         lines.push(line.trim_end().to_owned());
     }
     lines.join("\r\n")
+}
+
+/// Adds a cell's text as the screen shows it, so a copy carries nothing
+/// the user could not see. Characters that draw nothing (joiners,
+/// variation selectors, tags, invisible format characters) are left out,
+/// except a VS16 right after an emoji and a joiner right before one. So is
+/// everything after the first character of a joined cluster that is not an
+/// emoji sequence, since only that character is drawn. Fillers and other
+/// invisible characters that take a cell become spaces.
+fn push_drawn(line: &mut String, text: &str, width: u8) {
+    use vt::width::{char_width, is_emoji, is_ignorable};
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return;
+    };
+    if matches!(first, '\u{A0}' | '\u{2800}') || is_ignorable(first) {
+        line.extend(std::iter::repeat_n(' ', usize::from(width.max(1))));
+        return;
+    }
+    line.push(first);
+    let rest = chars.as_str();
+    let shows = |c| char_width(c) > 0;
+    let emoji = rest.chars().any(shows)
+        && rest
+            .chars()
+            .all(|c| matches!(c, '\u{200D}' | '\u{FE0F}') || shows(c));
+    if rest.contains('\u{200D}') && !emoji {
+        return;
+    }
+    let mut prev = first;
+    let mut rest = rest.chars().peekable();
+    while let Some(c) = rest.next() {
+        let keep = match c {
+            '\u{FE0F}' => is_emoji(prev),
+            '\u{200D}' => rest.peek().is_some_and(|&n| is_emoji(n)),
+            c => !is_ignorable(c),
+        };
+        if keep {
+            line.push(c);
+        }
+        prev = c;
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -2025,6 +2068,43 @@ mod tests {
         );
         let s = fed(4, 1, "\x1b[8m\u{4e2d}\x1b[0mx");
         assert_eq!(selection_text(&s, ((0, 0), (3, 0))), "  x");
+    }
+
+    #[test]
+    fn app_selection_copies_only_what_is_drawn() {
+        let copy = |bytes: &str| selection_text(&fed(40, 1, bytes), ((0, 0), (39, 0)));
+        assert_eq!(copy("ls\u{E0069}\u{E0067}\u{E006E}x"), "lsx", "tags");
+        assert_eq!(copy("a\u{E0100}\u{FE00}b"), "ab", "variation selectors");
+        assert_eq!(
+            copy("a\u{200D}\u{301}\u{302}b"),
+            "ab",
+            "marks after a joiner"
+        );
+        assert_eq!(copy("a\u{200D}b"), "ab", "a lone joiner");
+        assert_eq!(copy("x\u{3164}y\u{2800}z\u{A0}w"), "x  y z w", "fillers");
+        assert_eq!(copy("x\u{AD}y"), "x y", "soft hyphen");
+        for s in [
+            "a\u{200C}\u{200C}\u{200C}b",
+            "a\u{34F}b",
+            "a\u{180B}\u{180F}b",
+            "a\u{17B4}\u{17B5}b",
+            "a\u{FE0E}\u{FE0F}b",
+            "a\u{2060}\u{FEFF}b",
+        ] {
+            assert_eq!(copy(s), "ab", "{s:?}");
+        }
+        assert_eq!(copy("\u{2764}\u{FE0F}\u{FE0F}"), "\u{2764}\u{FE0F}");
+        // Text that draws keeps everything.
+        for s in [
+            "e\u{301}",
+            "\u{2764}\u{FE0F}",
+            "1\u{FE0F}\u{20E3}",
+            "\u{1F44D}\u{1F3FD}",
+            "\u{1F468}\u{200D}\u{1F469}",
+            "\u{4e2d}",
+        ] {
+            assert_eq!(copy(s), s);
+        }
     }
 
     #[test]

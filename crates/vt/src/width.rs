@@ -62,6 +62,23 @@ pub fn char_width(c: char) -> u8 {
     }
 }
 
+/// Whether `c` has the Emoji property.
+pub fn is_emoji(c: char) -> bool {
+    props(c) & EMOJI != 0
+}
+
+/// Default_Ignorable_Code_Point: joiners, variation selectors, bidi and
+/// other format controls, fillers and tags, which draw nothing of their
+/// own.
+pub fn is_ignorable(c: char) -> bool {
+    matches!(c,
+        '\u{AD}' | '\u{34F}' | '\u{61C}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
+        | '\u{FFA0}' | '\u{FFF0}'..='\u{FFF8}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
 /// Columns a grapheme cluster occupies.
 ///
 /// This is the width of its first code point, raised to 2 when an emoji
