@@ -55,6 +55,8 @@ const WHEEL_LINES: isize = 3;
 #[derive(Debug)]
 pub enum UserEvent {
     Pane(PaneId, Note),
+    /// The git branch of a pane's directory, read on another thread.
+    Branch(PaneId, String, Option<String>),
     /// Exit with this code: the self-test finished, or `--exit-after`
     /// ran out.
     Finish(i32),
@@ -294,6 +296,8 @@ struct View {
     notice: Option<Notice>,
     /// When the taskbar last flashed for this session.
     flashed: Option<Instant>,
+    /// A thread is reading the git branch of the session's directory.
+    finding_branch: bool,
 }
 
 struct App {
@@ -485,7 +489,6 @@ impl App {
         let (cw, ch) = self.cell();
         lock(&pane.term).set_cell_px(cw as u16, ch as u16);
         pane.name = program_name(&launch.cmdline);
-        pane.branch = cwd.as_deref().and_then(git_branch);
         self.views.push(View {
             pane,
             snap: Snapshot::default(),
@@ -493,7 +496,9 @@ impl App {
             rect: None,
             notice: None,
             flashed: None,
+            finding_branch: false,
         });
+        self.find_branch(id);
         self.next_id = id.0 + 1;
         let before = self.focus_id();
         self.win = win;
@@ -1012,8 +1017,8 @@ impl App {
                 }
             }
             Event::Cwd(dir) => {
-                v.pane.branch = git_branch(Path::new(&dir));
                 v.pane.cwd = dir;
+                self.find_branch(id);
             }
             Event::Notify { title, body } => {
                 if let Some(ev) = Ev::from_notify(&title) {
@@ -1022,6 +1027,38 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Reads the git branch of session `id`'s directory on another thread,
+    /// so a slow drive never stalls every session. One read per session
+    /// runs at a time; a directory reported meanwhile is read after it.
+    fn find_branch(&mut self, id: PaneId) {
+        let proxy = self.proxy.clone();
+        let Some(v) = self.view_mut(id) else {
+            return;
+        };
+        if v.finding_branch || v.pane.cwd.is_empty() {
+            return;
+        }
+        v.finding_branch = true;
+        let dir = v.pane.cwd.clone();
+        std::thread::spawn(move || {
+            let branch = git_branch(Path::new(&dir));
+            let _ = proxy.send_event(UserEvent::Branch(id, dir, branch));
+        });
+    }
+
+    fn on_branch(&mut self, id: PaneId, dir: String, branch: Option<String>) {
+        let Some(v) = self.view_mut(id) else {
+            return;
+        };
+        v.finding_branch = false;
+        if v.pane.cwd == dir {
+            v.pane.branch = branch;
+            self.request_redraw();
+        } else {
+            self.find_branch(id);
         }
     }
 
@@ -1559,6 +1596,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Pane(id, note) => self.on_pane(el, id, note),
+            UserEvent::Branch(id, dir, branch) => self.on_branch(id, dir, branch),
             UserEvent::Finish(code) => {
                 self.code = code;
                 if self.args.capture.is_some() {

@@ -184,8 +184,7 @@ pub fn program_name(cmdline: &str) -> String {
 
 /// The branch checked out in the repository that holds `dir`, read from
 /// `.git/HEAD` without running git. A detached HEAD gives the short hash.
-// A few file reads on the UI thread per prompt; move them off it
-// if network drives make that slow.
+/// Blocks on the drive, so the app calls it off the UI thread.
 pub fn git_branch(dir: &Path) -> Option<String> {
     for d in dir.ancestors() {
         let git = d.join(".git");
