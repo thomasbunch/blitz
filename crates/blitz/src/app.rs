@@ -1201,6 +1201,25 @@ impl App {
         if steps == 0.0 {
             return;
         }
+        // Over another pane, the wheel scrolls that pane's history without
+        // moving focus.
+        // ponytail: programs in unfocused panes never get wheel reports;
+        // route them by pane if a full-screen app needs them.
+        let (under, side) = self.hit(self.mouse.pos);
+        if side {
+            return;
+        }
+        if let Some(v) = under
+            .filter(|&id| Some(id) != self.focus_id())
+            .and_then(|id| self.view(id))
+        {
+            let mut t = lock(&v.pane.term);
+            if !t.input_modes().alt_screen {
+                t.scroll_viewport(steps as isize * WHEEL_LINES);
+                self.request_redraw();
+            }
+            return;
+        }
         let mods = mods_now();
         if let Some(m) = self.mouse_to_program(&mods) {
             let kind = if steps > 0.0 {
