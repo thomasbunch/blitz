@@ -35,7 +35,8 @@ impl Default for Options {
 /// OSC 133 shell-integration marks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptMark {
-    /// Prompt start. `blitz` is set when the mark carries `blitz=1`.
+    /// Prompt start. `blitz` is set when the mark carries `blitz=<token>`
+    /// with the token the host gave [`Terminal::set_prompt_token`].
     A { blitz: bool },
     /// Command input start.
     B,
@@ -142,6 +143,8 @@ pub struct Terminal {
     /// Output bytes not yet spent on replies; see [`MAX_REPLIES`].
     reply_credit: usize,
     events: VecDeque<Event>,
+    /// The secret that marks blitz's own shell-integration prompts.
+    prompt_token: String,
 }
 
 /// Foreground, background and cursor colours of the default dark and
@@ -202,6 +205,7 @@ impl Terminal {
             replies: Vec::new(),
             reply_credit: REPLY_CREDIT,
             events: VecDeque::new(),
+            prompt_token: "1".into(),
         }
     }
 
@@ -339,6 +343,13 @@ impl Terminal {
     pub fn set_theme(&mut self, dark: bool) {
         self.dark = dark;
         self.pal = if dark { DARK } else { LIGHT };
+    }
+
+    /// The secret blitz's shell integration puts in its prompt marks, as
+    /// `133;A;blitz=<token>`. Only a mark with it resets input modes, so
+    /// program output cannot. Until this is called the token is `1`.
+    pub fn set_prompt_token(&mut self, token: &str) {
+        token.clone_into(&mut self.prompt_token);
     }
 
     /// Cell size in pixels, for size reports.
@@ -708,6 +719,7 @@ impl Terminal {
         std::mem::swap(&mut t.replies, &mut self.replies);
         t.reply_credit = self.reply_credit;
         std::mem::swap(&mut t.events, &mut self.events);
+        std::mem::swap(&mut t.prompt_token, &mut self.prompt_token);
         t.dark = self.dark;
         t.cell_px = self.cell_px;
         t.pal = self.pal;
@@ -1286,7 +1298,7 @@ impl Handler for Terminal {
             // Resets palette entries set with OSC 4, which is not
             // supported, so there is nothing to reset.
             "104" => return,
-            "133" => match osc::prompt_mark(body) {
+            "133" => match osc::prompt_mark(body, &self.prompt_token) {
                 // blitz's own shell integration marks its prompts, so a
                 // program that died in this shell left its modes behind.
                 // Other prompt starts are left alone: in screen-reader mode

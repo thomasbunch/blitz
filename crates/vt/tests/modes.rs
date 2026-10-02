@@ -192,6 +192,24 @@ fn other_prompts_keep_input_modes() {
 }
 
 #[test]
+fn only_the_hosts_token_marks_a_blitz_prompt() {
+    let mut t = leftovers();
+    t.set_prompt_token("9c1e");
+    for mark in ["133;A;blitz=1", "133;A;blitz=9c1", "133;A;blitz=9c1e0"] {
+        t.feed(format!("\x1b]{mark}\x07").as_bytes());
+        let m = t.input_modes();
+        assert!(m.bracketed && m.kitty == 1, "{mark}");
+    }
+    t.feed(b"\x1b]133;A;blitz=9c1e\x07");
+    assert_clean(&t);
+    // A program's reset does not bring back the default token.
+    t.feed(b"\x1bc");
+    t.feed(LEFTOVERS.as_bytes());
+    t.feed(b"\x1b]133;A;blitz=1\x07");
+    assert!(t.input_modes().bracketed);
+}
+
+#[test]
 fn ris_resets_input_modes() {
     let mut t = leftovers();
     t.feed(b"\x1b[?1h\x1bc\x1b[?1h");

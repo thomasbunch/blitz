@@ -47,13 +47,13 @@ pub fn classify_osc9(body: &str) -> Osc9<'_> {
 }
 
 /// Parses the text after `133;`. Extra `key=value` options are ignored,
-/// except that a prompt start tagged `blitz=1` comes from blitz's own
-/// shell integration.
-pub fn prompt_mark(body: &str) -> Option<PromptMark> {
+/// except that a prompt start tagged `blitz=<token>` comes from blitz's own
+/// shell integration. An empty token matches nothing.
+pub fn prompt_mark(body: &str, token: &str) -> Option<PromptMark> {
     let mut it = body.split(';');
     Some(match it.next()? {
         "A" => PromptMark::A {
-            blitz: it.any(|o| o == "blitz=1"),
+            blitz: !token.is_empty() && it.any(|o| o.strip_prefix("blitz=") == Some(token)),
         },
         "B" => PromptMark::B,
         "C" => PromptMark::C,
@@ -214,31 +214,47 @@ mod tests {
 
     #[test]
     fn prompt_marks() {
-        assert_eq!(prompt_mark("A"), Some(PromptMark::A { blitz: false }));
+        assert_eq!(prompt_mark("A", "1"), Some(PromptMark::A { blitz: false }));
         assert_eq!(
-            prompt_mark("A;blitz=1"),
+            prompt_mark("A;blitz=1", "1"),
             Some(PromptMark::A { blitz: true })
         );
         assert_eq!(
-            prompt_mark("A;redraw=0"),
+            prompt_mark("A;redraw=0", "1"),
             Some(PromptMark::A { blitz: false })
         );
         assert_eq!(
-            prompt_mark("A;aid=7;blitz=1"),
+            prompt_mark("A;aid=7;blitz=1", "1"),
             Some(PromptMark::A { blitz: true })
         );
         assert_eq!(
-            prompt_mark("A;blitz=10"),
+            prompt_mark("A;blitz=10", "1"),
             Some(PromptMark::A { blitz: false })
         );
-        assert_eq!(prompt_mark("B"), Some(PromptMark::B));
-        assert_eq!(prompt_mark("C"), Some(PromptMark::C));
-        assert_eq!(prompt_mark("D"), Some(PromptMark::D(None)));
-        assert_eq!(prompt_mark("D;0"), Some(PromptMark::D(Some(0))));
-        assert_eq!(prompt_mark("D;-1;aid=3"), Some(PromptMark::D(Some(-1))));
-        assert_eq!(prompt_mark("D;x"), Some(PromptMark::D(None)));
-        assert_eq!(prompt_mark("Z"), None);
-        assert_eq!(prompt_mark(""), None);
+        assert_eq!(prompt_mark("B", "1"), Some(PromptMark::B));
+        assert_eq!(prompt_mark("C", "1"), Some(PromptMark::C));
+        assert_eq!(prompt_mark("D", "1"), Some(PromptMark::D(None)));
+        assert_eq!(prompt_mark("D;0", "1"), Some(PromptMark::D(Some(0))));
+        assert_eq!(
+            prompt_mark("D;-1;aid=3", "1"),
+            Some(PromptMark::D(Some(-1)))
+        );
+        assert_eq!(prompt_mark("D;x", "1"), Some(PromptMark::D(None)));
+        assert_eq!(
+            prompt_mark("A;blitz=7f3a", "7f3a"),
+            Some(PromptMark::A { blitz: true })
+        );
+        // Only the host's token marks blitz's own prompt.
+        assert_eq!(
+            prompt_mark("A;blitz=1", "7f3a"),
+            Some(PromptMark::A { blitz: false })
+        );
+        assert_eq!(
+            prompt_mark("A;blitz=", ""),
+            Some(PromptMark::A { blitz: false })
+        );
+        assert_eq!(prompt_mark("Z", "1"), None);
+        assert_eq!(prompt_mark("", "1"), None);
     }
 
     #[test]
