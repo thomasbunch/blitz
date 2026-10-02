@@ -120,9 +120,26 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// `s` without control characters, cut to `max` characters. The parser
-/// already drops C0 controls inside an OSC; this catches C1.
+/// already drops C0 controls inside an OSC; this catches C1. Format
+/// characters and line separators go too: bidi overrides would let a
+/// window title read reversed, and invisible ones would let two labels
+/// that look the same differ.
 pub fn clean(s: &str, max: usize) -> String {
-    s.chars().filter(|c| !c.is_control()).take(max).collect()
+    s.chars()
+        .filter(|&c| !c.is_control() && !is_format(c))
+        .take(max)
+        .collect()
+}
+
+/// Unicode format characters (Cf) and the line and paragraph separators.
+fn is_format(c: char) -> bool {
+    matches!(c,
+        '\u{AD}' | '\u{600}'..='\u{605}' | '\u{61C}' | '\u{6DD}' | '\u{70F}'
+        | '\u{890}'..='\u{891}' | '\u{8E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
 }
 
 /// Parses an X11 colour spec: `#rgb`, `#rrggbb`, `#rrrgggbbb`,
@@ -327,5 +344,7 @@ mod tests {
     fn clean_drops_controls_and_caps() {
         assert_eq!(clean("a\u{9b}b\u{85}c", 10), "abc");
         assert_eq!(clean("ééééé", 3), "ééé");
+        let spoof = "\u{202E}gpj\u{2028}x\u{200B}y\u{E0041}";
+        assert_eq!(clean(spoof, 10), "gpjxy", "format characters");
     }
 }
