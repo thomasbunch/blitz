@@ -2532,12 +2532,12 @@ mod tests {
             Args::parse(&args).expect("parse")
         };
         assert_eq!(parse(&["--cwd", "C:\""]).cwd, Some(r"C:\".into()));
-        assert_eq!(parse(&["--cwd", r"C:oo"]).cwd, Some(r"C:oo".into()));
-        let a = parse(&["--new-window", "--cwd", r"C:oo"]);
+        assert_eq!(parse(&["--cwd", r"C:\foo"]).cwd, Some(r"C:\foo".into()));
+        let a = parse(&["--new-window", "--cwd", r"C:\foo"]);
         assert!(a.new_window);
-        assert_eq!(a.cwd, Some(r"C:oo".into()));
-        let a = parse(&["--cwd", r"C:oo", "--new-window"]);
+        assert_eq!(a.cwd, Some(r"C:\foo".into()));
+        let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
         assert!(a.new_window);
-        assert_eq!(a.cwd, Some(r"C:oo".into()));
+        assert_eq!(a.cwd, Some(r"C:\foo".into()));
     }
 }
