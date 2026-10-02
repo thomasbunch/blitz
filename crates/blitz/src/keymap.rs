@@ -190,6 +190,39 @@ mod msg_to_key_tests {
         (0x6e, ".", ".", ""),
     ];
 
+    /// German: AltGr+Q is `@`, Z and Y swap places, the keypad has a comma.
+    const DE: &[(u16, &str, &str, &str)] = &[
+        (0x51, "q", "Q", "@"),
+        (0x5a, "z", "Z", ""),
+        (0x6e, ",", ",", ""),
+    ];
+
+    /// Polish (214): AltGr+Q is a backslash.
+    const PL: &[(u16, &str, &str, &str)] = &[(0x51, "q", "Q", "\\")];
+
+    fn modes(kitty: u8, w32im: bool) -> vt::InputModes {
+        vt::InputModes {
+            kitty,
+            w32im,
+            ..Default::default()
+        }
+    }
+
+    /// What the terminal sends for one key message.
+    fn enc(
+        vk: u16,
+        lparam: isize,
+        s: &[u8; 256],
+        rows: &'static [(u16, &'static str, &'static str, &'static str)],
+        m: &vt::InputModes,
+    ) -> String {
+        let mut t = String::new();
+        let k = msg_to_key(vk, lparam, s, layout(rows), &mut t);
+        let mut out = Vec::new();
+        vt::encode_key(&k, m, &mut out);
+        String::from_utf8(out).unwrap()
+    }
+
     #[test]
     fn keymap_shift_enter_fields() {
         let mut t = String::new();
@@ -304,7 +337,6 @@ mod msg_to_key_tests {
     #[test]
     fn keymap_us_base_follows_the_key_position() {
         // German Z sits where US has Y.
-        const DE: &[(u16, &str, &str, &str)] = &[(0x5a, "z", "Z", "")];
         let mut t = String::new();
         let k = msg_to_key(
             0x5a,
@@ -329,5 +361,98 @@ mod msg_to_key_tests {
             &mut t,
         );
         assert_eq!(k.key, Key::F(12));
+    }
+
+    #[test]
+    fn keymap_shift_enter_with_kitty_flags() {
+        // Num Lock stays out of the report unless all keys are escapes.
+        let s = state(&[0xa0], &[0x90]);
+        let enter = lp(0x1c, false, true, 1);
+        assert_eq!(enc(0x0d, enter, &s, US, &modes(5, true)), "\x1b[13;2u");
+    }
+
+    #[test]
+    fn keymap_shift_enter_in_win32_input_mode() {
+        let m = modes(0, true);
+        let shift = state(&[0xa0], &[]);
+        let up = state(&[], &[]);
+        let seq = [
+            enc(0x10, lp(0x2a, false, true, 1), &shift, US, &m),
+            enc(0x0d, lp(0x1c, false, true, 1), &shift, US, &m),
+            enc(0x0d, lp(0x1c, false, false, 1), &shift, US, &m),
+            enc(0x10, lp(0x2a, false, false, 1), &up, US, &m),
+        ]
+        .concat();
+        assert_eq!(
+            seq,
+            "\x1b[16;42;0;1;16;1_\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_\x1b[16;42;0;0;0;1_"
+        );
+    }
+
+    #[test]
+    fn keymap_altgr_sends_text_without_modifiers() {
+        // AltGr is Left Ctrl plus Right Alt.
+        let altgr = state(&[0xa2, 0xa5], &[]);
+        let q = lp(0x10, false, true, 1);
+        for m in [modes(0, false), modes(1, false), modes(5, false)] {
+            assert_eq!(enc(0x51, q, &altgr, DE, &m), "@");
+            assert_eq!(enc(0x51, q, &altgr, PL, &m), "\\");
+        }
+        // The console record keeps the real control state.
+        assert_eq!(
+            enc(0x51, q, &altgr, DE, &modes(0, true)),
+            "\x1b[81;16;64;1;9;1_"
+        );
+        // A US layout has no AltGr, so Ctrl+Alt+Q stays a chord.
+        assert_eq!(enc(0x51, q, &altgr, US, &modes(0, false)), "\x1b\x11");
+        assert_eq!(enc(0x51, q, &altgr, US, &modes(1, false)), "\x1b[113;7u");
+    }
+
+    #[test]
+    fn keymap_numpad() {
+        let mut t = String::new();
+        // Num Lock on: the keypad types digits, and a comma on German.
+        let num = state(&[], &[0x90]);
+        let k = msg_to_key(0x67, lp(0x47, false, true, 1), &num, layout(US), &mut t);
+        assert_eq!(
+            (k.key, k.text, k.extended, k.us_base),
+            (Key::Char('7'), "7", false, None)
+        );
+        assert!(k.locks.num);
+        let k = msg_to_key(0x6e, lp(0x53, false, true, 1), &num, layout(DE), &mut t);
+        assert_eq!((k.key, k.text), (Key::Char(','), ","));
+        // Num Lock off: keypad 7 is Home without the extended bit; the Home
+        // key has it.
+        let k = msg_to_key(
+            0x24,
+            lp(0x47, false, true, 1),
+            &[0; 256],
+            layout(US),
+            &mut t,
+        );
+        assert_eq!((k.key, k.extended), (Key::Home, false));
+        let k = msg_to_key(0x24, lp(0x47, true, true, 1), &[0; 256], layout(US), &mut t);
+        assert_eq!((k.key, k.extended), (Key::Home, true));
+    }
+
+    #[test]
+    fn keymap_enhanced_bit() {
+        let none = [0; 256];
+        let kp_enter = lp(0x1c, true, true, 1);
+        assert_eq!(
+            enc(0x0d, kp_enter, &none, US, &modes(0, true)),
+            "\x1b[13;28;13;1;256;1_"
+        );
+        // Keypad Enter has its own kitty code only when all keys are escapes.
+        assert_eq!(
+            enc(0x0d, kp_enter, &none, US, &modes(9, false)),
+            "\x1b[57414u"
+        );
+        assert_eq!(enc(0x0d, kp_enter, &none, US, &modes(1, false)), "\r");
+        // The arrow keys outside the keypad carry it too.
+        assert_eq!(
+            enc(0x26, lp(0x48, true, true, 1), &none, US, &modes(0, true)),
+            "\x1b[38;72;0;1;256;1_"
+        );
     }
 }
