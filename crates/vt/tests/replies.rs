@@ -165,3 +165,29 @@ fn claude_probe_batches_in_order() {
         "\x1b[?2026;2$y\x1b[6;0;0t\x1b[?1016;0$y\x1b[?62;22c"
     );
 }
+
+#[test]
+fn pending_replies_are_bounded() {
+    let mut t = Terminal::new(opts());
+    let flood = "\x1b[c\x1b]10;?;?;?\x07".repeat(10_000);
+    let r = ask_on(&mut t, &flood);
+    assert!(r.len() < 4200, "{}", r.len());
+    assert!(r.ends_with('\x07') || r.ends_with('c'));
+    // More output makes room again.
+    t.feed(" ".repeat(100).as_bytes());
+    assert_eq!(ask_on(&mut t, "\x1b[5n"), "\x1b[0n");
+}
+
+/// The host takes replies after every read, and reads are small, so the
+/// limit must hold however the output is split. A reset must not refill it.
+#[test]
+fn replies_stay_a_share_of_output() {
+    let mut t = Terminal::new(opts());
+    let flood = "\x1bc\x1b[c\x1b]10;?;?;?\x07".repeat(10_000);
+    let mut total = 0;
+    for chunk in flood.as_bytes().chunks(11) {
+        t.feed(chunk);
+        total += replies_of(&mut t).len();
+    }
+    assert!(total <= flood.len() / 16 + 4096, "{total}");
+}

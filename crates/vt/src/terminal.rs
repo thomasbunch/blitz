@@ -138,6 +138,8 @@ pub struct Terminal {
     /// The same colours as set by the program with OSC 10, 11 and 12.
     colors: [Option<u32>; 3],
     replies: Vec<u8>,
+    /// Output bytes not yet spent on replies; see [`MAX_REPLIES`].
+    reply_credit: usize,
     events: Vec<Event>,
 }
 
@@ -151,6 +153,13 @@ const LIGHT: [u32; 3] = [0x2F3135, 0xFCFCFB, 0x141518];
 const MAX_TITLE: usize = 256;
 const MAX_NOTIFY_TITLE: usize = 64;
 const MAX_NOTIFY_BODY: usize = 256;
+
+/// Replies may use a sixteenth of the output, plus a reserve of this
+/// many bytes for the questions a program asks at startup; queries past
+/// that go unanswered. Output full of queries would otherwise type an
+/// unbounded stream of answers into the program's input.
+const MAX_REPLIES: usize = 4096;
+const REPLY_CREDIT: usize = 16 * MAX_REPLIES;
 
 impl Terminal {
     pub fn new(o: Options) -> Self {
@@ -187,12 +196,14 @@ impl Terminal {
             pal: DARK,
             colors: [None; 3],
             replies: Vec::new(),
+            reply_credit: REPLY_CREDIT,
             events: Vec::new(),
         }
     }
 
     /// Parses `bytes`, queueing replies and events.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.reply_credit = (self.reply_credit + bytes.len()).min(REPLY_CREDIT);
         // The parser calls back into `self`, so it is moved out meanwhile.
         let mut p = std::mem::take(&mut self.parser);
         p.advance(self, bytes);
@@ -691,6 +702,7 @@ impl Terminal {
         let mut t = Self::new(self.opts);
         // Queued output and what the host told us survive.
         std::mem::swap(&mut t.replies, &mut self.replies);
+        t.reply_credit = self.reply_credit;
         std::mem::swap(&mut t.events, &mut self.events);
         t.dark = self.dark;
         t.cell_px = self.cell_px;
@@ -729,7 +741,9 @@ impl Terminal {
         for (n, item) in (first..3).zip(body.split(';')) {
             if item == "?" {
                 let rgb = self.colors[n].unwrap_or(self.pal[n]);
+                let start = self.replies.len();
                 osc::color_reply(10 + n, rgb, bel, &mut self.replies);
+                self.charge_reply(start);
             } else if let Some(rgb) = osc::parse_color(item) {
                 self.colors[n] = Some(rgb);
                 self.changed = true;
@@ -793,8 +807,20 @@ impl Terminal {
     // ---- replies ----
 
     fn reply(&mut self, args: std::fmt::Arguments) {
+        let start = self.replies.len();
         // Writing to a Vec cannot fail.
         let _ = self.replies.write_fmt(args);
+        self.charge_reply(start);
+    }
+
+    /// Pays for the reply queued from `start`, or drops it when the output
+    /// so far has not earned it.
+    fn charge_reply(&mut self, start: usize) {
+        let cost = 16 * (self.replies.len() - start);
+        match self.reply_credit.checked_sub(cost) {
+            Some(left) => self.reply_credit = left,
+            None => self.replies.truncate(start),
+        }
     }
 
     /// CPR and DECXCPR. Rows count from the top margin in origin mode.
@@ -1104,14 +1130,14 @@ impl Handler for Terminal {
             ([], b'Z') => self.back_tab(n(0)),
             // DA1. Never claim 28 (rectangular editing): ConPTY would
             // start sending DECCRA and DECFRA.
-            ([], b'c') if p.get(0) == 0 => self.replies.extend_from_slice(b"\x1b[?62;22c"),
-            ([b'>'], b'c') if p.get(0) == 0 => self.replies.extend_from_slice(b"\x1b[>1;0;0c"),
+            ([], b'c') if p.get(0) == 0 => self.reply(format_args!("\x1b[?62;22c")),
+            ([b'>'], b'c') if p.get(0) == 0 => self.reply(format_args!("\x1b[>1;0;0c")),
             ([b'>'], b'q') if p.get(0) == 0 => {
                 let v = env!("CARGO_PKG_VERSION");
                 self.reply(format_args!("\x1bP>|blitz {v}\x1b\\"));
             }
             ([], b'n') => match p.get(0) {
-                5 => self.replies.extend_from_slice(b"\x1b[0n"),
+                5 => self.reply(format_args!("\x1b[0n")),
                 6 => self.report_cursor(""),
                 _ => {}
             },
