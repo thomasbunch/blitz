@@ -218,6 +218,15 @@ impl Node {
         true
     }
 
+    fn equalize(&mut self) {
+        if let Node::Split(s) = self {
+            let (a, b) = (s.a.span(s.axis), s.b.span(s.axis));
+            s.ratio = a as f32 / (a + b) as f32;
+            s.a.equalize();
+            s.b.equalize();
+        }
+    }
+
     fn walk(&self, area: Rect, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Rect>) {
         match self {
             Node::Leaf(p) => panes.push((*p, area)),
@@ -373,6 +382,22 @@ impl Tab {
             self.zoom = None;
         }
         found
+    }
+
+    /// Shows only the focused pane, filling the tab, or ends the zoom.
+    /// Focusing another pane, splitting and resizing also end it.
+    pub fn toggle_zoom(&mut self) {
+        self.zoom = match self.zoom {
+            Some(_) => None,
+            None => Some(self.focus),
+        };
+    }
+
+    /// Gives panes equal space. Each split is weighted by how many panes
+    /// sit side by side in each half, so three columns made by two splits
+    /// come out at a third each rather than a half and two quarters.
+    pub fn equalize(&mut self) {
+        self.root.equalize();
     }
 
     /// Removes `p` and gives its space to its sibling. If `p` had focus, the
@@ -589,6 +614,49 @@ mod tests {
         let before = t.clone();
         assert!(!t.resize(Dir::Up, 10, AREA, MIN));
         assert_eq!(t, before);
+    }
+
+    #[test]
+    fn zoom_fills_the_tab_until_focus_moves() {
+        let mut t = four();
+        t.focus(PaneId(3));
+        t.toggle_zoom();
+        assert_eq!(t.rects(AREA), vec![(PaneId(3), AREA)]);
+        assert!(t.dividers(AREA).is_empty());
+        t.toggle_zoom();
+        assert_eq!(t.rects(AREA), four().rects(AREA));
+
+        t.toggle_zoom();
+        assert!(t.focus_dir(Dir::Right, AREA));
+        assert_eq!((t.focus, t.zoom), (PaneId(4), None));
+        t.toggle_zoom();
+        assert!(t.split(Dir::Down, PaneId(5), AREA, MIN));
+        assert_eq!(t.zoom, None);
+        t.toggle_zoom();
+        assert!(t.resize(Dir::Up, 1, AREA, MIN));
+        assert_eq!(t.zoom, None);
+        t.toggle_zoom();
+        assert!(t.close(PaneId(5)));
+        assert_eq!((t.focus, t.zoom), (PaneId(4), None));
+    }
+
+    #[test]
+    fn equalize_weights_by_panes_along_the_axis() {
+        let mut t = four();
+        t.resize(Dir::Left, 70, AREA, MIN);
+        t.focus(PaneId(1));
+        t.resize(Dir::Right, 123, AREA, MIN);
+        t.equalize();
+        // 1, 3 and 4 are three columns of a third each; 2 spans 3 and 4.
+        assert_eq!(
+            t.rects(AREA),
+            vec![
+                (PaneId(1), r(0, 0, 333, 601)),
+                (PaneId(2), r(334, 0, 667, 300)),
+                (PaneId(3), r(334, 301, 333, 300)),
+                (PaneId(4), r(668, 301, 333, 300)),
+            ]
+        );
     }
 
     #[test]
