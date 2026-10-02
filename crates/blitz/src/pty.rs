@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,8 @@ const PIPE_BYTES: u32 = 128 * 1024;
 /// The first bytes the bundled ConPTY writes. The inbox one starts with
 /// `ESC[?9001h` instead.
 const BUNDLED_PRELUDE: &[u8] = b"\x1b[1t";
+/// Bytes queued for the child's input beyond which replies are dropped.
+const MAX_PENDING: usize = 1 << 20;
 
 /// What `GetProcAddress` returns before it is cast.
 type Proc = unsafe extern "system" fn() -> isize;
@@ -152,12 +154,27 @@ pub enum PtyEvent<'a> {
 /// Sends bytes to the child's input. Cheap to clone; writes happen on the
 /// pane's writer thread, in the order they are sent.
 #[derive(Clone)]
-pub struct Writer(mpsc::Sender<Vec<u8>>);
+pub struct Writer {
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Bytes sent but not yet written.
+    pending: Arc<AtomicUsize>,
+}
 
 impl Writer {
     pub fn send(&self, bytes: impl Into<Vec<u8>>) {
+        let bytes = bytes.into();
+        self.pending.fetch_add(bytes.len(), Ordering::Relaxed);
         // An error only means the child has gone.
-        let _ = self.0.send(bytes.into());
+        let _ = self.tx.send(bytes);
+    }
+
+    /// [`Writer::send`] for answers to the child's queries. They are dropped
+    /// while its input is backed up, so a program that floods queries
+    /// cannot make blitz queue replies without limit.
+    pub fn reply(&self, bytes: impl Into<Vec<u8>>) {
+        if self.pending.load(Ordering::Relaxed) < MAX_PENDING {
+            self.send(bytes);
+        }
     }
 }
 
@@ -289,8 +306,12 @@ impl Pty {
         }
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let writer = Writer(tx);
+        let writer = Writer {
+            tx,
+            pending: Arc::default(),
+        };
         let mut input = File::from(in_w);
+        let pending = writer.pending.clone();
         std::thread::Builder::new()
             .name("pty-write".into())
             .spawn(move || {
@@ -298,6 +319,7 @@ impl Pty {
                     if input.write_all(&bytes).is_err() {
                         break;
                     }
+                    pending.fetch_sub(bytes.len(), Ordering::Relaxed);
                 }
             })?;
 
@@ -619,5 +641,21 @@ mod tests {
 
         let block = env_block(&env[..1]);
         assert_eq!(String::from_utf16(&block).unwrap(), "=C:=C:\\work\0\0");
+    }
+
+    #[test]
+    fn replies_wait_for_backed_up_input() {
+        let (tx, rx) = mpsc::channel();
+        let w = Writer {
+            tx,
+            pending: Arc::default(),
+        };
+        w.reply(&b"1"[..]);
+        w.send(vec![0; MAX_PENDING]);
+        w.reply(&b"2"[..]);
+        w.send(&b"typed"[..]);
+        let got: Vec<Vec<u8>> = rx.try_iter().collect();
+        assert_eq!(got.len(), 3);
+        assert_eq!((&got[0][..], &got[2][..]), (&b"1"[..], &b"typed"[..]));
     }
 }

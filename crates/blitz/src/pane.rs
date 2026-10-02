@@ -99,7 +99,7 @@ impl Pane {
                         drop(term);
                         // Replies go out in the order the queries came in.
                         if !replies.is_empty() {
-                            w.send(std::mem::take(&mut replies));
+                            w.reply(std::mem::take(&mut replies));
                         }
                     }
                     if !d.swap(true, Ordering::AcqRel) {
