@@ -71,6 +71,8 @@ pub struct Snapshot {
     pub rows: u16,
     /// `rows * cols` cells, row-major, viewport only.
     pub cells: Vec<RenderCell>,
+    /// Per row: its text continues on the next row.
+    pub wrapped: Vec<bool>,
     /// Column, row and shape; `None` when hidden or scrolled out of view.
     pub cursor: Option<(u16, u16, CursorShape)>,
     pub alt_screen: bool,

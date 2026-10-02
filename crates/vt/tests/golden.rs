@@ -122,6 +122,12 @@ fn hidden_text_has_no_characters() {
 }
 
 #[test]
+fn snapshot_marks_wrapped_rows() {
+    let mut t = run(4, 3, "abcdef\r\ngh");
+    assert_eq!(snap(&mut t).wrapped, [true, false, false]);
+}
+
+#[test]
 fn wide_cjk_at_the_last_column() {
     let mut t = run(10, 3, "abcdefghi中x");
     assert_eq!(t.screen_text(), "abcdefghi\n中x\n");

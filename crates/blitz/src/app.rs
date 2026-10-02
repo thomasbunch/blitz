@@ -1517,7 +1517,8 @@ fn refresh(
 }
 
 /// The text of the cells between two (column, row) points, inclusive, in
-/// reading order: trailing blanks trimmed, rows joined by CRLF.
+/// reading order: trailing blanks trimmed, rows joined by CRLF unless one
+/// wraps into the next.
 pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String {
     let (a, b) = sel;
     let (a, b) = if (a.1, a.0) <= (b.1, b.0) {
@@ -1526,8 +1527,9 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
         (b, a)
     };
     let cols = usize::from(snap.cols);
-    let mut lines = Vec::new();
-    for row in a.1..=b.1.min(snap.rows.saturating_sub(1)) {
+    let last = b.1.min(snap.rows.saturating_sub(1));
+    let mut out = String::new();
+    for row in a.1..=last {
         let from = if row == a.1 { usize::from(a.0) } else { 0 };
         let to = if row == b.1 {
             usize::from(b.0).min(cols.saturating_sub(1))
@@ -1535,6 +1537,7 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
             cols.saturating_sub(1)
         };
         let mut line = String::new();
+        let mut text_end = 0;
         for c in from..=to {
             let Some(cell) = snap.cells.get(usize::from(row) * cols + c) else {
                 break;
@@ -1547,12 +1550,23 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
                 n => {
                     let text = std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" ");
                     push_drawn(&mut line, text, cell.width);
+                    text_end = line.len();
                 }
             }
         }
-        lines.push(line.trim_end().to_owned());
+        // A row that wraps runs on into the next one: no line break, and
+        // only the empty cells at its end are dropped.
+        if row < last && snap.wrapped.get(usize::from(row)) == Some(&true) {
+            line.truncate(text_end);
+            out.push_str(&line);
+        } else {
+            out.push_str(line.trim_end());
+            if row < last {
+                out.push_str("\r\n");
+            }
+        }
     }
-    lines.join("\r\n")
+    out
 }
 
 /// Adds a cell's text as the screen shows it, so a copy carries nothing
@@ -2068,6 +2082,15 @@ mod tests {
         );
         let s = fed(4, 1, "\x1b[8m\u{4e2d}\x1b[0mx");
         assert_eq!(selection_text(&s, ((0, 0), (3, 0))), "  x");
+    }
+
+    #[test]
+    fn app_selection_joins_wrapped_rows() {
+        let two = ((0, 0), (3, 1));
+        assert_eq!(selection_text(&fed(4, 3, "ab  cd"), two), "ab  cd");
+        assert_eq!(selection_text(&fed(4, 3, "ab\r\ncd"), two), "ab\r\ncd");
+        // A wide character that did not fit leaves an empty cell behind.
+        assert_eq!(selection_text(&fed(3, 3, "ab\u{4e2d}"), two), "ab\u{4e2d}");
     }
 
     #[test]
