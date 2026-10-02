@@ -27,6 +27,11 @@ choose **More info**, then **Run anyway**.
 
 The shell is PowerShell 7 if installed, else Windows PowerShell, else cmd.
 
+The installer adds **Open in blitz** to the right-click menu of folders
+and drives; on Windows 11 it is under **Show more options**.
+Shift+right-click also offers **Open in new blitz window**. Untick the
+option during setup to leave the menu alone.
+
 blitz asks GitHub for the latest release when it starts and once a day.
 If there is a newer one, a strip under the panes says so. Ctrl+Shift+U
 downloads the installer, checks it against the release's `SHA256SUMS.txt`
