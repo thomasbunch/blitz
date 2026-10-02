@@ -1166,6 +1166,8 @@ impl ApplicationHandler<UserEvent> for App {
 /// - `waitfor MS TEXT`: wait until TEXT appears on the screen.
 /// - `clip TEXT`: put TEXT on the clipboard; `\n` is a line break.
 /// - `resize W H`: resize the window to W by H pixels.
+/// - `wheel N X Y`: turn the wheel N notches (up is positive) over the
+///   client pixel X, Y.
 /// - `snap`: print the screen.
 /// - `sleep MS`, `note TEXT`.
 mod selftest {
@@ -1173,13 +1175,16 @@ mod selftest {
     use std::time::{Duration, Instant};
 
     use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput,
-        VIRTUAL_KEY, VkKeyScanW,
+        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
+        MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY, VkKeyScanW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+        GetForegroundWindow, SWP_NOMOVE, SWP_NOZORDER, SetCursorPos, SetForegroundWindow,
+        SetWindowPos,
     };
 
     use crate::debug::Regex;
@@ -1242,6 +1247,13 @@ mod selftest {
                 if !crate::clipboard::set_text(None, &rest.replace(r"\n", "\r\n")) {
                     return Err("cannot set the clipboard".into());
                 }
+            }
+            "wheel" => {
+                let v: Vec<&str> = rest.split_whitespace().collect();
+                let [n, x, y] = v[..] else {
+                    return Err("wheel N X Y".into());
+                };
+                wheel(hwnd, num(n)?, num(x)?, num(y)?)?;
             }
             "resize" => {
                 let (w, h) = rest.trim().split_once(' ').ok_or("resize W H")?;
@@ -1348,9 +1360,9 @@ mod selftest {
         out
     }
 
-    /// Sends key strokes to the foreground window, which must be blitz:
-    /// anywhere else they would type into another program.
-    fn send(hwnd: isize, strokes: &[Stroke]) -> Result<(), String> {
+    /// Brings blitz to the front, or fails: input sent anywhere else would
+    /// go to another program.
+    fn to_front(hwnd: isize) -> Result<(), String> {
         // SAFETY: plain window queries.
         unsafe {
             if GetForegroundWindow().0 as isize != hwnd {
@@ -1361,6 +1373,36 @@ mod selftest {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn wheel(hwnd: isize, notches: i32, x: i32, y: i32) -> Result<(), String> {
+        to_front(hwnd)?;
+        let mut pt = POINT { x, y };
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    mouseData: (notches * 120) as u32,
+                    dwFlags: MOUSEEVENTF_WHEEL,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a live window, a valid point and one mouse input.
+        unsafe {
+            let _ = ClientToScreen(HWND(hwnd as *mut _), &mut pt);
+            SetCursorPos(pt.x, pt.y).map_err(|e| format!("cursor: {e}"))?;
+            if SendInput(&[input], size_of::<INPUT>() as i32) != 1 {
+                return Err("SendInput failed".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends key strokes to blitz.
+    fn send(hwnd: isize, strokes: &[Stroke]) -> Result<(), String> {
+        to_front(hwnd)?;
         let inputs: Vec<INPUT> = strokes
             .iter()
             .map(|s| {
