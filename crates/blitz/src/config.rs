@@ -34,6 +34,8 @@ pub struct Config {
     pub check_updates: bool,
     /// Reopen the last window's tabs, splits and folders at start.
     pub restore_session: bool,
+    /// Reopen the Claude Code session a restored pane was running.
+    pub restore_claude: bool,
     /// Overrides as (chord, action) pairs, e.g. ("ctrl+shift+r", "split_right").
     pub keys: Vec<(String, String)>,
 }
@@ -56,6 +58,7 @@ impl Default for Config {
             command_finish_after_ms: 5000,
             check_updates: true,
             restore_session: true,
+            restore_claude: true,
             keys: vec![("ctrl+shift+r".into(), "split_right".into())],
         }
     }
