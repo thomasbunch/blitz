@@ -178,7 +178,7 @@ fn hook(keys: &RefCell<Keys>, msg: &MSG) -> bool {
                 k.chars = vk == VK_PACKET || k.dead && matches!(input.key, vt::Key::Char(_));
                 k.dead = false;
             }
-            if vk == VK_PACKET || k.chars && down {
+            if vk == VK_PACKET || k.chars && down && !modifier {
                 k.skip_up = Some(vk);
             } else {
                 k.queue.push(Input::Key(owned(&input), text));
