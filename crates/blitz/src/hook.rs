@@ -166,6 +166,19 @@ pub fn setup(args: &[String]) -> i32 {
             hook.display()
         );
     }
+    #[cfg(windows)]
+    if [hook.parent(), Some(hook.as_path())]
+        .into_iter()
+        .flatten()
+        .any(others_can_write)
+    {
+        eprintln!(
+            "warning: other users can replace {}, and Claude Code would run their \
+             program in every session. Keep blitz in a folder only you can change, \
+             such as where the installer puts it.",
+            hook.display()
+        );
+    }
     let settings = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::home_dir().map(|h| h.join(".claude")))
@@ -178,6 +191,114 @@ pub fn setup(args: &[String]) -> i32 {
     );
     print!("{}", claude_settings(&hook.to_string_lossy()));
     0
+}
+
+/// Whether anyone but this user, SYSTEM, Administrators or TrustedInstaller
+/// may change `path`, or add and remove files in it if it is a folder. Deny
+/// entries are not weighed against the grants, so it errs towards yes.
+#[cfg(windows)]
+fn others_can_write(path: &std::path::Path) -> bool {
+    use windows::Win32::Foundation::{
+        CloseHandle, GENERIC_ALL, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree,
+    };
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, GetTokenInformation,
+        INHERIT_ONLY_ACE, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_DELETE_CHILD, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::{HSTRING, PWSTR};
+
+    // For a folder, FILE_WRITE_DATA is the right to add files.
+    const WRITE: u32 = FILE_WRITE_DATA.0
+        | FILE_DELETE_CHILD.0
+        | DELETE.0
+        | WRITE_DAC.0
+        | WRITE_OWNER.0
+        | GENERIC_WRITE.0
+        | GENERIC_ALL.0;
+    // SYSTEM, Administrators and TrustedInstaller.
+    const TRUSTED: [&str; 3] = [
+        "S-1-5-18",
+        "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    ];
+    let sid_string = |sid: PSID| {
+        let mut s = PWSTR::null();
+        // SAFETY: a valid SID; the string is copied, then freed.
+        unsafe {
+            ConvertSidToStringSidW(sid, &mut s).ok()?;
+            let out = s.to_string().ok();
+            LocalFree(Some(HLOCAL(s.0.cast())));
+            out
+        }
+    };
+    // SAFETY: the buffer is as large as the call is told; the token is
+    // closed after use.
+    let me = unsafe {
+        let mut token = HANDLE::default();
+        let mut user = [0u64; 64];
+        let mut len = 0;
+        let ok = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok()
+            && GetTokenInformation(
+                token,
+                TokenUser,
+                Some(user.as_mut_ptr().cast()),
+                size_of_val(&user) as u32,
+                &mut len,
+            )
+            .is_ok();
+        let _ = CloseHandle(token);
+        ok.then(|| sid_string((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid))
+            .flatten()
+    };
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: valid out pointers. The DACL and its entries live inside `sd`,
+    // which is freed after the last use of them.
+    unsafe {
+        let err = GetNamedSecurityInfoW(
+            &HSTRING::from(path),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        );
+        if err.is_err() {
+            return false;
+        }
+        // Without a DACL everyone may do anything.
+        let mut open = dacl.is_null();
+        for i in 0..if open { 0 } else { (*dacl).AceCount } {
+            let mut ace = std::ptr::null_mut();
+            if GetAce(dacl, i.into(), &mut ace).is_err() {
+                continue;
+            }
+            let ace = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+            // Type 0 grants access; an inherit-only entry is for children.
+            if ace.Header.AceType != 0
+                || u32::from(ace.Header.AceFlags) & INHERIT_ONLY_ACE.0 != 0
+                || ace.Mask & WRITE == 0
+            {
+                continue;
+            }
+            let who = sid_string(PSID((&raw const ace.SidStart).cast_mut().cast()));
+            if !who.is_some_and(|w| TRUSTED.contains(&w.as_str()) || Some(&w) == me.as_ref()) {
+                open = true;
+                break;
+            }
+        }
+        LocalFree(Some(HLOCAL(sd.0)));
+        open
+    }
 }
 
 /// The Claude Code settings fragment that runs `hook_exe claude` on every
@@ -673,5 +794,29 @@ mod tests {
         lit.push('"');
         assert!(lit.contains("\\u001b") && lit.contains("\\u0007") && lit.contains("\\u009b"));
         assert_eq!(Json::parse(&lit).unwrap().as_str(), Some(s));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn setup_notices_folders_others_can_change() {
+        let dir = std::env::temp_dir().join(format!("blitz-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let icacls = |args: &[&str]| {
+            let out = std::process::Command::new("icacls")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("icacls");
+            assert!(out.status.success(), "icacls {args:?}");
+        };
+        // Only SYSTEM; as the owner this process can still read and change
+        // the list.
+        icacls(&["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F"]);
+        assert!(!others_can_write(&dir));
+        icacls(&["/grant", "*S-1-1-0:(OI)(CI)RX"]);
+        assert!(!others_can_write(&dir));
+        icacls(&["/grant", "*S-1-1-0:(OI)(CI)M"]);
+        assert!(others_can_write(&dir));
+        let _ = std::fs::remove_dir(&dir);
     }
 }
