@@ -16,6 +16,11 @@ pub fn detect_with(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     // directory, and spawning where.exe would flash a console window.
     if let Some(path) = var("PATH") {
         for dir in std::env::split_paths(&path) {
+            // An empty or relative entry is the current directory again,
+            // and a bare result would be looked up there by CreateProcessW.
+            if !dir.is_absolute() {
+                continue;
+            }
             let exe = dir.join("pwsh.exe");
             if exe.is_file() {
                 return exe;
@@ -281,6 +286,17 @@ mod tests {
             detect_with(env),
             pf.join("PowerShell").join("7").join("pwsh.exe")
         );
+        // A relative entry is resolved against the current directory, so it
+        // is never used.
+        let rel = PathBuf::from(format!("blitz-shell-{}", std::process::id()));
+        touch(rel.join("pwsh.exe"));
+        let with_rel = |k: &str| match k {
+            "PATH" => Some(std::env::join_paths([&rel, &on_path]).unwrap()),
+            _ => env(k),
+        };
+        let got = detect_with(with_rel);
+        let _ = std::fs::remove_dir_all(&rel);
+        assert_eq!(got, pf.join("PowerShell").join("7").join("pwsh.exe"));
         touch(on_path.join("pwsh.exe"));
         assert_eq!(detect_with(env), on_path.join("pwsh.exe"));
 
