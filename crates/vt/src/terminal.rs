@@ -354,6 +354,18 @@ impl Terminal {
         self.pal = if dark { DARK } else { LIGHT };
     }
 
+    /// The user confirmed a multi-line paste. While bracketed paste stays
+    /// on, later ones go to the program that turned it on unasked.
+    pub fn confirm_paste(&mut self) {
+        self.modes.paste_confirmed = self.modes.input.bracketed;
+    }
+
+    /// Bracketed paste is on and the user has confirmed a paste under it;
+    /// see [`crate::keys::needs_paste_confirm`].
+    pub fn paste_trusted(&self) -> bool {
+        self.modes.input.bracketed && self.modes.paste_confirmed
+    }
+
     /// The secret blitz's shell integration puts in its prompt marks, as
     /// `133;A;blitz=<token>`. Only a mark with it resets input modes, so
     /// program output cannot. Until this is called the token is `1`.

@@ -834,7 +834,10 @@ impl App {
                     return false;
                 };
                 let bracketed = self.modes().bracketed;
-                if vt::keys::needs_paste_confirm(&text, bracketed) {
+                let trusted = self
+                    .current()
+                    .is_some_and(|v| lock(&v.pane.term).paste_trusted());
+                if vt::keys::needs_paste_confirm(&text, trusted) {
                     let Some(id) = before else {
                         return false;
                     };
@@ -855,6 +858,7 @@ impl App {
                     }
                     if let Some(v) = self.view_mut(id) {
                         v.notice = None;
+                        lock(&v.pane.term).confirm_paste();
                     }
                 }
                 let mut out = Vec::new();

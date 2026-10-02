@@ -646,11 +646,32 @@ fn paste_cannot_break_out_of_the_bracket() {
 }
 
 #[test]
-fn paste_confirm_only_for_unbracketed_line_breaks() {
+fn paste_confirm_only_for_untrusted_line_breaks() {
     use vt::keys::needs_paste_confirm;
     assert!(!needs_paste_confirm("ls -la", false));
     assert!(needs_paste_confirm("echo 1\necho 2", false));
     assert!(needs_paste_confirm("echo 1\r", false));
     assert!(!needs_paste_confirm("echo 1\necho 2", true));
     assert!(!needs_paste_confirm("", false));
+}
+
+/// Any output can turn bracketed paste on, also for a program that does
+/// not read it, so a paste under it is trusted only once the user has
+/// confirmed one.
+#[test]
+fn bracketed_paste_is_trusted_once_confirmed() {
+    let mut t = vt::Terminal::new(vt::Options::default());
+    t.confirm_paste();
+    t.feed(b"\x1b]133;A;blitz=1\x07\x1b]133;C\x07\x1b[?2004h");
+    assert!(!t.paste_trusted(), "set by output after a command started");
+    t.confirm_paste();
+    assert!(t.paste_trusted());
+    t.feed(b"\x1b[?2004h");
+    assert!(!t.paste_trusted(), "set again");
+    for reset in ["\x1b]133;A;blitz=1\x07", "\x1bc", "\x1b[?2004l"] {
+        t.confirm_paste();
+        t.feed(reset.as_bytes());
+        t.feed(b"\x1b[?2004h");
+        assert!(!t.paste_trusted(), "{reset:?}");
+    }
 }

@@ -573,9 +573,13 @@ pub fn encode_paste(text: &str, bracketed: bool, out: &mut Vec<u8>) {
 
 /// Whether a paste should be confirmed first. Without bracketed paste a
 /// shell runs every pasted line the moment it arrives; Windows PowerShell
-/// 5.1's PSReadLine never turns bracketed paste on.
-pub fn needs_paste_confirm(text: &str, bracketed: bool) -> bool {
-    !bracketed && text.contains(['\r', '\n'])
+/// 5.1's PSReadLine never turns bracketed paste on. Nor does cmd, but
+/// `type` on a file can turn the mode on while cmd or another program
+/// that knows nothing of it reads the keys, and conhost then runs every
+/// line. So `trusted` is [`crate::Terminal::paste_trusted`]: bracketed
+/// paste on, and a paste under it already confirmed by the user.
+pub fn needs_paste_confirm(text: &str, trusted: bool) -> bool {
+    !trusted && text.contains(['\r', '\n'])
 }
 
 /// Appends a focus report when mode 1004 is set.
