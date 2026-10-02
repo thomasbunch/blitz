@@ -183,6 +183,25 @@ impl Pane {
     }
 }
 
+/// What a new screen is fed before its shell starts, to show `text`, a
+/// pane's saved output, above a dim `restored · <stamp>` line. All of it
+/// goes into scrollback, leaving a blank screen with the cursor at the
+/// top: the console host in Windows clears the screen when it starts, and
+/// the bundled one writes over it as if it were blank. Control characters
+/// are dropped, since a query in the text would be answered to the new
+/// shell.
+pub fn restored(text: &str, stamp: &str, rows: u16) -> Vec<u8> {
+    let mut s = String::with_capacity(text.len() + 64 + usize::from(rows));
+    for line in text.lines() {
+        s.extend(line.chars().filter(|c| !c.is_control()));
+        s.push_str("\r\n");
+    }
+    s.push_str(&format!("\x1b[2m── restored · {stamp} ──\x1b[m\r\n"));
+    s.push_str(&"\n".repeat(rows.into()));
+    s.push_str("\x1b[H");
+    s.into_bytes()
+}
+
 /// The program a command line runs, without directory or extension:
 /// `pwsh` for `"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo`.
 pub fn program_name(cmdline: &str) -> String {
@@ -249,6 +268,37 @@ mod tests {
         assert_eq!(program_name(r"C:\Windows\system32\cmd.exe /d"), "cmd");
         assert_eq!(program_name("claude"), "claude");
         assert_eq!(program_name(""), "");
+    }
+
+    #[test]
+    fn pane_restored_text_goes_into_scrollback() {
+        for (text, last) in [("one\ntwo\n", "two"), (&"line\n".repeat(50), "line")] {
+            let mut term = vt::Terminal::new(vt::Options {
+                cols: 40,
+                rows: 5,
+                scrollback_lines: 100,
+                ..Default::default()
+            });
+            term.feed(&restored(text, "14:32", 5));
+            let sb = term.scrollback_text();
+            assert!(sb.starts_with(text.lines().next().unwrap()), "{sb:?}");
+            assert!(
+                sb.contains(&format!("{last}\n── restored · 14:32 ──")),
+                "{sb:?}"
+            );
+            assert_eq!(term.screen_text().trim(), "");
+            assert_eq!(term.cursor(), (0, 0, true));
+        }
+    }
+
+    #[test]
+    fn pane_restored_text_drops_control_characters() {
+        let mut term = vt::Terminal::new(vt::Options::default());
+        term.feed(&restored("a\x1b[cb\x07\x1b]0;t\x07\r\n", "14:32", 24));
+        let mut replies = Vec::new();
+        term.take_replies(&mut replies);
+        assert!(replies.is_empty(), "{replies:?}");
+        assert!(term.scrollback_text().starts_with("a[cb]0;t\n"));
     }
 
     #[test]
