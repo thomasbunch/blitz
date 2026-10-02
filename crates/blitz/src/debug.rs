@@ -21,7 +21,8 @@
 //!   but at most MAX ms.
 //! - `expect [MS] REGEX`: wait until a screen row matches REGEX, checking
 //!   after every chunk of output (3000 ms by default). See [`Regex`] for
-//!   the syntax.
+//!   the syntax. No-break spaces in a row match as spaces, since
+//!   Claude Code draws one after its `>` prompt.
 //! - `save NAME`: store the cursor row; later lines expand `${NAME}`.
 //! - `snap LABEL`: print the screen.
 //! - `resize COLS ROWS`: resize the pseudoconsole and the screen.
@@ -897,7 +898,9 @@ impl Regex {
     }
 
     pub(crate) fn matches_a_row(&self, screen: &str) -> bool {
-        screen.lines().any(|row| self.is_match(row))
+        screen
+            .lines()
+            .any(|row| self.is_match(&row.replace('\u{a0}', " ")))
     }
 }
 
@@ -1137,6 +1140,8 @@ mod tests {
             assert_eq!(re.is_match(row), want, "{pattern:?} on {row:?}");
         }
         assert!(Regex::new("^> a$").unwrap().matches_a_row("x\n> a\ny"));
+        assert!(Regex::new("^> a$").unwrap().matches_a_row(">\u{a0}a"));
+        assert!(Regex::new(r"^>\s*$").unwrap().matches_a_row(">\u{a0}"));
         for bad in ["(a", "a)", "*a", "[ab", "a{2", r"a\"] {
             assert!(Regex::new(bad).is_err(), "{bad:?}");
         }
