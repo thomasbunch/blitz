@@ -16,6 +16,14 @@ use std::path::Path;
 
 use vt::{Palette, RenderCell, Snapshot};
 
+/// Creates `path` as a new file for a capture or log. Whatever is there is
+/// removed first rather than opened, so a link planted at the path cannot
+/// send the write to another file.
+pub fn create_fresh(path: &Path) -> std::io::Result<std::fs::File> {
+    let _ = std::fs::remove_file(path);
+    std::fs::File::create_new(path)
+}
+
 /// Writes `w * h` BGRA pixels (top row first) as a 24-bit BMP.
 pub fn write_bmp(path: &Path, w: u32, h: u32, bgra: &[u8]) -> std::io::Result<()> {
     let (w, h) = (w as usize, h as usize);
@@ -41,7 +49,7 @@ pub fn write_bmp(path: &Path, w: u32, h: u32, bgra: &[u8]) -> std::io::Result<()
         }
         out.resize(out.len() + row - w * 3, 0);
     }
-    std::fs::File::create(path)?.write_all(&out)
+    create_fresh(path)?.write_all(&out)
 }
 
 /// A snapshot of plain text with no escape sequences: one line per row,
@@ -870,6 +878,21 @@ mod tests {
         assert_eq!(b.len(), 54 + 12 * 2);
         assert_eq!(b[54], 3, "bottom row comes first");
         assert_eq!(b[54 + 12], 0);
+    }
+
+    #[test]
+    fn bmp_replaces_a_link_at_the_path() {
+        let dir = std::env::temp_dir().join(format!("blitz-bmp-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (other, path) = (dir.join("other.txt"), dir.join("t.bmp"));
+        std::fs::write(&other, "keep").expect("write");
+        std::fs::hard_link(&other, &path).expect("link");
+        write_bmp(&path, 1, 1, &[0; 4]).expect("write");
+        let kept = std::fs::read_to_string(&other).expect("read");
+        let bmp = std::fs::read(&path).expect("read");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(kept, "keep");
+        assert_eq!(&bmp[..2], b"BM");
     }
 
     #[cfg(windows)]

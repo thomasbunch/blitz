@@ -34,6 +34,9 @@
 //! - `sleep MS`, `note TEXT`.
 //!
 //! A failed wait prints the screen and ends the run with exit code 1.
+//!
+//! `--trace FILE` logs every byte sent and received, pasted files
+//! included, so keep it out of folders other users can read.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -201,7 +204,8 @@ impl Counters {
     /// Writes the counters to the file named by `BLITZ_TRACE`, if it is set.
     pub fn write_trace(&self) -> io::Result<()> {
         match std::env::var_os("BLITZ_TRACE") {
-            Some(path) => std::fs::write(path, self.to_json() + "\n"),
+            Some(path) => crate::render::create_fresh(Path::new(&path))?
+                .write_all((self.to_json() + "\n").as_bytes()),
             None => Ok(()),
         }
     }
@@ -366,7 +370,9 @@ impl Runner {
         };
         env.extend(o.setenv.iter().cloned());
         let log = match &o.trace {
-            Some(path) => Some(File::create(path).map_err(|e| format!("{path}: {e}"))?),
+            Some(path) => Some(
+                crate::render::create_fresh(Path::new(path)).map_err(|e| format!("{path}: {e}"))?,
+            ),
             None => None,
         };
         let term = Terminal::new(vt::Options {
