@@ -668,7 +668,9 @@ impl App {
                 let p = &v.pane;
                 chrome::Session {
                     id: p.id,
-                    name: p.name.clone(),
+                    // Programs set the rest of the row, so the session's
+                    // number is what tells two look-alike sessions apart.
+                    name: format!("{} {}", p.name, p.id.0),
                     cwd: p.cwd.clone(),
                     branch: p.branch.clone(),
                     state: p.attn.state,
