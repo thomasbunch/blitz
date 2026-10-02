@@ -1592,8 +1592,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.attention(id, Ev::Attended);
                 }
             }
-            WindowEvent::Ime(Ime::Commit(text)) => {
+            WindowEvent::Ime(Ime::Commit(mut text)) => {
                 self.preedit.clear();
+                // Like typed characters, committed text carries no controls
+                // that could run or escape anything.
+                text.retain(|c| !c.is_control());
                 self.typed(text.into_bytes());
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
