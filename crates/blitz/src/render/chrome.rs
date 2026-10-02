@@ -78,6 +78,8 @@ pub struct Chrome {
     pub prims: Vec<Prim>,
     /// Where each visible pane's terminal grid goes.
     pub panes: Vec<(PaneId, Rect)>,
+    /// Each session's row in the sidebar or rail, for clicks.
+    pub rows: Vec<(PaneId, Rect)>,
 }
 
 /// Width of the expanded sidebar and of the collapsed rail at 96 DPI,
@@ -409,6 +411,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     w: s(222.0),
                     h: rh,
                 };
+                out.rows.push((x.id, row));
                 if focused {
                     p.push(Prim::Shape {
                         r: row,
@@ -530,6 +533,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     w: side - 1,
                     h: s(20.0),
                 };
+                out.rows.push((x.id, row));
                 if ti == m.win.active && x.id == t.focus {
                     p.push(Prim::Rect(row, c.rail_focus));
                 }
@@ -814,7 +818,7 @@ mod tests {
         };
         let sessions = [session(1, "a", Attn::NeedsYou, now)];
         let c = build(&model(&win, &sessions, now));
-        assert!(c.prims.is_empty());
+        assert!(c.prims.is_empty() && c.rows.is_empty());
         assert_eq!(c.panes.len(), 1);
         assert_eq!(c.panes[0].1.x, 14);
     }
@@ -824,6 +828,11 @@ mod tests {
         let (win, sessions, now) = fleet(true);
         let c = build(&model(&win, &sessions, now));
         assert!(c.panes.iter().all(|(_, r)| r.x >= 240));
+        // One clickable row per session, in the sidebar, top to bottom.
+        let rows: Vec<_> = c.rows.iter().map(|(id, _)| id.0).collect();
+        assert_eq!(rows, [1, 2, 3]);
+        assert!(c.rows.windows(2).all(|w| w[0].1.bottom() <= w[1].1.y));
+        assert!(c.rows.iter().all(|(_, r)| r.right() <= 240));
         // Panes start below their 22 px header strips.
         assert_eq!(c.panes[0].1.y, 22 + 8);
         let t = texts(&c);
@@ -852,6 +861,7 @@ mod tests {
         let c = build(&model(&win, &sessions, now));
         assert_eq!(c.panes[0].1.x, 15 + 16);
         assert_eq!(c.panes[0].1.y, 12, "no header strip");
+        assert!(c.rows.iter().all(|(_, r)| r.right() <= 15) && c.rows.len() == 3);
         let t = texts(&c);
         assert_eq!(t, ["api", "web"], "only the pane labels");
         // The needs-you pane gets a 2 px accent ring.

@@ -977,7 +977,7 @@ mod tests {
                     term: false,
                 },
             ],
-            panes: Vec::new(),
+            ..Chrome::default()
         };
         let (w, h) = (80, 20);
         let target = r.gpu.offscreen(w, h).expect("target");
