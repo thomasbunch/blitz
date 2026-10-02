@@ -1,5 +1,5 @@
 //! Window chrome: the session sidebar or its collapsed rail, pane headers,
-//! dividers, attention marks, the banner line and the IME preedit, laid out
+//! dividers, attention marks, the banner strip and the IME preedit, laid out
 //! as plain rectangles, rounded shapes and text runs.
 //!
 //! Nothing here touches the GPU, so layouts are testable on any platform.
@@ -41,7 +41,8 @@ pub struct ChromeModel<'a> {
     /// Cell size of the terminal font.
     pub term_cell: (u32, u32),
     pub now: Instant,
-    /// A one-line notice shown at the bottom of the first pane.
+    /// One line of text in a strip under the panes, such as an available
+    /// update.
     pub banner: Option<&'a str>,
     /// IME composition in the focused pane: column, row and text.
     pub preedit: Option<(u16, u16, &'a str)>,
@@ -80,12 +81,16 @@ pub struct Chrome {
     pub panes: Vec<(PaneId, Rect)>,
     /// Each session's row in the sidebar or rail, for clicks.
     pub rows: Vec<(PaneId, Rect)>,
+    /// The banner strip, for clicks.
+    pub banner: Option<Rect>,
 }
 
 /// Width of the expanded sidebar and of the collapsed rail at 96 DPI,
 /// each including its 1 px border.
 pub const SIDEBAR_W: f32 = 240.0;
 pub const RAIL_W: f32 = 15.0;
+/// Height of the banner strip at 96 DPI.
+pub const BANNER_H: f32 = 22.0;
 
 struct Colors {
     term_bg: u32,
@@ -191,11 +196,12 @@ pub fn build(m: &ChromeModel) -> Chrome {
         (true, true) => s(SIDEBAR_W),
         (true, false) => s(RAIL_W),
     };
+    let bh = m.banner.map_or(0, |_| s(BANNER_H));
     let area = Rect {
         x: side,
         y: 0,
         w: (w - side).max(0),
-        h,
+        h: (h - bh).max(0),
     };
     let session = |id: PaneId| m.sessions.iter().find(|x| x.id == id);
     // A tab's sessions, in the order the caller lists them.
@@ -560,20 +566,25 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let (cw, ch) = (m.term_cell.0 as i32, m.term_cell.1.max(1) as i32);
     let pane = |id: PaneId| out.panes.iter().find(|x| x.0 == id).map(|x| x.1);
     let mut extra = Vec::new();
-    if let (Some(msg), Some(r)) = (m.banner, tab.panes().first().copied().and_then(pane)) {
-        let rows = r.h / ch;
-        if rows > 0 {
-            let y = r.y + (rows - 1) * ch;
-            extra.push(Prim::Rect(Rect { y, h: ch, ..r }, c.term_bg));
-            extra.push(Prim::Text {
-                x: r.x,
-                y,
-                text: fit(msg, r.w, cw),
-                color: c.dim,
-                bold: false,
-                term: true,
-            });
-        }
+    if let Some(msg) = m.banner {
+        let strip = Rect {
+            y: area.bottom(),
+            h: bh,
+            ..area
+        };
+        out.banner = Some(strip);
+        extra.push(Prim::Rect(strip, c.hdr_bg));
+        extra.push(Prim::Rect(Rect { h: 1, ..strip }, c.hdr_line));
+        let x = strip.x + s(14.0);
+        let msg = fit(msg, strip.right() - s(14.0) - x, tw);
+        extra.push(Prim::Text {
+            x,
+            y: strip.y + (bh + 1 - th) / 2,
+            text: msg,
+            color: c.dim,
+            bold: false,
+            term: false,
+        });
     }
     if let (Some((col, row, t)), Some(r)) = (m.preedit, pane(tab.focus)) {
         let (x, y) = (r.x + i32::from(col) * cw, r.y + i32::from(row) * ch);
@@ -888,14 +899,41 @@ mod tests {
     }
 
     #[test]
-    fn banner_and_preedit_go_in_panes() {
+    fn banner_is_a_strip_under_the_panes() {
+        let now = Instant::now();
+        let win = Window {
+            tabs: vec![Tab::new("t".into(), PaneId(1))],
+            ..Window::default()
+        };
+        let sessions = [session(1, "a", Attn::Idle, now)];
+        let mut m = model(&win, &sessions, now);
+        m.banner = Some("blitz 0.0.2 is available");
+        let c = build(&m);
+        let strip = Rect {
+            x: 0,
+            y: AREA.h - 22,
+            w: AREA.w,
+            h: 22,
+        };
+        assert_eq!(c.banner, Some(strip), "even without a sidebar");
+        assert_eq!(c.panes[0].1.bottom(), strip.y, "panes end above it");
+        assert!(texts(&c).contains(&"blitz 0.0.2 is available"));
+
         let (win, sessions, now) = fleet(true);
         let mut m = model(&win, &sessions, now);
-        m.banner = Some("inbox ConPTY");
+        m.banner = Some("x");
+        let c = build(&m);
+        assert_eq!(c.banner.map(|r| (r.x, r.right())), Some((240, AREA.w)));
+        assert!(c.panes.iter().all(|(_, r)| r.bottom() <= AREA.h - 22));
+    }
+
+    #[test]
+    fn preedit_goes_in_the_focused_pane() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
         m.preedit = Some((2, 1, "\u{4e2d}a"));
         let c = build(&m);
-        let t = texts(&c);
-        assert!(t.contains(&"inbox ConPTY") && t.contains(&"\u{4e2d}a"));
+        assert!(texts(&c).contains(&"\u{4e2d}a"));
         let focus = c.panes.iter().find(|p| p.0 == PaneId(2)).map(|p| p.1);
         let focus = focus.expect("focused pane");
         // The underline spans the wide character's two cells plus one.
