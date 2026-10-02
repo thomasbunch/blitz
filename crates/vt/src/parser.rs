@@ -125,7 +125,7 @@ enum State {
 }
 
 /// Incremental parser. Sequences may be split across `advance` calls at any
-/// byte boundary.
+/// byte boundary, including inside a UTF-8 character.
 #[derive(Debug, Default)]
 pub struct Parser {
     state: State,
@@ -141,6 +141,9 @@ pub struct Parser {
     /// Too many parameters or intermediates, or an oversized OSC.
     overflow: bool,
     osc: Vec<u8>,
+    /// Start of a UTF-8 character cut off by the end of the last chunk.
+    utf8: [u8; 4],
+    utf8_len: u8,
 }
 
 impl Parser {
@@ -165,17 +168,67 @@ impl Parser {
     }
 
     /// Text up to the next control byte, then that byte. Returns the new index.
-    fn ground<H: Handler>(&mut self, h: &mut H, bytes: &[u8], i: usize) -> usize {
+    fn ground<H: Handler>(&mut self, h: &mut H, bytes: &[u8], mut i: usize) -> usize {
+        while self.utf8_len > 0 && i < bytes.len() {
+            let n = self.utf8_len as usize;
+            let mut buf = self.utf8;
+            buf[n] = bytes[i];
+            match std::str::from_utf8(&buf[..=n]) {
+                Ok(s) => {
+                    print_text(h, s);
+                    self.utf8_len = 0;
+                    i += 1;
+                }
+                Err(e) if e.error_len().is_none() => {
+                    self.utf8 = buf;
+                    self.utf8_len += 1;
+                    i += 1;
+                }
+                Err(_) => {
+                    // The carried bytes are one invalid sequence; this byte
+                    // starts over.
+                    h.print(REPLACEMENT);
+                    self.utf8_len = 0;
+                }
+            }
+        }
         let rest = &bytes[i..];
         let n = find_ctl(rest);
         if n > 0 {
-            text(h, &rest[..n]);
+            self.text(h, &rest[..n], n == rest.len());
         }
         if n < rest.len() {
             self.byte(h, rest[n]);
             return i + n + 1;
         }
         bytes.len()
+    }
+
+    /// Prints a run with no control bytes, replacing invalid UTF-8 with
+    /// U+FFFD one maximal subpart at a time (as `String::from_utf8_lossy`
+    /// does). An incomplete character at the end of the chunk is carried.
+    fn text<H: Handler>(&mut self, h: &mut H, mut run: &[u8], chunk_end: bool) {
+        loop {
+            match std::str::from_utf8(run) {
+                Ok(s) => return print_text(h, s),
+                Err(e) => {
+                    let (good, bad) = run.split_at(e.valid_up_to());
+                    print_text(h, std::str::from_utf8(good).unwrap_or_default());
+                    match e.error_len() {
+                        Some(n) => {
+                            h.print(REPLACEMENT);
+                            run = &bad[n..];
+                        }
+                        None if chunk_end => {
+                            self.utf8[..bad.len()].copy_from_slice(bad);
+                            self.utf8_len = bad.len() as u8;
+                            return;
+                        }
+                        None => return h.print(REPLACEMENT),
+                    }
+                }
+            }
+        }
     }
 
     fn osc_run<H: Handler>(&mut self, h: &mut H, bytes: &[u8], i: usize) -> usize {
@@ -389,25 +442,6 @@ impl Parser {
     fn end_params(&mut self) {
         if self.in_param && !self.params.push(self.cur, self.cur_sub) {
             self.overflow = true;
-        }
-    }
-}
-
-/// Prints a run with no control bytes, replacing invalid UTF-8 with U+FFFD
-/// one maximal subpart at a time (as `String::from_utf8_lossy` does).
-fn text<H: Handler>(h: &mut H, mut run: &[u8]) {
-    loop {
-        match std::str::from_utf8(run) {
-            Ok(s) => return print_text(h, s),
-            Err(e) => {
-                let (good, bad) = run.split_at(e.valid_up_to());
-                print_text(h, std::str::from_utf8(good).unwrap_or_default());
-                h.print(REPLACEMENT);
-                match e.error_len() {
-                    Some(n) => run = &bad[n..],
-                    None => return,
-                }
-            }
         }
     }
 }
