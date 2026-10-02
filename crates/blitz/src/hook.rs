@@ -4,8 +4,10 @@
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 
-/// Claude Code's payloads are a few KB; anything this big is not one.
-const MAX_INPUT: u64 = 1 << 20;
+/// Most payloads are a few KB, but a Write or Edit request carries the
+/// whole file, so the cap only stops a runaway stream. A payload cut at the
+/// cap does not parse and reports nothing.
+const MAX_INPUT: u64 = 64 << 20;
 /// Longest message carried in a notification, in chars.
 const MAX_MSG: usize = 120;
 /// Notification types that mean Claude Code is waiting on the user.

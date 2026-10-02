@@ -143,6 +143,18 @@ fn hook_handles_a_large_payload() {
 }
 
 #[test]
+fn hook_reports_a_request_to_write_a_large_file() {
+    let content = "x".repeat(3 << 20);
+    let payload = format!(
+        r#"{{"hook_event_name":"PermissionRequest","tool_name":"Write","tool_input":{{"file_path":"big.txt","content":"{content}"}}}}"#
+    );
+    assert_eq!(
+        hook(&payload, Some("1")),
+        (notify("needs-you", "Write: big.txt"), 0)
+    );
+}
+
+#[test]
 fn hook_runs_fast() {
     let payload = r#"{"hook_event_name":"UserPromptSubmit"}"#;
     // The first spawn pays for the virus scan and a cold disk cache.
