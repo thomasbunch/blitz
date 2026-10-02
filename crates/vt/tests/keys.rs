@@ -442,3 +442,23 @@ fn win32_input_mode_keys_send_every_transition() {
     given.repeat = 3;
     assert_eq!(enc(&given, &W32IM), "\x1b[65;30;97;1;32;3_");
 }
+
+#[test]
+fn altgr_keys_send_their_text() {
+    // AltGr arrives as Left Ctrl + Right Alt.
+    let at = key(0x51, 16, 0x40, "cg", Key::Char('q'), "@");
+    assert_eq!(enc(&at, &LEGACY), "@");
+    assert_eq!(enc(&at, &kitty(5)), "@");
+    assert_eq!(enc(&at, &W32IM), "\x1b[81;16;64;1;9;1_");
+    let ogonek = key(0x41, 30, 0x105, "cg", Key::Char('a'), "ą");
+    assert_eq!(enc(&ogonek, &LEGACY), "ą");
+    assert_eq!(enc(&ogonek, &kitty(5)), "ą");
+    assert_eq!(enc(&ogonek, &W32IM), "\x1b[65;30;261;1;9;1_");
+
+    // Ctrl+Alt+A on a US layout produces no text and stays a chord.
+    for uc in [0, 1] {
+        let chord = key(0x41, 30, uc, "ca", Key::Char('a'), "a");
+        assert_eq!(enc(&chord, &LEGACY), "\x1b\x01");
+        assert_eq!(enc(&chord, &kitty(5)), "\x1b[97;7u");
+    }
+}

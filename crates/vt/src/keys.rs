@@ -152,11 +152,23 @@ fn win32(k: &KeyInput, out: &mut Vec<u8>) {
 
 /// xterm modifier bits: shift 1, alt 2, ctrl 4, super 8. Kitty uses the same
 /// four.
-fn mod_bits(m: &Mods) -> u32 {
-    u32::from(m.lshift || m.rshift)
+///
+/// Windows reports AltGr as Ctrl+Alt. When Ctrl+Alt produced printable text
+/// the key was AltGr on a layout that has it (`@` on a German keyboard, `ą`
+/// on a Polish one), so Ctrl and Alt are dropped and the text goes out as
+/// typed. On a US layout Ctrl+Alt+A produces nothing and stays a chord.
+fn mod_bits(k: &KeyInput) -> u32 {
+    let m = &k.mods;
+    let bits = u32::from(m.lshift || m.rshift)
         | u32::from(m.lalt || m.ralt) << 1
         | u32::from(m.lctrl || m.rctrl) << 2
-        | u32::from(m.lsuper || m.rsuper) << 3
+        | u32::from(m.lsuper || m.rsuper) << 3;
+    let printable = k.uc >= 0x20 && !(0x7f..0xa0).contains(&k.uc);
+    if bits & 6 == 6 && printable && !k.text.is_empty() {
+        bits & !6
+    } else {
+        bits
+    }
 }
 
 /// Writes `CSI num[:shifted[:base]] [;mods[:event]] [;text] fin`. The
@@ -239,7 +251,7 @@ fn legacy(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     if !k.down {
         return;
     }
-    let bits = mod_bits(&k.mods);
+    let bits = mod_bits(k);
     let (shift, alt, ctrl) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
     let m1 = bits + 1;
     let esc_if_alt = |out: &mut Vec<u8>| {
@@ -350,7 +362,7 @@ fn kitty(k: &KeyInput, flags: u8, out: &mut Vec<u8>) {
     if !k.down && flags & EVENT_TYPES == 0 {
         return;
     }
-    let mut bits = mod_bits(&k.mods);
+    let mut bits = mod_bits(k);
     // Lock keys only show up with all keys as escape codes. Apps that push
     // less tend to compare the modifier field exactly, and Num Lock is on
     // for most Windows users.
