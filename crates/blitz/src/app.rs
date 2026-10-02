@@ -395,7 +395,7 @@ struct App {
 
 impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
-        let config = Config::default();
+        let config = Config::load();
         let dark = match config.theme {
             ThemeMode::System => !crate::theme::system_is_light(),
             ThemeMode::Dark => true,
