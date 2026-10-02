@@ -257,14 +257,21 @@ impl Terminal {
         (self.cur.x, self.cur.y, self.cursor_visible)
     }
 
-    /// True while a synchronized update (mode 2026) is open and recent.
-    pub fn sync_pending(&self, _now: Instant) -> bool {
-        false
+    /// True while a synchronized update (mode 2026) is open and younger
+    /// than [`crate::modes::SYNC_TIMEOUT`]. Snapshots wait meanwhile, so
+    /// the host should look again once it times out.
+    pub fn sync_pending(&self, now: Instant) -> bool {
+        self.modes.sync_pending(now)
     }
 
     /// Fills `out` with the visible screen. Returns whether anything changed
     /// since the last call; when nothing did, `out` is left as it was.
+    /// During a synchronized update the screen is half drawn, so nothing
+    /// is taken until it ends or times out.
     pub fn snapshot(&mut self, out: &mut Snapshot, pal: &Palette) -> bool {
+        if self.modes.sync.is_some() && self.sync_pending(Instant::now()) {
+            return false;
+        }
         let (cols, rows) = (self.cols(), self.rows());
         let n = cols as usize * rows as usize;
         if !self.changed && (out.cols, out.rows, out.cells.len()) == (cols, rows, n) {

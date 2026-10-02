@@ -1,5 +1,7 @@
 //! Input modes as the key, mouse and paste encoders see them.
 
+use std::time::{Duration, Instant};
+
 use vt::{InputModes, MouseMode, Options, Terminal};
 
 fn term(s: &str) -> Terminal {
@@ -80,4 +82,49 @@ fn ris_keeps_conpty_modes() {
     assert_eq!(t.screen_text().lines().next(), Some(""));
     t.feed(b"\x1b[?9001l");
     assert!(!t.input_modes().w32im);
+}
+
+const PAL: vt::Palette = vt::Palette {
+    fg: 1,
+    bg: 2,
+    cursor: 3,
+    selection_bg: 4,
+    ansi: [0; 16],
+};
+
+fn first_char(s: &vt::Snapshot) -> &[u8] {
+    &s.cells[0].text[..s.cells[0].len as usize]
+}
+
+#[test]
+fn synchronized_output_holds_snapshots() {
+    let mut t = term("a");
+    let mut s = vt::Snapshot::default();
+    assert!(t.snapshot(&mut s, &PAL));
+    t.feed(b"\x1b[?2026h\rb");
+    let now = Instant::now();
+    assert!(t.sync_pending(now));
+    assert!(!t.sync_pending(now + Duration::from_millis(150)));
+    assert!(!t.snapshot(&mut s, &PAL), "held during the update");
+    assert_eq!(first_char(&s), b"a");
+    t.feed(b"\x1b[?2026l");
+    assert!(!t.sync_pending(Instant::now()));
+    assert!(t.snapshot(&mut s, &PAL));
+    assert_eq!(first_char(&s), b"b");
+}
+
+#[test]
+fn synchronized_output_times_out() {
+    let mut t = term("\x1b[?2026hx");
+    let mut s = vt::Snapshot::default();
+    assert!(!t.snapshot(&mut s, &PAL));
+    std::thread::sleep(Duration::from_millis(160));
+    assert!(!t.sync_pending(Instant::now()));
+    assert!(t.snapshot(&mut s, &PAL), "shown after 150 ms");
+    assert_eq!(first_char(&s), b"x");
+    // The mode stays set until the program ends the update.
+    let mut r = Vec::new();
+    t.feed(b"\x1b[?2026$p");
+    t.take_replies(&mut r);
+    assert_eq!(r, b"\x1b[?2026;1$y");
 }
