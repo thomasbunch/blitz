@@ -34,6 +34,10 @@ pub struct Pane {
     /// The pane's `BLITZ_PANE_TOKEN`. Only hook notifications and prompt
     /// marks that carry it are believed.
     pub token: String,
+    /// The Claude Code session running in the pane, from its hook
+    /// notifications. Kept until Claude ends the session, so a window closed
+    /// mid-session can resume it.
+    pub claude: Option<String>,
     /// Set once the child has exited.
     pub exit_code: Option<u32>,
     /// Set by the reader thread when there is new output to draw.
@@ -155,6 +159,7 @@ impl Pane {
             branch: None,
             msg: String::new(),
             token: s.token.into(),
+            claude: None,
             exit_code: None,
             dirty,
         })

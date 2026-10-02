@@ -1219,7 +1219,14 @@ impl App {
                 self.find_branch(id);
             }
             Event::Notify { title, body } => {
-                if let Some(ev) = Ev::from_notify(&title, &v.pane.token) {
+                if let Some((ev, session)) = Ev::from_notify(&title, &v.pane.token) {
+                    // `idle` is SessionEnd: the user quit Claude, so there is
+                    // nothing left to resume.
+                    if ev == Ev::Idle {
+                        v.pane.claude = None;
+                    } else if let Some(id) = session {
+                        v.pane.claude = Some(id.to_owned());
+                    }
                     let changed = self.attention(id, ev);
                     if relabels(ev, changed)
                         && let Some(v) = self.view_mut(id)
