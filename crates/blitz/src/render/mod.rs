@@ -504,11 +504,227 @@ mod gpu {
         Ok((w, h, r.gpu.read(&target)?))
     }
 
+    /// Renders a made-up window of five sessions, four of them split in
+    /// one tab, for checking the chrome. With `--demo`, `--cols` and
+    /// `--rows` give the window size in pixels.
+    fn render_demo(
+        r: &mut Renderer,
+        light: bool,
+        collapsed: bool,
+        banner: Option<&str>,
+        w: u32,
+        h: u32,
+        scale: f32,
+    ) -> Result<Vec<u8>> {
+        use std::time::{Duration, Instant};
+
+        use crate::attention::Attn;
+        use crate::layout::{Dir, PaneId, Rect, Tab, Window};
+        use crate::render::chrome::{self, ChromeModel, Session};
+
+        let pal = if light {
+            crate::theme::light()
+        } else {
+            crate::theme::dark()
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: w as i32,
+            h: h as i32,
+        };
+        let (api, web, tests, infra, migrate) =
+            (PaneId(1), PaneId(2), PaneId(3), PaneId(4), PaneId(5));
+        let mut shop = Tab::new("shop".into(), api);
+        shop.split(Dir::Right, web, area, (0, 0));
+        shop.split(Dir::Down, tests, area, (0, 0));
+        shop.focus(api);
+        shop.split(Dir::Down, infra, area, (0, 0));
+        shop.focus(web);
+        let win = Window {
+            tabs: vec![shop, Tab::new("migrate".into(), migrate)],
+            active: 0,
+            sidebar_expanded: !collapsed,
+        };
+        let now = Instant::now();
+        let ago = |s| now.checked_sub(Duration::from_secs(s)).unwrap_or(now);
+        let session = |id, name: &str, cwd: &str, branch: &str, state, msg: &str| Session {
+            id,
+            name: name.into(),
+            cwd: cwd.into(),
+            branch: Some(branch.into()),
+            state,
+            since: ago(72),
+            msg: msg.into(),
+            progress: None,
+            exit_code: None,
+        };
+        let sessions = [
+            session(
+                api,
+                "api",
+                r"C:\dev\shop\api",
+                "paging",
+                Attn::NeedsYou,
+                "Edit src/routes/users.rs?",
+            ),
+            Session {
+                progress: Some(42),
+                ..session(
+                    web,
+                    "web",
+                    r"C:\dev\shop\web",
+                    "forms",
+                    Attn::Working,
+                    "Refactoring settings form\u{2026}",
+                )
+            },
+            session(
+                tests,
+                "tests",
+                r"C:\dev\shop",
+                "main",
+                Attn::DoneUnseen,
+                "cargo test \u{b7} 142 passed",
+            ),
+            session(infra, "infra", r"C:\dev\infra", "main", Attn::Idle, ""),
+            Session {
+                exit_code: Some(1),
+                ..session(
+                    migrate,
+                    "migrate",
+                    r"C:\dev\shop\db",
+                    "v5-schema",
+                    Attn::Error,
+                    "sqlx migrate run",
+                )
+            },
+        ];
+        // Removed and added line colours for each theme.
+        let (del, add) = if light {
+            (
+                "\x1b[48;2;251;232;232m\x1b[38;2;154;45;45m",
+                "\x1b[48;2;229;243;232m\x1b[38;2;34;100;58m",
+            )
+        } else {
+            (
+                "\x1b[48;2;43;27;29m\x1b[38;2;230;167;167m",
+                "\x1b[48;2;23;39;28m\x1b[38;2;166;214;175m",
+            )
+        };
+        let del = format!("{del}  43 -     Query(p): Query<Page>,\x1b[0m");
+        let add = format!("{add}  43 +     Query(p): Query<PageParams>,\x1b[0m");
+        let screen = |id: PaneId, cols: usize| -> String {
+            let rule = "\u{2500}".repeat(cols.saturating_sub(3));
+            let boxed = |lines: &[&str]| {
+                let mut out = format!("\x1b[90m\u{256d}{rule}\u{256e}\x1b[0m\r\n");
+                for l in lines {
+                    out += &format!(
+                        "\x1b[90m\u{2502}\x1b[0m {l}\x1b[{}G\x1b[90m\u{2502}\x1b[0m\r\n",
+                        cols - 1
+                    );
+                }
+                out + &format!("\x1b[90m\u{2570}{rule}\u{256f}\x1b[0m\r\n")
+            };
+            match id {
+                PaneId(1) => {
+                    "\x1b[90m\u{25cf}\x1b[0m \x1b[1mUpdate\x1b[0m(src/routes/users.rs)\r\n\r\n"
+                        .to_string()
+                        + &boxed(&[
+                            "\x1b[1mEdit file\x1b[0m  src/routes/users.rs",
+                            "\x1b[90m  42\x1b[0m   pub async fn list_users(",
+                            &del,
+                            &add,
+                            "",
+                            "Do you want to make this edit to \x1b[1musers.rs\x1b[0m?",
+                            "\x1b[1m\u{276f} 1. Yes\x1b[0m",
+                            "  2. Yes, allow all edits during this session",
+                            "  3. No, and tell Claude what to do differently",
+                        ])
+                }
+                PaneId(2) => {
+                    "\x1b[90m> refactor the settings page to use the new form hooks\x1b[0m\r\n\r\n"
+                        .to_string()
+                        + "\u{25cf} I'll start by reading the current settings page.\r\n\r\n"
+                        + "\x1b[32m\u{25cf}\x1b[0m \x1b[1mRead\x1b[0m(src/pages/Settings.tsx)\r\n"
+                        + "  \x1b[90m\u{23bf}  Read \x1b[1m214\x1b[22m lines\x1b[0m\r\n\r\n"
+                        + "\x1b[32m\u{25cf}\x1b[0m \x1b[1mUpdate\x1b[0m(src/pages/Settings.tsx)\r\n"
+                        + "  \x1b[90m\u{23bf}  Updated with \x1b[1m38\x1b[22m additions and \x1b[1m61\x1b[22m removals\x1b[0m\r\n\r\n"
+                        + "\u{273b} Refactoring settings form\u{2026} \x1b[90m(esc to interrupt \u{b7} 1m 12s \u{b7} \u{2193} 3.4k tokens)\x1b[0m\r\n\r\n"
+                        + &boxed(&["\x1b[90m>\x1b[0m \x1b7"])
+                        + "\x1b[90m  ? for shortcuts\x1b[0m\x1b8"
+                }
+                PaneId(3) => {
+                    "PS C:\\dev\\shop> cargo test\r\n".to_string()
+                        + "\x1b[1;32m   Compiling\x1b[0m shop-core v0.4.0 (C:\\dev\\shop\\core)\r\n"
+                        + "\x1b[1;32m    Finished\x1b[0m `test` profile [unoptimized + debuginfo] target(s) in 8.41s\r\n"
+                        + "\x1b[1;32m     Running\x1b[0m unittests src\\lib.rs\r\n"
+                        + "running 142 tests\r\n"
+                        + "test cart::tests::applies_discount ... \x1b[32mok\x1b[0m\r\n"
+                        + "test cart::tests::rejects_negative_qty ... \x1b[32mok\x1b[0m\r\n"
+                        + "test orders::tests::roundtrip_json ... \x1b[32mok\x1b[0m\r\n\r\n"
+                        + "test result: \x1b[32mok\x1b[0m. 142 passed; 0 failed; 0 ignored; finished in 2.31s\r\n"
+                        + "PS C:\\dev\\shop> "
+                }
+                _ => "PS C:\\dev\\infra> ".to_string(),
+            }
+        };
+
+        let (cw, ch) = r.cell();
+        let mut model = ChromeModel {
+            win: &win,
+            sessions: &sessions,
+            light,
+            accent: crate::theme::ACCENT,
+            size: (w as i32, h as i32),
+            scale,
+            text_cell: r.small_cell(),
+            term_cell: (cw, ch),
+            now,
+            banner,
+            preedit: None,
+        };
+        let mut snaps = Vec::new();
+        for &(id, rect) in &chrome::build(&model).panes {
+            let cols = (rect.w.max(0) as u32 / cw).max(1) as u16;
+            let rows = (rect.h.max(0) as u32 / ch).max(1) as u16;
+            let mut term = vt::Terminal::new(vt::Options {
+                cols,
+                rows,
+                ..vt::Options::default()
+            });
+            term.feed(screen(id, usize::from(cols)).as_bytes());
+            if id == web {
+                // An IME composition at the prompt.
+                let (col, row, _) = term.cursor();
+                model.preedit = Some((col, row, "\u{65e5}\u{672c}"));
+            }
+            let mut snap = Snapshot::default();
+            term.snapshot(&mut snap, &pal);
+            snaps.push((rect, snap));
+        }
+        let chrome = chrome::build(&model);
+
+        let target = r.gpu.offscreen(w, h)?;
+        for _ in 0..2 {
+            r.begin();
+            for (rect, snap) in &snaps {
+                r.snapshot(snap, &pal, rect.x, rect.y);
+            }
+            r.chrome(&chrome);
+            if !r.draw(&target.rtv, w, h, pal.bg)? {
+                break;
+            }
+        }
+        r.gpu.read(&target)
+    }
+
     pub fn debug_render(args: &[String]) -> std::result::Result<String, String> {
         let mut vt_file = None;
         let mut text_file = None;
         let mut bmp = None;
-        let (mut warp, mut light) = (false, false);
+        let (mut warp, mut light, mut demo, mut collapsed) = (false, false, false, false);
+        let mut banner = None;
         let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
         let mut px = DEFAULT_PX;
         let mut it = args.iter();
@@ -524,6 +740,9 @@ mod gpu {
                 "--px" => px = f32::from(num(val()?)?),
                 "--warp" => warp = true,
                 "--light" => light = true,
+                "--demo" => demo = true,
+                "--collapsed" => collapsed = true,
+                "--banner" => banner = Some(val()?.clone()),
                 "--script" => {
                     return Err("--script is not supported yet; pass --vt FILE".into());
                 }
@@ -536,6 +755,18 @@ mod gpu {
         } else {
             crate::theme::dark()
         };
+        if demo {
+            let mut r = Renderer::new(warp, px).map_err(|e| format!("renderer: {e}"))?;
+            let (w, h) = (
+                u32::from(cols.unwrap_or(1440)),
+                u32::from(rows.unwrap_or(868)),
+            );
+            let scale = px / DEFAULT_PX;
+            let pixels = render_demo(&mut r, light, collapsed, banner.as_deref(), w, h, scale)
+                .map_err(|e| format!("render: {e}"))?;
+            write_bmp(&bmp, w, h, &pixels).map_err(|e| format!("{}: {e}", bmp.display()))?;
+            return Ok(format!("{}: {w}x{h} demo", bmp.display()));
+        }
         let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
         let snap = match (vt_file, text_file) {
             (Some(f), None) => {
