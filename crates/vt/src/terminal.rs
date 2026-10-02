@@ -710,7 +710,9 @@ impl Terminal {
             y: self.cur.y,
             ..Cursor::default()
         };
+        // Both screens forget their saved cursor, as in conhost.
         self.screen.saved = None;
+        self.other.saved = None;
     }
 
     fn full_reset(&mut self) {

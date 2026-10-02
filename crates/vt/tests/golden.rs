@@ -298,6 +298,14 @@ fn save_restore_and_resets() {
     assert_eq!(t.cursor(), (0, 0, true));
 }
 
+/// DECSTR on the alternate screen also drops the cursor saved on entry,
+/// as conhost does, so leaving restores the same cursor on both sides.
+#[test]
+fn decstr_forgets_both_saved_cursors() {
+    let t = run(10, 3, "\x1b[2;3H\x1b[?1049h\x1b[!p\x1b[3;5H\x1b[?1049l");
+    assert_eq!(t.cursor(), (0, 0, true));
+}
+
 #[test]
 fn combining_marks_and_line_drawing() {
     let mut t = run(10, 2, "e\u{301}x\x1b(0lqk\x1b(B q");
