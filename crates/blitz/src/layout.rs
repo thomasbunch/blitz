@@ -152,6 +152,26 @@ impl Node {
         }
     }
 
+    /// Replaces the split that holds leaf `p` with `p`'s sibling and returns
+    /// the sibling's panes. The splits above keep their ratios.
+    fn remove(&mut self, p: PaneId) -> Option<Vec<PaneId>> {
+        let Node::Split(s) = self else {
+            return None;
+        };
+        let sibling = if s.a == Node::Leaf(p) {
+            &mut s.b
+        } else if s.b == Node::Leaf(p) {
+            &mut s.a
+        } else {
+            return s.a.remove(p).or_else(|| s.b.remove(p));
+        };
+        let sibling = std::mem::replace(sibling, Node::Leaf(p));
+        let mut panes = Vec::new();
+        sibling.leaves(&mut panes);
+        *self = sibling;
+        Some(panes)
+    }
+
     fn walk(&self, area: Rect, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Rect>) {
         match self {
             Node::Leaf(p) => panes.push((*p, area)),
@@ -258,6 +278,26 @@ impl Tab {
         self.focus(new);
         true
     }
+
+    /// Removes `p` and gives its space to its sibling. If `p` had focus, the
+    /// most recently focused pane on the sibling's side gets it. Returns
+    /// false if `p` is not in this tab or is its only pane; closing the
+    /// last pane closes the tab, which is up to the window.
+    pub fn close(&mut self, p: PaneId) -> bool {
+        let Some(sibling) = self.root.remove(p) else {
+            return false;
+        };
+        self.mru.retain(|&q| q != p);
+        if self.zoom == Some(p) {
+            self.zoom = None;
+        }
+        if self.focus == p {
+            let mut recent = self.mru.iter().copied();
+            let next = recent.find(|q| sibling.contains(q)).unwrap_or(sibling[0]);
+            self.focus(next);
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -276,6 +316,24 @@ impl Default for Window {
             active: 0,
             sidebar_expanded: true,
         }
+    }
+}
+
+impl Window {
+    /// Closes pane `p` wherever it is. Closing a tab's last pane removes
+    /// the tab; the window should close once `tabs` is empty. Returns false
+    /// if no tab has `p`.
+    pub fn close_pane(&mut self, p: PaneId) -> bool {
+        let Some(i) = self.tabs.iter().position(|t| t.root.contains(p)) else {
+            return false;
+        };
+        if !self.tabs[i].close(p) {
+            self.tabs.remove(i);
+            if i < self.active || self.active >= self.tabs.len() {
+                self.active = self.active.saturating_sub(1);
+            }
+        }
+        true
     }
 }
 
@@ -357,5 +415,75 @@ mod tests {
         let before = t.clone();
         assert!(!t.split(Dir::Right, PaneId(6), AREA, MIN));
         assert_eq!(t, before);
+    }
+
+    #[test]
+    fn close_promotes_the_sibling() {
+        // Pane 2's sibling (3 | 4) takes the whole right column; the root
+        // keeps its ratio and focus stays on 4.
+        let mut t = four();
+        assert!(t.close(PaneId(2)));
+        assert_eq!(t.panes(), ids(&[1, 3, 4]));
+        assert_eq!(t.focus, PaneId(4));
+        assert_eq!(t.mru, ids(&[4, 3, 1]));
+        assert_eq!(
+            t.rects(AREA),
+            vec![
+                (PaneId(1), r(0, 0, 500, 601)),
+                (PaneId(3), r(501, 0, 250, 601)),
+                (PaneId(4), r(752, 0, 249, 601)),
+            ]
+        );
+    }
+
+    #[test]
+    fn close_moves_focus_by_mru_within_the_sibling() {
+        let mut t = four();
+        assert!(t.close(PaneId(4)));
+        assert_eq!(t.focus, PaneId(3));
+
+        // Closing 1 hands focus to the most recent of 2, 3, 4, not to the
+        // first pane in the sibling.
+        let mut t = four();
+        t.focus(PaneId(3));
+        t.focus(PaneId(1));
+        assert!(t.close(PaneId(1)));
+        assert_eq!(t.focus, PaneId(3));
+        assert_eq!(t.panes(), ids(&[2, 3, 4]));
+        assert_eq!(t.rects(AREA)[0], (PaneId(2), r(0, 0, 1001, 300)));
+    }
+
+    #[test]
+    fn close_refuses_the_only_pane_and_strangers() {
+        let mut t = Tab::new("t".into(), PaneId(1));
+        assert!(!t.close(PaneId(1)));
+        assert!(!t.close(PaneId(9)));
+        let mut t = four();
+        assert!(!t.close(PaneId(9)));
+        assert_eq!(t, four());
+    }
+
+    #[test]
+    fn closing_the_last_pane_closes_the_tab() {
+        let mut w = Window::default();
+        for n in 1..=3 {
+            w.tabs.push(Tab::new(format!("t{n}"), PaneId(n)));
+        }
+        assert!(w.tabs[1].split(Dir::Right, PaneId(4), AREA, MIN));
+        w.active = 2;
+
+        assert!(w.close_pane(PaneId(4)));
+        assert_eq!(w.tabs.len(), 3);
+        // A tab before the active one goes away; the same tab stays active.
+        assert!(w.close_pane(PaneId(1)));
+        assert_eq!((w.tabs.len(), w.active), (2, 1));
+        assert_eq!(w.tabs[w.active].name, "t3");
+        // The active tab was last, so the one before it becomes active.
+        assert!(w.close_pane(PaneId(3)));
+        assert_eq!((w.tabs.len(), w.active), (1, 0));
+        assert!(!w.close_pane(PaneId(3)));
+        assert!(w.close_pane(PaneId(2)));
+        assert!(w.tabs.is_empty());
+        assert_eq!(w.active, 0);
     }
 }
