@@ -32,6 +32,8 @@ pub struct Config {
     pub command_finish_after_ms: u64,
     /// Look for a newer release on GitHub at start and once a day.
     pub check_updates: bool,
+    /// Reopen the last window's tabs, splits and folders at start.
+    pub restore_session: bool,
     /// Overrides as (chord, action) pairs, e.g. ("ctrl+shift+r", "split_right").
     pub keys: Vec<(String, String)>,
 }
@@ -53,6 +55,7 @@ impl Default for Config {
             bell_attention: true,
             command_finish_after_ms: 5000,
             check_updates: true,
+            restore_session: true,
             keys: vec![("ctrl+shift+r".into(), "split_right".into())],
         }
     }
