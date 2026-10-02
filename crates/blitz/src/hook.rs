@@ -131,10 +131,75 @@ pub fn one_line(s: &str) -> String {
     cut
 }
 
+/// Claude Code events blitz hooks, with the matcher each one needs.
+const CLAUDE_HOOKS: [(&str, &str); 7] = [
+    ("UserPromptSubmit", ""),
+    ("PermissionRequest", ""),
+    ("PreToolUse", "^(AskUserQuestion|ExitPlanMode)$"),
+    ("Notification", NOTIFY_TYPES),
+    ("Stop", ""),
+    ("StopFailure", ""),
+    ("SessionEnd", ""),
+];
+
 /// `blitz setup <app>`. Returns the process exit code.
-pub fn setup(_args: &[String]) -> i32 {
-    eprintln!("blitz setup: not available in this build");
-    2
+///
+/// `blitz setup claude` prints the hooks to add to Claude Code's settings,
+/// pointing at the `blitz-hook` next to this exe. It never edits the
+/// settings file itself; that file belongs to the user.
+pub fn setup(args: &[String]) -> i32 {
+    if args != ["claude"] {
+        eprintln!("usage: blitz setup claude");
+        return 2;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("blitz setup: cannot find blitz itself: {e}");
+            return 1;
+        }
+    };
+    let hook = exe.with_file_name(format!("blitz-hook{}", std::env::consts::EXE_SUFFIX));
+    if !hook.is_file() {
+        eprintln!(
+            "warning: {} is missing; keep it next to blitz",
+            hook.display()
+        );
+    }
+    let settings = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|h| h.join(".claude")))
+        .unwrap_or_default()
+        .join("settings.json");
+    eprintln!(
+        "Merge the \"hooks\" below into {}.\n\
+         Claude Code picks the change up without a restart.\n",
+        settings.display()
+    );
+    print!("{}", claude_settings(&hook.to_string_lossy()));
+    0
+}
+
+/// The Claude Code settings fragment that runs `hook_exe claude` on every
+/// event in `CLAUDE_HOOKS`.
+pub fn claude_settings(hook_exe: &str) -> String {
+    let mut cmd = String::new();
+    escape_json(hook_exe, &mut cmd);
+    let mut out = String::from("{\n  \"hooks\": {\n");
+    for (i, (event, matcher)) in CLAUDE_HOOKS.iter().enumerate() {
+        let matcher = match *matcher {
+            "" => String::new(),
+            m => format!("\"matcher\": \"{m}\", "),
+        };
+        let comma = if i + 1 < CLAUDE_HOOKS.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "    \"{event}\": [{{ {matcher}\"hooks\": [{{ \"type\": \"command\", \
+             \"command\": \"{cmd}\", \"args\": [\"claude\"], \"timeout\": 5 }}] }}]{comma}"
+        );
+    }
+    out.push_str("  }\n}\n");
+    out
 }
 
 /// A parsed JSON value. Objects keep their keys in order.
@@ -440,6 +505,39 @@ mod tests {
             let got = got.as_ref().map(|(s, m)| (*s, m.as_str()));
             assert_eq!(got, *want, "{payload}");
         }
+    }
+
+    #[test]
+    fn settings_snippet() {
+        let exe = r"C:\Program Files\blitz\blitz-hook.exe";
+        let v = Json::parse(&claude_settings(exe)).expect("snippet is valid JSON");
+        let hooks = v.get("hooks").unwrap();
+        for (event, matcher) in CLAUDE_HOOKS {
+            let Some(Json::Arr(groups)) = hooks.get(event) else {
+                panic!("{event} missing");
+            };
+            assert_eq!(groups.len(), 1, "{event}");
+            let group = &groups[0];
+            let want_matcher = (!matcher.is_empty()).then(|| Json::Str(matcher.into()));
+            assert_eq!(group.get("matcher"), want_matcher.as_ref(), "{event}");
+            let Some(Json::Arr(cmds)) = group.get("hooks") else {
+                panic!("{event} has no hooks");
+            };
+            let cmd = &cmds[0];
+            assert_eq!(cmd.get("type").and_then(Json::as_str), Some("command"));
+            assert_eq!(cmd.get("command").and_then(Json::as_str), Some(exe));
+            assert_eq!(
+                cmd.get("args"),
+                Some(&Json::Arr(vec![Json::Str("claude".into())]))
+            );
+            assert_eq!(cmd.get("timeout"), Some(&Json::Num(5.0)));
+        }
+    }
+
+    #[test]
+    fn setup_needs_an_app() {
+        assert_eq!(setup(&[]), 2);
+        assert_eq!(setup(&["vim".into()]), 2);
     }
 
     #[test]
