@@ -448,7 +448,10 @@ impl App {
         self.window = Some(window);
         self.ensure_gfx();
 
-        let cwd = (self.args.cwd.clone()).or_else(|| std::env::current_dir().ok());
+        let cwd = match &self.args.cwd {
+            Some(dir) => start_dir(dir),
+            None => std::env::current_dir().ok(),
+        };
         let id = PaneId(self.next_id);
         let mut win = layout::Window::default();
         win.tabs.push(Tab::new(tab_name(cwd.as_deref()), id));
@@ -1583,10 +1586,10 @@ fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &
 
 /// Where a new pane starts: `cwd` if it is still a directory, else the
 /// user's profile folder.
-fn start_dir(cwd: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(cwd);
-    if !cwd.is_empty() && dir.is_dir() {
-        return Some(dir);
+fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
+    let dir = cwd.as_ref();
+    if !dir.as_os_str().is_empty() && dir.is_dir() {
+        return Some(dir.to_path_buf());
     }
     std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
@@ -2274,7 +2277,7 @@ mod tests {
     #[test]
     fn app_new_panes_start_in_the_focused_directory() {
         let here = std::env::temp_dir();
-        assert_eq!(start_dir(&here.display().to_string()), Some(here));
+        assert_eq!(start_dir(here.display().to_string()), Some(here));
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
         assert_eq!(start_dir(r"Z:\gone"), home);
         assert_eq!(start_dir(""), home);
