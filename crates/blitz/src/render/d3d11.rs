@@ -560,4 +560,50 @@ mod tests {
         assert_eq!(at(10, 0), [128, 0, 0]);
         assert_eq!(at(15, 7), [128, 0, 0]);
     }
+
+    #[test]
+    fn swapchain_on_a_hidden_window_presents_and_resizes() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+        };
+        use windows::core::w;
+
+        let mut gpu = Gpu::new(true).expect("WARP device");
+        // SAFETY: a plain hidden top-level window of a system class.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                48,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("window");
+        let mut chain = Swapchain::new(&gpu, hwnd, 64, 48).expect("swap chain");
+        for (w, h) in [(64, 48), (32, 20), (0, 0)] {
+            chain.resize(&gpu, w, h).expect("resize");
+            chain.wait(100);
+            let rtv = chain.rtv(&gpu).expect("back buffer");
+            let quad = Quad {
+                size: [8, 8],
+                color: rgba(0xffffff),
+                ..Default::default()
+            };
+            gpu.draw(&rtv, chain.w, chain.h, 0x101010, &[quad])
+                .expect("draw");
+            chain.present().expect("present");
+        }
+        assert_eq!((chain.w, chain.h), (1, 1));
+        drop(chain);
+        // SAFETY: the window was created above on this thread.
+        unsafe { DestroyWindow(hwnd) }.expect("destroy");
+    }
 }
