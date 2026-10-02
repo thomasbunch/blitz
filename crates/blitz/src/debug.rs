@@ -295,10 +295,6 @@ impl Shared {
                 st.term.feed(d);
                 let mut reply = Vec::new();
                 st.term.take_replies(&mut reply);
-                if reply.is_empty() {
-                    let (col, row, _) = st.term.cursor();
-                    answer_queries(d, col, row, &mut reply);
-                }
                 if !reply.is_empty() {
                     st.log(ms, "ans", &esc(&reply));
                     w.send(reply);
@@ -321,32 +317,6 @@ impl Shared {
         }
         drop(guard);
         self.changed.notify_all();
-    }
-}
-
-/// Answers the queries programs send at start-up when the terminal left
-/// them unanswered, so a run never stalls waiting for a reply.
-fn answer_queries(chunk: &[u8], col: u16, row: u16, out: &mut Vec<u8>) {
-    const DA1: &[u8] = b"\x1b[?62;22c";
-    let cpr = format!("\x1b[{};{}R", row + 1, col + 1);
-    let version = format!("\x1bP>|blitz {}\x1b\\", env!("CARGO_PKG_VERSION"));
-    let table: [(&[u8], &[u8]); 11] = [
-        (b"\x1b[c", DA1),
-        (b"\x1b[0c", DA1),
-        (b"\x1b[>c", b"\x1b[>1;0;0c"),
-        (b"\x1b[6n", cpr.as_bytes()),
-        (b"\x1b[?u", b"\x1b[?0u"),
-        (b"\x1b[>q", version.as_bytes()),
-        (b"\x1b[>0q", version.as_bytes()),
-        (b"\x1b]10;?", b"\x1b]10;rgb:cccc/cccc/cccc\x1b\\"),
-        (b"\x1b]11;?", b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\"),
-        (b"\x1b[?2026$p", b"\x1b[?2026;2$y"),
-        (b"\x1b[?1016$p", b"\x1b[?1016;0$y"),
-    ];
-    for (query, answer) in table {
-        if find(chunk, query).is_some() {
-            out.extend_from_slice(answer);
-        }
     }
 }
 
@@ -1218,16 +1188,6 @@ mod tests {
         assert!(chord("hyper+a", &mut text).is_err());
         assert!(chord("f25", &mut text).is_err());
         assert!(chord("nosuchkey", &mut text).is_err());
-    }
-
-    #[test]
-    fn debug_answers_startup_queries() {
-        let mut out = Vec::new();
-        answer_queries(b"\x1b[1t\x1b[c", 0, 0, &mut out);
-        assert_eq!(out, b"\x1b[?62;22c");
-        out.clear();
-        answer_queries(b"\x1b[?u\x1b[6n", 4, 2, &mut out);
-        assert_eq!(out, b"\x1b[3;5R\x1b[?0u");
     }
 
     #[test]
