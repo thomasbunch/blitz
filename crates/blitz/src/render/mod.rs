@@ -317,7 +317,7 @@ mod gpu {
             let slot = match fits(&mut self.atlas) {
                 Some(slot) => slot,
                 None => {
-                    // ponytail: a full atlas is wiped mid-frame, so glyphs
+                    // A full atlas is wiped mid-frame, so glyphs
                     // already queued this frame may show stale pixels; the
                     // caller redraws when `draw` reports it. Fine unless one
                     // frame needs more glyphs than the whole atlas holds.

@@ -141,7 +141,7 @@ impl Font {
     /// from the system fallback font, shrunk to fit their cells and
     /// centred on them.
     pub fn raster(&mut self, text: &str, style: u8, width: u8) -> Result<Option<Raster>> {
-        // ponytail: no shaping. A cluster is drawn as its base character
+        // No shaping. A cluster is drawn as its base character
         // plus the marks the same font has; emoji ZWJ sequences show their
         // first emoji only (color emoji are not drawn as color anyway).
         let chars: Vec<char> = if text.contains('\u{200D}') {
