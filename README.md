@@ -14,32 +14,31 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   finished, and the taskbar button flashes if blitz is in the background.
 - Direct3D 11 and DirectWrite rendering, with a software fallback.
 
+## Install
+
+Windows 10 1809 or later, x64. From
+[Releases](https://github.com/thomasbunch/blitz/releases), run the
+`-setup.exe` (installs for the current user, no admin rights needed) or
+unzip the `.zip` anywhere. Builds are not code-signed yet: if SmartScreen
+says "Windows protected your PC", choose **More info**, then **Run anyway**.
+
+The shell is PowerShell 7 if installed, else Windows PowerShell, else cmd.
+
 ## Build
 
-Needs Windows 10 1809 or later and [Rust](https://rustup.rs). The pinned
-toolchain in `rust-toolchain.toml` is installed automatically.
+Needs [Rust](https://rustup.rs); `rust-toolchain.toml` pins the toolchain.
 
 ```
 cargo build --release
 ```
 
-This produces `target\release\blitz.exe` and `blitz-hook.exe`. Keep the
-two in the same folder.
-
-## Run
-
-```
-target\release\blitz.exe
-```
-
-The shell is PowerShell 7 if installed, else Windows PowerShell, else cmd.
-
-For best results, place Microsoft's `conpty.dll` and `OpenConsole.exe`
-(NuGet package `Microsoft.Windows.Console.ConPTY` 1.25 or later, folder
-`runtimes\win-x64`) next to `blitz.exe`, or set `BLITZ_CONPTY_DIR` to the
-folder that holds them. With 1.24, PowerShell's cursor can drift after a
-resize. Without them blitz uses the console host built into Windows,
-which is slower and drops some features such as synchronized output.
+This produces `target\release\blitz.exe` and `blitz-hook.exe`; keep them
+together. Releases also ship Microsoft's `conpty.dll` and `OpenConsole.exe`
+(NuGet `Microsoft.Windows.Console.ConPTY` 1.25 or later, from
+`runtimes\win-x64` and `build\native\runtimes\x64`). Put them next to
+`blitz.exe` or set `BLITZ_CONPTY_DIR` to their folder. Without them blitz
+uses the slower console host built into Windows, which drops some
+features such as synchronized output.
 
 ## Claude Code
 
@@ -67,12 +66,6 @@ nothing when Claude Code runs outside blitz.
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
-
-## Unsigned builds
-
-Builds are not code-signed yet, so SmartScreen may show "Windows protected
-your PC" the first time. Choose **More info**, then **Run anyway**, or build
-from source.
 
 ## License
 
