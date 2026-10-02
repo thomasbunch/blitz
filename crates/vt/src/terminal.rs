@@ -7,7 +7,7 @@ use crate::modes::InputModes;
 use crate::parser::{Handler, Params, Parser};
 use crate::snapshot::{self, CursorShape, Palette, RenderCell, Snapshot};
 use crate::style::{Color, Style, Styles, attr};
-use crate::width::cluster_width;
+use crate::width::{chars_width, joins};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -81,6 +81,16 @@ struct Cursor {
     gl: usize,
 }
 
+/// Where the last printed grapheme cluster went and what it holds so far.
+#[derive(Clone, Copy, Debug)]
+struct Cluster {
+    x: u16,
+    y: u16,
+    first: char,
+    last: char,
+    len: usize,
+}
+
 struct Screen {
     grid: Grid,
     /// DECSC slot. Each screen has its own.
@@ -110,11 +120,8 @@ pub struct Terminal {
     cursor_shape: CursorShape,
     /// Last printed character, for REP.
     rep: Option<char>,
-    /// Cell the last character went to, while combining marks may still
-    /// join it.
-    last_cell: Option<(u16, u16)>,
-    /// The previous code point was a zero-width joiner.
-    joiner: bool,
+    /// The cluster just printed, while more code points may still join it.
+    cluster: Option<Cluster>,
     /// Rows the view is scrolled back into scrollback.
     viewport: usize,
     changed: bool,
@@ -148,8 +155,7 @@ impl Terminal {
             cursor_visible: true,
             cursor_shape: CursorShape::Block,
             rep: None,
-            last_cell: None,
-            joiner: false,
+            cluster: None,
             viewport: 0,
             changed: true,
             replies: Vec::new(),
@@ -312,27 +318,59 @@ impl Terminal {
                 row.insert(x as usize, n, blank);
             }
             row.put_ascii(x as usize, &text[..n], sid);
-            self.last_cell = Some((x + n as u16 - 1, self.cur.y));
-            self.rep = Some(text[n - 1] as char);
+            let c = text[n - 1] as char;
+            self.cluster = Some(Cluster {
+                x: x + n as u16 - 1,
+                y: self.cur.y,
+                first: c,
+                last: c,
+                len: 1,
+            });
+            self.rep = Some(c);
             self.advance(n as u16);
             text = &text[n..];
         }
     }
 
     fn print_char(&mut self, c: char) {
-        if (self.joiner || is_extend(c))
-            && let Some((x, y)) = self.last_cell
-        {
-            self.screen.grid.row_mut(y).push_grapheme(x, c);
-            self.joiner = c == '\u{200D}';
-            return;
-        }
-        self.joiner = false;
         let c = match self.cur.charsets[self.cur.gl] {
             Charset::DecGraphics => dec_graphics(c),
             Charset::Ascii => c,
         };
-        self.put(c, is_wide(c));
+        if let Some(cl) = &mut self.cluster
+            && joins(cl.first, cl.last, cl.len, c)
+        {
+            cl.last = c;
+            cl.len += 1;
+            let Cluster { x, y, first, .. } = *cl;
+            self.join(x, y, first, c);
+            return;
+        }
+        match self.width(c) {
+            // A mark or joiner with nothing to attach to.
+            0 => {}
+            w => self.put(c, w == 2),
+        }
+    }
+
+    /// Adds `c` to the cluster in cell (`x`, `y`). VS16 or a skin tone can
+    /// make a narrow emoji wide; it then takes the next column when the
+    /// cursor is still right after it.
+    fn join(&mut self, x: u16, y: u16, first: char, c: char) {
+        let amb = self.opts.ambiguous_wide;
+        let at_cursor = self.cur.y == y && self.cur.x == x + 1 && !self.cur.pending_wrap;
+        let row = self.screen.grid.row_mut(y);
+        row.push_grapheme(x, c);
+        let narrow = row.cells[x as usize].flags & cf::WIDE == 0;
+        let tail = row.grapheme(x).unwrap_or_default().chars();
+        if narrow && at_cursor && chars_width(std::iter::once(first).chain(tail), amb) == 2 {
+            row.widen(x as usize);
+            self.advance(1);
+        }
+    }
+
+    fn width(&self, c: char) -> u8 {
+        chars_width([c], self.opts.ambiguous_wide)
     }
 
     /// Writes one character at the cursor and moves past it.
@@ -366,7 +404,13 @@ impl Terminal {
             flags: if wide { cf::WIDE } else { 0 },
         };
         self.row().put(x as usize, cell);
-        self.last_cell = Some((x, self.cur.y));
+        self.cluster = Some(Cluster {
+            x,
+            y: self.cur.y,
+            first: c,
+            last: c,
+            len: 1,
+        });
         self.rep = Some(c);
         self.advance(w);
     }
@@ -742,7 +786,6 @@ impl Handler for Terminal {
     fn print(&mut self, s: &str) {
         self.changed = true;
         if s.is_ascii() && self.cur.charsets[self.cur.gl] == Charset::Ascii {
-            self.joiner = false;
             self.print_ascii(s.as_bytes());
         } else {
             s.chars().for_each(|c| self.print_char(c));
@@ -751,8 +794,7 @@ impl Handler for Terminal {
 
     fn execute(&mut self, c0: u8) {
         self.changed = true;
-        self.last_cell = None;
-        self.joiner = false;
+        self.cluster = None;
         match c0 {
             0x07 => self.events.push(Event::Bell),
             0x08 => {
@@ -778,8 +820,7 @@ impl Handler for Terminal {
 
     fn esc(&mut self, inter: &[u8], fin: u8) {
         self.changed = true;
-        self.last_cell = None;
-        self.joiner = false;
+        self.cluster = None;
         match (inter, fin) {
             ([], b'7') => self.save_cursor(),
             ([], b'8') => self.restore_cursor(),
@@ -803,8 +844,7 @@ impl Handler for Terminal {
 
     fn csi(&mut self, p: &Params, inter: &[u8], fin: u8) {
         self.changed = true;
-        self.last_cell = None;
-        self.joiner = false;
+        self.cluster = None;
         // Count parameters: absent or 0 means 1.
         let n = |i: usize| p.get(i).max(1);
         let blank = self.blank();
@@ -854,7 +894,7 @@ impl Handler for Terminal {
             ([], b'Z') => self.back_tab(n(0)),
             ([], b'b') => {
                 if let Some(c) = self.rep {
-                    let wide = is_wide(c);
+                    let wide = self.width(c) == 2;
                     let max = self.cols() as usize * self.rows() as usize;
                     for _ in 0..(n(0) as usize).min(max) {
                         self.put(c, wide);
@@ -927,22 +967,6 @@ fn rows_text<'a>(rows: impl Iterator<Item = &'a Row>) -> String {
         s.truncate(s.trim_end_matches(' ').len());
     }
     s
-}
-
-fn is_wide(c: char) -> bool {
-    cluster_width(c.encode_utf8(&mut [0; 4])) == 2
-}
-
-/// Code points that join the previous cell instead of taking their own.
-// ponytail: common combining blocks, joiners, variation selectors, skin
-// tones and tags; the generated Unicode tables should own this list.
-fn is_extend(c: char) -> bool {
-    matches!(c as u32,
-        0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD | 0x0610..=0x061A
-        | 0x064B..=0x065F | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E
-        | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200C..=0x200D | 0x20D0..=0x20FF
-        | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F | 0x1F3FB..=0x1F3FF
-        | 0xE0020..=0xE007F | 0xE0100..=0xE01EF)
 }
 
 /// DEC Special Graphics for `_` and `` ` `` through `~`.

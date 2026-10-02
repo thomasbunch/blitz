@@ -359,6 +359,25 @@ fn combining_marks_and_line_drawing() {
 }
 
 #[test]
+fn clusters_that_change_width() {
+    // VS16 turns a text-style heart into a two-column emoji.
+    let mut t = run(10, 2, "\u{2764}x\r\n\u{2764}\u{FE0F}x");
+    assert_eq!(t.screen_text(), "\u{2764}x\n\u{2764}\u{FE0F}x");
+    assert_eq!(t.cursor(), (3, 1, true));
+    let s = snap(&mut t);
+    assert_eq!((cell(&s, 0, 1).width, cell(&s, 1, 1).width), (2, 0));
+
+    // A flag is one cluster of two regional indicators; a third starts
+    // a new one.
+    let t = run(10, 1, "\u{1F1FA}\u{1F1F8}\u{1F1EB}");
+    assert_eq!(t.cursor(), (4, 0, true));
+
+    // A mark with nothing before it is dropped.
+    let t = run(10, 1, "a\r\u{301}b");
+    assert_eq!(t.screen_text(), "b");
+}
+
+#[test]
 fn insert_mode() {
     let mut t = run(6, 1, "abc\x1b[4h\x1b[1GXY");
     assert_eq!(t.screen_text(), "XYabc");

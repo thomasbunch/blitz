@@ -169,6 +169,23 @@ impl Row {
         }
     }
 
+    /// Turns the narrow cell at `x` into a wide one, taking `x + 1` as its
+    /// spacer. Does nothing at the last column.
+    pub fn widen(&mut self, x: usize) {
+        if x + 1 >= self.cells.len() {
+            return;
+        }
+        self.split_pair(x + 2);
+        self.drop_graphemes(x + 1..x + 2);
+        let style = self.cells[x].style;
+        self.cells[x].flags |= cf::WIDE;
+        self.cells[x + 1] = Cell {
+            cp: 0,
+            style,
+            flags: cf::SPACER_TAIL,
+        };
+    }
+
     /// Writes a run of printable ASCII starting at `x`. The caller guarantees
     /// it fits.
     pub fn put_ascii(&mut self, x: usize, text: &[u8], style: u16) {
