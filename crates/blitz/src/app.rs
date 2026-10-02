@@ -324,8 +324,9 @@ struct App {
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
-    /// A multi-line paste waiting for its confirming Ctrl+V.
-    paste: Option<(String, Instant)>,
+    /// A multi-line paste waiting for its confirming Ctrl+V in the pane
+    /// that asked.
+    paste: Option<(PaneId, String, Instant)>,
     /// A busy session waiting for a second Ctrl+Shift+W.
     close_confirm: Option<(PaneId, Instant)>,
     /// The release of this key belongs to a shortcut and is not sent.
@@ -832,17 +833,16 @@ impl App {
                 };
                 let bracketed = self.modes().bracketed;
                 if vt::keys::needs_paste_confirm(&text, bracketed) {
-                    let confirmed = self
-                        .paste
-                        .take()
-                        .is_some_and(|(t, until)| t == text && Instant::now() < until);
                     let Some(id) = before else {
                         return false;
                     };
+                    let confirmed = self.paste.take().is_some_and(|(p, t, until)| {
+                        p == id && t == text && Instant::now() < until
+                    });
                     if !confirmed {
                         let lines = text.lines().count();
                         let until = Instant::now() + CONFIRM;
-                        self.paste = Some((text, until));
+                        self.paste = Some((id, text, until));
                         self.set_notice(
                             id,
                             format!("Paste {lines} lines? Press Ctrl+V again within 3 s"),
