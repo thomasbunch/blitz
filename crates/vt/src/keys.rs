@@ -101,12 +101,24 @@ const ESC: u8 = 0x1b;
 /// Windows' "the IME owns this key" virtual key.
 const VK_PROCESSKEY: u16 = 0xe5;
 
+// Kitty keyboard protocol flags.
+const DISAMBIGUATE: u8 = 1;
+const EVENT_TYPES: u8 = 2;
+const ALTERNATE_KEYS: u8 = 4;
+const ALL_KEYS: u8 = 8;
+const ASSOCIATED_TEXT: u8 = 16;
+
 /// Appends the bytes for `k` under the current modes.
 pub fn encode_key(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     if k.vk == VK_PROCESSKEY {
         return;
     }
-    legacy(k, m, out);
+    // Without disambiguate or all-keys, kitty flags leave presses legacy.
+    if m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0 {
+        kitty(k, m.kitty, out);
+    } else {
+        legacy(k, m, out);
+    }
 }
 
 /// xterm modifier bits: shift 1, alt 2, ctrl 4, super 8. Kitty uses the same
@@ -297,6 +309,132 @@ fn tilde_number(key: Key) -> u32 {
 /// `CSI n ~` number for F5 to F12.
 fn f_tilde(n: u8) -> u32 {
     [15, 17, 18, 19, 20, 21, 23, 24][usize::from(n - 5)]
+}
+
+/// The kitty keyboard protocol, limited to the flags the application
+/// pushed: no event types, alternates or text unless asked for.
+fn kitty(k: &KeyInput, flags: u8, out: &mut Vec<u8>) {
+    let all = flags & ALL_KEYS != 0;
+    // KeyInput has no auto-repeat bit, so repeats go out as presses. Add
+    // one if an app that pushes event types turns out to care.
+    let event = if k.down { 1 } else { 3 };
+    if !k.down && flags & EVENT_TYPES == 0 {
+        return;
+    }
+    let mut bits = mod_bits(&k.mods);
+    // Lock keys only show up with all keys as escape codes. Apps that push
+    // less tend to compare the modifier field exactly, and Num Lock is on
+    // for most Windows users.
+    if all {
+        bits |= u32::from(k.locks.caps) << 6 | u32::from(k.locks.num) << 7;
+    }
+    let m1 = bits + 1;
+    let text = if all && flags & ASSOCIATED_TEXT != 0 && k.down {
+        k.text
+    } else {
+        ""
+    };
+    // Keypad keys get their own codes only with all keys as escape codes.
+    // The spec also wants them for non-text keypad keys under disambiguate,
+    // but apps that push just that may not map them, and keypad Enter has
+    // to keep submitting.
+    if all && let Some(code) = keypad_code(k) {
+        csi(out, code, None, None, m1, event, text, b'u');
+        return;
+    }
+    let key = |out: &mut Vec<u8>, num: u32, fin: u8| csi(out, num, None, None, m1, event, "", fin);
+    match k.key {
+        Key::Char(c) => {
+            if !all && bits & !1 == 0 {
+                // Text keys alone or with Shift stay plain text.
+                if k.down {
+                    out.extend_from_slice(k.text.as_bytes());
+                }
+                return;
+            }
+            let code = c.to_lowercase().next().unwrap_or(c) as u32;
+            let alternates = flags & ALTERNATE_KEYS != 0;
+            let shifted =
+                single(k.text).filter(|s| alternates && bits & 1 != 0 && *s as u32 != code);
+            let base = k.us_base.filter(|b| alternates && *b as u32 != code);
+            csi(out, code, shifted, base, m1, event, text, b'u');
+        }
+        Key::Enter | Key::Tab | Key::Backspace => {
+            let (code, plain) = match k.key {
+                Key::Enter => (13, b'\r'),
+                Key::Tab => (9, b'\t'),
+                _ => (127, 0x7f),
+            };
+            // Unmodified they keep their legacy bytes, so `reset` can still
+            // be typed after a crashed app leaves flags pushed, and they
+            // report releases only with all keys as escape codes.
+            if !all && (bits == 0 || !k.down) {
+                if k.down {
+                    out.push(plain);
+                }
+                return;
+            }
+            key(out, code, b'u');
+        }
+        Key::Escape => key(out, 27, b'u'),
+        Key::Up | Key::Down | Key::Right | Key::Left | Key::Home | Key::End => {
+            key(out, 1, cursor_final(k.key));
+        }
+        Key::Insert | Key::Delete | Key::PageUp | Key::PageDown => {
+            key(out, tilde_number(k.key), b'~');
+        }
+        // CSI R would read as a cursor position report.
+        Key::F(3) => key(out, 13, b'~'),
+        Key::F(n @ (1 | 2 | 4)) => key(out, 1, b'P' + n - 1),
+        Key::F(n @ 5..=12) => key(out, f_tilde(n), b'~'),
+        Key::F(n @ 13..=35) => key(out, 57376 + u32::from(n - 13), b'u'),
+        _ => {
+            if all && let Some(code) = modifier_code(k) {
+                key(out, code, b'u');
+            }
+        }
+    }
+}
+
+/// The string's only character, if it has exactly one.
+fn single(s: &str) -> Option<char> {
+    let mut it = s.chars();
+    it.next().filter(|_| it.next().is_none())
+}
+
+/// Kitty's private-use code for a keypad key.
+fn keypad_code(k: &KeyInput) -> Option<u32> {
+    Some(match k.vk {
+        0x60..=0x69 => 57399 + u32::from(k.vk - 0x60),
+        0x6e => 57409, // decimal
+        0x6f => 57410, // divide
+        0x6a => 57411, // multiply
+        0x6d => 57412, // subtract
+        0x6b => 57413, // add
+        0x0d if k.extended => 57414,
+        0x6c => 57416, // separator
+        _ => return None,
+    })
+}
+
+/// Kitty's code for a modifier or lock key. Windows reports the generic
+/// VK_SHIFT, VK_CONTROL and VK_MENU; the right-hand ones are told apart by
+/// scan code or the extended bit.
+fn modifier_code(k: &KeyInput) -> Option<u32> {
+    Some(match k.vk {
+        0x10 | 0xa0 | 0xa1 if k.vk == 0xa1 || k.scan == 0x36 => 57447,
+        0x10 | 0xa0 | 0xa1 => 57441,
+        0x11 | 0xa2 | 0xa3 if k.vk == 0xa3 || k.extended => 57448,
+        0x11 | 0xa2 | 0xa3 => 57442,
+        0x12 | 0xa4 | 0xa5 if k.vk == 0xa5 || k.extended => 57449,
+        0x12 | 0xa4 | 0xa5 => 57443,
+        0x5b => 57444,
+        0x5c => 57450,
+        0x14 => 57358, // caps lock
+        0x91 => 57359, // scroll lock
+        0x90 => 57360, // num lock
+        _ => return None,
+    })
 }
 
 /// Appends a mouse report. Returns false when the modes don't ask for this
