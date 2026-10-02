@@ -55,6 +55,17 @@ fn kitty_stacks_are_per_screen() {
 }
 
 #[test]
+fn colon_in_a_mode_list_ignores_it() {
+    let mut t = term("\x1b[?9001h\x1b[?1004h\x1b[?1:9001l\x1b[?1:1004l\x1b[?1:7l\x1b[4:1h");
+    let m = t.input_modes();
+    assert!(m.w32im && m.focus);
+    t.feed(b"\x1b[?7$p\x1b[4$p");
+    let mut r = Vec::new();
+    t.take_replies(&mut r);
+    assert_eq!(r, b"\x1b[?7;1$y\x1b[4;2$y");
+}
+
+#[test]
 fn modify_other_keys_is_not_sgr() {
     let mut t = term("x\x1b[>4;2my");
     t.feed(b"\x1b[>4m");

@@ -1238,6 +1238,10 @@ impl Handler for Terminal {
                 3 => self.tabs.fill(false),
                 _ => {}
             },
+            // A `:` has no place in a mode list. ConPTY ignores such a
+            // sequence whole, so acting on any of it would leave the two
+            // out of step.
+            ([] | [b'?'], b'h' | b'l') if (1..p.len()).any(|i| p.is_sub(i)) => {}
             ([], b'h' | b'l') => {
                 for &m in p.as_slice() {
                     self.set_ansi_mode(m, fin == b'h');
