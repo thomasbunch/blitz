@@ -12,6 +12,10 @@
 //! - `waitany MS A|B|...`: the same for any of several texts.
 //! - `idle QUIET MAX`: wait until there has been no output for QUIET ms,
 //!   but at most MAX ms.
+//! - `expect [MS] REGEX`: wait until a screen row matches REGEX, checking
+//!   after every chunk of output (3000 ms by default). See [`Regex`] for
+//!   the syntax.
+//! - `save NAME`: store the cursor row; later lines expand `${NAME}`.
 //! - `snap LABEL`: print the screen.
 //! - `resize COLS ROWS`: resize the pseudoconsole and the screen.
 //! - `latency N TEXT`: send TEXT N times and time how long each takes to
@@ -341,6 +345,8 @@ struct Runner {
     pty: Pty,
     /// `waitfor` looks for text after this offset in the output.
     seen: usize,
+    /// Values stored by `save`, expanded as `${name}`.
+    vars: Vec<(String, String)>,
 }
 
 impl Runner {
@@ -389,7 +395,12 @@ impl Runner {
         let reader = s.clone();
         let pty = Pty::spawn(&opts, move |ev, w| reader.on_event(ev, w))
             .map_err(|e| format!("cannot start {cmdline}: {e}"))?;
-        Ok(Runner { s, pty, seen: 0 })
+        Ok(Runner {
+            s,
+            pty,
+            seen: 0,
+            vars: Vec::new(),
+        })
     }
 
     fn send(&self, bytes: &[u8]) {
@@ -407,7 +418,11 @@ impl Runner {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Err(e) = self.step(line) {
+            let mut line = line.to_owned();
+            for (name, value) in &self.vars {
+                line = line.replace(&format!("${{{name}}}"), value);
+            }
+            if let Err(e) = self.step(&line) {
                 self.s.fail(&format!("line {}: {e}", n + 1));
                 return 1;
             }
@@ -503,6 +518,27 @@ impl Runner {
                     at(90),
                     times.last().copied().unwrap_or(0.0),
                 ));
+            }
+            "expect" => {
+                let (ms, pattern) = match rest.split_once(' ') {
+                    Some((ms, p)) if ms.bytes().all(|b| b.is_ascii_digit()) => (num(ms)?, p),
+                    _ => (3000, rest),
+                };
+                let re = Regex::new(pattern)?;
+                if !self
+                    .s
+                    .wait(ms, |st| re.matches_a_row(&st.term.screen_text()))
+                {
+                    return Err(format!("no row matched {pattern:?} within {ms} ms"));
+                }
+                self.s.note(&format!("expect ok: {pattern}"));
+            }
+            "save" => {
+                let name = rest.trim();
+                let (_, row, _) = self.s.lock().term.cursor();
+                self.vars.retain(|(n, _)| n != name);
+                self.vars.push((name.to_owned(), row.to_string()));
+                self.s.note(&format!("save {name} = {row}"));
             }
             "modes" => {
                 let modes = self.s.lock().term.input_modes();
@@ -650,6 +686,204 @@ fn plain(b: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A small regular expression for `expect`, matched against one screen
+/// row at a time: literals, `.`, classes such as `[a-z]`, `[^ ]`, `\d`,
+/// `\s` and `\w` (and `\D`, `\S`, `\W`), groups with `|`, the quantifiers
+/// `*`, `+`, `?`, `{n}`, `{n,}` and `{n,m}`, and the anchors `^` and `$`.
+/// Other characters after `\` stand for themselves.
+///
+/// Matching backtracks, which can be slow on pathological patterns but is
+/// fine for screen rows of a few hundred characters.
+struct Regex(Vec<Re>);
+
+enum Re {
+    Char(char),
+    Any,
+    /// Inclusive ranges; the flag negates the set.
+    Set(Vec<(char, char)>, bool),
+    Start,
+    End,
+    Group(Vec<Vec<Re>>),
+    Repeat(Box<Re>, u32, u32),
+}
+
+impl Regex {
+    fn new(pattern: &str) -> Result<Regex, String> {
+        let p: Vec<char> = pattern.chars().collect();
+        let mut i = 0;
+        let alts = re_alts(&p, &mut i)?;
+        if i < p.len() {
+            return Err(format!("unmatched ) in {pattern:?}"));
+        }
+        Ok(Regex(vec![Re::Group(alts)]))
+    }
+
+    fn is_match(&self, row: &str) -> bool {
+        let s: Vec<char> = row.chars().collect();
+        (0..=s.len()).any(|i| re_seq(&self.0, &s, i, &|_| true))
+    }
+
+    fn matches_a_row(&self, screen: &str) -> bool {
+        screen.lines().any(|row| self.is_match(row))
+    }
+}
+
+fn re_alts(p: &[char], i: &mut usize) -> Result<Vec<Vec<Re>>, String> {
+    let mut alts = vec![Vec::new()];
+    while let Some(&c) = p.get(*i) {
+        *i += 1;
+        let atom = match c {
+            '|' => {
+                alts.push(Vec::new());
+                continue;
+            }
+            ')' => {
+                *i -= 1;
+                break;
+            }
+            '(' => {
+                let inner = re_alts(p, i)?;
+                if p.get(*i) != Some(&')') {
+                    return Err("missing )".into());
+                }
+                *i += 1;
+                Re::Group(inner)
+            }
+            '[' => re_set(p, i)?,
+            '\\' => {
+                let e = *p.get(*i).ok_or("pattern ends with \\")?;
+                *i += 1;
+                match re_class(e) {
+                    Some((ranges, negated)) => Re::Set(ranges, negated),
+                    None => Re::Char(e),
+                }
+            }
+            '.' => Re::Any,
+            '^' => Re::Start,
+            '$' => Re::End,
+            '*' | '+' | '?' | '{' => return Err(format!("nothing to repeat before {c:?}")),
+            c => Re::Char(c),
+        };
+        let atom = re_quantifier(p, i, atom)?;
+        if let Some(seq) = alts.last_mut() {
+            seq.push(atom);
+        }
+    }
+    Ok(alts)
+}
+
+fn re_quantifier(p: &[char], i: &mut usize, atom: Re) -> Result<Re, String> {
+    let (min, max) = match p.get(*i) {
+        Some('*') => (0, u32::MAX),
+        Some('+') => (1, u32::MAX),
+        Some('?') => (0, 1),
+        Some('{') => {
+            let close = p[*i..].iter().position(|&c| c == '}').ok_or("missing }")? + *i;
+            let body: String = p[*i + 1..close].iter().collect();
+            *i = close;
+            match body.split_once(',') {
+                None => (num(&body)?, num(&body)?),
+                Some((lo, "")) => (num(lo)?, u32::MAX),
+                Some((lo, hi)) => (num(lo)?, num(hi)?),
+            }
+        }
+        _ => return Ok(atom),
+    };
+    *i += 1;
+    Ok(Re::Repeat(Box::new(atom), min, max))
+}
+
+/// `[...]` after the opening bracket.
+fn re_set(p: &[char], i: &mut usize) -> Result<Re, String> {
+    let negated = p.get(*i) == Some(&'^');
+    if negated {
+        *i += 1;
+    }
+    let mut ranges = Vec::new();
+    let mut first = true;
+    loop {
+        let mut c = *p.get(*i).ok_or("missing ]")?;
+        *i += 1;
+        if c == ']' && !first {
+            return Ok(Re::Set(ranges, negated));
+        }
+        first = false;
+        if c == '\\' {
+            c = *p.get(*i).ok_or("missing ]")?;
+            *i += 1;
+            match re_class(c) {
+                Some((r, false)) => {
+                    ranges.extend(r);
+                    continue;
+                }
+                Some(_) => return Err(format!("\\{c} inside [...] is not supported")),
+                None => {}
+            }
+        }
+        match (p.get(*i), p.get(*i + 1)) {
+            (Some('-'), Some(&hi)) if hi != ']' => {
+                ranges.push((c, hi));
+                *i += 2;
+            }
+            _ => ranges.push((c, c)),
+        }
+    }
+}
+
+/// `\d`, `\s`, `\w` and their negated capitals.
+fn re_class(e: char) -> Option<(Vec<(char, char)>, bool)> {
+    let ranges = match e.to_ascii_lowercase() {
+        'd' => vec![('0', '9')],
+        's' => vec![(' ', ' '), ('\t', '\r')],
+        'w' => vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
+        _ => return None,
+    };
+    Some((ranges, e.is_ascii_uppercase()))
+}
+
+/// Matches `seq` at `s[i..]`, then hands the end position to `k`.
+fn re_seq(seq: &[Re], s: &[char], i: usize, k: &dyn Fn(usize) -> bool) -> bool {
+    match seq.split_first() {
+        None => k(i),
+        Some((Re::Repeat(r, min, max), rest)) => re_repeat(r, *min, *max, rest, s, i, k),
+        Some((r, rest)) => re_one(r, s, i, &|j| re_seq(rest, s, j, k)),
+    }
+}
+
+fn re_one(r: &Re, s: &[char], i: usize, k: &dyn Fn(usize) -> bool) -> bool {
+    let c = s.get(i).copied();
+    match r {
+        Re::Char(want) => c == Some(*want) && k(i + 1),
+        Re::Any => c.is_some() && k(i + 1),
+        Re::Set(ranges, negated) => {
+            c.is_some_and(|c| ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)) != *negated)
+                && k(i + 1)
+        }
+        Re::Start => i == 0 && k(i),
+        Re::End => i == s.len() && k(i),
+        Re::Group(alts) => alts.iter().any(|seq| re_seq(seq, s, i, k)),
+        Re::Repeat(r, min, max) => re_repeat(r, *min, *max, &[], s, i, k),
+    }
+}
+
+/// Greedy: takes as many repeats as it can, then backs off one at a time.
+fn re_repeat(
+    r: &Re,
+    min: u32,
+    max: u32,
+    rest: &[Re],
+    s: &[char],
+    i: usize,
+    k: &dyn Fn(usize) -> bool,
+) -> bool {
+    // A repeat that consumes nothing would loop forever.
+    let more = max > 0
+        && re_one(r, s, i, &|j| {
+            j > i && re_repeat(r, min.saturating_sub(1), max - 1, rest, s, j, k)
+        });
+    more || (min == 0 && re_seq(rest, s, i, k))
+}
+
 /// `text` the way [`plain`] leaves it.
 fn squash(text: &str) -> String {
     text.chars()
@@ -676,6 +910,63 @@ mod tests {
         assert_eq!(squash("Claude Code"), "claudecode");
         assert!(!past_prelude(b"\x1b[1t\x1b[c\x1b[?1004h"));
         assert!(past_prelude(b"\x1b[1thi"));
+    }
+
+    #[test]
+    fn debug_regex() {
+        let rule90 = "─".repeat(90);
+        let cases: &[(&str, &str, bool)] = &[
+            ("^> line1$", "> line1", true),
+            ("^> line1$", ">  line1", false),
+            ("^> line1$", "> line1 x", false),
+            ("^  line2$", "  line2", true),
+            ("^  line2$", " line2", false),
+            (r"^>\s*$", ">", true),
+            (r"^>\s*$", ">   ", true),
+            (r"^>\s*$", "> a", false),
+            (
+                r"\[Pasted text #1 \+1(19|20) lines\]",
+                "> [Pasted text #1 +119 lines] ",
+                true,
+            ),
+            (
+                r"\[Pasted text #1 \+1(19|20) lines\]",
+                "[Pasted text #1 +120 lines]",
+                true,
+            ),
+            (
+                r"\[Pasted text #1 \+1(19|20) lines\]",
+                "[Pasted text #1 +121 lines]",
+                false,
+            ),
+            ("^─{90}$", &rule90, true),
+            ("^─{90}$", &rule90[3..], false),
+            ("^─{90}$", &(rule90.clone() + "─"), false),
+            ("^● ok$", "● ok", true),
+            ("^1$", "11", false),
+            (">>", "PS C:\\> >> ", true),
+            ("a.*b", "xxaxxbyy", true),
+            ("a.*b", "bxxa", false),
+            ("colou?r", "color", true),
+            ("colou?r", "colouur", false),
+            (r"^\d{2,3}$", "123", true),
+            (r"^\d{2,3}$", "1234", false),
+            (r"^\d{2,}$", "12345", true),
+            ("[^a-c]x", "ax bx dx", true),
+            ("[^a-c]x", "ax bx", false),
+            (r"[\d_]+z", "a_9z", true),
+            ("^(ab)+$", "ababab", true),
+            ("^(ab)+$", "ababa", false),
+            ("^$", "", true),
+        ];
+        for &(pattern, row, want) in cases {
+            let re = Regex::new(pattern).unwrap();
+            assert_eq!(re.is_match(row), want, "{pattern:?} on {row:?}");
+        }
+        assert!(Regex::new("^> a$").unwrap().matches_a_row("x\n> a\ny"));
+        for bad in ["(a", "a)", "*a", "[ab", "a{2", r"a\"] {
+            assert!(Regex::new(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
