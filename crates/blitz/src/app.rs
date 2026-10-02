@@ -1158,6 +1158,8 @@ impl ApplicationHandler<UserEvent> for App {
 /// - `expect [MS] REGEX`: wait until a screen row matches (3000 ms default).
 /// - `waitfor MS TEXT`: wait until TEXT appears on the screen.
 /// - `clip TEXT`: put TEXT on the clipboard; `\n` is a line break.
+/// - `resize W H`: resize the window to W by H pixels.
+/// - `snap`: print the screen.
 /// - `sleep MS`, `note TEXT`.
 mod selftest {
     use std::sync::Mutex;
@@ -1169,7 +1171,9 @@ mod selftest {
         KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput,
         VIRTUAL_KEY, VkKeyScanW,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+    };
 
     use crate::debug::Regex;
     use crate::pane::lock;
@@ -1232,6 +1236,23 @@ mod selftest {
                     return Err("cannot set the clipboard".into());
                 }
             }
+            "resize" => {
+                let (w, h) = rest.trim().split_once(' ').ok_or("resize W H")?;
+                // SAFETY: a live window; the call waits for the UI thread.
+                unsafe {
+                    SetWindowPos(
+                        HWND(hwnd as *mut _),
+                        None,
+                        0,
+                        0,
+                        num(w)?,
+                        num(h)?,
+                        SWP_NOMOVE | SWP_NOZORDER,
+                    )
+                }
+                .map_err(|e| format!("resize: {e}"))?;
+            }
+            "snap" => println!("--- screen ---\n{}", lock(term).screen_text()),
             "sleep" => std::thread::sleep(Duration::from_millis(num(rest)?)),
             "note" => {}
             _ => return Err(format!("unknown command {cmd:?}")),
