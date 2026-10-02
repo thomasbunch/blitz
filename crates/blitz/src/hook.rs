@@ -2,11 +2,133 @@
 //! `blitz setup claude` prints the hook settings to install.
 
 use std::fmt::Write as _;
+use std::io::{Read, Write};
+
+/// Claude Code's payloads are a few KB; anything this big is not one.
+const MAX_INPUT: u64 = 1 << 20;
+/// Longest message carried in a notification, in chars.
+const MAX_MSG: usize = 120;
+/// Notification types that mean Claude Code is waiting on the user.
+/// `idle_prompt` is left out: it fires a minute after every finished turn.
+const NOTIFY_TYPES: &str =
+    "permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input";
 
 /// Entry point of `blitz-hook`. Always returns 0, so a hook can never block
 /// Claude Code.
+///
+/// `blitz-hook claude` reads a hook payload on stdin and prints a
+/// `terminalSequence` for Claude Code to write to its own terminal, so the
+/// state lands in the right pane without any IPC. Outside a blitz pane
+/// (`BLITZ_PANE_ID` unset) it prints nothing.
 pub fn run() -> i32 {
+    let claude = std::env::args().nth(1).as_deref() == Some("claude");
+    let in_pane = std::env::var_os("BLITZ_PANE_ID").is_some_and(|v| !v.is_empty());
+    if claude && in_pane {
+        let mut input = Vec::new();
+        let _ = std::io::stdin().take(MAX_INPUT).read_to_end(&mut input);
+        if let Some(out) = claude_output(&String::from_utf8_lossy(&input)) {
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout
+                .write_all(out.as_bytes())
+                .and_then(|()| stdout.flush());
+        }
+    }
     0
+}
+
+/// The hook's stdout for one Claude Code payload, or `None` when the event
+/// is not one blitz reports.
+pub fn claude_output(payload: &str) -> Option<String> {
+    let (state, msg) = claude_state(&Json::parse(payload)?)?;
+    Some(notify_json(state, &msg))
+}
+
+/// Maps a hook payload to a state (`working`, `needs-you`, `done`, `error`,
+/// `idle`) and a one-line message.
+pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
+    fn field<'a>(v: &'a Json, k: &str) -> &'a str {
+        v.get(k).and_then(Json::as_str).unwrap_or("")
+    }
+    let tool = field(ev, "tool_name");
+    let input = ev.get("tool_input").unwrap_or(&Json::Null);
+    Some(match field(ev, "hook_event_name") {
+        "UserPromptSubmit" => ("working", String::new()),
+        "PermissionRequest" => {
+            let detail = match field(input, "command") {
+                "" => field(input, "file_path"),
+                c => c,
+            };
+            let msg = match detail {
+                "" => tool.to_owned(),
+                d => format!("{tool}: {d}"),
+            };
+            ("needs-you", msg)
+        }
+        "PreToolUse" if tool == "AskUserQuestion" => {
+            let question = match input.get("questions") {
+                Some(Json::Arr(qs)) => qs.first().map_or("", |q| field(q, "question")),
+                _ => "",
+            };
+            let msg = if question.is_empty() {
+                "Question"
+            } else {
+                question
+            };
+            ("needs-you", msg.to_owned())
+        }
+        "PreToolUse" if tool == "ExitPlanMode" => ("needs-you", "Plan ready".to_owned()),
+        "Notification" => {
+            let kind = field(ev, "notification_type");
+            if !kind.is_empty() && !NOTIFY_TYPES.split('|').any(|t| t == kind) {
+                return None;
+            }
+            ("needs-you", field(ev, "message").to_owned())
+        }
+        "Stop" => {
+            // A Stop hook made Claude continue; the turn is not over.
+            if ev.get("stop_hook_active") == Some(&Json::Bool(true)) {
+                return None;
+            }
+            match ev.get("background_tasks") {
+                Some(Json::Arr(tasks)) if !tasks.is_empty() => ("working", String::new()),
+                _ => {
+                    let reply = field(ev, "last_assistant_message");
+                    let first = reply.lines().map(str::trim).find(|l| !l.is_empty());
+                    ("done", first.unwrap_or("").to_owned())
+                }
+            }
+        }
+        "StopFailure" => ("error", field(ev, "error").to_owned()),
+        "SessionEnd" => ("idle", String::new()),
+        _ => return None,
+    })
+}
+
+/// `{"terminalSequence":"ESC]777;notify;blitz:<state>;<msg>BEL"}` and a
+/// newline. The message is made safe to embed first.
+pub fn notify_json(state: &str, msg: &str) -> String {
+    let seq = format!("\x1b]777;notify;blitz:{state};{}\x07", one_line(msg));
+    let mut out = String::from("{\"terminalSequence\":\"");
+    escape_json(&seq, &mut out);
+    out.push_str("\"}\n");
+    out
+}
+
+/// Drops control characters (which could end the OSC early), folds runs of
+/// whitespace into one space, and caps the length at `MAX_MSG` chars.
+pub fn one_line(s: &str) -> String {
+    let words: Vec<String> = s
+        .split_whitespace()
+        .map(|w| w.replace(char::is_control, ""))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let line = words.join(" ");
+    if line.chars().count() <= MAX_MSG {
+        return line;
+    }
+    let mut cut: String = line.chars().take(MAX_MSG - 1).collect();
+    cut.push('…');
+    cut
 }
 
 /// `blitz setup <app>`. Returns the process exit code.
@@ -228,6 +350,137 @@ pub fn escape_json(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::Ev;
+
+    fn state(payload: &str) -> Option<(&'static str, String)> {
+        claude_state(&Json::parse(payload).expect("valid test JSON"))
+    }
+
+    #[test]
+    fn claude_events() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            (
+                r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#,
+                Some(("working", "")),
+            ),
+            (
+                r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"git push"}}"#,
+                Some(("needs-you", "Bash: git push")),
+            ),
+            (
+                r#"{"hook_event_name":"PermissionRequest","tool_name":"Write","tool_input":{"file_path":"C:\\x\\a.rs"}}"#,
+                Some(("needs-you", "Write: C:\\x\\a.rs")),
+            ),
+            (
+                r#"{"hook_event_name":"PermissionRequest","tool_name":"mcp__x__y","tool_input":{"q":1}}"#,
+                Some(("needs-you", "mcp__x__y")),
+            ),
+            (
+                r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which one?"}]}}"#,
+                Some(("needs-you", "Which one?")),
+            ),
+            (
+                r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{}}"#,
+                Some(("needs-you", "Question")),
+            ),
+            (
+                r#"{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode"}"#,
+                Some(("needs-you", "Plan ready")),
+            ),
+            (
+                r#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#,
+                None,
+            ),
+            (
+                r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission"}"#,
+                Some(("needs-you", "Claude needs your permission")),
+            ),
+            (
+                r#"{"hook_event_name":"Notification","notification_type":"agent_needs_input","message":"m"}"#,
+                Some(("needs-you", "m")),
+            ),
+            (
+                r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting"}"#,
+                None,
+            ),
+            (
+                r#"{"hook_event_name":"Stop","last_assistant_message":"\n  Done: tests pass.\nMore detail."}"#,
+                Some(("done", "Done: tests pass.")),
+            ),
+            (r#"{"hook_event_name":"Stop"}"#, Some(("done", ""))),
+            (
+                r#"{"hook_event_name":"Stop","stop_hook_active":true}"#,
+                None,
+            ),
+            (
+                r#"{"hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[{"id":"1"}]}"#,
+                Some(("working", "")),
+            ),
+            (
+                r#"{"hook_event_name":"Stop","background_tasks":[],"last_assistant_message":"ok"}"#,
+                Some(("done", "ok")),
+            ),
+            (
+                r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#,
+                Some(("error", "rate_limit")),
+            ),
+            (
+                r#"{"hook_event_name":"SessionEnd","reason":"clear"}"#,
+                Some(("idle", "")),
+            ),
+            (
+                r#"{"hook_event_name":"PostToolUse","tool_name":"Bash"}"#,
+                None,
+            ),
+            (r#"{"prompt":"no event name"}"#, None),
+            (r#"[1,2]"#, None),
+        ];
+        for (payload, want) in cases {
+            let got = state(payload);
+            let got = got.as_ref().map(|(s, m)| (*s, m.as_str()));
+            assert_eq!(got, *want, "{payload}");
+        }
+    }
+
+    #[test]
+    fn every_state_is_an_attention_event() {
+        for s in ["working", "needs-you", "done", "error", "idle"] {
+            assert!(Ev::from_notify(&format!("blitz:{s}")).is_some(), "{s}");
+        }
+    }
+
+    #[test]
+    fn output_is_one_json_line() {
+        assert_eq!(
+            notify_json("done", "All \"good\" \\ ok"),
+            "{\"terminalSequence\":\"\\u001b]777;notify;blitz:done;All \\\"good\\\" \\\\ ok\\u0007\"}\n"
+        );
+        let out = claude_output(r#"{"hook_event_name":"SessionEnd"}"#).unwrap();
+        let v = Json::parse(&out).unwrap();
+        assert_eq!(
+            v.get("terminalSequence").and_then(Json::as_str),
+            Some("\x1b]777;notify;blitz:idle;\x07")
+        );
+        assert_eq!(claude_output("not json"), None);
+    }
+
+    #[test]
+    fn message_cannot_break_the_sequence() {
+        let evil = "a\x1b]0;pwned\x07b\u{9c}c\r\nd\te\x00f";
+        assert_eq!(one_line(evil), "a]0;pwnedbc d ef");
+        assert_eq!(one_line("  lots   of\n\n space  "), "lots of space");
+        assert_eq!(one_line(" \x1b \x07 "), "");
+    }
+
+    #[test]
+    fn message_is_capped() {
+        let long = "é".repeat(500);
+        let m = one_line(&long);
+        assert_eq!(m.chars().count(), MAX_MSG);
+        assert!(m.ends_with('…'));
+        let exact = "x".repeat(MAX_MSG);
+        assert_eq!(one_line(&exact), exact);
+    }
 
     #[test]
     fn json_values() {
