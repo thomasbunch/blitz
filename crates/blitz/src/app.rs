@@ -11,7 +11,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vt::{Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, Snapshot};
+use vt::{
+    Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
+};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState};
@@ -54,6 +56,9 @@ const UPDATE_FIRST: Duration = Duration::from_secs(10);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
+/// How long a restored pane waits for its shell's first prompt before it
+/// types the Claude Code resume command anyway.
+const RESUME_AFTER: Duration = Duration::from_secs(3);
 /// Lines scrolled per wheel notch when the program takes no mouse input.
 const WHEEL_LINES: isize = 3;
 
@@ -333,6 +338,9 @@ struct View {
     flashed: Option<Instant>,
     /// A thread is reading the git branch of the session's directory.
     finding_branch: bool,
+    /// A restored Claude Code session: the line to type at the shell's
+    /// first prompt, and when to type it anyway.
+    resume: Option<(String, Instant)>,
 }
 
 struct App {
@@ -581,6 +589,14 @@ impl App {
                 self.views.clear();
                 return Err(e);
             }
+            if let Some(line) = resume_line(self.config.restore_claude, meta.claude.as_deref())
+                && let Some(v) = self.views.last_mut()
+            {
+                // Known from the start, so closing blitz again before the
+                // first prompt still resumes it next time.
+                v.pane.claude = meta.claude.clone();
+                v.resume = Some((line, Instant::now() + RESUME_AFTER));
+            }
         }
         self.install(win);
         Ok(())
@@ -643,6 +659,7 @@ impl App {
             notice: None,
             flashed: None,
             finding_branch: false,
+            resume: None,
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
@@ -1218,6 +1235,12 @@ impl App {
                 v.pane.cwd = dir;
                 self.find_branch(id);
             }
+            // The shell is ready for input: bring back its Claude session.
+            Event::Prompt(PromptMark::A { blitz: true }) => {
+                if let Some((line, _)) = v.resume.take() {
+                    v.pane.send(line);
+                }
+            }
             Event::Notify { title, body } => {
                 if let Some((ev, session)) = Ev::from_notify(&title, &v.pane.token) {
                     // `idle` is SessionEnd: the user quit Claude, so there is
@@ -1632,12 +1655,12 @@ impl App {
         if !self.persist || self.views.is_empty() {
             return;
         }
-        let meta = |id| PaneMeta {
-            cwd: self
-                .view(id)
-                .map(|v| v.pane.cwd.clone())
-                .unwrap_or_default(),
-            claude: None,
+        let meta = |id| {
+            let v = self.view(id);
+            PaneMeta {
+                cwd: v.map(|v| v.pane.cwd.clone()).unwrap_or_default(),
+                claude: v.and_then(|v| v.pane.claude.clone()),
+            }
         };
         let mut s = session::State::capture(&self.win, self.placed, meta);
         let same = self.saved.as_ref().is_some_and(|old| {
@@ -1695,7 +1718,10 @@ impl App {
                 since + Duration::from_secs(now.saturating_duration_since(since).as_secs() + 1)
             })
             .min();
-        [sync, notice, timer].into_iter().flatten().min()
+        let resume = (self.views.iter())
+            .filter_map(|v| Some(v.resume.as_ref()?.1))
+            .min();
+        [sync, notice, timer, resume].into_iter().flatten().min()
     }
 }
 
@@ -1754,6 +1780,14 @@ fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
         Some(primary) => session::on_screen(g, &monitors, primary),
         None => g,
     }
+}
+
+/// What to type into a restored pane's shell to bring back the Claude Code
+/// session it was running, if anything. The id comes from a file on disk,
+/// so only a well-formed one is ever typed.
+fn resume_line(enabled: bool, claude: Option<&str>) -> Option<String> {
+    let id = claude.filter(|id| enabled && crate::hook::is_session_id(id))?;
+    Some(format!("claude --resume {id}\r"))
 }
 
 /// Where a new pane starts: `cwd` if it is still a directory, else the
@@ -1915,6 +1949,10 @@ impl ApplicationHandler<UserEvent> for App {
                     .is_some_and(|n| n.until.is_some_and(|t| t <= now))
                 {
                     v.notice = None;
+                }
+                // No prompt mark came: shell integration is off or failed.
+                if let Some((line, _)) = v.resume.take_if(|r| r.1 <= now) {
+                    v.pane.send(line);
                 }
             }
             // A synchronized update timed out, a notice expired, or a
@@ -2539,5 +2577,23 @@ mod tests {
         let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
         assert!(a.new_window);
         assert_eq!(a.cwd, Some(r"C:\foo".into()));
+    }
+
+    #[test]
+    fn resume_line_types_only_a_session_id() {
+        const ID: &str = "3f2a9c1e-0b7d-4e5f-9a8b-1c2d3e4f5a6b";
+        assert_eq!(
+            resume_line(true, Some(ID)).as_deref(),
+            Some("claude --resume 3f2a9c1e-0b7d-4e5f-9a8b-1c2d3e4f5a6b\r")
+        );
+        assert_eq!(resume_line(false, Some(ID)), None);
+        assert_eq!(resume_line(true, None), None);
+        for bad in [
+            "",
+            "x; rm -rf ~",
+            "3f2a9c1e-0b7d-4e5f-9a8b-1c2d3e4f5a6b\rcalc",
+        ] {
+            assert_eq!(resume_line(true, Some(bad)), None, "{bad:?}");
+        }
     }
 }
