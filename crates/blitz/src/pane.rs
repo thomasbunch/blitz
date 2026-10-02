@@ -113,6 +113,14 @@ impl Pane {
             }));
             if r.is_err() {
                 dead = true;
+                // The panic may have left the screen half updated, and the UI
+                // thread reads it every frame. A blank one takes its place,
+                // 1x1 until the next resize so it never draws past the pane.
+                *lock(&t) = vt::Terminal::new(vt::Options {
+                    cols: 1,
+                    rows: 1,
+                    ..Default::default()
+                });
                 notify(id, Note::Dead);
             }
         };
@@ -279,5 +287,36 @@ mod tests {
         assert_eq!(exit, Some(0));
         let text = lock(&pane.term).screen_text();
         assert!(text.contains("pane-7"), "screen: {text:?}");
+    }
+
+    /// After a panic on the reader thread the UI never sees the screen it
+    /// was updating.
+    #[test]
+    fn pane_drops_its_screen_after_a_panic() {
+        let (tx, rx) = mpsc::channel();
+        let pane = Pane::spawn(
+            PaneId(8),
+            &Spawn {
+                cmdline: "cmd.exe /d /c echo pane-output",
+                env: &[],
+                cwd: None,
+                cols: 40,
+                rows: 5,
+                scrollback: 100,
+                dark: true,
+                parent: None,
+            },
+            move |_, n| {
+                // Stands in for a parser panic, once all output is on screen.
+                assert!(!matches!(n, Note::Exit(_)), "test panic at exit");
+                let _ = tx.send(n);
+            },
+        )
+        .expect("spawn");
+        let dead = std::iter::from_fn(|| rx.recv_timeout(Duration::from_secs(20)).ok())
+            .any(|n| n == Note::Dead);
+        assert!(dead);
+        let text = lock(&pane.term).screen_text();
+        assert!(!text.contains("pane-output"), "screen: {text:?}");
     }
 }
