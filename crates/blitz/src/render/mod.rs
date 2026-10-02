@@ -505,4 +505,35 @@ mod tests {
         assert!(first.iter().any(|&c| c != p.bg));
         assert_eq!(at(0, 0), p.bg);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_underline_selection_and_bar_cursor() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("_中x", 4, 2, &p);
+        snap.cells[0].attrs = vt::snapshot::attr::UNDERLINE;
+        snap.cells[0].text[0] = b'a';
+        snap.cells[3].bg = p.ansi[1];
+        snap.selection = Some(((1, 1), (0, 1)));
+        snap.cursor = Some((3, 1, vt::CursorShape::Bar));
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        let uy = r.font.underline_y as u32;
+        assert_eq!(at(1, uy), p.fg, "underline under the first cell");
+        assert_eq!(at(3 * cw + 1, 1), p.ansi[1], "cell background");
+        // The selection is given end first and covers two cells.
+        assert_eq!(at(1, ch + 1), p.selection_bg);
+        assert_eq!(at(2 * cw - 1, ch + 1), p.selection_bg);
+        assert_eq!(at(2 * cw + 2, ch + 1), p.bg);
+        assert_eq!(at(3 * cw, ch + 2), p.cursor, "bar cursor");
+        assert_eq!(at(4 * cw - 1, ch + 2), p.bg, "bar is thin");
+        // The wide character's ink reaches into its second cell.
+        let ink = (0..ch).any(|y| (2 * cw..3 * cw).any(|x| at(x, y) != p.bg));
+        assert!(ink, "wide glyph spans two cells");
+    }
 }
