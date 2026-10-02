@@ -1176,6 +1176,31 @@ mod tests {
         let keys = chord("ctrl++", &mut text).unwrap();
         assert_eq!((keys[1].key, keys[1].mods.lctrl), (Key::Char('+'), true));
         assert_eq!(chord("f5", &mut text).unwrap()[0].vk, 0x74);
+        // Through the encoder, Shift+Enter is what Claude Code and
+        // PSReadLine expect for a newline.
+        let encode = |spec: &str, modes: vt::InputModes| {
+            let mut text = String::new();
+            let mut out = Vec::new();
+            for k in chord(spec, &mut text).unwrap() {
+                vt::encode_key(&k, &modes, &mut out);
+            }
+            String::from_utf8(out).unwrap()
+        };
+        let kitty = vt::InputModes {
+            kitty: 5,
+            ..Default::default()
+        };
+        let w32im = vt::InputModes {
+            w32im: true,
+            ..Default::default()
+        };
+        assert_eq!(encode("shift+enter", kitty), "\x1b[13;2u");
+        assert_eq!(
+            encode("shift+enter", w32im),
+            "\x1b[16;42;0;1;16;1_\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_\x1b[16;42;0;0;0;1_"
+        );
+        assert_eq!(encode("ctrl+c", Default::default()), "\x03");
+
         assert!(chord("hyper+a", &mut text).is_err());
         assert!(chord("f25", &mut text).is_err());
         assert!(chord("nosuchkey", &mut text).is_err());
