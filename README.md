@@ -66,6 +66,32 @@ edits that file itself. The hooks run `blitz-hook.exe`, which does
 nothing when Claude Code runs outside blitz. Remove them before you move
 or uninstall blitz: Claude Code keeps running whatever is at that path.
 
+## Sessions
+
+Closing the window keeps its tabs, splits and folders, and blitz opens
+them again the next time it starts; so does an update. A pane that was
+running Claude Code reopens the conversation with `claude --resume`
+once its shell is ready (this needs the hooks above). Typing `exit` in
+the last pane ends it all, and the next start is fresh. **Open in blitz**
+adds a tab to the running window, or to the reopened one; **Open in new
+blitz window** opens a separate window that is never saved.
+
+Saved state lives in `%LOCALAPPDATA%\blitz`.
+
+## Settings
+
+Optional, in `%APPDATA%\blitz\config.toml`, one `key = true` or
+`key = false` per line, read when blitz starts:
+
+| Key | Default | |
+|---|---|---|
+| `restore_session` | `true` | Reopen the last window's tabs, splits and folders |
+| `restore_claude` | `true` | Resume the Claude Code sessions they were running |
+| `restore_scrollback` | `false` | Save each pane's last 1000 lines when blitz closes and show them again above the new prompt. Off by default because old output can contain secrets |
+| `check_updates` | `true` | Look for a newer release |
+| `flash` | `true` | Flash the taskbar button when a session needs you |
+| `bell_attention` | `true` | Treat a bell in a background pane as needing you |
+
 ## Default keys
 
 | Keys | Action |
