@@ -6,7 +6,9 @@ use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 
 /// Holds the clipboard open; closes it on drop.
@@ -38,7 +40,9 @@ impl Drop for Open {
 pub fn get_text() -> Option<String> {
     let _open = Open::new(None)?;
     // SAFETY: the clipboard is open; the handle stays valid until it closes,
-    // and the locked memory is a NUL-terminated UTF-16 string.
+    // and the locked memory is `GlobalSize` bytes long. Whoever put the text
+    // there need not have ended it with a NUL, so the read stops at the end
+    // of the block too.
     unsafe {
         let h = GetClipboardData(u32::from(CF_UNICODETEXT.0)).ok()?;
         let mem = HGLOBAL(h.0);
@@ -46,11 +50,9 @@ pub fn get_text() -> Option<String> {
         if p.is_null() {
             return None;
         }
-        let mut n = 0;
-        while *p.add(n) != 0 {
-            n += 1;
-        }
-        let text = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+        let units = std::slice::from_raw_parts(p, GlobalSize(mem) / 2);
+        let n = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+        let text = String::from_utf16_lossy(&units[..n]);
         let _ = GlobalUnlock(mem);
         Some(text)
     }
@@ -90,6 +92,30 @@ pub fn set_text(owner: Option<HWND>, text: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Puts `bytes` on the clipboard as text, exactly as given.
+    fn set_raw(bytes: &[u8]) -> bool {
+        let Some(_open) = Open::new(None) else {
+            return false;
+        };
+        // SAFETY: as in `set_text`.
+        unsafe {
+            if EmptyClipboard().is_err() {
+                return false;
+            }
+            let Ok(mem) = GlobalAlloc(GMEM_MOVEABLE, bytes.len()) else {
+                return false;
+            };
+            let p = GlobalLock(mem).cast::<u8>();
+            if p.is_null() {
+                let _ = GlobalFree(Some(mem));
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+            let _ = GlobalUnlock(mem);
+            SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(mem.0))).is_ok()
+        }
+    }
+
     /// Writes and reads back the real clipboard, then restores it.
     #[test]
     fn clipboard_round_trip() {
@@ -100,6 +126,14 @@ mod tests {
             return;
         }
         assert_eq!(get_text().as_deref(), Some(text));
+        // Another program can leave out the NUL. With an odd size not even
+        // the last unit is zero, and the text must still end with the block.
+        for n in (3..400).step_by(2) {
+            if set_raw(&b"A\0".repeat(n)[..n]) {
+                let got = get_text().unwrap_or_default();
+                assert!(got.len() <= n / 2, "{n} bytes read as {got:?}");
+            }
+        }
         if let Some(b) = before {
             set_text(None, &b);
         }
