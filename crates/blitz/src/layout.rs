@@ -279,6 +279,41 @@ impl Tab {
         true
     }
 
+    /// Focuses the nearest pane in `dir`: one entirely on that side of the
+    /// focused pane that overlaps it on the other axis. Ties go to the
+    /// larger overlap, then to the most recently used. There is no wrap at
+    /// the edges, since jumping to the far side by accident is worse than
+    /// not moving. Returns whether focus moved.
+    pub fn focus_dir(&mut self, dir: Dir, area: Rect) -> bool {
+        let tiles = self.tiles(area);
+        let Some(&(_, f)) = tiles.iter().find(|t| t.0 == self.focus) else {
+            return false;
+        };
+        let best = tiles
+            .iter()
+            .filter(|t| t.0 != self.focus)
+            .filter_map(|&(p, r)| {
+                let gap = match dir {
+                    Dir::Left => f.x - r.right(),
+                    Dir::Right => r.x - f.right(),
+                    Dir::Up => f.y - r.bottom(),
+                    Dir::Down => r.y - f.bottom(),
+                };
+                let overlap = match dir.axis() {
+                    Axis::Row => f.bottom().min(r.bottom()) - f.y.max(r.y),
+                    Axis::Column => f.right().min(r.right()) - f.x.max(r.x),
+                };
+                let rank = self.mru.iter().position(|&q| q == p);
+                (gap >= 0 && overlap > 0).then_some((gap, -overlap, rank.unwrap_or(usize::MAX), p))
+            })
+            .min();
+        let Some((.., p)) = best else {
+            return false;
+        };
+        self.focus(p);
+        true
+    }
+
     /// Removes `p` and gives its space to its sibling. If `p` had focus, the
     /// most recently focused pane on the sibling's side gets it. Returns
     /// false if `p` is not in this tab or is its only pane; closing the
@@ -415,6 +450,48 @@ mod tests {
         let before = t.clone();
         assert!(!t.split(Dir::Right, PaneId(6), AREA, MIN));
         assert_eq!(t, before);
+    }
+
+    #[test]
+    fn focus_moves_to_the_nearest_neighbour() {
+        let mut t = four();
+        let mut go = |d| {
+            t.focus_dir(d, AREA);
+            t.focus.0
+        };
+        assert_eq!(go(Dir::Left), 3);
+        assert_eq!(go(Dir::Up), 2);
+        assert_eq!(go(Dir::Down), 3, "3 overlaps 2 by 250 px, 4 by 249");
+        assert_eq!(go(Dir::Right), 4);
+        assert_eq!(go(Dir::Left), 3);
+        assert_eq!(go(Dir::Left), 1);
+    }
+
+    #[test]
+    fn focus_does_not_wrap() {
+        let mut t = four();
+        assert!(!t.focus_dir(Dir::Right, AREA));
+        assert!(!t.focus_dir(Dir::Down, AREA));
+        t.focus(PaneId(1));
+        assert!(!t.focus_dir(Dir::Left, AREA));
+        assert!(!t.focus_dir(Dir::Up, AREA));
+        assert_eq!(t.focus, PaneId(1));
+        let mut lone = Tab::new("t".into(), PaneId(1));
+        assert!(!lone.focus_dir(Dir::Right, AREA));
+    }
+
+    #[test]
+    fn focus_breaks_ties_by_mru() {
+        // From 1, panes 2 and 3 are both 1 px away and overlap it by 300
+        // px; the one used last wins.
+        let mut t = four();
+        t.focus(PaneId(1));
+        assert!(t.focus_dir(Dir::Right, AREA));
+        assert_eq!(t.focus, PaneId(3));
+        t.focus(PaneId(2));
+        t.focus(PaneId(1));
+        assert!(t.focus_dir(Dir::Right, AREA));
+        assert_eq!(t.focus, PaneId(2));
     }
 
     #[test]
