@@ -161,11 +161,87 @@ impl Pane {
     }
 }
 
+/// The program a command line runs, without directory or extension:
+/// `pwsh` for `"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo`.
+pub fn program_name(cmdline: &str) -> String {
+    let s = cmdline.trim_start();
+    let program = match s.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => s.split_whitespace().next().unwrap_or(s),
+    };
+    Path::new(program)
+        .file_stem()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
+/// The branch checked out in the repository that holds `dir`, read from
+/// `.git/HEAD` without running git. A detached HEAD gives the short hash.
+// ponytail: a few file reads on the UI thread per prompt; move them off it
+// if network drives make that slow.
+pub fn git_branch(dir: &Path) -> Option<String> {
+    for d in dir.ancestors() {
+        let git = d.join(".git");
+        let head = if git.is_dir() {
+            git.join("HEAD")
+        } else if git.is_file() {
+            // A worktree or submodule: the file names the real git dir.
+            let link = std::fs::read_to_string(&git).ok()?;
+            d.join(link.strip_prefix("gitdir:")?.trim()).join("HEAD")
+        } else {
+            continue;
+        };
+        let head = std::fs::read_to_string(head).ok()?;
+        let head = head.trim();
+        return match head.strip_prefix("ref: refs/heads/") {
+            Some(branch) => Some(branch.to_string()),
+            None => head.get(..7).map(str::to_string),
+        };
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn pane_program_names() {
+        let pwsh = r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit"#;
+        assert_eq!(program_name(pwsh), "pwsh");
+        assert_eq!(program_name(r"C:\Windows\system32\cmd.exe /d"), "cmd");
+        assert_eq!(program_name("claude"), "claude");
+        assert_eq!(program_name(""), "");
+    }
+
+    #[test]
+    fn pane_git_branch_from_head() {
+        let root = std::env::temp_dir().join(format!("blitz-branch-{}", std::process::id()));
+        let sub = root.join("repo").join("src").join("deep");
+        std::fs::create_dir_all(&sub).expect("dirs");
+        std::fs::create_dir_all(root.join("repo").join(".git")).expect("git dir");
+        let head = root.join("repo").join(".git").join("HEAD");
+        std::fs::write(&head, "ref: refs/heads/feature/x\n").expect("head");
+        assert_eq!(git_branch(&sub).as_deref(), Some("feature/x"));
+        std::fs::write(&head, "0123456789abcdef\n").expect("head");
+        assert_eq!(git_branch(&sub).as_deref(), Some("0123456"));
+
+        // A worktree's `.git` is a file pointing at its git dir.
+        let wt = root.join("wt");
+        std::fs::create_dir_all(root.join("meta")).expect("meta");
+        std::fs::create_dir_all(&wt).expect("wt");
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", root.join("meta").display()),
+        )
+        .expect("link");
+        std::fs::write(root.join("meta").join("HEAD"), "ref: refs/heads/side\n").expect("head");
+        assert_eq!(git_branch(&wt).as_deref(), Some("side"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(git_branch(&root), None);
+    }
 
     /// A pane parses its child's output on the reader thread, answers
     /// queries, and reports the exit.
