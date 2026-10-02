@@ -108,9 +108,11 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ steps.v.outputs.version }}
+        # No fallback install: an installer fetched here would run next to
+        # the staged files before they are hashed.
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup 6 is not on this runner image" }
           & $iscc "/DAppVersion=$env:VERSION" "/DSrcDir=$PWD\dist\blitz-$env:VERSION-windows-x64" "/DOutDir=$PWD\out" .github\blitz.iss
 
       - name: Checksums
