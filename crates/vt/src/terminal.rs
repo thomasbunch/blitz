@@ -730,6 +730,27 @@ impl Terminal {
         *self = t;
     }
 
+    /// At the shell's own prompt, clears what a program can leave behind
+    /// that would bend or hide everything printed after it: input modes,
+    /// margins, origin, insert and wrap modes, charsets, tab stops and
+    /// colours set with OSC 10, 11 and 12. The cursor stays where the
+    /// prompt is about to be drawn. The screen is left alone: the prompt
+    /// leaves the alternate screen with its own sequences, which conhost
+    /// acts on too.
+    fn prompt_reset(&mut self) {
+        self.modes.reset_input();
+        self.top = 0;
+        self.bottom = self.rows() - 1;
+        self.cur.origin = false;
+        self.cur.charsets = Default::default();
+        self.cur.gl = 0;
+        self.insert = false;
+        self.autowrap = true;
+        self.tabs = default_tabs(self.cols());
+        self.colors = [None; 3];
+        self.changed = true;
+    }
+
     // ---- OSC ----
 
     fn set_link(&mut self, body: &str) {
@@ -1305,7 +1326,7 @@ impl Handler for Terminal {
                 // Claude Code sends 133;A;redraw=0 every turn while it
                 // still wants its kitty keys.
                 Some(m @ PromptMark::A { blitz: true }) => {
-                    self.modes.reset_input();
+                    self.prompt_reset();
                     Event::Prompt(m)
                 }
                 Some(m) => Event::Prompt(m),

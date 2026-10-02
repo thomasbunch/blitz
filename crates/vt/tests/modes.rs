@@ -172,6 +172,38 @@ fn blitz_prompt_resets_input_modes() {
     assert_clean(&t);
 }
 
+/// Display state a program can leave behind that would garble or hide
+/// whatever the shell and later programs print.
+#[test]
+fn blitz_prompt_resets_display_state() {
+    let mut t = Terminal::new(Options {
+        cols: 20,
+        rows: 4,
+        ..Options::default()
+    });
+    // Colours, margins, origin, insert mode, no wrap, line drawing in G0
+    // and G1 with G1 shifted in, no tab stops.
+    t.feed(b"\x1b]10;#123456\x07\x1b]11;#123456\x07\x1b[2;3r\x1b[?6h\x1b[4h\x1b[?7l");
+    t.feed(b"\x1b(0\x1b)0\x0e\x1b[3g");
+    t.feed(b"\x1b]133;A;blitz=1\x07");
+    t.feed(b"\x1b[H\tq\rx\r\n\n\n\n");
+    t.feed("a".repeat(25).as_bytes());
+    assert_eq!(t.scrollback_text(), "x       q\n");
+    assert_eq!(t.screen_text(), "\n\naaaaaaaaaaaaaaaaaaaa\naaaaa");
+    let mut s = vt::Snapshot::default();
+    t.snapshot(&mut s, &PAL);
+    assert_eq!((s.cells[0].fg, s.cells[0].bg), (PAL.fg, PAL.bg));
+}
+
+/// The prompt mark leaves the screen alone. conhost stays on its
+/// alternate screen at the mark, so leaving ours would part the two.
+#[test]
+fn blitz_prompt_keeps_the_screen() {
+    let mut t = term("\x1b[?1049h");
+    t.feed(b"\x1b]133;A;blitz=1\x07");
+    assert!(t.input_modes().alt_screen);
+}
+
 #[test]
 fn other_prompts_keep_input_modes() {
     for mark in [
