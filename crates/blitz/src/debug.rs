@@ -50,6 +50,9 @@ use crate::pty::{Pty, PtyEvent, SpawnOpts, Writer};
 const USAGE: &str = "usage: blitz debug run --script FILE [--cmd CMD] [--cwd DIR] \
 [--cols N --rows N] [--trace FILE] [--setenv K=V]... [--timeout MS]";
 
+/// Output kept for `waitfor` and `latency`; older output is dropped.
+const MAX_OUT: usize = 16 << 20;
+
 /// What the console host writes before any output of the child.
 const PRELUDE: [&[u8]; 4] = [b"\x1b[1t", b"\x1b[c", b"\x1b[?1004h", b"\x1b[?9001h"];
 
@@ -214,7 +217,11 @@ struct Shared {
 
 struct State {
     term: Terminal,
+    /// The most recent output, at most `MAX_OUT` bytes.
     out: Vec<u8>,
+    /// Bytes dropped from the front of `out`. Offsets into the output
+    /// count them, so they stay valid when `out` is trimmed.
+    dropped: usize,
     chunks: u64,
     /// When the last output arrived, in ms since start.
     last_ms: f64,
@@ -225,6 +232,25 @@ struct State {
 }
 
 impl State {
+    fn push_out(&mut self, d: &[u8]) {
+        self.out.extend_from_slice(d);
+        if self.out.len() > MAX_OUT {
+            let cut = self.out.len() - MAX_OUT / 2;
+            self.out.drain(..cut);
+            self.dropped += cut;
+        }
+    }
+
+    /// Output from offset `at` on, or what is left of it.
+    fn out_from(&self, at: usize) -> &[u8] {
+        &self.out[at.saturating_sub(self.dropped).min(self.out.len())..]
+    }
+
+    /// Offset of the end of the output.
+    fn out_end(&self) -> usize {
+        self.dropped + self.out.len()
+    }
+
     fn log(&mut self, ms: f64, kind: &str, text: &str) {
         if let Some(f) = &mut self.log {
             let _ = f.write_all(format!("{ms:.1}\t{kind}\t{text}\n").as_bytes());
@@ -306,7 +332,7 @@ impl Shared {
                     eprintln!("[{ms:.0}] event {e}");
                     st.log(ms, "event", &e);
                 }
-                st.out.extend_from_slice(d);
+                st.push_out(d);
                 st.chunks += 1;
                 st.last_ms = ms;
             }
@@ -352,6 +378,7 @@ impl Runner {
             state: Mutex::new(State {
                 term,
                 out: Vec::new(),
+                dropped: 0,
                 chunks: 0,
                 last_ms: 0.0,
                 counters: Counters::default(),
@@ -486,14 +513,14 @@ impl Runner {
                 let mut from = seen;
                 let mut hit = None;
                 self.s.wait(num(ms)?, |st| {
-                    let hay = plain(&st.out[from..]);
+                    let hay = plain(st.out_from(from));
                     // Rescan a little of the old output in case a match
                     // straddles two chunks.
-                    from = st.out.len().saturating_sub(4096).max(seen);
+                    from = st.out_end().saturating_sub(4096).max(seen);
                     hit = squashed
                         .iter()
                         .position(|w| hay.contains(w.as_str()))
-                        .map(|i| (i, st.out.len()));
+                        .map(|i| (i, st.out_end()));
                     hit.is_some()
                 });
                 let (i, end) = hit.ok_or_else(|| format!("{text:?} did not show up in {ms} ms"))?;
@@ -541,11 +568,11 @@ impl Runner {
                 let echo = unesc(text);
                 let mut times = Vec::new();
                 for _ in 0..num::<u32>(n)? {
-                    let from = self.s.lock().out.len();
+                    let from = self.s.lock().out_end();
                     let t = Instant::now();
                     self.pty.writer().send(echo.as_slice());
                     self.s
-                        .wait(2000, |st| find(&st.out[from..], &echo).is_some());
+                        .wait(2000, |st| find(st.out_from(from), &echo).is_some());
                     times.push(t.elapsed().as_secs_f64() * 1000.0);
                     std::thread::sleep(Duration::from_millis(30));
                 }
@@ -613,7 +640,7 @@ impl Runner {
             format!(
                 "exit={:?} out_bytes={} chunks={} first_pty_byte_ms={} first_post_prelude_ms={} conpty={}",
                 st.exit,
-                st.out.len(),
+                st.out_end(),
                 st.chunks,
                 ms(c.first_pty_byte_ms),
                 ms(c.first_post_prelude_ms),
@@ -1320,6 +1347,29 @@ mod tests {
             "{\"first_pty_byte_ms\":13.0,\"first_post_prelude_ms\":40.0,\"first_present_ms\":null,\
              \"frames\":3,\"wakeups\":0,\"inbox\":false}"
         );
+    }
+
+    #[test]
+    fn debug_output_is_bounded() {
+        let mut st = State {
+            term: Terminal::new(vt::Options::default()),
+            out: Vec::new(),
+            dropped: 0,
+            chunks: 0,
+            last_ms: 0.0,
+            counters: Counters::default(),
+            exit: None,
+            log: None,
+        };
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..40 {
+            st.push_out(&chunk);
+        }
+        st.push_out(b"end");
+        assert!(st.out.len() <= MAX_OUT);
+        assert_eq!(st.out_end(), (40 << 20) + 3);
+        assert_eq!(st.out_from(st.out_end() - 3), b"end");
+        assert_eq!(st.out_from(0).len(), st.out.len());
     }
 
     #[test]
