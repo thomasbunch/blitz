@@ -1,0 +1,64 @@
+[package]
+name = "blitz"
+description = "A fast terminal for running many coding agents side by side"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "blitz"
+publish = false
+
+[[bin]]
+name = "blitz"
+path = "src/main.rs"
+
+# Console-subsystem helper that Claude Code runs as a hook.
+[[bin]]
+name = "blitz-hook"
+path = "src/bin/blitz-hook.rs"
+
+[dependencies]
+vt = { path = "../vt" }
+
+[target.'cfg(windows)'.dependencies]
+winit = "=0.30.13"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "=0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_TextServices",
+]
+
+# Shaders are compiled at build time; the app itself never links the
+# shader compiler.
+[target.'cfg(windows)'.build-dependencies.windows]
+version = "=0.62.2"
+features = ["Win32_Graphics_Direct3D_Fxc"]
+
+[lints]
+workspace = true
