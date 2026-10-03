@@ -32,7 +32,7 @@ use winit::platform::windows::{
     EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorIcon, Icon, UserAttentionType, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowId};
 
 use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev};
@@ -515,7 +515,8 @@ struct App {
     save_after: Option<Instant>,
     /// No renderer could be built; the next try is not before this.
     gfx_retry: Option<Instant>,
-    /// Where the window last was while neither minimized nor maximized.
+    /// Where the window last was while not minimized, maximized or full
+    /// screen.
     placed: Geometry,
     /// The terminal a running self-test reads: the focused pane's.
     watched: Option<Arc<selftest::Focus>>,
@@ -1925,6 +1926,15 @@ impl App {
                     self.reload_font();
                 }
             }
+            // Borderless on the window's monitor. winit puts the window back
+            // where it was; the session keeps that place, not the monitor's.
+            Action::Fullscreen => {
+                self.note_place();
+                if let Some(w) = &self.window {
+                    let full = w.fullscreen().is_none();
+                    w.set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
+                }
+            }
         }
         true
     }
@@ -2553,6 +2563,28 @@ impl App {
         }
     }
 
+    /// Notes where the window is, unless it is minimized, maximized or full
+    /// screen, none of which is a place to go back to.
+    fn note_place(&mut self) {
+        let Some(w) = &self.window else {
+            return;
+        };
+        if !w.is_maximized()
+            && w.is_minimized() != Some(true)
+            && w.fullscreen().is_none()
+            && let Ok(p) = w.outer_position()
+        {
+            let size = w.inner_size();
+            self.placed = Geometry {
+                x: p.x,
+                y: p.y,
+                w: size.width,
+                h: size.height,
+                maximized: false,
+            };
+        }
+    }
+
     /// Saves the session when its tabs, splits or folders changed since
     /// the last save, or always with `force`. The window's place alone
     /// does not count, so dragging the window writes nothing until exit.
@@ -2577,23 +2609,10 @@ impl App {
             return;
         }
         self.save_after = None;
+        self.note_place();
         if let Some(w) = &self.window {
-            let maximized = w.is_maximized();
-            if !maximized
-                && w.is_minimized() != Some(true)
-                && let Ok(p) = w.outer_position()
-            {
-                let size = w.inner_size();
-                self.placed = Geometry {
-                    x: p.x,
-                    y: p.y,
-                    w: size.width,
-                    h: size.height,
-                    maximized: false,
-                };
-            }
             s.window = Geometry {
-                maximized,
+                maximized: w.is_maximized(),
                 ..self.placed
             };
         }

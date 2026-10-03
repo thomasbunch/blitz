@@ -44,6 +44,8 @@ pub enum Action {
     /// Make the font a point bigger (1) or smaller (-1) until blitz
     /// restarts, or go back to the size in the settings (0).
     FontSize(i8),
+    /// Fill the monitor without a frame, or go back.
+    Fullscreen,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -82,6 +84,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::FontSize(1), "font_size_up", "Bigger font"),
     (Action::FontSize(-1), "font_size_down", "Smaller font"),
     (Action::FontSize(0), "font_size_reset", "Font size from the settings"),
+    (Action::Fullscreen, "fullscreen", "Full screen"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
@@ -135,6 +138,8 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL, 0xbb, Action::FontSize(1)),
     (CTRL, 0xbd, Action::FontSize(-1)),
     (CTRL, b'0' as u16, Action::FontSize(0)),
+    // F11.
+    (0, 0x7a, Action::Fullscreen),
 ];
 
 /// Key names for chords, matched ignoring case. The first name of each
