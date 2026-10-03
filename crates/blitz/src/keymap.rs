@@ -36,6 +36,11 @@ pub enum Action {
     ThemePicker,
     /// Open or close the settings panel.
     Settings,
+    /// Show only the focused pane, filling the tab, or every pane again.
+    /// In a tab of one pane the key goes to the program.
+    Zoom,
+    /// Give the tab's panes equal space.
+    Equalize,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -61,6 +66,16 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Update, "update", "Update blitz"),
     (Action::ThemePicker, "theme_picker", "Pick a theme"),
     (Action::Settings, "settings", "Settings"),
+    (Action::Zoom, "zoom", "Zoom the pane, or show every pane"),
+    (Action::Resize(Dir::Left), "resize_left", "Move the divider left"),
+    (Action::Resize(Dir::Right), "resize_right", "Move the divider right"),
+    (Action::Resize(Dir::Up), "resize_up", "Move the divider up"),
+    (Action::Resize(Dir::Down), "resize_down", "Move the divider down"),
+    (Action::Swap(Dir::Left), "swap_left", "Swap with the pane on the left"),
+    (Action::Swap(Dir::Right), "swap_right", "Swap with the pane on the right"),
+    (Action::Swap(Dir::Up), "swap_up", "Swap with the pane above"),
+    (Action::Swap(Dir::Down), "swap_down", "Swap with the pane below"),
+    (Action::Equalize, "equalize", "Give the panes equal space"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
@@ -108,6 +123,7 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, b'K' as u16, Action::ThemePicker),
     // VK_OEM_COMMA: the comma key on every layout.
     (CTRL, 0xbc, Action::Settings),
+    (CTRL | SHIFT, b'Z' as u16, Action::Zoom),
 ];
 
 /// Key names for chords, matched ignoring case. The first name of each
@@ -891,7 +907,9 @@ mod msg_to_key_tests {
             press(0x27, &[LCTRL, LALT, LSHIFT]),
             Some(Action::Swap(Dir::Right))
         );
+        assert_eq!(press(0x5a, &[LCTRL, LSHIFT]), Some(Action::Zoom));
         // Modifiers match exactly.
+        assert_eq!(press(0x25, &[LCTRL, LSHIFT]), None, "selects a word");
         assert_eq!(press(0x52, &[LCTRL]), None);
         assert_eq!(press(0x43, &[LCTRL, LALT]), None, "AltGr is not Ctrl");
         assert_eq!(press(0x43, &[LCTRL, 0x5b]), None);

@@ -1884,6 +1884,27 @@ impl App {
                     let _ = proxy.send_event(UserEvent::Installed(done));
                 });
             }
+            // The next frame sizes each pane's session to its new place, as
+            // it does after a split.
+            Action::Zoom => {
+                let active = self.win.active;
+                let Some(t) = self.win.tabs.get_mut(active) else {
+                    return false;
+                };
+                if t.zoom.is_none() && t.panes().len() < 2 {
+                    return false;
+                }
+                t.toggle_zoom();
+                self.request_redraw();
+            }
+            Action::Equalize => {
+                let active = self.win.active;
+                if let Some(t) = self.win.tabs.get_mut(active) {
+                    t.zoom = None;
+                    t.equalize();
+                }
+                self.request_redraw();
+            }
         }
         true
     }
