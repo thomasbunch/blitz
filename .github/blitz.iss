@@ -26,6 +26,7 @@ WizardStyle=modern
 Compression=lzma2
 SolidCompression=yes
 UninstallDisplayIcon={app}\blitz.exe
+SetupIconFile=..\crates\blitz\icon\blitz.ico
 OutputDir={#OutDir}
 OutputBaseFilename=blitz-{#AppVersion}-windows-x64-setup
 
