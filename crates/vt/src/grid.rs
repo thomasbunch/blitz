@@ -728,8 +728,10 @@ mod tests {
             g.scroll_up(0, 1, 1, Cell::default(), true);
         }
         assert_eq!(g.scrollback_len(), 10);
+        assert_eq!(g.dropped(), 15, "rows keep their numbers");
         g.clear_scrollback();
         assert_eq!(g.scrollback_len(), 0);
+        assert_eq!(g.dropped(), 25);
         assert!(g.pool.len() >= 10);
     }
 

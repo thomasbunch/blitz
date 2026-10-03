@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::ops::Range;
 use std::time::Instant;
 
 use crate::grid::{Cell, Found, Grid, Row, cf, rf};
@@ -130,6 +131,8 @@ pub struct Terminal {
     viewport: usize,
     /// The main screen's view while the alternate screen is up.
     other_viewport: usize,
+    /// Counts the times line numbers started over; see [`Self::line_epoch`].
+    line_epoch: u32,
     changed: bool,
     modes: Modes,
     /// Dark or light system theme, for `CSI ? 996 n`.
@@ -202,6 +205,7 @@ impl Terminal {
             cluster: None,
             viewport: 0,
             other_viewport: 0,
+            line_epoch: 0,
             changed: true,
             modes: Modes::default(),
             dark: true,
@@ -269,6 +273,7 @@ impl Terminal {
             (c.x, c.y, c.pending_wrap) = other_at;
         }
         if cols != self.cols() {
+            self.line_epoch = self.line_epoch.wrapping_add(1);
             self.cur.pending_wrap &= reflow && !self.alt;
             self.cur.x = self.cur.x.min(cols - 1);
             self.tabs = default_tabs(cols);
@@ -492,12 +497,67 @@ impl Terminal {
         rows_text((0..g.scrollback_len()).filter_map(|i| g.line(i)))
     }
 
+    /// The numbers of the lines kept on the screen being shown, scrollback
+    /// first. A line keeps its number while output scrolls it into
+    /// scrollback, until it drops off the top, so the host can point at
+    /// text that is out of view.
+    pub fn lines(&self) -> Range<usize> {
+        let g = &self.screen.grid;
+        let first = g.dropped();
+        first..first + g.scrollback_len() + usize::from(g.lines())
+    }
+
+    /// The number of the screen's top row.
+    pub fn screen_top(&self) -> usize {
+        let g = &self.screen.grid;
+        g.dropped() + g.scrollback_len()
+    }
+
+    /// Changes whenever line numbers start over and name other text: the
+    /// width changed and the lines were wrapped again, the other screen is
+    /// shown, or the terminal was reset.
+    pub fn line_epoch(&self) -> u32 {
+        self.line_epoch
+    }
+
+    /// Line `n` of the screen being shown, scrollback included, as
+    /// [`Self::snapshot`] draws it: fills `out` with one cell per column
+    /// and returns whether the line's text runs on into the next line.
+    /// `None` when the line is not kept.
+    pub fn line_cells(&self, n: usize, pal: &Palette, out: &mut Vec<RenderCell>) -> Option<bool> {
+        let row = self.line(n)?;
+        let [fg, bg, cursor] = self.colors;
+        let pal = &Palette {
+            fg: fg.unwrap_or(pal.fg),
+            bg: bg.unwrap_or(pal.bg),
+            cursor: cursor.unwrap_or(pal.cursor),
+            ..*pal
+        };
+        out.clear();
+        out.extend((0..self.cols()).map(|x| {
+            let cell = row.cells.get(usize::from(x)).copied().unwrap_or_default();
+            render_cell(cell, row, x, self.styles.get(cell.style), pal)
+        }));
+        Some(row.flags & rf::WRAPPED != 0)
+    }
+
+    /// Whether line `n`'s text runs on into the next line.
+    pub fn wraps(&self, n: usize) -> bool {
+        self.line(n).is_some_and(|r| r.flags & rf::WRAPPED != 0)
+    }
+
     fn cols(&self) -> u16 {
         self.opts.cols
     }
 
     fn rows(&self) -> u16 {
         self.opts.rows
+    }
+
+    /// Line `n` of the screen being shown; see [`Self::lines`].
+    fn line(&self, n: usize) -> Option<&Row> {
+        let g = &self.screen.grid;
+        g.line(n.checked_sub(g.dropped())?)
     }
 
     /// The kitty keyboard stack of the screen being shown.
@@ -849,6 +909,7 @@ impl Terminal {
         t.reply_credit = self.reply_credit;
         std::mem::swap(&mut t.events, &mut self.events);
         std::mem::swap(&mut t.prompt_token, &mut self.prompt_token);
+        t.line_epoch = self.line_epoch.wrapping_add(1);
         t.dark = self.dark;
         t.cell_px = self.cell_px;
         t.pal = self.pal;
@@ -966,6 +1027,7 @@ impl Terminal {
         if alt != self.alt {
             std::mem::swap(&mut self.screen, &mut self.other);
             self.alt = alt;
+            self.line_epoch = self.line_epoch.wrapping_add(1);
             // The main screen's view comes back on the text it showed.
             std::mem::swap(&mut self.viewport, &mut self.other_viewport);
             self.viewport = self.viewport.min(self.screen.grid.scrollback_len());

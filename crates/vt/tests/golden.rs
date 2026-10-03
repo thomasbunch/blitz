@@ -273,6 +273,69 @@ fn erase_scrollback_with_csi_3_j() {
     assert_eq!(t.screen_text(), "3\n4\n");
 }
 
+/// Line `n` as drawn, trailing blanks trimmed; `None` when it is gone.
+fn line_text(t: &Terminal, n: usize) -> Option<String> {
+    let mut cells = Vec::new();
+    t.line_cells(n, &PAL, &mut cells)?;
+    Some(cells.iter().map(text).collect::<String>().trim_end().into())
+}
+
+#[test]
+fn lines_keep_their_numbers_until_they_leave_scrollback() {
+    let mut t = Terminal::new(Options {
+        cols: 10,
+        rows: 3,
+        scrollback_lines: 5,
+        ambiguous_wide: false,
+    });
+    feed(&mut t, "a\r\nb\r\nc");
+    assert_eq!((t.lines(), t.screen_top(), t.view_top()), (0..3, 0, 0));
+    let epoch = t.line_epoch();
+    for i in 0..4 {
+        feed(&mut t, &format!("\r\n{i}"));
+    }
+    assert_eq!((t.lines(), t.screen_top()), (0..7, 4));
+    assert_eq!(line_text(&t, 1).as_deref(), Some("b"));
+    t.scroll_viewport(3);
+    assert_eq!(t.view_top(), 1);
+    for i in 4..7 {
+        feed(&mut t, &format!("\r\n{i}"));
+    }
+    // Scrollback keeps five lines, so a and b are gone.
+    assert_eq!(t.lines(), 2..10);
+    assert_eq!(line_text(&t, 1), None);
+    assert_eq!(line_text(&t, 2).as_deref(), Some("c"));
+    assert_eq!(line_text(&t, 9).as_deref(), Some("6"));
+    assert_eq!(t.line_epoch(), epoch, "scrolling keeps the numbers");
+    t.resize(10, 4);
+    assert_eq!(t.line_epoch(), epoch, "so does a new height");
+    t.resize(8, 4);
+    assert_ne!(t.line_epoch(), epoch, "a new width wraps the lines again");
+    let epoch = t.line_epoch();
+    feed(&mut t, "\x1b[?1049h");
+    assert_ne!(t.line_epoch(), epoch, "the other screen");
+    assert_eq!(t.lines(), 0..4, "has no scrollback");
+    let epoch = t.line_epoch();
+    feed(&mut t, "\x1bc");
+    assert_ne!(t.line_epoch(), epoch, "a reset");
+}
+
+#[test]
+fn line_cells_read_scrollback_as_drawn() {
+    let t = run(4, 2, "abcdef\r\n\x1b[8mhid\x1b[0m\r\nx");
+    assert!(t.wraps(0));
+    assert!(!t.wraps(1));
+    assert_eq!(line_text(&t, 0).as_deref(), Some("abcd"));
+    assert_eq!(line_text(&t, 1).as_deref(), Some("ef"));
+    assert_eq!(
+        line_text(&t, 2).as_deref(),
+        Some(""),
+        "hidden text is left out"
+    );
+    assert_eq!(line_text(&t, 3).as_deref(), Some("x"));
+    assert_eq!(line_text(&t, 4), None);
+}
+
 #[test]
 fn pending_wrap_and_autowrap() {
     let mut t = run(5, 3, "abcde");
