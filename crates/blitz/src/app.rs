@@ -1562,12 +1562,13 @@ impl App {
         // A repeat of a key blitz took goes where its press went, and only
         // some keys do anything again; see `keymap::drops_repeat`.
         let panel = self.picker.is_some() || self.settings.is_some();
-        if held && k.down && keymap::drops_repeat(k, self.eaten.0.contains(&k.vk), panel) {
+        let taken = self.eaten.0.contains(&k.vk);
+        if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
             return;
         }
         if let Some((g, _)) = &mut self.game {
             // Every key is the game's, but a shortcut closes it and runs.
-            if keymap::action(k).is_some() {
+            if keymap::action(k, &self.config.keys).is_some() {
                 self.close_game();
             } else {
                 if k.down {
@@ -1588,7 +1589,7 @@ impl App {
         // which saw the press.
         if self.picker.is_some() && k.down {
             self.eaten.press(k.vk);
-            if keymap::action(k) == Some(Action::ThemePicker) {
+            if keymap::action(k, &self.config.keys) == Some(Action::ThemePicker) {
                 self.picker = None;
                 self.set_theme_from_config();
             } else {
@@ -1599,7 +1600,7 @@ impl App {
         // The same for the panel, but the theme picker opens over it.
         if self.settings.is_some() && k.down {
             self.eaten.press(k.vk);
-            match keymap::action(k) {
+            match keymap::action(k, &self.config.keys) {
                 Some(Action::Settings) => {
                     self.settings = None;
                     self.request_redraw();
@@ -1609,7 +1610,7 @@ impl App {
             }
             return;
         }
-        if let Some(a) = keymap::action(k)
+        if let Some(a) = keymap::action(k, &self.config.keys)
             && self.act(el, a)
         {
             self.eaten.press(k.vk);

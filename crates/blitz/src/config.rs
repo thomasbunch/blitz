@@ -1,7 +1,9 @@
-//! Settings: built-in defaults, with the ones in [`SETTINGS`] read from
-//! `%APPDATA%\blitz\config.toml`.
+//! Settings: built-in defaults, with the ones in [`SETTINGS`] and key
+//! bindings read from `%APPDATA%\blitz\config.toml`.
 
 use std::path::{Path, PathBuf};
+
+use crate::keymap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -33,6 +35,9 @@ pub struct Config {
     pub scenery: String,
     /// The spark at the foot of the sidebar.
     pub mascot: bool,
+    /// Key bindings from `keybind` lines, one per chord, which take the
+    /// place of the default for that chord; see [`keymap::binding`].
+    pub keys: Vec<keymap::Binding>,
 }
 
 impl Default for Config {
@@ -52,6 +57,7 @@ impl Default for Config {
             restore_scrollback: false,
             scenery: "off".into(),
             mascot: false,
+            keys: Vec::new(),
         }
     }
 }
@@ -260,12 +266,20 @@ impl Config {
     /// Sets `key` from a value as `config.toml` holds it. Returns false,
     /// changing nothing, for an unknown key or a value of the wrong type or
     /// out of range. On/off and numbers must not be quoted; names may be.
+    /// Each `keybind` adds a binding, replacing only one for the same chord.
     pub fn set(&mut self, key: &str, value: &str) -> bool {
         let text = unquote(value);
         let bare = text.is_none().then_some(value);
         let num = bare.and_then(number);
         let text = text.unwrap_or_else(|| value.to_string());
         match key {
+            "keybind" => match keymap::binding(&text) {
+                Some(b) => {
+                    self.keys.retain(|k| (k.0, k.1) != (b.0, b.1));
+                    self.keys.push(b);
+                }
+                None => return false,
+            },
             "theme" | "font_family" if text.is_empty() => return false,
             "theme" => self.theme = text,
             "font_family" => self.font_family = text,
@@ -598,6 +612,23 @@ mod tests {
     }
 
     #[test]
+    fn config_reads_key_bindings() {
+        let c = Config::parse(
+            "keybind = ctrl+shift+r=new_tab\n\
+             keybind = \"ctrl+shift+w=none\" # mine\n\
+             keybind = ctrl+shift+r=split_down\n\
+             keybind = ctrl+shift+q=quit\n\
+             keybind = ctrl+shift\n",
+        );
+        let want: Vec<keymap::Binding> = ["ctrl+shift+w=none", "ctrl+shift+r=split_down"]
+            .into_iter()
+            .filter_map(keymap::binding)
+            .collect();
+        assert_eq!(c.keys, want, "the last line for a chord counts");
+        assert_eq!(c.font_size, Config::default().font_size);
+    }
+
+    #[test]
     fn every_setting_reads_back_what_it_writes() {
         let mut c = Config::default();
         for s in SETTINGS.iter().filter(|s| s.kind != Kind::Game) {
@@ -759,7 +790,8 @@ scenery = stars
         }
         for line in readme.lines().filter(|l| l.starts_with("| `")) {
             let key = line[3..].split('`').next().unwrap_or_default();
-            let known = SETTINGS.iter().any(|s| s.key == key);
+            // Key bindings are read too, though the panel does not show them.
+            let known = key == "keybind" || SETTINGS.iter().any(|s| s.key == key);
             assert!(
                 known,
                 "README.md documents {key}, which blitz does not read"
