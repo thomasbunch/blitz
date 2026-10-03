@@ -2,6 +2,7 @@
 //! hyperlinks they point to.
 
 use std::collections::HashMap;
+use std::hash::Hasher;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Color {
@@ -51,7 +52,7 @@ pub struct Link {
 #[derive(Debug)]
 pub struct Styles {
     list: Vec<Style>,
-    map: HashMap<Style, u16>,
+    map: HashMap<Style, u16, FxBuild>,
     /// Link `n` is `links[n - 1]`.
     links: Vec<Link>,
     link_map: HashMap<Link, u32>,
@@ -73,7 +74,7 @@ impl Styles {
         let d = Style::default();
         Self {
             list: vec![d],
-            map: HashMap::from([(d, 0)]),
+            map: HashMap::from_iter([(d, 0)]),
             links: Vec::new(),
             link_map: HashMap::new(),
             link_bytes: 0,
@@ -184,6 +185,53 @@ impl Styles {
             .collect();
         self.misses = 0;
         map
+    }
+}
+
+/// rustc's Fx hash: a rotate and multiply per word. For hot tables keyed
+/// by small values, where SipHash costs more than the work around it: the
+/// style table, looked up on every SGR, and the renderer's glyph atlas,
+/// looked up for every cell drawn. Both are bounded, so colliding keys can
+/// cost a program no more than a full table does.
+#[derive(Default)]
+pub struct FxHasher(u64);
+
+/// Builds [`FxHasher`]s, for `HashMap::with_hasher`.
+pub type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
+
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, tail) = bytes.as_chunks::<8>();
+        for w in words {
+            self.write_u64(u64::from_le_bytes(*w));
+        }
+        for &b in tail {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u8(&mut self, n: u8) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_u16(&mut self, n: u16) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 
