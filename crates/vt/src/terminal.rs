@@ -1132,10 +1132,27 @@ fn ext_color(v: &[u16], i: usize, subs: usize) -> (Option<Color>, usize) {
 impl Handler for Terminal {
     fn print(&mut self, s: &str) {
         self.changed = true;
-        if s.is_ascii() && self.cur.charsets[self.cur.gl] == Charset::Ascii {
-            self.print_ascii(s.as_bytes());
-        } else {
-            s.chars().for_each(|c| self.print_char(c));
+        if self.cur.charsets[self.cur.gl] != Charset::Ascii {
+            return s.chars().for_each(|c| self.print_char(c));
+        }
+        // ASCII never joins the cluster before it (only a prepend mark could
+        // take it, and those never get into a cluster), so ASCII stretches,
+        // even in mixed text, take the bulk path.
+        if s.is_ascii() {
+            return self.print_ascii(s.as_bytes());
+        }
+        let mut rest = s.as_bytes();
+        while !rest.is_empty() {
+            let n = rest.iter().position(|b| !b.is_ascii()).unwrap_or(rest.len());
+            let (ascii, tail) = rest.split_at(n);
+            if !ascii.is_empty() {
+                self.print_ascii(ascii);
+            }
+            let m = tail.iter().position(u8::is_ascii).unwrap_or(tail.len());
+            // Both ends of `tail[..m]` sit on character boundaries.
+            let other = std::str::from_utf8(&tail[..m]).unwrap_or_default();
+            other.chars().for_each(|c| self.print_char(c));
+            rest = &tail[m..];
         }
     }
 
