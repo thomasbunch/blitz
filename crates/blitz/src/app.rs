@@ -468,6 +468,11 @@ struct App {
     game_ended: Option<Instant>,
     /// Windows shows animations; scenery and the spark keep still if not.
     motion: bool,
+    /// The command palette, while it is open.
+    commands: Option<Commands>,
+    /// Where the command palette and its rows were in the last frame, for
+    /// clicks.
+    commands_hits: Option<(Rect, Vec<(usize, Rect)>)>,
     /// Points Ctrl+= and Ctrl+- add to the font size in the settings.
     /// Never saved, and dropped when that setting changes.
     font_zoom: f32,
@@ -570,6 +575,40 @@ impl Picker {
     }
 }
 
+/// The open command palette.
+#[derive(Default)]
+struct Commands {
+    /// Typed text; actions whose label or `config.toml` name holds every
+    /// typed word, ignoring case, match.
+    filter: String,
+    /// The highlighted action, among the matching ones.
+    sel: usize,
+}
+
+impl Commands {
+    /// The matching actions and their labels, in [`keymap::ACTIONS`] order.
+    /// The palette leaves itself out.
+    fn matches(&self) -> Vec<(Action, &'static str)> {
+        let words: Vec<String> = (self.filter.split_whitespace())
+            .map(str::to_lowercase)
+            .collect();
+        (keymap::ACTIONS.iter())
+            .filter(|a| a.0 != Action::Palette)
+            .filter(|a| {
+                let text = format!("{} {}", a.2, a.1).to_lowercase();
+                words.iter().all(|w| text.contains(w.as_str()))
+            })
+            .map(|a| (a.0, a.2))
+            .collect()
+    }
+
+    /// Moves the highlight `by` rows, stopping at either end.
+    fn move_by(&mut self, by: isize) {
+        let last = self.matches().len().saturating_sub(1);
+        self.sel = self.sel.saturating_add_signed(by).min(last);
+    }
+}
+
 /// Sends [`UserEvent::Settings`] whenever a file in `%APPDATA%\blitz`, or
 /// its themes folder, is written. Creates the themes folder, so there is
 /// a place to drop theme files.
@@ -638,6 +677,8 @@ impl App {
             game: None,
             game_ended: None,
             motion: animations_on(),
+            commands: None,
+            commands_hits: None,
             font_zoom: 0.0,
             scale: 1.0,
             win: layout::Window::default(),
@@ -1084,6 +1125,16 @@ impl App {
                 top: p.top,
                 error: p.error.as_deref(),
             }),
+            commands: self.commands.as_ref().map(|cm| chrome::Commands {
+                filter: &cm.filter,
+                items: (cm.matches().into_iter())
+                    .map(|(a, label)| {
+                        let keys = keymap::keys_for(a, &self.config.keys);
+                        (label, keys.unwrap_or_default())
+                    })
+                    .collect(),
+                sel: cm.sel,
+            }),
             spark: self.config.mascot.then(|| self.anim_time()),
             game: self.game.as_ref().map(|g| &g.0),
         }
@@ -1398,11 +1449,75 @@ impl App {
         self.request_redraw();
     }
 
-    /// Typed text for the filter of the theme picker or the settings
-    /// panel. False when neither is open.
+    /// A key while the command palette is open: up and down choose an
+    /// action, typing narrows the list, Enter runs the action and Esc
+    /// closes the palette.
+    fn commands_key(&mut self, el: &ActiveEventLoop, k: &KeyInput) {
+        let Some(cm) = &mut self.commands else {
+            return;
+        };
+        let m = &k.mods;
+        // Ctrl and Alt together are AltGr when the layout gives a character.
+        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+        let chord = ctrl != alt || (ctrl && k.uc == 0);
+        let page = chrome::PICKER_ROWS as isize;
+        match k.vk {
+            VK_ESCAPE => self.commands = None,
+            VK_RETURN => {
+                let picked = cm.matches().get(cm.sel).map(|a| a.0);
+                self.commands = None;
+                if let Some(a) = picked {
+                    self.act(el, a);
+                }
+            }
+            VK_UP => cm.move_by(-1),
+            VK_DOWN => cm.move_by(1),
+            VK_PRIOR => cm.move_by(-page),
+            VK_NEXT => cm.move_by(page),
+            VK_BACK if cm.filter.pop().is_some() => cm.sel = 0,
+            VK_BACK => return,
+            _ if !chord && !k.text.is_empty() => {
+                cm.filter.push_str(k.text);
+                cm.sel = 0;
+            }
+            _ => return,
+        }
+        self.request_redraw();
+    }
+
+    /// A left click while the command palette is open: one on an action
+    /// runs it, and one outside the palette closes it.
+    fn commands_click(&mut self, el: &ActiveEventLoop) {
+        let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
+        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let Some((panel, rows)) = &self.commands_hits else {
+            return;
+        };
+        if !inside(panel) {
+            self.commands = None;
+            self.request_redraw();
+            return;
+        }
+        let Some(&(i, _)) = rows.iter().find(|r| inside(&r.1)) else {
+            return;
+        };
+        let picked = (self.commands.as_ref()).and_then(|cm| cm.matches().get(i).map(|a| a.0));
+        self.commands = None;
+        self.request_redraw();
+        if let Some(a) = picked {
+            self.act(el, a);
+        }
+    }
+
+    /// Typed text for the filter of the command palette, the theme picker
+    /// or the settings panel. False when none is open.
     fn filter_text(&mut self, t: &str) -> bool {
         if self.game.is_some() {
             // The game takes keys, not text.
+        } else if let Some(cm) = &mut self.commands {
+            cm.filter.push_str(t);
+            cm.sel = 0;
+            self.request_redraw();
         } else if let Some(p) = &mut self.picker {
             p.filter.push_str(t);
             p.sel = 0;
@@ -1569,7 +1684,7 @@ impl App {
         }
         // A repeat of a key blitz took goes where its press went, and only
         // some keys do anything again; see `keymap::drops_repeat`.
-        let panel = self.picker.is_some() || self.settings.is_some();
+        let panel = self.commands.is_some() || self.picker.is_some() || self.settings.is_some();
         let taken = self.eaten.0.contains(&k.vk);
         if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
             return;
@@ -1590,6 +1705,17 @@ impl App {
                 }
                 return;
             }
+        }
+        // The same for the command palette.
+        if self.commands.is_some() && k.down {
+            self.eaten.press(k.vk);
+            if keymap::action(k, &self.config.keys) == Some(Action::Palette) {
+                self.commands = None;
+                self.request_redraw();
+            } else {
+                self.commands_key(el, k);
+            }
+            return;
         }
         // Every key pressed while the picker is open is the picker's, and
         // so is its release. A key pressed before it opened, such as the
@@ -1799,6 +1925,10 @@ impl App {
             }
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
+            Action::Palette => {
+                self.commands = Some(Commands::default());
+                self.request_redraw();
+            }
             Action::Focus(dir) => {
                 let (area, active) = (self.tab_area(), self.win.active);
                 if let Some(t) = self.win.tabs.get_mut(active) {
@@ -2223,8 +2353,14 @@ impl App {
         };
         let mods = mods_now();
         let pressed = state == ElementState::Pressed;
-        // Presses go to the settings panel; a release still goes wherever
-        // its press went.
+        // Presses go to the command palette or the settings panel; a
+        // release still goes wherever its press went.
+        if pressed && self.commands.is_some() {
+            if b == 0 {
+                self.commands_click(el);
+            }
+            return;
+        }
         if pressed && self.settings.is_some() && self.picker.is_none() {
             if b == 0 {
                 self.settings_click();
@@ -2343,6 +2479,11 @@ impl App {
         if steps == 0.0 {
             return;
         }
+        if let Some(cm) = &mut self.commands {
+            cm.move_by(-steps as isize);
+            self.request_redraw();
+            return;
+        }
         if let Some(p) = self.settings.as_mut().filter(|_| self.picker.is_none()) {
             p.move_by(-steps as isize);
             self.request_redraw();
@@ -2428,6 +2569,7 @@ impl App {
         self.rows = std::mem::take(&mut chrome.rows);
         self.banner = chrome.banner;
         self.settings_hits = chrome.settings.take();
+        self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
             p.top = h.top;
         }
@@ -3991,6 +4133,20 @@ mod tests {
         ] {
             assert_eq!(resume_line(true, Some(bad)), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn palette_matches_every_word_of_the_label_or_name() {
+        let mut c = Commands::default();
+        assert_eq!(c.matches().len(), keymap::ACTIONS.len() - 1, "not itself");
+        c.filter = "Split R".into();
+        assert_eq!(c.matches(), [(Action::SplitRight, "Split right")]);
+        c.filter = "font_size_up".into();
+        assert_eq!(c.matches(), [(Action::FontSize(1), "Bigger font")]);
+        c.move_by(5);
+        assert_eq!(c.sel, 0, "one match");
+        c.filter = "zzz".into();
+        assert!(c.matches().is_empty());
     }
 
     #[test]

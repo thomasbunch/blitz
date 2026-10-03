@@ -53,6 +53,7 @@ pub struct ChromeModel<'a> {
     pub spark: Option<f64>,
     /// blitz run, while it is open.
     pub game: Option<&'a crate::arcade::run::Run>,
+    pub commands: Option<Commands<'a>>,
 }
 
 /// The theme picker, drawn over everything.
@@ -65,7 +66,17 @@ pub struct Picker<'a> {
     pub sel: usize,
 }
 
-/// Rows the picker shows at once.
+/// The command palette, drawn over everything.
+pub struct Commands<'a> {
+    /// What was typed to narrow the list.
+    pub filter: &'a str,
+    /// The actions that match it, each with the keys that run it, if any.
+    pub items: Vec<(&'a str, String)>,
+    /// The highlighted item.
+    pub sel: usize,
+}
+
+/// Rows the theme picker and the command palette show at once.
 pub const PICKER_ROWS: usize = 12;
 
 /// The settings panel, drawn over everything but the theme picker.
@@ -148,6 +159,8 @@ pub struct Chrome {
     /// The banner strip, for clicks.
     pub banner: Option<Rect>,
     pub settings: Option<SettingsHits>,
+    /// The command palette and each row it shows, by index, for clicks.
+    pub commands: Option<(Rect, Vec<(usize, Rect)>)>,
 }
 
 /// Width of the expanded sidebar and of the collapsed rail at 96 DPI,
@@ -629,20 +642,41 @@ pub fn build(m: &ChromeModel) -> Chrome {
     if let Some(g) = m.game {
         g.draw(&mut extra, area, m.scale, c, (tw, th));
     }
+    if let Some(cm) = &m.commands {
+        out.commands = Some(commands(&mut extra, cm, c, m.size, s, (tw, th)));
+    }
     out.prims.extend(extra);
     out
 }
 
-/// The theme picker: a panel near the top with the filter, a window of
-/// matching themes, each with a strip of its colours, and a key hint.
-fn picker(
+/// What the theme picker and the command palette have in common.
+struct List<'a> {
+    title: &'a str,
+    /// What was typed to narrow the list.
+    filter: &'a str,
+    /// The names that match it, and the highlighted one.
+    names: Vec<&'a str>,
+    sel: usize,
+    /// Shown when nothing matches.
+    empty: &'a str,
+    hint: &'a str,
+    /// Panel width at 96 DPI.
+    width: f32,
+}
+
+/// A list panel near the top: the title and the filter, a window of rows
+/// that follows the highlight, and a key hint. `side(p, i, row, right)`
+/// draws the right end of row `i` up to `right` and returns where the name
+/// must end. Returns the panel and each row shown, by index.
+fn list(
     p: &mut Vec<Prim>,
-    pk: &Picker,
+    l: &List,
     c: &Ui,
     (w, h): (i32, i32),
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
-) {
+    mut side: impl FnMut(&mut Vec<Prim>, usize, Rect, i32) -> i32,
+) -> (Rect, Vec<(usize, Rect)>) {
     let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
         p.push(Prim::Text {
             x,
@@ -654,8 +688,8 @@ fn picker(
         });
     };
     let (pad, row_h, one) = (s(12.0), th + s(10.0), s(1.0).max(1));
-    let shown = pk.items.len().clamp(1, PICKER_ROWS) as i32;
-    let pw = s(380.0).min(w - s(32.0)).max(0);
+    let shown = l.names.len().clamp(1, PICKER_ROWS) as i32;
+    let pw = s(l.width).min(w - s(32.0)).max(0);
     let ph = 2 * row_h + shown * row_h + s(12.0);
     let panel = Rect {
         x: (w - pw) / 2,
@@ -663,25 +697,19 @@ fn picker(
         w: pw,
         h: ph,
     };
-    let inset = |r: Rect| Rect {
-        x: r.x + one,
-        y: r.y + one,
-        w: (r.w - 2 * one).max(0),
-        h: (r.h - 2 * one).max(0),
-    };
     p.push(Prim::Rect(panel, c.border));
-    let inner = inset(panel);
+    let inner = inset(panel, one);
     p.push(Prim::Rect(inner, c.side_bg));
     let (left, right) = (inner.x + pad, inner.right() - pad);
     let ty = |row_y: i32| row_y + (row_h - th) / 2;
 
     let mut y = inner.y + s(4.0);
-    text(p, left, ty(y), "Theme".into(), c.name, true);
-    let fx = left + 7 * tw;
-    let (filter, color) = if pk.filter.is_empty() {
+    text(p, left, ty(y), l.title.into(), c.name, true);
+    let fx = left + text_w(l.title, tw) + 2 * tw;
+    let (filter, color) = if l.filter.is_empty() {
         ("type to filter", c.dim)
     } else {
-        (pk.filter, c.msg)
+        (l.filter, c.msg)
     };
     text(p, fx, ty(y), fit(filter, right - fx, tw), color, false);
     y += row_h;
@@ -694,36 +722,73 @@ fn picker(
     p.push(Prim::Rect(rule, c.rule));
     y += s(4.0);
 
-    if pk.items.is_empty() {
-        text(p, left, ty(y), "no theme matches".into(), c.dim, false);
+    if l.names.is_empty() {
+        text(p, left, ty(y), l.empty.into(), c.dim, false);
     }
-    // Six of the theme's colours on its own background.
-    let (sq, gap) = (s(8.0), s(4.0));
-    let strip_w = 6 * sq + 7 * gap;
-    let first = (pk.sel + 1).saturating_sub(PICKER_ROWS);
-    for (i, t) in pk.items.iter().enumerate().skip(first).take(PICKER_ROWS) {
+    let mut rows = Vec::new();
+    let first = (l.sel + 1).saturating_sub(PICKER_ROWS);
+    for (i, name) in l.names.iter().enumerate().skip(first).take(PICKER_ROWS) {
         let row = Rect {
             x: inner.x,
             y,
             w: inner.w,
             h: row_h,
         };
-        let sel = i == pk.sel;
+        let sel = i == l.sel;
         if sel {
             p.push(Prim::Rect(row, c.row_focus));
             p.push(Prim::Rect(Rect { w: s(2.0), ..row }, c.accent));
         }
+        let end = side(p, i, row, right);
+        let color = if sel { c.name } else { c.msg };
+        text(
+            p,
+            left,
+            ty(y),
+            fit(name, end - s(8.0) - left, tw),
+            color,
+            sel,
+        );
+        rows.push((i, row));
+        y += row_h;
+    }
+
+    let hy = panel.bottom() - row_h - s(2.0);
+    text(p, left, ty(hy), fit(l.hint, right - left, tw), c.dim, false);
+    (panel, rows)
+}
+
+/// The theme picker: the matching themes, each with a strip of its colours.
+fn picker(
+    p: &mut Vec<Prim>,
+    pk: &Picker,
+    c: &Ui,
+    size: (i32, i32),
+    s: impl Fn(f32) -> i32,
+    cells: (i32, i32),
+) {
+    let l = List {
+        title: "Theme",
+        filter: pk.filter,
+        names: pk.items.iter().map(|t| t.name.as_str()).collect(),
+        sel: pk.sel,
+        empty: "no theme matches",
+        hint: "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel",
+        width: 380.0,
+    };
+    // Six of the theme's colours on its own background.
+    let (sq, gap, one) = (s(8.0), s(4.0), s(1.0).max(1));
+    let strip_w = 6 * sq + 7 * gap;
+    list(p, &l, c, size, &s, cells, |p, i, row, right| {
+        let t = pk.items[i];
         let strip = Rect {
             x: right - strip_w,
-            y: y + (row_h - sq - 2 * gap) / 2,
+            y: row.y + (row.h - sq - 2 * gap) / 2,
             w: strip_w,
             h: sq + 2 * gap,
         };
-        let color = if sel { c.name } else { c.msg };
-        let name = fit(&t.name, strip.x - s(8.0) - left, tw);
-        text(p, left, ty(y), name, color, sel);
         p.push(Prim::Rect(strip, c.border));
-        p.push(Prim::Rect(inset(strip), t.pal.bg));
+        p.push(Prim::Rect(inset(strip, one), t.pal.bg));
         for (k, &col) in t.pal.ansi[1..7].iter().enumerate() {
             let x = strip.x + gap + k as i32 * (sq + gap);
             let r = Rect {
@@ -734,12 +799,51 @@ fn picker(
             };
             p.push(Prim::Rect(r, col));
         }
-        y += row_h;
-    }
+        strip.x
+    });
+}
 
-    let hint = "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel";
-    let hy = panel.bottom() - row_h - s(2.0);
-    text(p, left, ty(hy), fit(hint, right - left, tw), c.dim, false);
+/// The command palette: the matching actions, each with its keys.
+fn commands(
+    p: &mut Vec<Prim>,
+    cm: &Commands,
+    c: &Ui,
+    size: (i32, i32),
+    s: impl Fn(f32) -> i32,
+    (tw, th): (i32, i32),
+) -> (Rect, Vec<(usize, Rect)>) {
+    let l = List {
+        title: "Commands",
+        filter: cm.filter,
+        names: cm.items.iter().map(|i| i.0).collect(),
+        sel: cm.sel,
+        empty: "no command matches",
+        hint: "\u{2191}\u{2193} choose  \u{b7}  Enter run  \u{b7}  Esc close",
+        width: 460.0,
+    };
+    list(p, &l, c, size, s, (tw, th), |p, i, row, right| {
+        let keys = &cm.items[i].1;
+        let x = right - text_w(keys, tw);
+        p.push(Prim::Text {
+            x,
+            y: row.y + (row.h - th) / 2,
+            text: keys.clone(),
+            color: c.dim,
+            bold: false,
+            term: false,
+        });
+        x
+    })
+}
+
+/// `r` shrunk by `by` on every side.
+fn inset(r: Rect, by: i32) -> Rect {
+    Rect {
+        x: r.x + by,
+        y: r.y + by,
+        w: (r.w - 2 * by).max(0),
+        h: (r.h - 2 * by).max(0),
+    }
 }
 
 /// The settings panel: a search line, the settings under group headings,
@@ -1195,6 +1299,7 @@ mod tests {
             settings: None,
             spark: None,
             game: None,
+            commands: None,
         }
     }
 
@@ -1425,6 +1530,29 @@ mod tests {
         assert_eq!(up.top, last.top);
         // Going back to the top shows the first heading again.
         assert_eq!(show(0, up.top).top, 0);
+    }
+
+    #[test]
+    fn command_palette_follows_the_highlight() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let items = (0..20)
+            .map(|i| ("Split right", format!("Ctrl+{i}")))
+            .collect();
+        m.commands = Some(Commands {
+            filter: "",
+            items,
+            sel: 15,
+        });
+        let c = build(&m);
+        let (panel, rows) = c.commands.clone().expect("palette hits");
+        let shown: Vec<usize> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(shown, (4..16).collect::<Vec<_>>());
+        let inside = |r: Rect| r.y >= panel.y && r.bottom() <= panel.bottom();
+        assert!(rows.iter().all(|&(_, r)| inside(r)));
+        let t = texts(&c);
+        assert!(t.contains(&"Commands") && t.contains(&"Ctrl+15"));
+        assert!(!t.contains(&"Ctrl+3"), "scrolled out");
     }
 
     #[test]
