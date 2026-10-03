@@ -15,6 +15,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
   format.
 - A settings panel on Ctrl+, for the font, shell, sessions and more.
+- A command palette on Ctrl+Shift+P lists every action with its keys,
+  and `config.toml` can bind any of them to other keys.
 - Direct3D 11 and DirectWrite rendering, with a software fallback.
 
 ## Install
@@ -113,6 +115,7 @@ writes it.
 | `bell_attention` | `true` | Treat a bell in a background pane as needing you |
 | `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
 | `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
+| `keybind` | | Binds a key to an action; one line per key. See [Key bindings](#key-bindings) |
 
 blitz run, the last row of the panel, is a game rather than a setting:
 Enter starts it, and it keeps its best score in
@@ -173,14 +176,56 @@ good place to start.
 | Ctrl+Alt+Arrows | Move focus between panes |
 | Alt+Shift+Arrows | Resize the focused pane (or drag the line between panes) |
 | Ctrl+Alt+Shift+Arrows | Swap the focused pane with its neighbour |
+| Ctrl+Shift+Z | Zoom the focused pane to fill the tab, or show every pane again |
 | Ctrl+Shift+J | Jump to the next session that needs you |
 | Ctrl+Shift+B | Expand or collapse the sidebar |
 | Ctrl+Shift+U | Update, or look for a newer release now |
 | Ctrl+Shift+K | Pick a theme |
 | Ctrl+, | Settings |
+| Ctrl+Shift+P | Command palette |
+| Ctrl+=, Ctrl+-, Ctrl+0 | Font size up, down, and back to the setting, until blitz restarts |
+| F11 | Full screen |
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
+
+A zoomed pane stays zoomed until you zoom again, move focus to another
+pane, split or resize.
+
+The command palette lists every action with its keys. Typing narrows
+the list, the arrow keys choose, and Enter or a click runs the action;
+Esc closes it. Giving the panes equal space has no keys by default, so
+it is only in the palette.
+
+## Key bindings
+
+`keybind` lines in `config.toml` change the keys. Each binds a chord to
+an action, or with `none` gives a chord back to the program:
+
+```
+keybind = ctrl+shift+e=split_right
+keybind = ctrl+shift+r=none
+keybind = alt+f11=command_palette
+```
+
+A chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`:
+a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
+`end`, `pageup`, `pagedown`, `insert`, `delete`, `tab`, `enter`, `esc`,
+`space`, `backspace`, or a punctuation key by its character or its name,
+such as `,` or `comma` and `=` or `plus`. The modifiers must match
+exactly. A binding replaces the default on the same chord, and the other
+defaults stay; Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them.
+Lines blitz cannot read are skipped.
+
+The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
+`new_tab`, `close_pane`, `next_tab`, `previous_tab`, `split_right`,
+`split_down`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
+`jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
+`settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
+`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
+`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
+`fullscreen` and `command_palette`. Typing a name in the command palette
+finds its action.
 
 ## License
 
