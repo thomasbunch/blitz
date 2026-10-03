@@ -103,8 +103,44 @@ fn sgr_colours() {
     assert_eq!(cell(&s, 10, 0).bg, 0xFFFF55);
     assert_eq!(cell(&s, 13, 0).fg, cell(&s, 13, 0).bg, "invisible");
     let attrs: Vec<u16> = (0..16).map(|x| cell(&s, x, 0).attrs).collect();
-    let (inv, ul) = (attr::INVERSE, attr::UNDERLINE);
-    assert_eq!(attrs, [0, 0, 0, 0, 0, 0, inv, ul, 0, 0, 0, 0, 0, 0, ul, 0]);
+    let inv = attr::INVERSE;
+    let (ul, curly) = (1 << attr::UNDERLINE_SHIFT, 3 << attr::UNDERLINE_SHIFT);
+    assert_eq!(
+        attrs,
+        [0, 0, 0, 0, 0, 0, inv, curly, 0, 0, 0, 0, 0, 0, ul, 0]
+    );
+}
+
+#[test]
+fn sgr_lines_and_underline_colour() {
+    let mut t = run(
+        10,
+        1,
+        concat!(
+            "\x1b[4:3;58:5:1ma\x1b[59;9mb\x1b[0;21;53;32mc\x1b[0;4:4md",
+            "\x1b[4:5;7me\x1b[0;8;4;58:5:1mf\x1b[0;5mg",
+        ),
+    );
+    let s = snap(&mut t);
+    let ul = |kind: u16| kind << attr::UNDERLINE_SHIFT;
+    let lines: Vec<(u16, u32)> = (0..7)
+        .map(|x| (cell(&s, x, 0).attrs, cell(&s, x, 0).ul))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (ul(3), PAL.ansi[1]),
+            (ul(3) | attr::STRIKE, PAL.fg),
+            (ul(2) | attr::OVERLINE, PAL.ansi[2]),
+            (ul(4), PAL.fg),
+            // The default underline colour follows the text, inverse too.
+            (ul(5) | attr::INVERSE, PAL.bg),
+            // Concealed: drawn in the background, colour or not.
+            (ul(1), PAL.bg),
+            // Blink is not drawn.
+            (0, PAL.fg),
+        ]
+    );
 }
 
 #[test]
@@ -610,9 +646,11 @@ fn rare_renditions_and_malformed_colours() {
         ),
     );
     let s = snap(&mut t);
+    // SGR 21 is a double underline.
+    let double = 2 << attr::UNDERLINE_SHIFT;
     assert_eq!(
         [0, 1, 2, 3, 4].map(|x| cell(&s, x, 0).attrs),
-        [attr::ITALIC, 0, 0, attr::UNDERLINE, 0]
+        [attr::ITALIC, 0, 0, double, 0]
     );
     assert_eq!((cell(&s, 5, 0).fg, cell(&s, 6, 0).fg), (0x080808, 0xEEEEEE));
     // A malformed colour and an unknown code leave the colour alone.

@@ -34,17 +34,23 @@ impl Palette {
     }
 }
 
-/// [`RenderCell::attrs`] bits. Inverse and invisible are already applied
-/// to the cell's colours, and a cell whose text would not show has none;
-/// `INVERSE` is only informational.
+/// [`RenderCell::attrs`] bits, the same as the style's. Inverse and
+/// invisible are already applied to the cell's colours, and a cell whose
+/// text would not show has none; `INVERSE` is only informational. Blink
+/// is left out: nothing blitz draws moves.
 pub mod attr {
-    pub const BOLD: u16 = 1 << 0;
-    pub const ITALIC: u16 = 1 << 1;
-    pub const UNDERLINE: u16 = 1 << 2;
-    pub const INVERSE: u16 = 1 << 3;
-    pub const DIM: u16 = 1 << 4;
-    pub const STRIKE: u16 = 1 << 5;
-    pub const OVERLINE: u16 = 1 << 6;
+    use crate::style::attr as s;
+
+    pub const BOLD: u16 = s::BOLD;
+    pub const DIM: u16 = s::DIM;
+    pub const ITALIC: u16 = s::ITALIC;
+    /// Underline kind as in SGR `4:x`: 0 none, 1 single, 2 double,
+    /// 3 curly, 4 dotted, 5 dashed.
+    pub const UNDERLINE: u16 = s::UNDERLINE;
+    pub const UNDERLINE_SHIFT: u16 = s::UNDERLINE_SHIFT;
+    pub const INVERSE: u16 = s::INVERSE;
+    pub const STRIKE: u16 = s::STRIKE;
+    pub const OVERLINE: u16 = s::OVERLINE;
 }
 
 /// Longest grapheme cluster a cell holds, in bytes: its first code point
@@ -61,8 +67,13 @@ pub struct RenderCell {
     pub width: u8,
     pub fg: u32,
     pub bg: u32,
+    /// Underline colour; `fg` unless the program chose one.
+    pub ul: u32,
     pub attrs: u16,
 }
+
+// Snapshots are rebuilt every frame something changes; keep cells small.
+const _: () = assert!(size_of::<RenderCell>() == 48);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorShape {
@@ -109,10 +120,12 @@ mod tests {
         let mut s = Snapshot::default();
         t.snapshot(&mut s, &pal);
         let attrs: Vec<u16> = s.cells.iter().map(|c| c.attrs).collect();
-        let (st, ov, ul) = (attr::STRIKE, attr::OVERLINE, attr::UNDERLINE);
+        // A plain SGR 4 is a single underline.
+        let ul = 1 << attr::UNDERLINE_SHIFT;
+        let (st, ov) = (attr::STRIKE, attr::OVERLINE);
         assert_eq!(attrs, [st, st | ov, ov, ul, st | ov | ul, 0]);
-        // Each bit is its own.
-        let bits = [
+        // Each field is its own.
+        let fields = [
             attr::BOLD,
             attr::ITALIC,
             attr::UNDERLINE,
@@ -121,7 +134,10 @@ mod tests {
             attr::STRIKE,
             attr::OVERLINE,
         ];
-        let all = bits.iter().fold(0, |a, b| a | b);
-        assert_eq!(all.count_ones() as usize, bits.len());
+        for (i, a) in fields.iter().enumerate() {
+            for b in &fields[i + 1..] {
+                assert_eq!(a & b, 0, "{a:#x} and {b:#x}");
+            }
+        }
     }
 }

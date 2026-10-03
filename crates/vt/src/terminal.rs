@@ -8,7 +8,7 @@ use crate::grid::{Cell, Grid, Row, cf, rf};
 use crate::modes::{InputModes, KittyStack, Modes};
 use crate::osc::{self, Osc9};
 use crate::parser::{Handler, Params, Parser};
-use crate::snapshot::{self, CursorShape, Palette, RenderCell, Snapshot};
+use crate::snapshot::{CursorShape, Palette, RenderCell, Snapshot};
 use crate::style::{Color, Style, Styles, attr};
 use crate::width::{chars_width, joins};
 
@@ -1500,6 +1500,16 @@ fn dec_graphics(c: char) -> char {
     }
 }
 
+/// Style bits a [`RenderCell`] keeps; [`crate::snapshot::attr`] uses the
+/// same.
+const RENDER_ATTRS: u16 = attr::BOLD
+    | attr::DIM
+    | attr::ITALIC
+    | attr::UNDERLINE
+    | attr::INVERSE
+    | attr::STRIKE
+    | attr::OVERLINE;
+
 fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> RenderCell {
     let a = style.attrs;
     let mut fg = pal.resolve(style.fg, pal.fg);
@@ -1507,22 +1517,10 @@ fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> R
     if a & attr::INVERSE != 0 {
         std::mem::swap(&mut fg, &mut bg);
     }
+    let mut ul = pal.resolve(style.ul, fg);
     if a & attr::INVISIBLE != 0 {
-        fg = bg;
-    }
-    let mut attrs = 0;
-    for (from, to) in [
-        (attr::BOLD, snapshot::attr::BOLD),
-        (attr::ITALIC, snapshot::attr::ITALIC),
-        (attr::UNDERLINE, snapshot::attr::UNDERLINE),
-        (attr::INVERSE, snapshot::attr::INVERSE),
-        (attr::DIM, snapshot::attr::DIM),
-        (attr::STRIKE, snapshot::attr::STRIKE),
-        (attr::OVERLINE, snapshot::attr::OVERLINE),
-    ] {
-        if a & from != 0 {
-            attrs |= to;
-        }
+        // Concealed text takes its lines with it.
+        (fg, ul) = (bg, bg);
     }
     let mut rc = RenderCell {
         width: match cell.flags {
@@ -1532,7 +1530,8 @@ fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> R
         },
         fg,
         bg,
-        attrs,
+        ul,
+        attrs: a & RENDER_ATTRS,
         ..RenderCell::default()
     };
     // Text drawn in its own background, concealed or not, is left out, so
