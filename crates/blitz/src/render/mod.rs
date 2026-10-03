@@ -321,6 +321,26 @@ mod gpu {
                     (a.1, a.0) <= p && p <= (b.1, b.0)
                 })
             };
+            // Search matches by cell: 1 for a match, 2 for the current one.
+            let mut marks = Vec::new();
+            if !dim && !snap.highlights.is_empty() {
+                marks = vec![0u8; cols * rows];
+                let at = |(c, r): (u16, u16)| usize::from(r) * cols + usize::from(c);
+                for h in &snap.highlights {
+                    let end = (at(h.end) + 1).min(marks.len());
+                    for m in &mut marks[at(h.start).min(end)..end] {
+                        *m = (*m).max(1 + u8::from(h.current));
+                    }
+                }
+            }
+            let marked = |c: usize, r: usize| marks.get(r * cols + c).copied().unwrap_or(0);
+            // Matches sit on a tint halfway to the selection colour, the
+            // current one on the selection colour a quarter of the way to
+            // the text.
+            let (matched, current) = (
+                super::mix(pal.bg, pal.selection_bg),
+                super::toward(pal.selection_bg, pal.fg),
+            );
             let px = |c: usize| x + (c as u32 * cw) as i32;
             let py = |r: usize| y + (r as u32 * ch) as i32;
 
@@ -331,12 +351,11 @@ mod gpu {
             for r in 0..rows {
                 let mut c = 0;
                 while c < cols {
-                    let bg = |c| {
-                        if selected(c, r) {
-                            pal.selection_bg
-                        } else {
-                            cell(c, r).bg
-                        }
+                    let bg = |c| match (selected(c, r), marked(c, r)) {
+                        (true, _) => pal.selection_bg,
+                        (false, 2) => current,
+                        (false, 1) => matched,
+                        _ => cell(c, r).bg,
                     };
                     let color = bg(c);
                     let start = c;
@@ -387,10 +406,10 @@ mod gpu {
                         });
                     // Selected text is drawn in the theme's colour, so
                     // text close to its background shows before it is
-                    // copied.
+                    // copied. So is a match, on its new background.
                     let fg = if under_block {
                         on_cursor
-                    } else if selected(c, r) {
+                    } else if selected(c, r) || marked(c, r) != 0 {
                         pal.fg
                     } else if cl.attrs & attr::DIM != 0 {
                         super::mix(cl.fg, cl.bg)
@@ -1436,6 +1455,37 @@ mod tests {
         let i = ((ch / 2 * w + cw / 2) * 4) as usize;
         let at = u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]]);
         assert_eq!(at, p.fg);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_search_matches_and_the_current_one() {
+        use vt::snapshot::Highlight;
+
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("ab cd", 5, 1, &p);
+        snap.highlights = vec![
+            Highlight {
+                start: (0, 0),
+                end: (1, 0),
+                current: false,
+            },
+            Highlight {
+                start: (3, 0),
+                end: (4, 0),
+                current: true,
+            },
+        ];
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, _) = r.cell();
+        let at = |x: u32| {
+            let i = ((w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        assert_eq!(at(cw + 1), 0x1f2125, "halfway to the selection colour");
+        assert_eq!(at(2 * cw + 1), p.bg, "between the matches");
+        assert_eq!(at(5 * cw - 1), toward(p.selection_bg, p.fg), "current");
     }
 
     #[cfg(windows)]
