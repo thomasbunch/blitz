@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vt::grid::Found;
 use vt::{
     Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
 };
@@ -67,6 +68,7 @@ const VK_DOWN: u16 = 0x28;
 const VK_DELETE: u16 = 0x2e;
 const VK_SPACE: u16 = 0x20;
 const VK_W: u16 = 0x57;
+const VK_F3: u16 = 0x72;
 const VK_F4: u16 = 0x73;
 
 /// How long a multi-line paste waits for a second Ctrl+V, and closing a
@@ -483,6 +485,8 @@ struct App {
     /// Points Ctrl+= and Ctrl+- add to the font size in the settings.
     /// Never saved, and dropped when that setting changes.
     font_zoom: f32,
+    /// The find bar of the focused pane, while it is open.
+    find: Option<Find>,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -620,6 +624,51 @@ impl Commands {
     }
 }
 
+/// The open find bar.
+struct Find {
+    /// The pane it searches, which has focus.
+    pane: PaneId,
+    query: String,
+    /// Every match, oldest first.
+    found: Vec<Found>,
+    /// The current match; `None` when there are none.
+    cur: Option<usize>,
+    /// Output came since the last search.
+    stale: bool,
+}
+
+impl Find {
+    fn new(pane: PaneId) -> Find {
+        Find {
+            pane,
+            query: String::new(),
+            found: Vec::new(),
+            cur: None,
+            stale: false,
+        }
+    }
+
+    /// Searches `term` again. The current match stays on the one that
+    /// starts where it did, or else the nearest one above it; with none
+    /// yet, it is the nearest one above the bottom of the `rows` high view.
+    fn search(&mut self, term: &vt::Terminal, rows: u16) {
+        let anchor = match self.cur.and_then(|i| self.found.get(i)) {
+            Some(m) => m.start,
+            None => (term.view_top() + usize::from(rows.max(1)) - 1, u16::MAX),
+        };
+        self.found = term.find(&self.query);
+        self.stale = false;
+        let above = self.found.partition_point(|m| m.start <= anchor);
+        self.cur = (!self.found.is_empty()).then(|| above.saturating_sub(1));
+    }
+
+    /// Moves `by` matches, down when positive, wrapping at either end.
+    fn step(&mut self, by: isize) {
+        let n = self.found.len() as isize;
+        self.cur = (self.cur).map(|i| (i as isize + by).rem_euclid(n) as usize);
+    }
+}
+
 /// Sends [`UserEvent::Settings`] whenever a file in `%APPDATA%\blitz`, or
 /// its themes folder, is written. Creates the themes folder, so there is
 /// a place to drop theme files.
@@ -691,6 +740,7 @@ impl App {
             commands: None,
             commands_hits: None,
             font_zoom: 0.0,
+            find: None,
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -1021,7 +1071,7 @@ impl App {
     }
 
     /// Catches up after the focused pane may have changed: focus reports,
-    /// attention, the selection and the window title.
+    /// attention, the selection, the find bar and the window title.
     fn focus_moved(&mut self, before: Option<PaneId>) {
         self.request_redraw();
         let now = self.focus_id();
@@ -1029,6 +1079,7 @@ impl App {
             return;
         }
         self.selection = None;
+        self.find = None;
         self.mouse.anchor = None;
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
@@ -1149,6 +1200,10 @@ impl App {
                     })
                     .collect(),
                 sel: cm.sel,
+            }),
+            find: self.find.as_ref().map(|f| chrome::FindBar {
+                query: &f.query,
+                count: f.cur.map(|i| (i + 1, f.found.len())),
             }),
             spark: self.config.mascot.then(|| self.anim_time()),
             game: self.game.as_ref().map(|g| &g.0),
@@ -1524,8 +1579,60 @@ impl App {
         }
     }
 
+    /// A key while the find bar is open: typing searches as it goes, Enter
+    /// or F3 goes to the next match up, with Shift the next one down, and
+    /// Esc closes the bar, leaving the view where it is.
+    fn find_key(&mut self, k: &KeyInput) {
+        let Some(f) = &mut self.find else {
+            return;
+        };
+        let m = &k.mods;
+        // Ctrl and Alt together are AltGr when the layout gives a character.
+        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+        let chord = ctrl != alt || (ctrl && k.uc == 0);
+        // Matches are oldest first, so up is back through the list.
+        let by = if m.lshift || m.rshift { 1 } else { -1 };
+        match k.vk {
+            VK_ESCAPE => {
+                self.find = None;
+                self.request_redraw();
+            }
+            VK_RETURN | VK_F3 => self.find_go(false, by),
+            VK_BACK if f.query.pop().is_some() => self.find_go(true, 0),
+            VK_BACK => {}
+            _ if !chord && !k.text.is_empty() => {
+                f.query.push_str(k.text);
+                self.find_go(true, 0);
+            }
+            _ => {}
+        }
+    }
+
+    /// Searches the find bar's pane again when `search` is set or output
+    /// came since the last search, moves `by` matches, and scrolls the
+    /// current one into view.
+    fn find_go(&mut self, search: bool, by: isize) {
+        let Some(f) = &mut self.find else {
+            return;
+        };
+        let Some(v) = self.views.iter().find(|v| v.pane.id == f.pane) else {
+            return;
+        };
+        let mut term = lock(&v.pane.term);
+        if search || f.stale {
+            f.search(&term, v.grid.1);
+        }
+        f.step(by);
+        let shown = f.cur.map(|i| f.found[i]);
+        if shown.is_some_and(|m| reveal(&mut term, m, v.grid.1)) {
+            self.selection = None;
+        }
+        drop(term);
+        self.request_redraw();
+    }
+
     /// Typed text for the filter of the command palette, the theme picker
-    /// or the settings panel. False when none is open.
+    /// or the settings panel, or for the find bar. False when none is open.
     fn filter_text(&mut self, t: &str) -> bool {
         if self.game.is_some() {
             // The game takes keys, not text.
@@ -1541,6 +1648,9 @@ impl App {
             p.filter.push_str(t);
             p.sel = 0;
             self.request_redraw();
+        } else if let Some(f) = &mut self.find {
+            f.query.push_str(t);
+            self.find_go(true, 0);
         } else {
             return false;
         }
@@ -1699,7 +1809,10 @@ impl App {
         }
         // A repeat of a key blitz took goes where its press went, and only
         // some keys do anything again; see `keymap::drops_repeat`.
-        let panel = self.commands.is_some() || self.picker.is_some() || self.settings.is_some();
+        let panel = self.commands.is_some()
+            || self.picker.is_some()
+            || self.settings.is_some()
+            || self.find.is_some();
         let taken = self.eaten.0.contains(&k.vk);
         if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
             return;
@@ -1756,6 +1869,17 @@ impl App {
                 }
                 Some(Action::ThemePicker) => self.open_picker(),
                 _ => self.settings_key(k),
+            }
+            return;
+        }
+        // And for the find bar.
+        if self.find.is_some() && k.down {
+            self.eaten.press(k.vk);
+            if keymap::action(k, &self.config.keys) == Some(Action::Find) {
+                self.find = None;
+                self.request_redraw();
+            } else {
+                self.find_key(k);
             }
             return;
         }
@@ -2089,6 +2213,13 @@ impl App {
                 self.selection = None;
                 self.request_redraw();
             }
+            Action::Find => {
+                let Some(id) = before else {
+                    return false;
+                };
+                self.find = Some(Find::new(id));
+                self.request_redraw();
+            }
         }
         true
     }
@@ -2110,6 +2241,9 @@ impl App {
                 let shown = v.rect.is_some() || !events.is_empty();
                 for e in events {
                     self.on_term_event(id, e);
+                }
+                if let Some(f) = self.find.as_mut().filter(|f| f.pane == id) {
+                    f.stale = true;
                 }
                 if !self.checked_conpty {
                     self.checked_conpty = true;
@@ -2659,10 +2793,15 @@ impl App {
             };
             let fit = |n: i32, cell: u32| (n / cell as i32).clamp(1, i32::from(u16::MAX)) as u16;
             let grid = (fit(rect.w, cw), fit(rect.h, ch));
+            let mut find = self.find.as_mut().filter(|f| f.pane == id);
             if grid != v.grid {
                 v.grid = grid;
                 v.pane.resize(grid.0, grid.1);
                 lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
+                // A new width rewraps the lines that matched.
+                if let Some(f) = &mut find {
+                    f.stale = true;
+                }
             }
             v.rect = Some(rect);
             let sel = self.selection.filter(|_| Some(id) == focus);
@@ -2670,6 +2809,16 @@ impl App {
             v.sync_until = term.sync_deadline();
             if !refresh(&mut term, &mut v.snap, &self.theme.pal, sel) {
                 self.selection = None;
+            }
+            v.snap.highlights.clear();
+            if let Some(f) = find {
+                // ponytail: searches all of the scrollback again on each
+                // frame with new output, ~50 ms for 100,000 full rows; keep
+                // the matches in scrollback rows if that ever shows.
+                if f.stale {
+                    f.search(&term, grid.1);
+                }
+                v.snap.highlight(&f.found, f.cur);
             }
             if Some(id) == focus {
                 v.snap.selection = self.selection.map(|s| whole_chars(&v.snap, s));
@@ -3024,6 +3173,17 @@ fn flash_kind(state: Attn, last: &mut Option<Instant>, now: Instant) -> Option<U
     }
     *last = Some(now);
     Some(kind)
+}
+
+/// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
+/// unless it shows already. Returns whether the view moved.
+fn reveal(term: &mut vt::Terminal, m: Found, rows: u16) -> bool {
+    let (top, rows) = (term.view_top(), usize::from(rows));
+    if (top..top + rows).contains(&m.start.0) {
+        return false;
+    }
+    term.scroll_to(m.start.0.saturating_sub(rows / 2));
+    term.view_top() != top
 }
 
 /// Draws a notice over the bottom row of the pane whose grid is at `at`.
@@ -4074,6 +4234,44 @@ mod tests {
         assert!(!e.release(0x41), "once");
         // Ctrl was down before the picker opened: its release goes on.
         assert!(!e.release(0x11));
+    }
+
+    #[test]
+    fn app_find_keeps_its_place_as_output_goes_on() {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 20,
+            rows: 3,
+            scrollback_lines: 100,
+            ..vt::Options::default()
+        });
+        for i in 0..10 {
+            t.feed(format!("match {i}\r\n").as_bytes());
+        }
+        let mut f = Find::new(PaneId(1));
+        f.query = "match".into();
+        f.search(&t, 3);
+        // The nearest match above the bottom of the view.
+        assert_eq!((f.found.len(), f.cur), (10, Some(9)));
+        f.step(-1);
+        assert_eq!(f.cur, Some(8));
+        // Output scrolls the matches up; the current one stays on its line.
+        t.feed(b"match 10\r\nmatch 11\r\n");
+        f.search(&t, 3);
+        assert_eq!(f.found.len(), 12);
+        assert_eq!(f.cur.map(|i| f.found[i].start), Some((8, 0)));
+        // Up from the oldest goes round to the newest.
+        f.cur = Some(0);
+        f.step(-1);
+        assert_eq!(f.cur, Some(11));
+        // A match out of view comes into the middle of it.
+        assert!(reveal(&mut t, f.found[2], 3));
+        assert_eq!(t.view_top(), 1);
+        assert!(!reveal(&mut t, f.found[2], 3), "already in view");
+
+        f.query = "zzz".into();
+        f.search(&t, 3);
+        f.step(1);
+        assert_eq!((f.found.len(), f.cur), (0, None));
     }
 
     #[test]

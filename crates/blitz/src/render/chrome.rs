@@ -78,6 +78,16 @@ pub struct ChromeModel<'a> {
     /// blitz run, while it is open.
     pub game: Option<&'a crate::arcade::run::Run>,
     pub commands: Option<Commands<'a>>,
+    pub find: Option<FindBar<'a>>,
+}
+
+/// The find bar, drawn at the top right of the focused pane.
+pub struct FindBar<'a> {
+    /// What was typed.
+    pub query: &'a str,
+    /// The current match, counting from 1, and how many there are; `None`
+    /// when nothing matches.
+    pub count: Option<(usize, usize)>,
 }
 
 /// The theme picker, drawn over everything.
@@ -667,6 +677,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
         };
         extra.push(Prim::Rect(line, c.term_fg));
     }
+    if let (Some(f), Some(r)) = (&m.find, pane(tab.focus)) {
+        find_bar(&mut extra, f, c, r, s, (tw, th));
+    }
     if let Some(st) = &m.settings {
         out.settings = Some(settings(&mut extra, st, c, m.size, s, (tw, th)));
     }
@@ -681,6 +694,63 @@ pub fn build(m: &ChromeModel) -> Chrome {
     }
     out.prims.extend(extra);
     out
+}
+
+/// The find bar: one line at the top right of pane `r` with the query and
+/// which match is current, or that nothing matches.
+fn find_bar(
+    p: &mut Vec<Prim>,
+    f: &FindBar,
+    c: &Ui,
+    r: Rect,
+    s: impl Fn(f32) -> i32,
+    (tw, th): (i32, i32),
+) {
+    let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
+        p.push(Prim::Text {
+            x,
+            y,
+            text: t,
+            color,
+            bold,
+            term: false,
+        });
+    };
+    let (pad, one) = (s(10.0), s(1.0).max(1));
+    let (w, h) = (s(300.0).min(r.w).max(0), th + s(10.0));
+    let panel = Rect {
+        x: r.right() - w,
+        y: r.y,
+        w,
+        h,
+    };
+    p.push(Prim::Rect(panel, c.border));
+    let inner = Rect {
+        x: panel.x + one,
+        y: panel.y + one,
+        w: (w - 2 * one).max(0),
+        h: (h - 2 * one).max(0),
+    };
+    p.push(Prim::Rect(inner, c.side_bg));
+    let (left, right, ty) = (inner.x + pad, inner.right() - pad, panel.y + (h - th) / 2);
+    text(p, left, ty, "Find".into(), c.name, true);
+    let (count, color) = match f.count {
+        Some((at, of)) => (format!("{at}/{of}"), c.dim),
+        None if f.query.is_empty() => (String::new(), c.dim),
+        None => ("no matches".into(), c.error),
+    };
+    let cx = right - text_w(&count, tw);
+    let qx = left + 6 * tw;
+    let (query, qc) = if f.query.is_empty() {
+        ("type to find", c.dim)
+    } else {
+        (f.query, c.msg)
+    };
+    // The end of a long query is the part being typed.
+    text(p, qx, ty, fit_left(query, cx - s(8.0) - qx, tw), qc, false);
+    if !count.is_empty() {
+        text(p, cx, ty, count, color, false);
+    }
 }
 
 /// What the theme picker and the command palette have in common.
@@ -1334,6 +1404,7 @@ mod tests {
             spark: None,
             game: None,
             commands: None,
+            find: None,
         }
     }
 
@@ -1526,6 +1597,36 @@ mod tests {
             c.prims
                 .contains(&Prim::Rect(line, crate::theme::blitz(false).ui.term_fg))
         );
+    }
+
+    #[test]
+    fn find_bar_sits_at_the_top_right_of_the_focused_pane() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.find = Some(FindBar {
+            query: "needle",
+            count: Some((3, 17)),
+        });
+        let c = build(&m);
+        let t = texts(&c);
+        assert!(t.contains(&"Find") && t.contains(&"needle") && t.contains(&"3/17"));
+        let focus = c.panes.iter().find(|p| p.0 == PaneId(2)).map(|p| p.1);
+        let focus = focus.expect("focused pane");
+        let border = m.ui.border;
+        let corner = |p: &Prim| {
+            matches!(p, Prim::Rect(r, c)
+                if *c == border && r.right() == focus.right() && r.y == focus.y && r.w < focus.w)
+        };
+        assert!(c.prims.iter().any(corner));
+
+        m.find = Some(FindBar {
+            query: "zzz",
+            count: None,
+        });
+        let c = build(&m);
+        let error = m.ui.error;
+        let none = |p: &Prim| matches!(p, Prim::Text { text, color, .. } if text == "no matches" && *color == error);
+        assert!(c.prims.iter().any(none));
     }
 
     fn setting_rows() -> Vec<SettingRow> {

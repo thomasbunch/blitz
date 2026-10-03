@@ -746,14 +746,15 @@ mod gpu {
     /// Renders a made-up window of five sessions, four of them split in
     /// one tab, for checking the chrome. With `--demo`, `--cols` and
     /// `--rows` give the window size in pixels, `--picker` opens the
-    /// theme picker filtered to `--picker`'s value, and `--settings N`
-    /// opens the settings panel with row N highlighted.
+    /// theme picker filtered to `--picker`'s value, `--settings N` opens
+    /// the settings panel with row N highlighted, and `--find TEXT` finds
+    /// TEXT in the focused pane.
     fn render_demo(
         r: &mut Renderer,
         theme: &crate::theme::Theme,
         collapsed: bool,
         banner: Option<&str>,
-        (picker, settings): (Option<&str>, Option<usize>),
+        (picker, settings, find): (Option<&str>, Option<usize>, Option<&str>),
         (w, h): (u32, u32),
         scale: f32,
     ) -> Result<Vec<u8>> {
@@ -927,6 +928,7 @@ mod gpu {
             spark: None,
             game: None,
             commands: None,
+            find: None,
         };
         // One setting changed, to show its mark and a switch that is off.
         let config = crate::config::Config {
@@ -975,6 +977,16 @@ mod gpu {
             }
             let mut snap = Snapshot::default();
             term.snapshot(&mut snap, &pal);
+            if id == web
+                && let Some(query) = find
+            {
+                // The newest match is the current one.
+                let found = term.find(query);
+                let cur = found.len().checked_sub(1);
+                snap.highlight(&found, cur);
+                let count = cur.map(|i| (i + 1, found.len()));
+                model.find = Some(chrome::FindBar { query, count });
+            }
             snaps.push((id, rect, snap));
         }
         let chrome = chrome::build(&model);
@@ -1003,6 +1015,7 @@ mod gpu {
         let mut bmp = None;
         let (mut warp, mut light, mut demo, mut collapsed) = (false, false, false, false);
         let (mut banner, mut theme, mut picker, mut settings) = (None, None, None, None);
+        let mut find = None;
         let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
         let mut px = DEFAULT_PX;
         let mut it = args.iter();
@@ -1024,6 +1037,7 @@ mod gpu {
                 "--theme" => theme = Some(val()?.clone()),
                 "--picker" => picker = Some(val()?.clone()),
                 "--settings" => settings = Some(usize::from(num(val()?)?)),
+                "--find" => find = Some(val()?.clone()),
                 "--script" => {
                     return Err("--script is not supported yet; pass --vt FILE".into());
                 }
@@ -1050,7 +1064,7 @@ mod gpu {
                 &theme,
                 collapsed,
                 banner.as_deref(),
-                (picker.as_deref(), settings),
+                (picker.as_deref(), settings, find.as_deref()),
                 (w, h),
                 scale,
             )

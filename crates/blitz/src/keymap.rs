@@ -51,6 +51,8 @@ pub enum Action {
     /// Scroll to the previous (1) or next (-1) prompt. With none that way,
     /// or on the alternate screen, the key goes to the program.
     JumpToPrompt(i8),
+    /// Open the find bar on the focused pane, or close it.
+    Find,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -93,6 +95,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Palette, "command_palette", "Command palette"),
     (Action::JumpToPrompt(1), "previous_prompt", "Scroll to the previous prompt"),
     (Action::JumpToPrompt(-1), "next_prompt", "Scroll to the next prompt"),
+    (Action::Find, "find", "Find in the scrollback"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
@@ -151,6 +154,7 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, b'P' as u16, Action::Palette),
     (CTRL | SHIFT, 0x26, Action::JumpToPrompt(1)),
     (CTRL | SHIFT, 0x28, Action::JumpToPrompt(-1)),
+    (CTRL | SHIFT, b'F' as u16, Action::Find),
 ];
 
 /// Key names for chords, matched ignoring case. The first name of each
@@ -1190,9 +1194,11 @@ mod msg_to_key_tests {
     }
 
     #[test]
-    fn keymap_prompt_jumps() {
+    fn keymap_find_and_prompt_jumps() {
         const LCTRL: usize = 0xa2;
         const LSHIFT: usize = 0xa0;
+        assert_eq!(press(0x46, &[LCTRL, LSHIFT]), Some(Action::Find));
+        assert_eq!(press(0x46, &[LCTRL]), None, "Ctrl+F goes to the program");
         assert_eq!(press(0x26, &[LCTRL, LSHIFT]), Some(Action::JumpToPrompt(1)));
         assert_eq!(
             press(0x28, &[LCTRL, LSHIFT]),
