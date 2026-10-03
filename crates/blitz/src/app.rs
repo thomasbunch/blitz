@@ -1788,9 +1788,14 @@ impl App {
             return;
         }
         self.ensure_gfx();
-        if self.gfx.is_none() {
+        let Some(g) = &self.gfx else {
             return;
-        }
+        };
+        // Wait for the swap chain before reading the panes, so the frame
+        // shows output that arrived during the wait.
+        g.chain.wait(100);
+        let started = Instant::now();
+        let mut waited = Duration::ZERO;
         let (cw, ch) = self.cell();
         let focus = self.focus_id();
         let cursor = self.current().map(|v| lock(&v.pane.term).cursor());
@@ -1838,7 +1843,6 @@ impl App {
         };
         let result = (|| {
             g.chain.resize(&g.r.gpu, size.width, size.height)?;
-            g.chain.wait(100);
             for _ in 0..2 {
                 g.r.begin();
                 for v in &self.views {
@@ -1871,8 +1875,12 @@ impl App {
                     eprintln!("blitz: {}: {e}", path.display());
                 }
             }
-            g.chain.present()
+            let t = Instant::now();
+            let shown = g.chain.present();
+            waited += t.elapsed();
+            shown
         })();
+        self.counters.frame_cpu_ms += (started.elapsed() - waited).as_secs_f64() * 1000.0;
         match result {
             Ok(_) => {
                 self.counters.frames += 1;
@@ -2292,7 +2300,11 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                // Keys queued behind this paint go out before its vsync wait.
+                self.drain_keys(el);
+                self.redraw();
+            }
             WindowEvent::Resized(_) => self.request_redraw(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;
