@@ -215,6 +215,24 @@ fn hyperlinks_do_not_print() {
 }
 
 #[test]
+fn link_at_covers_the_link_across_a_wrap() {
+    let mut t = Terminal::new(Options {
+        cols: 6,
+        rows: 3,
+        ..Options::default()
+    });
+    t.feed(b"ab\x1b]8;;https://e.com/x\x1b\\linktext\x1b]8;;\x1b\\ z");
+    t.feed(b"\r\n\x1b]8;;https://e.com/y\x1b\\y\x1b]8;;\x1b\\");
+    let link = Some(("https://e.com/x", (0, 2), (1, 3)));
+    assert_eq!(t.link_at(0, 2), link);
+    assert_eq!(t.link_at(1, 1), link);
+    assert_eq!(t.link_at(0, 1), None);
+    assert_eq!(t.link_at(1, 4), None);
+    assert_eq!(t.link_at(2, 0), Some(("https://e.com/y", (2, 0), (2, 0))));
+    assert_eq!(t.link_at(9, 0), None);
+}
+
+#[test]
 fn ignored_strings_leave_no_trace() {
     let mut t = Terminal::new(Options::default());
     t.feed(b"\x1b]52;c;aGk=\x07\x1b]104\x07\x1b]1337;SetUserVar=a=b\x07\x1bP+q544e\x1b\\ok");

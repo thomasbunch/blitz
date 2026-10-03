@@ -33,6 +33,9 @@ impl Default for Options {
     }
 }
 
+/// A cell as a line number and a column; see [`Terminal::lines`].
+pub type LineCol = (usize, u16);
+
 /// OSC 133 shell-integration marks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptMark {
@@ -175,6 +178,10 @@ const REPLY_CREDIT: usize = 16 * MAX_REPLIES;
 
 /// Most events queued between [`Terminal::take_events`] calls.
 const MAX_EVENTS: usize = 1024;
+
+/// Farthest [`Terminal::link_at`] follows a link either way: a program
+/// could link all of scrollback.
+const MAX_LINK_CELLS: usize = 4096;
 
 impl Terminal {
     pub fn new(o: Options) -> Self {
@@ -544,6 +551,32 @@ impl Terminal {
     /// Whether line `n`'s text runs on into the next line.
     pub fn wraps(&self, n: usize) -> bool {
         self.line(n).is_some_and(|r| r.flags & rf::WRAPPED != 0)
+    }
+
+    /// The OSC 8 hyperlink in column `col` of line `n`: its URI, and the
+    /// first and last cell it covers, following soft wraps.
+    pub fn link_at(&self, n: usize, col: u16) -> Option<(&str, LineCol, LineCol)> {
+        let link = |(n, x): LineCol| {
+            let cell = self.line(n)?.cells.get(usize::from(x))?;
+            Some(self.styles.get(cell.style).link)
+        };
+        let id = link((n, col)).filter(|&l| l != 0)?;
+        let last = self.cols() - 1;
+        let back = |&(n, x): &LineCol| match x {
+            0 => (n > 0 && self.wraps(n - 1)).then(|| (n - 1, last)),
+            x => Some((n, x - 1)),
+        };
+        let fwd = |&(n, x): &LineCol| match x {
+            x if x < last => Some((n, x + 1)),
+            _ => self.wraps(n).then_some((n + 1, 0)),
+        };
+        let end = |step: &dyn Fn(&LineCol) -> Option<LineCol>| {
+            std::iter::successors(Some((n, col)), step)
+                .take(MAX_LINK_CELLS)
+                .take_while(|&p| link(p) == Some(id))
+                .last()
+        };
+        Some((&self.styles.link(id)?.uri, end(&back)?, end(&fwd)?))
     }
 
     fn cols(&self) -> u16 {
