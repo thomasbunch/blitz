@@ -452,6 +452,20 @@ mod gpu {
                     self.push_glyph(key, px(c), py(r), fg);
                 }
             }
+            if let Some((a, b)) = snap.hover.filter(|_| !dim) {
+                let (top, bottom) = (usize::from(a.1), usize::from(b.1));
+                for r in top..=bottom.min(rows.saturating_sub(1)) {
+                    let from = if r == top { usize::from(a.0) } else { 0 };
+                    let to = if r == bottom { usize::from(b.0) } else { cols };
+                    for c in from..=to.min(cols.saturating_sub(1)) {
+                        let cl = cell(c, r);
+                        // Nothing for the right half of a wide character.
+                        let w = u32::from(cl.width) * cw;
+                        let uy = py(r) + self.font.underline_y;
+                        self.rect(px(c), uy, w, self.font.underline_h, cl.fg);
+                    }
+                }
+            }
             // A cluster of several glyphs can be far wider than its cells;
             // keep it inside the grid so it cannot draw over another pane.
             for q in &mut self.quads[first..] {
@@ -1524,6 +1538,26 @@ mod tests {
         assert_eq!(at(cw + 1, 1), p.selection_bg);
         assert_eq!(at(cw + 1, ch + 1), p.selection_bg);
         assert_eq!(at(2 * cw + 1, 1), p.bg, "not the rest of the first row");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_link_under_the_pointer_is_underlined() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("", 3, 2, &p);
+        snap.hover = Some(((2, 0), (0, 1)));
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        let uy = r.font.underline_y as u32;
+        assert_eq!(at(2 * cw + 1, uy), p.fg, "its first cell");
+        assert_eq!(at(1, ch + uy), p.fg, "on into the next row");
+        assert_eq!(at(1, uy), p.bg, "nothing before it");
+        assert_eq!(at(cw + 1, ch + uy), p.bg, "nothing after it");
     }
 
     #[cfg(windows)]

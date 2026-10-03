@@ -116,6 +116,9 @@ pub struct Snapshot {
     /// The selection is a block: start and end are its corners, and it
     /// takes the same columns of every row between them.
     pub block: bool,
+    /// A link under the pointer, drawn underlined: start and end (column,
+    /// row), inclusive.
+    pub hover: Option<((u16, u16), (u16, u16))>,
 }
 
 impl Snapshot {

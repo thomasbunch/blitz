@@ -48,6 +48,7 @@ use crate::config::{Config, Kind};
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
 use crate::layout::{self, Axis, Dir, PaneId, Rect, Tab};
+use crate::links::{Link, Target};
 use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
 use crate::render::chrome::{self, ChromeModel};
 use crate::render::d3d11::{Gpu, Swapchain, is_device_lost};
@@ -748,6 +749,9 @@ struct App {
     focused: bool,
     /// A selection in the focused pane.
     selection: Option<Selection>,
+    /// The link under the pointer while Ctrl is held, drawn underlined:
+    /// the line epoch and its first and last cell.
+    hover: Option<(u32, Pos, Pos)>,
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
@@ -998,6 +1002,7 @@ impl App {
             next_id: 1,
             focused: false,
             selection: None,
+            hover: None,
             mouse: Mouse::default(),
             preedit: String::new(),
             paste: None,
@@ -1333,6 +1338,7 @@ impl App {
         self.mouse.drag = None;
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
+        self.set_hover(None);
         self.ime_at = None;
         if self.focused {
             for (id, f) in [(before, false), (now, true)] {
@@ -2055,6 +2061,9 @@ impl App {
 
     /// A key transition; `held` when it is the auto-repeat of a held key.
     fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput, held: bool) {
+        if matches!(k.key, vt::Key::Control | vt::Key::Shift) {
+            self.update_hover();
+        }
         if !k.down && self.eaten.release(k.vk) {
             return;
         }
@@ -2875,6 +2884,14 @@ impl App {
             return;
         }
         if pressed {
+            // Ctrl+click opens a link; with mouse reporting on, the click
+            // got here because Shift was held too.
+            if (mods.lctrl || mods.rctrl)
+                && let Some((target, _)) = self.link_under(self.mouse.pos)
+            {
+                self.open_link(&target);
+                return;
+            }
             // With mouse reporting on, Shift is what brought the click
             // here, so it does not extend.
             let shift = mods.lshift || mods.rshift;
@@ -2982,6 +2999,71 @@ impl App {
         self.mouse.scroll_at = Some(Instant::now() + AUTOSCROLL);
     }
 
+    /// The link under `pos` in the focused pane, with the cells it
+    /// covers: an OSC 8 hyperlink, else a URL or the path of a file or
+    /// folder that exists in the text around it.
+    fn link_under(&self, pos: PhysicalPosition<f64>) -> Option<(Target, (Pos, Pos))> {
+        let v = self
+            .current()
+            .filter(|v| self.hit(pos).0 == Some(v.pane.id))?;
+        let (col, row) = self.cell_at(pos);
+        let t = lock(&v.pane.term);
+        let at = (t.view_top() + usize::from(row), col);
+        if let Some((uri, a, b)) = t.link_at(at.0, at.1) {
+            return Some((Target::Uri(uri.to_owned()), (a, b)));
+        }
+        let l = Logical::new(&t, &self.theme.pal, at.0);
+        let here = l.cells[l.index(at)?].0;
+        let (range, found) =
+            (crate::links::scan(&l.text).into_iter()).find(|(r, _)| r.contains(&here))?;
+        let target = match found {
+            Link::Url(u) => Target::Uri(u),
+            Link::Path(p) => Target::Path(crate::links::resolve(&p, &v.pane.cwd)?),
+        };
+        Some((target, l.span(range)))
+    }
+
+    /// Underlines the link under the pointer, and shows the hand, while
+    /// Ctrl is held; with mouse reporting on, Ctrl and Shift.
+    fn update_hover(&mut self) {
+        let mods = mods_now();
+        let ctrl = (mods.lctrl || mods.rctrl) && self.mouse_to_program(&mods).is_none();
+        let hover = (ctrl && self.mouse.drag.is_none())
+            .then(|| self.link_under(self.mouse.pos))
+            .flatten()
+            .and_then(|(_, (a, b))| {
+                let epoch = lock(&self.current()?.pane.term).line_epoch();
+                Some((epoch, a, b))
+            });
+        self.set_hover(hover);
+    }
+
+    fn set_hover(&mut self, hover: Option<(u32, Pos, Pos)>) {
+        if hover == self.hover {
+            return;
+        }
+        if let Some(w) = &self.window
+            && hover.is_some() != self.hover.is_some()
+        {
+            w.set_cursor(if hover.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            });
+        }
+        self.hover = hover;
+        self.request_redraw();
+    }
+
+    /// Opens a link, or says in the pane why not.
+    fn open_link(&mut self, target: &Target) {
+        if let Err(e) = crate::links::open(target)
+            && let Some(id) = self.focus_id()
+        {
+            self.set_notice(id, e, Some(Instant::now() + NOTICE), false);
+        }
+    }
+
     fn on_mouse_move(&mut self, pos: PhysicalPosition<f64>) {
         self.mouse.pos = pos;
         if let Some((i, min)) = self.mouse.divider {
@@ -3015,6 +3097,7 @@ impl App {
         if self.game.is_some() {
             return;
         }
+        self.update_hover();
         let mods = mods_now();
         // A drag goes where its press went, like the release will.
         let held = (0..3).find_map(|b| Some((b, self.mouse.reported[b]?)));
@@ -3177,6 +3260,8 @@ impl App {
                 v.snap.selection =
                     sel.and_then(|s| in_view(s.start, s.end, s.drag.block, top, size));
                 v.snap.block = sel.is_some_and(|s| s.drag.block);
+                let hover = self.hover.filter(|h| h.0 == term.line_epoch());
+                v.snap.hover = hover.and_then(|(_, a, b)| in_view(a, b, false, top, size));
             } else if split {
                 dimmed.push(id);
             }
@@ -3812,6 +3897,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
                 }
+                // Ctrl may be let go while another window has the keys.
+                self.set_hover(None);
                 // The cursor is hollow while the window is in the background.
                 self.request_redraw();
                 let mut out = Vec::new();
@@ -4451,6 +4538,16 @@ mod tests {
         let t = fed(3, 2, "abcdef");
         let block = drag(&t, (0, 0), (1, 1), 1, true);
         assert_eq!(selection_text(&t, &pal, &block, 0), "ab\r\nde");
+    }
+
+    #[test]
+    fn app_links_map_back_to_their_cells() {
+        let t = fed(10, 3, "go https://e.com/abc now");
+        let l = Logical::new(&t, &crate::theme::dark(), 1);
+        assert_eq!(l.index((1, 4)).map(|i| l.cells[i].0), Some(14));
+        let (range, found) = crate::links::scan(&l.text).remove(0);
+        assert_eq!(found, Link::Url("https://e.com/abc".into()));
+        assert_eq!(l.span(range), ((0, 3), (1, 9)), "across the wrap");
     }
 
     #[test]
