@@ -19,6 +19,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 - A settings panel on Ctrl+, for the font, shell, sessions and more.
 - A command palette on Ctrl+Shift+P lists every action with its keys,
   and `config.toml` can bind any of them to other keys.
+- Selections that reach into scrollback, and Ctrl+click on links and
+  file paths.
 - Direct3D 11 and DirectWrite rendering, with a software fallback.
 
 ## Install
@@ -164,6 +166,32 @@ from the background and foreground; to choose them yourself, add any of
 and `top-track`. The
 [blitz dark](crates/blitz/themes/blitz-dark) file sets every key and is a
 good place to start.
+
+## Selection and links
+
+| Mouse | Action |
+|---|---|
+| Drag | Select; past the top or bottom of the pane it scrolls |
+| Double-click, triple-click | Select a word, or the whole line as the program printed it |
+| Alt+drag | Select a block of columns |
+| Shift+click | Extend the selection |
+| Ctrl+click | Open a link |
+| Wheel | Scroll; in less, man and other full-screen programs, press the arrow keys |
+
+A selection can reach into scrollback and stays on its text while
+output scrolls; it ends when output rewrites the text. A double click
+takes a path or URL whole, and dragging after a double or triple click
+selects by words or lines.
+
+Holding Ctrl underlines the link under the pointer: a hyperlink a
+program printed, a web address, or the path of a file that exists,
+relative ones from the pane's folder. Only web, mail and local file
+links open. A file that would run when opened, such as a program,
+script, shortcut or installer, is shown selected in Explorer instead.
+
+When a program takes the mouse itself, as Claude Code does in
+fullscreen, clicks go to it. Hold Shift as well to use blitz's
+selection: Shift+drag selects, and Ctrl+Shift+click opens a link.
 
 ## Find and prompts
 
