@@ -18,16 +18,18 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState};
 use windows::Win32::UI::WindowsAndMessaging::{
-    MSG, SetForegroundWindow, TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP,
-    WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage, WM_CHAR,
+    WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::platform::windows::{EventLoopBuilderExtWindows, WindowAttributesExtWindows};
+use winit::platform::windows::{
+    EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
+};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{UserAttentionType, Window, WindowId};
+use winit::window::{Icon, UserAttentionType, Window, WindowId};
 
 use crate::attention::{Attn, Ev};
 use crate::config::Config;
@@ -534,7 +536,10 @@ impl App {
     fn start(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
         let mut attrs = Window::default_attributes()
             .with_title("blitz")
-            .with_inner_size(LogicalSize::new(980.0, 620.0));
+            .with_inner_size(LogicalSize::new(980.0, 620.0))
+            // Icon group 1, which build.rs links in.
+            .with_window_icon(Icon::from_resource(1, Some(small_icon_size())).ok())
+            .with_taskbar_icon(Icon::from_resource(1, None).ok());
         // Only the main window takes folders from other launches.
         if !self.args.new_window {
             attrs = attrs.with_class_name(crate::handoff::CLASS);
@@ -2014,6 +2019,14 @@ fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &
     let banner = Palette { bg, ..*pal };
     let y = at.y + i32::from(grid.1.saturating_sub(1)) * ch as i32;
     r.snapshot(&s, &banner, at.x, y);
+}
+
+/// The title bar icon size, so Windows picks the hand-tuned small icon
+/// rather than shrinking the big one.
+fn small_icon_size() -> PhysicalSize<u32> {
+    // SAFETY: reads a system metric; no pointers.
+    let n = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
+    PhysicalSize::new(n, n)
 }
 
 /// `g`, moved onto the primary monitor when no monitor shows enough of it.
