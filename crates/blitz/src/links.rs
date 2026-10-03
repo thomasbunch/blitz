@@ -65,6 +65,41 @@ const RUNS: &[&str] = &[
     "appref-ms",
     "application",
     "settingcontent-ms",
+    // Run by an interpreter when one is installed.
+    "py",
+    "pyw",
+    "pyz",
+    "pyzw",
+    "pyc",
+    "rb",
+    "rbw",
+    "pl",
+    "tcl",
+    "ahk",
+    "au3",
+    // Run code or change settings when opened, without being programs.
+    "ws",
+    "wsc",
+    "sct",
+    "chm",
+    "diagcab",
+    "theme",
+    "themepack",
+    "desktopthemepackfile",
+    "library-ms",
+    "searchconnector-ms",
+    "website",
+    "xbap",
+    "gadget",
+    "msp",
+    "mst",
+    "msix",
+    "msixbundle",
+    "appx",
+    "appxbundle",
+    "appinstaller",
+    "xll",
+    "iqy",
 ];
 
 /// Every URL and path-like word in `text`, the logical line under the
@@ -434,6 +469,10 @@ mod tests {
             "appref-ms",
             "application",
             "settingcontent-ms",
+            "py",
+            "chm",
+            "diagcab",
+            "themepack",
         ] {
             let p = format!(r"C:\x\a.{t}");
             assert_eq!(plan_path(Path::new(&p), ""), reveal(&p), "{t}");
