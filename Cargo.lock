@@ -94,7 +94,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "blitz"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "vt",
  "windows",
@@ -1300,7 +1300,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vt"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "walkdir"
