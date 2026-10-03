@@ -100,6 +100,9 @@ const WHEEL_LINES: isize = 3;
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// How long to wait before building the renderer again after it failed.
 const GFX_RETRY: Duration = Duration::from_secs(1);
+/// Time between the steps a drag scrolls while the pointer is held above
+/// or below its pane.
+const AUTOSCROLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -421,13 +424,120 @@ struct Mouse {
     tracker: vt::keys::MouseTracker,
     /// Wheel movement not yet turned into whole steps.
     wheel: f64,
-    /// A left-button drag is making a selection from this cell.
-    anchor: Option<(u16, u16)>,
     /// A left-button drag is moving this divider of the active tab; the
     /// second value is the smallest pane it may leave.
     divider: Option<(usize, (i32, i32))>,
     /// The pointer is over a divider along this axis and shows it.
     over_divider: Option<Axis>,
+    /// A left-button drag is making a selection.
+    drag: Option<Drag>,
+    /// When the drag next scrolls, while the pointer is outside its pane.
+    scroll_at: Option<Instant>,
+}
+
+/// A cell as a line number and a column. Line numbers stay with their
+/// text while output scrolls it into scrollback; see [`vt::Terminal::lines`].
+type Pos = vt::terminal::LineCol;
+
+/// How a selection grows while the button is held, fixed by the press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Drag {
+    /// [`vt::Terminal::line_epoch`] at the press: line numbers from
+    /// another epoch name other text.
+    epoch: u32,
+    /// The cell pressed.
+    anchor: Pos,
+}
+
+/// Selected cells in the focused pane.
+struct Selection {
+    drag: Drag,
+    /// The first and last cell, in reading order.
+    start: Pos,
+    end: Pos,
+    /// The screen's top line at the last look, and the selected text from
+    /// there on. Only lines that were on the screen can have been
+    /// rewritten since.
+    seen: (usize, String),
+}
+
+impl Selection {
+    /// What `drag` selects with the pointer on `head`.
+    fn new(term: &vt::Terminal, pal: &Palette, drag: Drag, head: Pos) -> Selection {
+        let (mut start, mut end) = (drag.anchor.min(head), drag.anchor.max(head));
+        // Half of a wide character takes in all of it, so what is
+        // highlighted is what is copied.
+        let mut cells = Vec::new();
+        let width = |cells: &[vt::RenderCell], x: u16| cells.get(usize::from(x)).map(|c| c.width);
+        if term.line_cells(start.0, pal, &mut cells).is_some()
+            && start.1 > 0
+            && width(&cells, start.1) == Some(0)
+        {
+            start.1 -= 1;
+        }
+        if term.line_cells(end.0, pal, &mut cells).is_some()
+            && width(&cells, end.1) == Some(2)
+            && width(&cells, end.1 + 1).is_some()
+        {
+            end.1 += 1;
+        }
+        let mut s = Selection {
+            drag,
+            start,
+            end,
+            seen: (0, String::new()),
+        };
+        s.look(term, pal);
+        s
+    }
+
+    /// Whether the lines are still the ones picked: none dropped off the
+    /// top of scrollback and the numbers did not start over.
+    fn kept(&self, term: &vt::Terminal) -> bool {
+        term.line_epoch() == self.drag.epoch && term.lines().contains(&self.start.0)
+    }
+
+    /// Catches up with output since the last look. False when it rewrote
+    /// selected text, which ends the selection, so a copy never takes text
+    /// the user did not pick.
+    fn still(&mut self, term: &vt::Terminal, pal: &Palette) -> bool {
+        if !self.kept(term) || selection_text(term, pal, self, self.seen.0) != self.seen.1 {
+            return false;
+        }
+        self.look(term, pal);
+        true
+    }
+
+    fn look(&mut self, term: &vt::Terminal, pal: &Palette) {
+        let top = term.screen_top();
+        self.seen = (top, selection_text(term, pal, self, top));
+    }
+}
+
+/// The cells from `start` to `end` that a view of `rows` by `cols` cells
+/// from line `top` shows, as (column, row) of the first and last.
+fn in_view(
+    start: Pos,
+    end: Pos,
+    top: usize,
+    (cols, rows): (u16, u16),
+) -> Option<((u16, u16), (u16, u16))> {
+    let bottom = top + usize::from(rows);
+    if end.0 < top || start.0 >= bottom || cols == 0 {
+        return None;
+    }
+    let row = |n: usize| (n - top) as u16;
+    let a = if start.0 < top {
+        (0, 0)
+    } else {
+        (start.1, row(start.0))
+    };
+    let b = if end.0 >= bottom {
+        (cols - 1, rows - 1)
+    } else {
+        (end.1, row(end.0))
+    };
+    Some((a, b))
 }
 
 /// A session and what the window keeps to draw it.
@@ -497,7 +607,7 @@ struct App {
     next_id: u32,
     focused: bool,
     /// A selection in the focused pane.
-    selection: Option<((u16, u16), (u16, u16))>,
+    selection: Option<Selection>,
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
@@ -1080,7 +1190,7 @@ impl App {
         }
         self.selection = None;
         self.find = None;
-        self.mouse.anchor = None;
+        self.mouse.drag = None;
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
         self.ime_at = None;
@@ -1624,8 +1734,8 @@ impl App {
         }
         f.step(by);
         let shown = f.cur.map(|i| f.found[i]);
-        if shown.is_some_and(|m| reveal(&mut term, m, v.grid.1)) {
-            self.selection = None;
+        if let Some(m) = shown {
+            reveal(&mut term, m, v.grid.1);
         }
         drop(term);
         self.request_redraw();
@@ -1751,7 +1861,8 @@ impl App {
     fn scroll(&mut self, lines: isize) {
         if let Some(v) = self.current() {
             lock(&v.pane.term).scroll_viewport(lines);
-            self.selection = None;
+            // The pointer is over other text now.
+            self.extend_drag();
             self.request_redraw();
         }
     }
@@ -1944,10 +2055,15 @@ impl App {
         let before = self.focus_id();
         match a {
             Action::Copy => {
-                let (Some(sel), Some(v)) = (self.selection, self.current()) else {
+                let Some(v) = self.current() else {
                     return false;
                 };
-                let text = selection_text(&v.snap, sel);
+                let term = lock(&v.pane.term);
+                let Some(sel) = self.selection.as_ref().filter(|s| s.kept(&term)) else {
+                    return false;
+                };
+                let text = selection_text(&term, &self.theme.pal, sel, 0);
+                drop(term);
                 if !crate::clipboard::set_text(Some(HWND(self.hwnd as *mut c_void)), &text) {
                     eprintln!("blitz: could not copy to the clipboard");
                 }
@@ -2210,7 +2326,6 @@ impl App {
                 if !moved {
                     return false;
                 }
-                self.selection = None;
                 self.request_redraw();
             }
             Action::Find => {
@@ -2620,13 +2735,86 @@ impl App {
             return;
         }
         if pressed {
-            self.mouse.anchor = Some(self.cell_at(self.mouse.pos));
-            if self.selection.take().is_some() {
-                self.request_redraw();
-            }
+            self.press();
         } else {
-            self.mouse.anchor = None;
+            self.mouse.drag = None;
+            self.mouse.scroll_at = None;
         }
+    }
+
+    /// The cell under `pos` in the focused pane, and the terminal's line
+    /// epoch.
+    fn line_cell(&self, pos: PhysicalPosition<f64>) -> Option<(u32, Pos)> {
+        let v = self.current()?;
+        let (col, row) = self.cell_at(pos);
+        let t = lock(&v.pane.term);
+        Some((t.line_epoch(), (t.view_top() + usize::from(row), col)))
+    }
+
+    /// A left press that goes to selection: starts a drag from the cell
+    /// under the pointer.
+    fn press(&mut self) {
+        let Some((epoch, anchor)) = self.line_cell(self.mouse.pos) else {
+            return;
+        };
+        self.mouse.drag = Some(Drag { epoch, anchor });
+        if self.selection.take().is_some() {
+            self.request_redraw();
+        }
+    }
+
+    /// Grows the selection being dragged to the cell under the pointer. A
+    /// drag shows nothing until the pointer leaves the cell pressed.
+    fn extend_drag(&mut self) {
+        let Some(drag) = self.mouse.drag else {
+            return;
+        };
+        let Some(v) = self.current() else {
+            return;
+        };
+        let (col, row) = self.cell_at(self.mouse.pos);
+        let term = lock(&v.pane.term);
+        if term.line_epoch() != drag.epoch {
+            drop(term);
+            self.mouse.drag = None;
+            return;
+        }
+        let head = (term.view_top() + usize::from(row), col);
+        if self.selection.is_none() && head == drag.anchor {
+            return;
+        }
+        let s = Selection::new(&term, &self.theme.pal, drag, head);
+        drop(term);
+        if self.selection.as_ref().map(|o| (o.start, o.end)) != Some((s.start, s.end)) {
+            self.selection = Some(s);
+            self.request_redraw();
+        }
+    }
+
+    /// While a drag holds the pointer above or below the focused pane,
+    /// scrolls toward it, faster the farther out it is, and grows the
+    /// selection; then waits for the next step. The alternate screen has
+    /// no scrollback to scroll.
+    fn autoscroll(&mut self) {
+        self.mouse.scroll_at = None;
+        let Some(v) = self.current().filter(|_| self.mouse.drag.is_some()) else {
+            return;
+        };
+        let (Some(r), false) = (v.rect, v.snap.alt_screen) else {
+            return;
+        };
+        let y = self.mouse.pos.y as i32;
+        let out = if y < r.y {
+            r.y - y
+        } else if y >= r.bottom() {
+            r.bottom() - 1 - y
+        } else {
+            return;
+        };
+        let ch = self.cell().1 as i32;
+        let lines = (out.abs() / ch + 1).min(10) * out.signum();
+        self.scroll(lines as isize);
+        self.mouse.scroll_at = Some(Instant::now() + AUTOSCROLL);
     }
 
     fn on_mouse_move(&mut self, pos: PhysicalPosition<f64>) {
@@ -2640,12 +2828,10 @@ impl App {
             }
             return;
         }
-        if let Some(anchor) = self.mouse.anchor {
-            let here = self.cell_at(pos);
-            let sel = Some((anchor, here));
-            if (self.selection.is_some() || here != anchor) && self.selection != sel {
-                self.selection = sel;
-                self.request_redraw();
+        if self.mouse.drag.is_some() {
+            self.extend_drag();
+            if self.mouse.scroll_at.is_none() {
+                self.autoscroll();
             }
             return;
         }
@@ -2804,7 +2990,7 @@ impl App {
                 }
             }
             v.rect = Some(rect);
-            let sel = self.selection.filter(|_| Some(id) == focus);
+            let sel = self.selection.as_mut().filter(|_| Some(id) == focus);
             let mut term = lock(&v.pane.term);
             v.sync_until = term.sync_deadline();
             if !refresh(&mut term, &mut v.snap, &self.theme.pal, sel) {
@@ -2821,7 +3007,9 @@ impl App {
                 v.snap.highlight(&f.found, f.cur);
             }
             if Some(id) == focus {
-                v.snap.selection = self.selection.map(|s| whole_chars(&v.snap, s));
+                let (top, size) = (term.view_top(), (v.snap.cols, v.snap.rows));
+                v.snap.selection =
+                    (self.selection.as_ref()).and_then(|s| in_view(s.start, s.end, top, size));
             } else if split {
                 dimmed.push(id);
             }
@@ -3055,10 +3243,19 @@ impl App {
             (true, false, false) => Some(now + SCENERY_FRAME),
             _ => None,
         };
-        [sync, notice, timer, resume, self.save_after, gfx, anim]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            sync,
+            notice,
+            timer,
+            resume,
+            self.save_after,
+            gfx,
+            anim,
+            self.mouse.scroll_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }
 
@@ -3278,63 +3475,44 @@ fn tab_name(cwd: Option<&Path>) -> String {
 }
 
 /// Takes a fresh snapshot of `term` into `snap`. Returns false when that
-/// changed the text under `sel`: output that scrolls or rewrites selected
-/// text ends the selection, so a copy never takes text the user did not
-/// pick.
+/// found output rewrote the text under `sel`; see [`Selection::still`].
 fn refresh(
     term: &mut vt::Terminal,
     snap: &mut Snapshot,
     pal: &Palette,
-    sel: Option<((u16, u16), (u16, u16))>,
+    sel: Option<&mut Selection>,
 ) -> bool {
     // Only a terminal with news can change the selected text.
-    let before = sel
-        .filter(|_| term.is_changed())
-        .map(|s| selection_text(snap, s));
-    !term.snapshot(snap, pal) || sel.map(|s| selection_text(snap, s)) == before
+    !term.snapshot(snap, pal) || sel.is_none_or(|s| s.still(term, pal))
 }
 
-/// The text of the cells between two (column, row) points, inclusive, in
-/// reading order: trailing blanks trimmed, rows joined by CRLF unless one
-/// wraps into the next.
-pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String {
-    let (a, b) = whole_chars(snap, sel);
-    let cols = usize::from(snap.cols);
-    let last = b.1.min(snap.rows.saturating_sub(1));
+/// The text of the selected cells from line `from` on, in reading order:
+/// trailing blanks trimmed, rows joined by CRLF unless one wraps into the
+/// next.
+fn selection_text(term: &vt::Terminal, pal: &Palette, sel: &Selection, from: usize) -> String {
+    let (a, b) = (sel.start, sel.end);
     let mut out = String::new();
-    for row in a.1..=last {
-        let from = if row == a.1 { usize::from(a.0) } else { 0 };
-        let to = if row == b.1 {
-            usize::from(b.0).min(cols.saturating_sub(1))
+    let mut cells = Vec::new();
+    for n in a.0.max(from)..=b.0 {
+        let Some(wraps) = term.line_cells(n, pal, &mut cells) else {
+            break;
+        };
+        let first = if n == a.0 { usize::from(a.1) } else { 0 };
+        let last = if n == b.0 {
+            usize::from(b.1)
         } else {
-            cols.saturating_sub(1)
+            usize::MAX
         };
         let mut line = String::new();
-        let mut text_end = 0;
-        for c in from..=to {
-            let Some(cell) = snap.cells.get(usize::from(row) * cols + c) else {
-                break;
-            };
-            match cell.len {
-                // The right half of a wide character.
-                0 if cell.width == 0 => {}
-                // A blank, or hidden text: a space for each column.
-                0 => line.extend(std::iter::repeat_n(' ', usize::from(cell.width))),
-                n => {
-                    let text = std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" ");
-                    push_drawn(&mut line, text, cell.width);
-                    text_end = line.len();
-                }
-            }
-        }
+        let text_end = push_cells(&mut line, &cells, first, last);
         // A row that wraps runs on into the next one: no line break, and
         // only the empty cells at its end are dropped.
-        if row < last && snap.wrapped.get(usize::from(row)) == Some(&true) {
+        if n < b.0 && wraps {
             line.truncate(text_end);
             out.push_str(&line);
         } else {
             out.push_str(line.trim_end());
-            if row < last {
+            if n < b.0 {
                 out.push_str("\r\n");
             }
         }
@@ -3342,26 +3520,24 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
     out
 }
 
-/// `sel` in reading order, grown to take in the whole of a wide character
-/// it ends on half of, so what is highlighted is what is copied.
-fn whole_chars(snap: &Snapshot, (a, b): ((u16, u16), (u16, u16))) -> ((u16, u16), (u16, u16)) {
-    let (mut a, mut b) = if (a.1, a.0) <= (b.1, b.0) {
-        (a, b)
-    } else {
-        (b, a)
-    };
-    let width = |(c, r): (u16, u16)| {
-        let i = usize::from(r) * usize::from(snap.cols) + usize::from(c);
-        snap.cells.get(i).map(|c| c.width)
-    };
-    // The right half of a wide character starts at its left half.
-    if a.0 > 0 && width(a) == Some(0) && width((a.0 - 1, a.1)) == Some(2) {
-        a.0 -= 1;
+/// Adds the text of `cells[first..=last]` as the screen shows it. Returns
+/// the length of `line` after the last cell that holds text.
+fn push_cells(line: &mut String, cells: &[vt::RenderCell], first: usize, last: usize) -> usize {
+    let mut text_end = line.len();
+    for cell in cells.iter().take(last.saturating_add(1)).skip(first) {
+        match cell.len {
+            // The right half of a wide character.
+            0 if cell.width == 0 => {}
+            // A blank, or hidden text: a space for each column.
+            0 => line.extend(std::iter::repeat_n(' ', usize::from(cell.width))),
+            n => {
+                let text = std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" ");
+                push_drawn(line, text, cell.width);
+                text_end = line.len();
+            }
+        }
     }
-    if width(b) == Some(2) && b.0 + 1 < snap.cols {
-        b.0 += 1;
-    }
-    (a, b)
+    text_end
 }
 
 /// Adds a cell's text as the screen shows it, so a copy carries nothing
@@ -3433,6 +3609,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some((line, _)) = v.resume.take_if(|r| r.1 <= now) {
                     v.pane.send(line);
                 }
+            }
+            if self.mouse.scroll_at.is_some_and(|t| t <= now) {
+                self.autoscroll();
             }
             // A synchronized update timed out, a notice expired, or a
             // working timer ticked.
@@ -3898,69 +4077,74 @@ mod selftest {
 mod tests {
     use super::*;
 
-    #[test]
-    fn app_selection_text_reads_cells_in_order() {
-        let pal = crate::theme::dark();
-        let s = text_snapshot("ab  \nc\u{4e2d}d\nxyz", 4, 3, &pal);
-        // Given end first; spans three rows.
-        assert_eq!(
-            selection_text(&s, ((1, 2), (1, 0))),
-            "b\r\nc\u{4e2d}d\r\nxy"
-        );
-        assert_eq!(selection_text(&s, ((0, 1), (3, 1))), "c\u{4e2d}d");
-        assert_eq!(selection_text(&s, ((2, 0), (3, 0))), "");
-    }
-
-    /// A snapshot of a `cols` x `rows` terminal fed `bytes`.
-    fn fed(cols: u16, rows: u16, bytes: &str) -> Snapshot {
+    /// A `cols` x `rows` terminal fed `bytes`.
+    fn fed(cols: u16, rows: u16, bytes: &str) -> vt::Terminal {
         let mut t = vt::Terminal::new(vt::Options {
             cols,
             rows,
             ..vt::Options::default()
         });
         t.feed(bytes.as_bytes());
-        let mut s = Snapshot::default();
-        t.snapshot(&mut s, &crate::theme::dark());
-        s
+        t
+    }
+
+    /// A selection dragged from `a` to `b`.
+    fn select(t: &vt::Terminal, a: Pos, b: Pos) -> Selection {
+        let drag = Drag {
+            epoch: t.line_epoch(),
+            anchor: a,
+        };
+        Selection::new(t, &crate::theme::dark(), drag, b)
+    }
+
+    /// What a copy of the selection dragged from `a` to `b` takes.
+    fn copy(t: &vt::Terminal, a: Pos, b: Pos) -> String {
+        selection_text(t, &crate::theme::dark(), &select(t, a, b), 0)
+    }
+
+    #[test]
+    fn app_selection_text_reads_cells_in_order() {
+        let t = fed(4, 3, "ab  \r\nc\u{4e2d}d\r\nxyz");
+        // Dragged from the end; spans three rows.
+        assert_eq!(copy(&t, (2, 1), (0, 1)), "b\r\nc\u{4e2d}d\r\nxy");
+        assert_eq!(copy(&t, (1, 0), (1, 3)), "c\u{4e2d}d");
+        assert_eq!(copy(&t, (0, 2), (0, 3)), "");
     }
 
     #[test]
     fn app_selection_leaves_out_hidden_text() {
-        let s = fed(
+        let t = fed(
             30,
             2,
             "git status\x1b[8m; iwr x|iex\x1b[28m!\r\n\x1b[38;2;19;20;23mcalc\x1b[0m",
         );
-        assert_eq!(
-            selection_text(&s, ((0, 0), (29, 1))),
-            "git status           !\r\n"
-        );
-        let s = fed(4, 1, "\x1b[8m\u{4e2d}\x1b[0mx");
-        assert_eq!(selection_text(&s, ((0, 0), (3, 0))), "  x");
+        assert_eq!(copy(&t, (0, 0), (1, 29)), "git status           !\r\n");
+        let t = fed(4, 1, "\x1b[8m\u{4e2d}\x1b[0mx");
+        assert_eq!(copy(&t, (0, 0), (0, 3)), "  x");
     }
 
     #[test]
     fn app_selection_joins_wrapped_rows() {
-        let two = ((0, 0), (3, 1));
-        assert_eq!(selection_text(&fed(4, 3, "ab  cd"), two), "ab  cd");
-        assert_eq!(selection_text(&fed(4, 3, "ab\r\ncd"), two), "ab\r\ncd");
+        let two = |t| copy(&t, (0, 0), (1, 3));
+        assert_eq!(two(fed(4, 3, "ab  cd")), "ab  cd");
+        assert_eq!(two(fed(4, 3, "ab\r\ncd")), "ab\r\ncd");
         // A wide character that did not fit leaves an empty cell behind.
-        assert_eq!(selection_text(&fed(3, 3, "ab\u{4e2d}"), two), "ab\u{4e2d}");
+        assert_eq!(two(fed(3, 3, "ab\u{4e2d}")), "ab\u{4e2d}");
     }
 
     #[test]
     fn app_selection_copies_only_what_is_drawn() {
-        let copy = |bytes: &str| selection_text(&fed(40, 1, bytes), ((0, 0), (39, 0)));
-        assert_eq!(copy("ls\u{E0069}\u{E0067}\u{E006E}x"), "lsx", "tags");
-        assert_eq!(copy("a\u{E0100}\u{FE00}b"), "ab", "variation selectors");
+        let drawn = |bytes: &str| copy(&fed(40, 1, bytes), (0, 0), (0, 39));
+        assert_eq!(drawn("ls\u{E0069}\u{E0067}\u{E006E}x"), "lsx", "tags");
+        assert_eq!(drawn("a\u{E0100}\u{FE00}b"), "ab", "variation selectors");
         assert_eq!(
-            copy("a\u{200D}\u{301}\u{302}b"),
+            drawn("a\u{200D}\u{301}\u{302}b"),
             "ab",
             "marks after a joiner"
         );
-        assert_eq!(copy("a\u{200D}b"), "ab", "a lone joiner");
-        assert_eq!(copy("x\u{3164}y\u{2800}z\u{A0}w"), "x  y z w", "fillers");
-        assert_eq!(copy("x\u{AD}y"), "x y", "soft hyphen");
+        assert_eq!(drawn("a\u{200D}b"), "ab", "a lone joiner");
+        assert_eq!(drawn("x\u{3164}y\u{2800}z\u{A0}w"), "x  y z w", "fillers");
+        assert_eq!(drawn("x\u{AD}y"), "x y", "soft hyphen");
         for s in [
             "a\u{200C}\u{200C}\u{200C}b",
             "a\u{34F}b",
@@ -3969,9 +4153,9 @@ mod tests {
             "a\u{FE0E}\u{FE0F}b",
             "a\u{2060}\u{FEFF}b",
         ] {
-            assert_eq!(copy(s), "ab", "{s:?}");
+            assert_eq!(drawn(s), "ab", "{s:?}");
         }
-        assert_eq!(copy("\u{2764}\u{FE0F}\u{FE0F}"), "\u{2764}\u{FE0F}");
+        assert_eq!(drawn("\u{2764}\u{FE0F}\u{FE0F}"), "\u{2764}\u{FE0F}");
         // Text that draws keeps everything.
         for s in [
             "e\u{301}",
@@ -3981,66 +4165,119 @@ mod tests {
             "\u{1F468}\u{200D}\u{1F469}",
             "\u{4e2d}",
         ] {
-            assert_eq!(copy(s), s);
+            assert_eq!(drawn(s), s);
         }
     }
 
     #[test]
-    fn app_output_that_moves_selected_text_ends_the_selection() {
+    fn app_copy_reaches_into_scrollback() {
+        let t = fed(4, 2, "one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(t.screen_top(), 3);
+        assert_eq!(copy(&t, (1, 1), (4, 1)), "wo\r\nthree\r\nfo");
+    }
+
+    #[test]
+    fn app_selection_stays_on_its_text_until_output_rewrites_it() {
+        let pal = crate::theme::dark();
+        let mut t = fed(10, 3, "a\r\nb\r\nc");
+        let mut s = Snapshot::default();
+        let mut sel = select(&t, (1, 0), (1, 9));
+        assert!(refresh(&mut t, &mut s, &pal, None));
+        assert!(refresh(&mut t, &mut s, &pal, Some(&mut sel)), "nothing new");
+        t.feed(b"\x1b[1;5Hx");
+        assert!(
+            refresh(&mut t, &mut s, &pal, Some(&mut sel)),
+            "another row changed"
+        );
+        t.feed(b"\x1b[3;1H\r\nd");
+        assert!(refresh(&mut t, &mut s, &pal, Some(&mut sel)), "scrolled");
+        assert_eq!(selection_text(&t, &pal, &sel, 0), "b");
+        t.feed(b"\x1b[1;1Hz");
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)), "rewritten");
+        let mut sel = select(&t, (2, 0), (2, 9));
+        t.feed(b"\x1b[2;1Hq\x1b[3;1H\r\n\r\n");
+        assert!(
+            !refresh(&mut t, &mut s, &pal, Some(&mut sel)),
+            "rewritten, then scrolled out of the screen"
+        );
+    }
+
+    #[test]
+    fn app_selection_ends_when_its_lines_are_gone() {
         let pal = crate::theme::dark();
         let mut t = vt::Terminal::new(vt::Options {
             cols: 10,
-            rows: 3,
+            rows: 2,
+            scrollback_lines: 2,
             ..vt::Options::default()
         });
-        t.feed(b"a\r\nb\r\nc");
+        t.feed(b"a\r\nb");
         let mut s = Snapshot::default();
-        let sel = Some(((0, 1), (9, 1)));
-        assert!(refresh(&mut t, &mut s, &pal, None));
-        assert!(refresh(&mut t, &mut s, &pal, sel), "nothing new");
-        t.feed(b"\x1b[1;5Hx");
-        assert!(refresh(&mut t, &mut s, &pal, sel), "another row changed");
-        t.feed(b"\x1b[3;1H\r\nd");
-        assert!(!refresh(&mut t, &mut s, &pal, sel), "scrolled");
-        t.feed(b"\x1b[2;1Hz");
-        assert!(!refresh(&mut t, &mut s, &pal, sel), "rewritten");
+        let mut sel = select(&t, (0, 0), (0, 0));
+        t.feed(b"\r\n1\r\n2");
+        assert!(
+            refresh(&mut t, &mut s, &pal, Some(&mut sel)),
+            "in scrollback"
+        );
+        t.feed(b"\r\n3");
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)), "dropped");
+        let mut sel = select(&t, (3, 0), (3, 0));
+        t.resize(8, 2);
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)), "rewrapped");
+    }
+
+    #[test]
+    fn app_selection_shows_the_part_in_view() {
+        let size = (10, 3);
+        assert_eq!(in_view((5, 2), (6, 4), 5, size), Some(((2, 0), (4, 1))));
+        assert_eq!(
+            in_view((1, 2), (9, 4), 5, size),
+            Some(((0, 0), (9, 2))),
+            "runs past both ends"
+        );
+        assert_eq!(in_view((1, 2), (4, 4), 5, size), None, "above");
+        assert_eq!(in_view((8, 0), (9, 4), 5, size), None, "below");
     }
 
     #[test]
     fn app_selection_takes_whole_wide_characters() {
-        let pal = crate::theme::dark();
-        let s = text_snapshot("a\u{4e2d}b", 4, 1, &pal);
-        assert_eq!(selection_text(&s, ((0, 0), (1, 0))), "a\u{4e2d}");
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 4,
+            rows: 1,
+            ..vt::Options::default()
+        });
+        t.feed("a\u{4e2d}b".as_bytes());
+        let ends = |a, b| {
+            let s = select(&t, a, b);
+            (s.start, s.end)
+        };
+        assert_eq!(copy(&t, (0, 0), (0, 1)), "a\u{4e2d}");
         // Starting on the right half takes the whole character, which is
         // also what is highlighted.
-        assert_eq!(selection_text(&s, ((2, 0), (3, 0))), "\u{4e2d}b");
-        assert_eq!(whole_chars(&s, ((2, 0), (3, 0))), ((1, 0), (3, 0)));
-        assert_eq!(selection_text(&s, ((2, 0), (2, 0))), "\u{4e2d}");
-        assert_eq!(whole_chars(&s, ((2, 0), (2, 0))), ((1, 0), (2, 0)));
-        // Ending on the left half highlights the right half too.
-        assert_eq!(whole_chars(&s, ((1, 0), (0, 0))), ((0, 0), (2, 0)));
-        assert_eq!(whole_chars(&s, ((3, 0), (3, 0))), ((3, 0), (3, 0)));
-        // A wide character in the last column cannot reach past it.
-        let edge = text_snapshot("ab\u{4e2d}", 4, 1, &pal);
-        assert_eq!(whole_chars(&edge, ((2, 0), (2, 0))), ((2, 0), (3, 0)));
+        assert_eq!(copy(&t, (0, 2), (0, 3)), "\u{4e2d}b");
+        assert_eq!(ends((0, 2), (0, 3)), ((0, 1), (0, 3)));
+        assert_eq!(copy(&t, (0, 2), (0, 2)), "\u{4e2d}");
+        assert_eq!(ends((0, 2), (0, 2)), ((0, 1), (0, 2)));
+        // Ending on the left half takes the right half too.
+        assert_eq!(ends((0, 1), (0, 0)), ((0, 0), (0, 2)));
+        assert_eq!(ends((0, 3), (0, 3)), ((0, 3), (0, 3)));
     }
 
     #[test]
-    fn app_selection_text_of_short_or_empty_snapshots() {
-        let pal = crate::theme::dark();
-        // A pane whose terminal is smaller than its grid, as after a
-        // session stopped updating.
-        let mut short = text_snapshot("ab\ncd", 2, 2, &pal);
-        short.cells.truncate(1);
-        assert_eq!(selection_text(&short, ((0, 0), (1, 1))), "a\r\n");
-        assert_eq!(selection_text(&Snapshot::default(), ((0, 0), (3, 3))), "");
-        // Past the last row and column.
-        let s = text_snapshot("ab\ncd", 2, 2, &pal);
-        assert_eq!(selection_text(&s, ((0, 0), (9, 9))), "ab\r\ncd");
+    fn app_selection_text_past_the_last_column_or_not_utf8() {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 2,
+            rows: 2,
+            ..vt::Options::default()
+        });
+        t.feed(b"ab\r\ncd");
+        assert_eq!(copy(&t, (0, 0), (1, 9)), "ab\r\ncd", "past the last column");
         // Text that is not UTF-8 copies as a space.
-        let mut bad = text_snapshot("ab", 2, 1, &pal);
-        bad.cells[0].text[0] = 0xff;
-        assert_eq!(selection_text(&bad, ((0, 0), (1, 0))), " b");
+        let mut cells = text_snapshot("ab", 2, 1, &crate::theme::dark()).cells;
+        cells[0].text[0] = 0xff;
+        let mut line = String::new();
+        push_cells(&mut line, &cells, 0, usize::MAX);
+        assert_eq!(line, " b");
     }
 
     #[test]
