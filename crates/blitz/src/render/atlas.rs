@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use vt::style::FxBuild;
+
 /// Empty glyphs remembered before they are all forgotten at once. They
 /// take no room in the texture, so filling it never clears them.
 const MAX_EMPTY: usize = 1 << 14;
@@ -43,7 +45,7 @@ pub struct Atlas {
     w: u16,
     h: u16,
     shelves: Vec<Shelf>,
-    glyphs: HashMap<GlyphKey, Slot>,
+    glyphs: HashMap<GlyphKey, Slot, FxBuild>,
     /// Empty glyphs in `glyphs`.
     empty: usize,
 }
@@ -54,7 +56,7 @@ impl Atlas {
             w,
             h,
             shelves: Vec::new(),
-            glyphs: HashMap::new(),
+            glyphs: HashMap::default(),
             empty: 0,
         }
     }
