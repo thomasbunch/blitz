@@ -1731,6 +1731,11 @@ impl App {
                     }
                 }
             }
+            // Like a question from Claude Code: it needs the user, unless
+            // they are already looking at the pane.
+            Event::Bell if self.config.bell_attention => {
+                self.attention(id, Ev::NeedsYou);
+            }
             _ => {}
         }
     }
