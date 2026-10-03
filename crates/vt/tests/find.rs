@@ -133,3 +133,104 @@ fn snapshots_mark_the_matches_in_view() {
     s.highlight(&across, None);
     assert_eq!(s.highlights, [hl((9, 1), (9, 1), false)]);
 }
+
+/// blitz's own prompt start, as its shell integration sends it.
+const PROMPT: &str = "\x1b]133;A;blitz=1\x07$ ";
+
+/// A shell session on a 20 x 4 screen: a prompt and a command on lines 0,
+/// 5, 10 and 15, output in between, and a fresh prompt on line 20.
+fn session() -> Terminal {
+    let mut t = term(20, 4, 100);
+    for i in 0..20 {
+        let line = if i % 5 == 0 {
+            format!("{PROMPT}command {i}\r\n")
+        } else {
+            format!("output {i}\r\n")
+        };
+        t.feed(line.as_bytes());
+    }
+    t.feed(PROMPT.as_bytes());
+    t
+}
+
+/// The text of the top row of the view.
+fn top_row(t: &mut Terminal) -> String {
+    let s = shot(t);
+    let row = &s.cells[..usize::from(s.cols)];
+    let text: String = (row.iter())
+        .map(|c| std::str::from_utf8(&c.text[..usize::from(c.len)]).unwrap_or(""))
+        .map(|t| if t.is_empty() { " " } else { t })
+        .collect();
+    text.trim_end().to_string()
+}
+
+#[test]
+fn prompt_jumps_go_up_and_down_and_back_to_the_bottom() {
+    let mut t = session();
+    // Lines 17 to 20 are on screen.
+    assert_eq!(t.view_top(), 17);
+    for want in [15, 10, 5, 0] {
+        assert!(t.jump_to_prompt(true));
+        assert_eq!(t.view_top(), want);
+    }
+    assert_eq!(top_row(&mut t), "$ command 0");
+    assert!(!t.jump_to_prompt(true), "no prompt above the first");
+    assert_eq!(t.view_top(), 0);
+    for want in [5, 10, 15] {
+        assert!(t.jump_to_prompt(false));
+        assert_eq!(t.view_top(), want);
+    }
+    // The last prompt is on the screen, so down from 15 is the bottom.
+    assert!(t.jump_to_prompt(false));
+    assert_eq!(t.view_top(), 17);
+    assert!(!t.jump_to_prompt(false), "already at the bottom");
+}
+
+#[test]
+fn prompt_jumps_need_a_prompt_that_way() {
+    let mut t = term(20, 4, 100);
+    // Prompt starts that are not blitz's own do not count.
+    for i in 0..10 {
+        t.feed(format!("\x1b]133;A\x07$ x\r\n\x1b]133;A;blitz=2\x07{i}\r\n").as_bytes());
+    }
+    assert!(!t.jump_to_prompt(true));
+
+    let mut t = term(20, 4, 100);
+    t.feed(format!("{PROMPT}build\r\n").as_bytes());
+    for i in 0..30 {
+        t.feed(format!("output {i}\r\n").as_bytes());
+    }
+    t.scroll_to(10);
+    // Down: nothing marked below line 10, so the key is not used.
+    assert!(!t.jump_to_prompt(false));
+    assert_eq!(t.view_top(), 10);
+    assert!(t.jump_to_prompt(true));
+    assert_eq!(t.view_top(), 0);
+
+    // Nor on the alternate screen.
+    let mut t = session();
+    t.feed(b"\x1b[?1049h");
+    assert!(!t.jump_to_prompt(true));
+}
+
+#[test]
+fn prompt_marks_survive_scrolling_off_and_rewrapping() {
+    let mut t = session();
+    // Narrower: each "$ command N" line wraps in two.
+    t.resize(6, 4);
+    let mut tops = Vec::new();
+    while t.jump_to_prompt(true) {
+        tops.push(top_row(&mut t));
+    }
+    assert_eq!(tops, ["$ comm"; 4]);
+    // Wider again: the marks come back to whole lines.
+    t.resize(20, 4);
+    let mut rows = Vec::new();
+    while t.jump_to_prompt(false) {
+        rows.push(top_row(&mut t));
+    }
+    assert_eq!(
+        rows,
+        ["$ command 5", "$ command 10", "$ command 15", "output 17"]
+    );
+}

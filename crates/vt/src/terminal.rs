@@ -313,6 +313,34 @@ impl Terminal {
         self.screen.grid.find(query)
     }
 
+    /// Scrolls the main screen so a prompt of blitz's own shell integration
+    /// starts the view: with `up` the nearest one above its top row, else
+    /// the nearest one below it, and down from the last prompt back to the
+    /// bottom. Returns false, leaving the view alone, on the alternate
+    /// screen or with no prompt that way.
+    pub fn jump_to_prompt(&mut self, up: bool) -> bool {
+        if self.alt {
+            return false;
+        }
+        let g = &self.screen.grid;
+        let (live, top) = (g.scrollback_len(), g.scrollback_len() - self.viewport);
+        let prompt = |i: &usize| g.line(*i).is_some_and(|r| r.flags & rf::PROMPT != 0);
+        let to = if up {
+            (0..top).rev().find(prompt)
+        } else if top < live && (top..live + usize::from(g.lines())).any(|i| prompt(&i)) {
+            // A prompt on the bottom screenful cannot be at the top.
+            (top + 1..live).find(prompt).or(Some(live))
+        } else {
+            None
+        };
+        let Some(to) = to else {
+            return false;
+        };
+        let line = g.dropped() + to;
+        self.scroll_to(line);
+        true
+    }
+
     pub fn input_modes(&self) -> InputModes {
         InputModes {
             kitty: self.kitty().flags(),
@@ -1461,6 +1489,8 @@ impl Handler for Terminal {
                 Some(m @ PromptMark::A { blitz: true }) => {
                     self.prompt_reset();
                     self.at_prompt = true;
+                    // A place for prompt jumps to go back to.
+                    self.row().flags |= rf::PROMPT;
                     Event::Prompt(m)
                 }
                 Some(m) => {

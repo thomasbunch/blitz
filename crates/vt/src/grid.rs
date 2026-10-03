@@ -49,6 +49,8 @@ pub mod cf {
 pub mod rf {
     /// The row's text continues on the next row (soft wrap).
     pub const WRAPPED: u8 = 1 << 0;
+    /// A prompt of blitz's own shell integration starts on this row.
+    pub const PROMPT: u8 = 1 << 1;
 }
 
 /// Longest grapheme tail kept per cell, in bytes, so that with its first
@@ -555,10 +557,12 @@ impl Grid {
         let mut line = Vec::new();
         let mut graphemes = Vec::new();
         let mut cursor = None;
+        // A prompt mark anywhere in a line goes to its first new row.
+        let mut prompt = 0;
         for (i, mut row) in old.into_iter().enumerate() {
             let wrapped = row.flags & rf::WRAPPED != 0 && i < last;
             if line.is_empty() && !wrapped && i != cy && text_len(&row.cells) <= new {
-                row.flags = 0;
+                row.flags &= rf::PROMPT;
                 row.set_width(cols);
                 out.push_back(row);
                 continue;
@@ -568,6 +572,7 @@ impl Grid {
             let mut tails = row.extra.take().map(|e| e.graphemes).unwrap_or_default();
             tails.sort_unstable_by_key(|g| g.0);
             let mut tails = tails.into_iter().peekable();
+            prompt |= row.flags & rf::PROMPT;
             for (x, c) in row.cells.iter().enumerate() {
                 if i == cy && x == usize::from(cur.0) {
                     cursor = Some(line.len());
@@ -592,6 +597,7 @@ impl Grid {
             let keep = line.len().min(len.div_ceil(new).max(1) * new).max(len);
             line.resize(keep.max(cursor.map_or(0, |c| c + 1)), Cell::default());
             let mut row = self.fresh(Cell::default());
+            row.flags = std::mem::take(&mut prompt);
             let mut x = 0;
             let mut tails = graphemes.drain(..).peekable();
             for (k, &c) in line.iter().enumerate() {
@@ -889,6 +895,22 @@ mod tests {
         assert_eq!(g.scrollback_len(), 10_000);
         let used = g.bytes_used();
         assert!(used <= 10 << 20, "{used} bytes");
+    }
+
+    #[test]
+    fn rewrapping_keeps_prompt_marks_on_the_first_row_of_a_line() {
+        let mut g = grid_with(&["$ ab", "cd", "x", ""]);
+        g.row_mut(0).flags = rf::WRAPPED | rf::PROMPT;
+        g.row_mut(2).flags = rf::PROMPT;
+        g.reflow(8, (0, 3, false));
+        assert_eq!(text(&g), ["$ abcd", "x", "", ""]);
+        let flags: Vec<u8> = (0..4).map(|i| g.line(i).unwrap().flags).collect();
+        assert_eq!(flags, [rf::PROMPT, rf::PROMPT, 0, 0]);
+        g.reflow(2, (0, 3, false));
+        assert_eq!(text(&g), ["$", "ab", "cd", "x", "", ""]);
+        assert_eq!(g.line(0).unwrap().flags, rf::WRAPPED | rf::PROMPT);
+        assert_eq!(g.line(1).unwrap().flags, rf::WRAPPED);
+        assert_eq!(g.line(3).unwrap().flags, rf::PROMPT);
     }
 
     #[test]
