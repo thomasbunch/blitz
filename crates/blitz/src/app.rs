@@ -41,7 +41,7 @@ use crate::keymap::{self, Action};
 use crate::layout::{self, Dir, PaneId, Rect, Tab};
 use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
 use crate::render::chrome::{self, ChromeModel};
-use crate::render::d3d11::{Swapchain, is_device_lost};
+use crate::render::d3d11::{Gpu, Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
 use crate::session::{self, Geometry, PaneMeta};
 use crate::theme::Theme;
@@ -161,6 +161,9 @@ pub fn run(args: &[String]) -> i32 {
     {
         return 0;
     }
+    // Loading the graphics driver is most of the time to the first
+    // frame; it runs while the window is made.
+    let gpu = std::thread::spawn(|| Gpu::new(false));
     let keys = Rc::new(RefCell::new(Keys::default()));
     let hook_keys = keys.clone();
     let mut builder = EventLoop::<UserEvent>::with_user_event();
@@ -177,6 +180,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let mut app = App::new(args, keys, event_loop.create_proxy());
+    app.gpu = Some(gpu);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("blitz: {e}");
         return 1;
@@ -417,6 +421,8 @@ struct App {
     /// The terminal a running self-test reads: the focused pane's.
     watched: Option<Arc<selftest::Focus>>,
     started: Instant,
+    /// The device started at launch, until the first renderer takes it.
+    gpu: Option<std::thread::JoinHandle<windows::core::Result<Gpu>>>,
     counters: Counters,
     code: i32,
 }
@@ -529,6 +535,7 @@ impl App {
             placed: Geometry::default(),
             watched: None,
             started: Instant::now(),
+            gpu: None,
             counters: Counters::default(),
             code: 0,
         }
@@ -1100,7 +1107,12 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let built = Renderer::new(false, self.font_px()).and_then(|r| {
+        let early = self.gpu.take().and_then(|h| h.join().ok()?.ok());
+        let built = match early {
+            Some(gpu) => Renderer::with_gpu(gpu, self.font_px()),
+            None => Renderer::new(false, self.font_px()),
+        };
+        let built = built.and_then(|r| {
             let hwnd = HWND(self.hwnd as *mut c_void);
             let chain = Swapchain::new(&r.gpu, hwnd, size.width, size.height)?;
             Ok(Gfx { r, chain })

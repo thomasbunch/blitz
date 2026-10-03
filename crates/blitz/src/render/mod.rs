@@ -180,9 +180,13 @@ mod gpu {
 
     impl Renderer {
         pub fn new(warp: bool, px: f32) -> Result<Self> {
+            Self::with_gpu(Gpu::new(warp)?, px)
+        }
+
+        /// [`Self::new`] on a device made elsewhere.
+        pub fn with_gpu(mut gpu: Gpu, px: f32) -> Result<Self> {
             let font = Font::new(DEFAULT_FAMILIES, px)?;
             let small = Font::new(DEFAULT_FAMILIES, px * CHROME_TEXT)?;
-            let mut gpu = Gpu::new(warp)?;
             gpu.set_text_params(font.gamma, font.contrast);
             Ok(Self {
                 gpu,
