@@ -468,6 +468,9 @@ struct App {
     game_ended: Option<Instant>,
     /// Windows shows animations; scenery and the spark keep still if not.
     motion: bool,
+    /// Points Ctrl+= and Ctrl+- add to the font size in the settings.
+    /// Never saved, and dropped when that setting changes.
+    font_zoom: f32,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -634,6 +637,7 @@ impl App {
             game: None,
             game_ended: None,
             motion: animations_on(),
+            font_zoom: 0.0,
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -667,7 +671,7 @@ impl App {
     }
 
     fn font_px(&self) -> f32 {
-        self.config.font_size * 96.0 / 72.0 * self.scale as f32
+        (self.config.font_size + self.font_zoom) * 96.0 / 72.0 * self.scale as f32
     }
 
     /// Creates the window and starts the first session.
@@ -1363,6 +1367,9 @@ impl App {
     fn apply_config(&mut self, c: Config) {
         let font =
             (&c.font_family, c.font_size) != (&self.config.font_family, self.config.font_size);
+        if c.font_size != self.config.font_size {
+            self.font_zoom = 0.0;
+        }
         self.config = c;
         if font {
             self.reload_font();
@@ -1374,8 +1381,8 @@ impl App {
         self.request_redraw();
     }
 
-    /// Loads the configured font at the size the window's DPI needs, and
-    /// tells each terminal its new cell size.
+    /// Loads the configured font at the size the window's DPI and the font
+    /// zoom need, and tells each terminal its new cell size.
     fn reload_font(&mut self) {
         let px = self.font_px();
         if let Some(g) = &mut self.gfx
@@ -1904,6 +1911,19 @@ impl App {
                     t.equalize();
                 }
                 self.request_redraw();
+            }
+            // Within the range the font_size setting allows.
+            Action::FontSize(by) => {
+                let set = self.config.font_size;
+                let now = set + self.font_zoom;
+                let pt = match by {
+                    0 => set,
+                    _ => (now + f32::from(by)).clamp(4.0, 72.0),
+                };
+                if pt != now {
+                    self.font_zoom = pt - set;
+                    self.reload_font();
+                }
             }
         }
         true

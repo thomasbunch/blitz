@@ -41,6 +41,9 @@ pub enum Action {
     Zoom,
     /// Give the tab's panes equal space.
     Equalize,
+    /// Make the font a point bigger (1) or smaller (-1) until blitz
+    /// restarts, or go back to the size in the settings (0).
+    FontSize(i8),
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -76,6 +79,9 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Swap(Dir::Up), "swap_up", "Swap with the pane above"),
     (Action::Swap(Dir::Down), "swap_down", "Swap with the pane below"),
     (Action::Equalize, "equalize", "Give the panes equal space"),
+    (Action::FontSize(1), "font_size_up", "Bigger font"),
+    (Action::FontSize(-1), "font_size_down", "Smaller font"),
+    (Action::FontSize(0), "font_size_reset", "Font size from the settings"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
@@ -124,6 +130,11 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     // VK_OEM_COMMA: the comma key on every layout.
     (CTRL, 0xbc, Action::Settings),
     (CTRL | SHIFT, b'Z' as u16, Action::Zoom),
+    // VK_OEM_PLUS and VK_OEM_MINUS. Ctrl+Shift+- still goes to the
+    // program: it is Claude Code's undo.
+    (CTRL, 0xbb, Action::FontSize(1)),
+    (CTRL, 0xbd, Action::FontSize(-1)),
+    (CTRL, b'0' as u16, Action::FontSize(0)),
 ];
 
 /// Key names for chords, matched ignoring case. The first name of each
@@ -910,6 +921,9 @@ mod msg_to_key_tests {
         assert_eq!(press(0x5a, &[LCTRL, LSHIFT]), Some(Action::Zoom));
         // Modifiers match exactly.
         assert_eq!(press(0x25, &[LCTRL, LSHIFT]), None, "selects a word");
+        assert_eq!(press(0xbd, &[LCTRL]), Some(Action::FontSize(-1)));
+        assert_eq!(press(0xbd, &[LCTRL, LSHIFT]), None, "Claude Code's undo");
+        assert_eq!(press(0x30, &[LCTRL]), Some(Action::FontSize(0)));
         assert_eq!(press(0x52, &[LCTRL]), None);
         assert_eq!(press(0x43, &[LCTRL, LALT]), None, "AltGr is not Ctrl");
         assert_eq!(press(0x43, &[LCTRL, 0x5b]), None);
@@ -1027,7 +1041,7 @@ mod msg_to_key_tests {
         for i in 0..9 {
             assert_eq!(press(0x31 + i, &[0xa2]), Some(Action::GoToTab(i as u8)));
         }
-        assert_eq!(press(0x30, &[0xa2]), None, "Ctrl+0");
+        assert_eq!(press(0x30, &[0xa2]), Some(Action::FontSize(0)), "Ctrl+0");
         assert_eq!(press(0x31, &[0xa2, 0xa0]), None, "Ctrl+Shift+1");
         assert_eq!(press(0x31, &[0xa2, 0xa4]), None, "AltGr+1");
         assert_eq!(press(0x61, &[0xa2]), None, "Ctrl+keypad 1 is not tab 1");
@@ -1047,30 +1061,21 @@ mod msg_to_key_tests {
     #[test]
     fn readme_lists_every_default_shortcut() {
         let readme = include_str!("../../../README.md");
-        for &(m, vk, _) in DEFAULT_KEYS {
-            let key = match vk {
-                0x09 => "Tab".to_string(),
-                0x21 => "PgUp".into(),
-                0x22 => "PgDn".into(),
-                0x2d => "Insert".into(),
-                0x25..=0x28 => "Arrows".into(),
-                0xbc => ",".into(),
-                _ => char::from(vk as u8).to_string(),
-            };
-            let mut chord = String::new();
-            for (bit, name) in [(CTRL, "Ctrl+"), (ALT, "Alt+"), (SHIFT, "Shift+")] {
-                if m & bit != 0 {
-                    chord.push_str(name);
-                }
-            }
-            chord.push_str(&key);
-            // Followed by something other than more of a key name, so
-            // Ctrl+Shift+T does not count as Ctrl+Shift+Tab.
-            let listed = readme.match_indices(&chord).any(|(i, _)| {
+        // Followed by something other than more of a key name, so
+        // Ctrl+Shift+T does not count as Ctrl+Shift+Tab.
+        let listed = |chord: &str| {
+            readme.match_indices(chord).any(|(i, _)| {
                 (readme[i + chord.len()..].chars().next())
                     .is_none_or(|c| !c.is_ascii_alphanumeric())
-            });
-            assert!(listed, "README.md does not list {chord}");
+            })
+        };
+        for &(m, vk, _) in DEFAULT_KEYS {
+            let chord = chord_label(m, vk);
+            // Arrow keys may be listed together, as Ctrl+Alt+Arrows.
+            let mods = chord_label(m, b'A' as u16);
+            let arrows = format!("{}Arrows", mods.trim_end_matches('A'));
+            let arrow = (0x25..=0x28).contains(&vk) && listed(&arrows);
+            assert!(listed(&chord) || arrow, "README.md does not list {chord}");
         }
     }
 
