@@ -179,6 +179,15 @@ pub const SETTINGS: &[Setting] = &[
         applies: NOW,
     },
     Setting {
+        key: "bell_attention",
+        group: "Notifications",
+        label: "Bell needs you",
+        help: "A bell in a pane you are not looking at marks its session as \
+               needing you, as a question from Claude Code does.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
         key: "check_updates",
         group: "Updates",
         label: "Check for updates",
