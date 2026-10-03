@@ -263,20 +263,24 @@ mod gpu {
         /// the palette), except that dim text is drawn halfway to its
         /// background.
         pub fn snapshot(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
-            self.grid(snap, pal, x, y, false, true);
+            self.grid(snap, pal, x, y, false, false, true);
         }
 
-        /// [`Self::snapshot`] for a pane without focus: text at reduced
-        /// contrast, each cell's moved a quarter of the way to its
-        /// background, and no cursor or selection.
-        pub fn dimmed(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
-            self.grid(snap, pal, x, y, true, true);
+        /// [`Self::snapshot`] for a pane that keys do not reach, because
+        /// another pane or another window has focus: a block cursor is
+        /// drawn as an outline. With `dim` the text is drawn at reduced
+        /// contrast too, each cell's moved a quarter of the way to its
+        /// background, and the selection is left out.
+        pub fn unfocused(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32, dim: bool) {
+            self.grid(snap, pal, x, y, dim, true, true);
         }
 
-        /// [`Self::snapshot`], or with `dim` as [`Self::dimmed`] draws it,
-        /// without copying the snapshot. Without `clear`, the grid's own
-        /// background is left to what is already drawn under it, such as
-        /// scenery; cells in other colours still cover it.
+        /// [`Self::snapshot`], or with `dim` and `hollow` as
+        /// [`Self::unfocused`] draws it, without copying the snapshot.
+        /// Without `clear`, the grid's own background is left to what is
+        /// already drawn under it, such as scenery; cells in other colours
+        /// still cover it.
+        #[allow(clippy::too_many_arguments)]
         pub fn grid(
             &mut self,
             snap: &Snapshot,
@@ -284,6 +288,7 @@ mod gpu {
             x: i32,
             y: i32,
             dim: bool,
+            hollow: bool,
             clear: bool,
         ) {
             let (cw, ch) = self.cell();
@@ -338,19 +343,28 @@ mod gpu {
 
             let cursor = snap
                 .cursor
-                .filter(|&(c, r, _)| !dim && c < snap.cols && r < snap.rows);
+                .filter(|&(c, r, _)| c < snap.cols && r < snap.rows);
+            let cursor_rgb = snap.cursor_color.unwrap_or(pal.cursor);
             if let Some((c, r, shape)) = cursor {
-                let (c, r) = (usize::from(c), usize::from(r));
-                let w = u32::from(cell(c, r).width.max(1)) * cw;
+                let (x, y) = (px(usize::from(c)), py(usize::from(r)));
+                let w = u32::from(cell(usize::from(c), usize::from(r)).width.max(1)) * cw;
                 match shape {
-                    CursorShape::Block => self.rect(px(c), py(r), w, ch, pal.cursor),
-                    CursorShape::Bar => self.rect(px(c), py(r), (cw / 5).max(2), ch, pal.cursor),
+                    CursorShape::Block if hollow => {
+                        let t = self.font.underline_h;
+                        self.rect(x, y, w, t, cursor_rgb);
+                        self.rect(x, y + (ch - t) as i32, w, t, cursor_rgb);
+                        self.rect(x, y, t, ch, cursor_rgb);
+                        self.rect(x + (w - t) as i32, y, t, ch, cursor_rgb);
+                    }
+                    CursorShape::Block => self.rect(x, y, w, ch, cursor_rgb),
+                    CursorShape::Bar => self.rect(x, y, (cw / 5).max(2), ch, cursor_rgb),
                     CursorShape::Underline => {
                         let h = (ch / 10).max(2);
-                        self.rect(px(c), py(r) + (ch - h) as i32, w, h, pal.cursor);
+                        self.rect(x, y + (ch - h) as i32, w, h, cursor_rgb);
                     }
                 }
             }
+            let on_cursor = on_cursor(cursor_rgb, pal);
 
             for r in 0..rows {
                 for c in 0..cols {
@@ -359,14 +373,15 @@ mod gpu {
                         cl.fg = super::toward(cl.fg, cl.bg);
                         cl.ul = super::toward(cl.ul, cl.bg);
                     }
-                    let under_block = cursor.is_some_and(|(cc, cr, s)| {
-                        (usize::from(cc), usize::from(cr)) == (c, r) && s == CursorShape::Block
-                    });
+                    let under_block = !hollow
+                        && cursor.is_some_and(|(cc, cr, s)| {
+                            (usize::from(cc), usize::from(cr)) == (c, r) && s == CursorShape::Block
+                        });
                     // Selected text is drawn in the theme's colour, so
                     // text close to its background shows before it is
                     // copied.
                     let fg = if under_block {
-                        pal.bg
+                        on_cursor
                     } else if selected(c, r) {
                         pal.fg
                     } else if cl.attrs & attr::DIM != 0 {
@@ -658,6 +673,22 @@ mod gpu {
         q.size = [(right - left) as u16, (bottom - top) as u16];
     }
 
+    /// Text on a block cursor of colour `cursor`: the background colour,
+    /// unless the cursor is closer to it than to the foreground, as one a
+    /// program chose can be.
+    fn on_cursor(cursor: u32, pal: &Palette) -> u32 {
+        let luma = |c: u32| {
+            let [_, r, g, b] = c.to_be_bytes();
+            2 * u32::from(r) + 5 * u32::from(g) + u32::from(b)
+        };
+        let l = luma(cursor);
+        if l.abs_diff(luma(pal.bg)) >= l.abs_diff(luma(pal.fg)) {
+            pal.bg
+        } else {
+            pal.fg
+        }
+    }
+
     /// The colour halfway between two `0xRRGGBB` colours.
     fn mix(a: u32, b: u32) -> u32 {
         let [_, ar, ag, ab] = a.to_be_bytes();
@@ -933,7 +964,7 @@ mod gpu {
                 if *id == web {
                     r.snapshot(snap, &pal, rect.x, rect.y);
                 } else {
-                    r.dimmed(snap, &pal, rect.x, rect.y);
+                    r.unfocused(snap, &pal, rect.x, rect.y, true);
                 }
             }
             r.chrome(&chrome);
@@ -1081,7 +1112,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn render_warp_unfocused_pane_hides_cursor_and_selection() {
+    fn render_warp_unfocused_pane_hollows_cursor_and_hides_selection() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}  ", 3, 1, &p);
@@ -1091,7 +1122,7 @@ mod tests {
         let (w, h) = (3 * cw, ch);
         let t = r.gpu.offscreen(w, h).expect("target");
         r.begin();
-        r.dimmed(&snap, &p, 0, 0);
+        r.unfocused(&snap, &p, 0, 0, true);
         r.draw(&t.rtv, w, h, p.bg).expect("draw");
         let px = r.gpu.read(&t).expect("read");
         let mid = ch / 2;
@@ -1100,7 +1131,7 @@ mod tests {
             toward(p.fg, p.bg),
             "text dimmed"
         );
-        assert_eq!(pixel(&px, w, cw + cw / 2, mid), p.bg, "no cursor");
+        assert_eq!(pixel(&px, w, cw + cw / 2, mid), p.bg, "a hollow cursor");
         assert_eq!(pixel(&px, w, 2 * cw + cw / 2, mid), p.bg, "no selection");
         // The same snapshot with focus shows both.
         r.begin();
@@ -1305,6 +1336,40 @@ mod tests {
         // The wide character's ink reaches into its second cell.
         let ink = (0..ch).any(|y| (2 * cw..3 * cw).any(|x| at(x, y) != p.bg));
         assert!(ink, "wide glyph spans two cells");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_program_cursor_colour_and_hollow_cursor() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let (cw, ch) = r.cell();
+        let (w, h) = (2 * cw, ch);
+        let target = r.gpu.offscreen(w, h).expect("target");
+        let mut snap = text_snapshot("\u{2588}", 2, 1, &p);
+        // Too close to the background to carry text.
+        let dark = 0x202020;
+        snap.cursor_color = Some(dark);
+        let mut frame = |col, hollow| {
+            snap.cursor = Some((col, 0, vt::CursorShape::Block));
+            r.begin();
+            if hollow {
+                r.unfocused(&snap, &p, 0, 0, false);
+            } else {
+                r.snapshot(&snap, &p, 0, 0);
+            }
+            r.draw(&target.rtv, w, h, p.bg).expect("draw");
+            let px = r.gpu.read(&target).expect("read");
+            move |x: u32, y: u32| {
+                let i = ((y * w + x) * 4) as usize;
+                u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+            }
+        };
+        assert_eq!(frame(1, false)(cw + cw / 2, ch / 2), dark);
+        assert_eq!(frame(0, false)(cw / 2, ch / 2), p.fg, "text on it");
+        let at = frame(1, true);
+        assert_eq!(at(cw + cw / 2, ch / 2), p.bg, "hollow");
+        assert_eq!((at(cw, 0), at(2 * cw - 1, ch - 1)), (dark, dark));
     }
 
     #[cfg(windows)]

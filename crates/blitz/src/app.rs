@@ -2637,7 +2637,8 @@ impl App {
                         continue;
                     };
                     let dim = dimmed.contains(&v.pane.id);
-                    g.r.grid(&v.snap, &pal, at.x, at.y, dim, scenery.is_none());
+                    let hollow = dim || !self.focused;
+                    g.r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
                     if let Some(n) = &v.notice {
                         draw_notice(&mut g.r, &pal, at, v.grid, n);
                     }
@@ -3229,6 +3230,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
                 }
+                // The cursor is hollow while the window is in the background.
+                self.request_redraw();
                 let mut out = Vec::new();
                 vt::encode_focus(f, &self.modes(), &mut out);
                 self.send(out);
