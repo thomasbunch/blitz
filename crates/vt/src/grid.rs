@@ -293,6 +293,16 @@ pub struct Grid {
     cols: u16,
     lines: u16,
     max_scrollback: usize,
+    /// Rows dropped off the top so far; see [`Grid::dropped`].
+    dropped: usize,
+}
+
+/// One match of [`Grid::find`]: its first and last cell as (line, column),
+/// inclusive. A wide character's last cell is its right half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Found {
+    pub start: (usize, u16),
+    pub end: (usize, u16),
 }
 
 impl Grid {
@@ -303,6 +313,7 @@ impl Grid {
             cols,
             lines,
             max_scrollback,
+            dropped: 0,
         }
     }
 
@@ -344,6 +355,88 @@ impl Grid {
                 Some((x as u16, y))
             })
             .unwrap_or((0, 0))
+    }
+
+    /// Rows dropped off the top of the scrollback so far. Row `i` of
+    /// [`Self::line`] is line `dropped() + i`, a number that stays with
+    /// the row while output scrolls it up and older rows drop away.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Every place `query` appears, oldest first. Rows joined by soft wraps
+    /// are searched as one line, so a match can run from one into the
+    /// next. Case is ignored unless the query has a capital letter. Matches
+    /// do not overlap.
+    // ponytail: plain substring, regex if asked
+    pub fn find(&self, query: &str) -> Vec<Found> {
+        let exact = query.chars().any(char::is_uppercase);
+        let fold = |c: char| if exact { c } else { lower(c) };
+        let needle: Vec<char> = query.chars().map(fold).collect();
+        let n = needle.len();
+        let mut out = Vec::new();
+        if n == 0 {
+            return out;
+        }
+        // The line so far: its text, the column each character came from,
+        // and where in the text each of its rows starts.
+        let mut text: Vec<char> = Vec::new();
+        let mut cols: Vec<u16> = Vec::new();
+        let mut starts: Vec<(usize, usize)> = Vec::new();
+        let last = self.rows.len() - 1;
+        for (i, row) in self.rows.iter().enumerate() {
+            let wrapped = row.flags & rf::WRAPPED != 0 && i < last;
+            let end = if wrapped {
+                row.cells.len()
+            } else {
+                text_len(&row.cells)
+            };
+            starts.push((text.len(), i));
+            for (x, c) in row.cells[..end].iter().enumerate() {
+                if c.has(cf::SPACER_TAIL | cf::SPACER_HEAD) {
+                    continue;
+                }
+                let ch = match c.cp {
+                    0 => ' ',
+                    cp => char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
+                };
+                text.push(fold(ch));
+                cols.push(x as u16);
+                if c.has(cf::GRAPHEME) {
+                    for g in row.grapheme(x as u16).unwrap_or_default().chars() {
+                        text.push(fold(g));
+                        cols.push(x as u16);
+                    }
+                }
+            }
+            if wrapped {
+                continue;
+            }
+            let cell = |k: usize| {
+                let r = starts[starts.partition_point(|s| s.0 <= k) - 1].1;
+                (r, cols[k])
+            };
+            let mut k = 0;
+            while k + n <= text.len() {
+                if text[k] != needle[0] || text[k + 1..k + n] != needle[1..] {
+                    k += 1;
+                    continue;
+                }
+                let (start, (r, mut x)) = (cell(k), cell(k + n - 1));
+                if self.rows[r].cells[usize::from(x)].has(cf::WIDE) {
+                    x += 1;
+                }
+                out.push(Found {
+                    start: (self.dropped + start.0, start.1),
+                    end: (self.dropped + r, x),
+                });
+                k += n;
+            }
+            text.clear();
+            cols.clear();
+            starts.clear();
+        }
+        out
     }
 
     /// Every cell, scrollback included.
@@ -398,11 +491,13 @@ impl Grid {
     /// Drops all scrollback, keeping the rows for reuse.
     pub fn clear_scrollback(&mut self) {
         let n = self.scrollback_len();
+        self.dropped += n;
         self.pool.extend(self.rows.drain(..n));
     }
 
     fn trim(&mut self) {
         let excess = self.scrollback_len().saturating_sub(self.max_scrollback);
+        self.dropped += excess;
         self.pool.extend(self.rows.drain(..excess));
     }
 
@@ -455,11 +550,6 @@ impl Grid {
         let old = std::mem::take(&mut self.rows);
         let last = old.len() - 1;
         self.cols = cols;
-        let text_len = |cells: &[Cell]| {
-            (cells.iter())
-                .rposition(|c| c.cp != 0 || c.flags != 0)
-                .map_or(0, |t| t + 1)
-        };
         let mut out = VecDeque::with_capacity(old.len());
         let mut at = (0, 0);
         let mut line = Vec::new();
@@ -567,6 +657,25 @@ impl Grid {
         };
         (self.rows.capacity() + self.pool.capacity()) * size_of::<Row>()
             + self.rows.iter().chain(&self.pool).map(row).sum::<usize>()
+    }
+}
+
+/// Cells up to the last one that was ever written.
+fn text_len(cells: &[Cell]) -> usize {
+    (cells.iter())
+        .rposition(|c| c.cp != 0 || c.flags != 0)
+        .map_or(0, |t| t + 1)
+}
+
+/// `c` in lower case, when that is a single character.
+fn lower(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    let mut l = c.to_lowercase();
+    match (l.next(), l.next()) {
+        (Some(l), None) => l,
+        _ => c,
     }
 }
 
@@ -780,5 +889,54 @@ mod tests {
         assert_eq!(g.scrollback_len(), 10_000);
         let used = g.bytes_used();
         assert!(used <= 10 << 20, "{used} bytes");
+    }
+
+    #[test]
+    fn find_covers_both_halves_of_a_wide_character() {
+        let mut g = Grid::new(6, 1, 0);
+        let wide = Cell {
+            cp: '中' as u32,
+            style: 0,
+            flags: cf::WIDE,
+        };
+        g.row_mut(0).put_ascii(0, b"a", 0);
+        g.row_mut(0).put(1, wide);
+        g.row_mut(0).put_ascii(3, b"b", 0);
+        let found = g.find("中b");
+        assert_eq!(
+            found,
+            [Found {
+                start: (0, 1),
+                end: (0, 3)
+            }]
+        );
+        assert_eq!(g.find("a中")[0].end, (0, 2));
+    }
+
+    /// The scan the find bar runs on every keystroke, over the largest
+    /// scrollback the settings allow, at a width few windows reach.
+    #[test]
+    fn find_scans_100k_rows_of_200_columns_quickly() {
+        let mut g = Grid::new(200, 50, 100_000);
+        let line: Vec<u8> = (0..200)
+            .map(|i| b"lorem ipsum dolor sit amet, "[i % 28])
+            .collect();
+        for i in 0..100_050 {
+            g.row_mut(49).put_ascii(0, &line, 0);
+            if i % 1000 == 0 {
+                g.row_mut(49).put_ascii(0, b"needle", 0);
+            }
+            g.scroll_up(0, 49, 1, Cell::default(), true);
+        }
+        let t = std::time::Instant::now();
+        let found = g.find("needle");
+        let rare = t.elapsed();
+        let t = std::time::Instant::now();
+        let common = g.find("e").len();
+        let one_letter = t.elapsed();
+        eprintln!("100k x 200 scan: {rare:?} for a rare word, {one_letter:?} for {common} matches");
+        // The first needle went with the oldest rows.
+        assert_eq!(found.len(), 100);
+        assert!(rare.as_secs() < 5, "{rare:?}");
     }
 }

@@ -1,5 +1,6 @@
 //! A resolved, render-ready copy of the visible screen.
 
+use crate::grid::Found;
 use crate::style::Color;
 
 /// Colours as `0xRRGGBB`.
@@ -82,6 +83,16 @@ pub enum CursorShape {
     Underline,
 }
 
+/// A search match to mark on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Highlight {
+    /// First and last (column, row), inclusive.
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+    /// The current match, marked more strongly than the rest.
+    pub current: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub cols: u16,
@@ -97,6 +108,43 @@ pub struct Snapshot {
     pub alt_screen: bool,
     /// Start and end (column, row), inclusive.
     pub selection: Option<((u16, u16), (u16, u16))>,
+    /// The first row's line, numbered as [`crate::grid::Grid::dropped`]
+    /// numbers them.
+    pub top: usize,
+    /// Search matches to mark, in reading order.
+    pub highlights: Vec<Highlight>,
+}
+
+impl Snapshot {
+    /// Sets [`Self::highlights`] to the matches of `found` that show, with
+    /// match `cur` as the current one. `found` is in order, as
+    /// [`crate::grid::Grid::find`] gives it.
+    pub fn highlight(&mut self, found: &[Found], cur: Option<usize>) {
+        self.highlights.clear();
+        let (top, bottom) = (self.top, self.top + usize::from(self.rows));
+        let last = (self.cols.saturating_sub(1), self.rows.saturating_sub(1));
+        let row = |line: usize| (line - top) as u16;
+        let first = found.partition_point(|f| f.end.0 < top);
+        for (i, f) in found.iter().enumerate().skip(first) {
+            if f.start.0 >= bottom {
+                break;
+            }
+            // A match can run off the top or the bottom of the view.
+            let start = match f.start {
+                (line, x) if line >= top => (x, row(line)),
+                _ => (0, 0),
+            };
+            let end = match f.end {
+                (line, x) if line < bottom => (x, row(line)),
+                _ => last,
+            };
+            self.highlights.push(Highlight {
+                start,
+                end,
+                current: Some(i) == cur,
+            });
+        }
+    }
 }
 
 #[cfg(test)]

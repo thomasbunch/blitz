@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::time::Instant;
 
-use crate::grid::{Cell, Grid, Row, cf, rf};
+use crate::grid::{Cell, Found, Grid, Row, cf, rf};
 use crate::modes::{InputModes, KittyStack, Modes};
 use crate::osc::{self, Osc9};
 use crate::parser::{Handler, Params, Parser};
@@ -293,6 +293,26 @@ impl Terminal {
         self.viewport = v;
     }
 
+    /// The line at the top of the view, numbered as [`Grid::dropped`]
+    /// numbers them.
+    pub fn view_top(&self) -> usize {
+        let g = &self.screen.grid;
+        g.dropped() + g.scrollback_len() - self.viewport
+    }
+
+    /// Scrolls the view so `line` is at its top, or as close as it gets.
+    pub fn scroll_to(&mut self, line: usize) {
+        let g = &self.screen.grid;
+        let v = (g.dropped() + g.scrollback_len()).saturating_sub(line);
+        self.scroll_viewport(v.min(g.scrollback_len()) as isize - self.viewport as isize);
+    }
+
+    /// Where `query` appears on the screen shown and, on the main screen,
+    /// in its scrollback; see [`Grid::find`].
+    pub fn find(&self, query: &str) -> Vec<Found> {
+        self.screen.grid.find(query)
+    }
+
     pub fn input_modes(&self) -> InputModes {
         InputModes {
             kitty: self.kitty().flags(),
@@ -359,6 +379,7 @@ impl Terminal {
         out.wrapped.clear();
         let g = &self.screen.grid;
         let first = g.scrollback_len().saturating_sub(self.viewport);
+        out.top = g.dropped() + first;
         let empty = Row::default();
         for i in first..first + rows as usize {
             let row = g.line(i).unwrap_or(&empty);
