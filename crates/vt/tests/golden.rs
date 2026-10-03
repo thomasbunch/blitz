@@ -416,11 +416,53 @@ fn resize_keeps_the_cursor_row() {
 
 #[test]
 fn joiner_after_a_resize_starts_fresh() {
-    // The last cluster sat past the new width on a row that moved up.
+    // The last cluster's cell moved when its row rewrapped.
     let mut t = run(10, 4, "\x1b[4;9Hp");
     t.resize(5, 2);
     feed(&mut t, "\u{200d}\u{301}x");
-    assert_eq!(t.screen_text(), "\n    x");
+    assert_eq!(t.screen_text(), "\n   px");
+}
+
+#[test]
+fn resize_rewraps_the_main_screen() {
+    let mut t = run(5, 3, "abcdefghij\r\n$ ");
+    t.resize(10, 3);
+    assert_eq!(t.screen_text(), "abcdefghij\n$\n");
+    assert_eq!(t.cursor(), (2, 1, true));
+    t.resize(4, 3);
+    assert_eq!(t.scrollback_text(), "abcd");
+    assert_eq!(t.screen_text(), "efgh\nij\n$");
+    assert_eq!(t.cursor(), (2, 2, true));
+    feed(&mut t, "x");
+    assert_eq!(t.screen_text(), "efgh\nij\n$ x");
+}
+
+#[test]
+fn resize_rewraps_past_a_pending_wrap() {
+    let mut t = run(5, 2, "abcde");
+    t.resize(8, 2);
+    assert_eq!(t.cursor(), (5, 0, true));
+    feed(&mut t, "f");
+    assert_eq!(t.screen_text(), "abcdef\n");
+}
+
+#[test]
+fn resize_rewraps_wide_characters_whole() {
+    let mut t = run(5, 2, "abcd中");
+    assert_eq!(t.screen_text(), "abcd\n中");
+    t.resize(6, 2);
+    assert_eq!(t.screen_text(), "abcd中\n");
+    t.resize(5, 2);
+    assert_eq!(t.screen_text(), "abcd\n中");
+    assert_eq!(t.cursor(), (2, 1, true));
+}
+
+#[test]
+fn resize_rewraps_the_main_screen_under_the_alternate_one() {
+    let mut t = run(5, 3, "abcdefg\x1b[?1049hALT-SCREEN");
+    t.resize(10, 3);
+    feed(&mut t, "\x1b[?1049lX");
+    assert_eq!(t.screen_text(), "abcdefgX\n\n");
 }
 
 #[test]

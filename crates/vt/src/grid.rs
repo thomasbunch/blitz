@@ -418,6 +418,108 @@ impl Grid {
         y
     }
 
+    /// Rewraps every row at a new width, keeping the line count: rows
+    /// joined by soft wraps split again at `cols`. Blank space past a
+    /// line's text is kept only up to the end of its last new row. `cur`
+    /// is the cursor's screen column, row and pending wrap; returns where
+    /// it lands. Blank rows below the cursor go before rows above it move
+    /// into scrollback. Needs `cols >= 2` so a wide character fits a row.
+    // ponytail: walks all scrollback on each width change; rows whose line
+    // already fits are moved, not copied.
+    pub fn reflow(&mut self, cols: u16, cur: (u16, u16, bool)) -> (u16, u16, bool) {
+        let new = usize::from(cols);
+        let cy = self.scrollback_len() + usize::from(cur.1);
+        let old = std::mem::take(&mut self.rows);
+        let last = old.len() - 1;
+        self.cols = cols;
+        let text_len = |cells: &[Cell]| {
+            (cells.iter())
+                .rposition(|c| c.cp != 0 || c.flags != 0)
+                .map_or(0, |t| t + 1)
+        };
+        let mut out = VecDeque::with_capacity(old.len());
+        let mut at = (0, 0);
+        let mut line = Vec::new();
+        let mut graphemes = Vec::new();
+        let mut cursor = None;
+        for (i, mut row) in old.into_iter().enumerate() {
+            let wrapped = row.flags & rf::WRAPPED != 0 && i < last;
+            if line.is_empty() && !wrapped && i != cy && text_len(&row.cells) <= new {
+                row.flags = 0;
+                row.set_width(cols);
+                out.push_back(row);
+                continue;
+            }
+            for (x, c) in row.cells.iter().enumerate() {
+                if i == cy && x == usize::from(cur.0) {
+                    cursor = Some(line.len());
+                }
+                // Left where a wide character did not fit; placed anew below.
+                if c.has(cf::SPACER_HEAD) {
+                    continue;
+                }
+                if c.has(cf::GRAPHEME) {
+                    let g = row.grapheme(x as u16).unwrap_or_default();
+                    graphemes.push((line.len(), g.to_string()));
+                }
+                line.push(*c);
+            }
+            self.pool.push(row);
+            if wrapped {
+                continue;
+            }
+            let len = text_len(&line);
+            let keep = line.len().min(len.div_ceil(new).max(1) * new).max(len);
+            line.resize(keep.max(cursor.map_or(0, |c| c + 1)), Cell::default());
+            let mut row = self.fresh(Cell::default());
+            let mut x = 0;
+            for (k, &c) in line.iter().enumerate() {
+                if x == new || (c.has(cf::WIDE) && x + 1 == new) {
+                    if x < new {
+                        row.cells[x].flags = cf::SPACER_HEAD;
+                    }
+                    row.flags |= rf::WRAPPED;
+                    let next = self.fresh(Cell::default());
+                    out.push_back(std::mem::replace(&mut row, next));
+                    x = 0;
+                }
+                row.cells[x] = c;
+                if let Some(g) = graphemes.iter_mut().find(|g| g.0 == k) {
+                    let ex = row.extra.get_or_insert_with(Default::default);
+                    ex.graphemes.push((x as u16, std::mem::take(&mut g.1)));
+                }
+                if cursor == Some(k) {
+                    at = (out.len(), x);
+                }
+                x += 1;
+            }
+            out.push_back(row);
+            line.clear();
+            graphemes.clear();
+            cursor = None;
+        }
+
+        let (mut x, mut pending) = (at.1, cur.2);
+        if pending && x + 1 < new {
+            (x, pending) = (x + 1, false);
+        }
+        let lines = usize::from(self.lines);
+        let blank = |r: &Row| r.cells.iter().all(|c| c.cp == 0 && c.flags == 0);
+        while out.len() > lines && out.len() - 1 > at.0 && out.back().is_some_and(blank) {
+            self.pool.extend(out.pop_back());
+        }
+        while out.len() < lines {
+            out.push_back(self.fresh(Cell::default()));
+        }
+        let top = (out.len() - lines).min(at.0);
+        while out.len() > top + lines {
+            self.pool.extend(out.pop_back());
+        }
+        self.rows = out;
+        self.trim();
+        (x as u16, (at.0 - top) as u16, pending)
+    }
+
     /// Heap bytes held by rows, scrollback and the pool.
     pub fn bytes_used(&self) -> usize {
         let row = |r: &Row| {

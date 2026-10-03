@@ -109,8 +109,9 @@ fn cursor_position_reports() {
         ..Options::default()
     });
     assert_eq!(ask_on(&mut t, "0123456789\x1b[6n"), "\x1b[1;10R");
+    // The row rewraps in two at the new width.
     t.resize(5, 3);
-    assert_eq!(ask_on(&mut t, "\x1b[6n"), "\x1b[1;5R", "after a resize");
+    assert_eq!(ask_on(&mut t, "\x1b[6n"), "\x1b[2;5R", "after a resize");
 }
 
 #[test]
