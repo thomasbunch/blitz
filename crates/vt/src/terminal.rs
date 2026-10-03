@@ -280,8 +280,10 @@ impl Terminal {
     /// Scrolls the view of the main screen; positive is up into scrollback.
     pub fn scroll_viewport(&mut self, delta: isize) {
         let max = self.screen.grid.scrollback_len();
-        self.viewport = self.viewport.saturating_add_signed(delta).min(max);
-        self.changed = true;
+        let v = self.viewport.saturating_add_signed(delta).min(max);
+        // Every keystroke asks to follow the cursor; only a move redraws.
+        self.changed |= v != self.viewport;
+        self.viewport = v;
     }
 
     pub fn input_modes(&self) -> InputModes {
@@ -307,6 +309,16 @@ impl Terminal {
     /// the host should look again once it times out.
     pub fn sync_pending(&self, now: Instant) -> bool {
         self.modes.sync_pending(now)
+    }
+
+    /// Something changed since the last [`Self::snapshot`] took the screen.
+    pub fn is_changed(&self) -> bool {
+        self.changed
+    }
+
+    /// When the open synchronized update times out, if one is open.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.modes.sync.map(|t| t + crate::modes::SYNC_TIMEOUT)
     }
 
     /// Fills `out` with the visible screen. Returns whether anything changed
@@ -1132,10 +1144,30 @@ fn ext_color(v: &[u16], i: usize, subs: usize) -> (Option<Color>, usize) {
 impl Handler for Terminal {
     fn print(&mut self, s: &str) {
         self.changed = true;
-        if s.is_ascii() && self.cur.charsets[self.cur.gl] == Charset::Ascii {
-            self.print_ascii(s.as_bytes());
-        } else {
-            s.chars().for_each(|c| self.print_char(c));
+        if self.cur.charsets[self.cur.gl] != Charset::Ascii {
+            return s.chars().for_each(|c| self.print_char(c));
+        }
+        // ASCII never joins the cluster before it (only a prepend mark could
+        // take it, and those never get into a cluster), so ASCII stretches,
+        // even in mixed text, take the bulk path.
+        if s.is_ascii() {
+            return self.print_ascii(s.as_bytes());
+        }
+        let mut rest = s.as_bytes();
+        while !rest.is_empty() {
+            let n = rest
+                .iter()
+                .position(|b| !b.is_ascii())
+                .unwrap_or(rest.len());
+            let (ascii, tail) = rest.split_at(n);
+            if !ascii.is_empty() {
+                self.print_ascii(ascii);
+            }
+            let m = tail.iter().position(u8::is_ascii).unwrap_or(tail.len());
+            // Both ends of `tail[..m]` sit on character boundaries.
+            let other = std::str::from_utf8(&tail[..m]).unwrap_or_default();
+            other.chars().for_each(|c| self.print_char(c));
+            rest = &tail[m..];
         }
     }
 

@@ -180,6 +180,8 @@ pub struct Counters {
     /// From start-up to the first frame on screen.
     pub first_present_ms: Option<f64>,
     pub frames: u64,
+    /// Time spent building frames, waits for vsync left out.
+    pub frame_cpu_ms: f64,
     /// Times the UI thread woke up.
     pub wakeups: u64,
     /// Running on the system's ConPTY rather than the bundled one.
@@ -191,11 +193,12 @@ impl Counters {
         let ms = |v: Option<f64>| v.map_or_else(|| "null".to_owned(), |v| format!("{v:.1}"));
         format!(
             "{{\"first_pty_byte_ms\":{},\"first_post_prelude_ms\":{},\"first_present_ms\":{},\
-             \"frames\":{},\"wakeups\":{},\"inbox\":{}}}",
+             \"frames\":{},\"frame_cpu_ms\":{:.1},\"wakeups\":{},\"inbox\":{}}}",
             ms(self.first_pty_byte_ms),
             ms(self.first_post_prelude_ms),
             ms(self.first_present_ms),
             self.frames,
+            self.frame_cpu_ms,
             self.wakeups,
             self.inbox,
         )
@@ -1354,7 +1357,7 @@ mod tests {
         assert_eq!(
             c.to_json(),
             "{\"first_pty_byte_ms\":13.0,\"first_post_prelude_ms\":40.0,\"first_present_ms\":null,\
-             \"frames\":3,\"wakeups\":0,\"inbox\":false}"
+             \"frames\":3,\"frame_cpu_ms\":0.0,\"wakeups\":0,\"inbox\":false}"
         );
     }
 

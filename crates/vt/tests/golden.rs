@@ -334,6 +334,17 @@ fn combining_marks_and_line_drawing() {
     assert_eq!(t.cursor(), (7, 0, true));
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "e\u{301}");
 
+    // Marks after an ASCII stretch of mixed text still join its last
+    // character.
+    let mut t = run(10, 1, "ab\u{301}c \u{2500}x\u{301}");
+    assert_eq!(t.screen_text(), "ab\u{301}c \u{2500}x\u{301}");
+    assert_eq!(t.cursor(), (6, 0, true));
+    let s = snap(&mut t);
+    assert_eq!(
+        (text(&cell(&s, 1, 0)), text(&cell(&s, 5, 0))),
+        ("b\u{301}", "x\u{301}")
+    );
+
     let mut t = run(10, 2, "\u{1F468}\u{200D}\u{1F469}!");
     assert_eq!(t.screen_text(), "\u{1F468}\u{200D}\u{1F469}!\n");
     assert_eq!(t.cursor(), (3, 0, true));

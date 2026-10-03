@@ -97,17 +97,19 @@ pub fn text_snapshot(text: &str, cols: u16, rows: u16, pal: &Palette) -> Snapsho
 /// Draws a pane without focus at reduced contrast: each cell's text moves a
 /// quarter of the way to its background. The cursor is hidden.
 pub fn dim(snap: &mut Snapshot) {
-    let toward = |fg: u32, bg: u32| {
-        let ch = |s: u32| {
-            let (f, b) = ((fg >> s & 0xff) as i32, (bg >> s & 0xff) as i32);
-            ((b + (f - b) * 3 / 4) as u32) << s
-        };
-        ch(16) | ch(8) | ch(0)
-    };
     for c in &mut snap.cells {
         c.fg = toward(c.fg, c.bg);
     }
     snap.cursor = None;
+}
+
+/// `fg` a quarter of the way to `bg`.
+fn toward(fg: u32, bg: u32) -> u32 {
+    let ch = |s: u32| {
+        let (f, b) = ((fg >> s & 0xff) as i32, (bg >> s & 0xff) as i32);
+        ((b + (f - b) * 3 / 4) as u32) << s
+    };
+    ch(16) | ch(8) | ch(0)
 }
 
 /// `blitz debug render`: renders a terminal screen offscreen and writes it
@@ -178,9 +180,13 @@ mod gpu {
 
     impl Renderer {
         pub fn new(warp: bool, px: f32) -> Result<Self> {
+            Self::with_gpu(Gpu::new(warp)?, px)
+        }
+
+        /// [`Self::new`] on a device made elsewhere.
+        pub fn with_gpu(mut gpu: Gpu, px: f32) -> Result<Self> {
             let font = Font::new(DEFAULT_FAMILIES, px)?;
             let small = Font::new(DEFAULT_FAMILIES, px * CHROME_TEXT)?;
-            let mut gpu = Gpu::new(warp)?;
             gpu.set_text_params(font.gamma, font.contrast);
             Ok(Self {
                 gpu,
@@ -251,6 +257,16 @@ mod gpu {
         /// the palette), except that dim text is drawn halfway to its
         /// background.
         pub fn snapshot(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
+            self.grid(snap, pal, x, y, false);
+        }
+
+        /// [`Self::snapshot`] as [`dim`] would leave it, without copying
+        /// the snapshot.
+        pub fn dimmed(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
+            self.grid(snap, pal, x, y, true);
+        }
+
+        fn grid(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32, dim: bool) {
             let (cw, ch) = self.cell();
             let (cols, rows) = (usize::from(snap.cols), usize::from(snap.rows));
             let blank = RenderCell {
@@ -260,8 +276,9 @@ mod gpu {
                 ..RenderCell::default()
             };
             let cell = |c: usize, r: usize| *snap.cells.get(r * cols + c).unwrap_or(&blank);
+            let selection = snap.selection.filter(|_| !dim);
             let selected = |c: usize, r: usize| {
-                snap.selection.is_some_and(|(a, b)| {
+                selection.is_some_and(|(a, b)| {
                     let (a, b) = if (a.1, a.0) <= (b.1, b.0) {
                         (a, b)
                     } else {
@@ -299,7 +316,7 @@ mod gpu {
 
             let cursor = snap
                 .cursor
-                .filter(|&(c, r, _)| c < snap.cols && r < snap.rows);
+                .filter(|&(c, r, _)| !dim && c < snap.cols && r < snap.rows);
             if let Some((c, r, shape)) = cursor {
                 let (c, r) = (usize::from(c), usize::from(r));
                 let w = u32::from(cell(c, r).width.max(1)) * cw;
@@ -315,7 +332,10 @@ mod gpu {
 
             for r in 0..rows {
                 for c in 0..cols {
-                    let cl = cell(c, r);
+                    let mut cl = cell(c, r);
+                    if dim {
+                        cl.fg = super::toward(cl.fg, cl.bg);
+                    }
                     let under_block = cursor.is_some_and(|(cc, cr, s)| {
                         (usize::from(cc), usize::from(cr)) == (c, r) && s == CursorShape::Block
                     });

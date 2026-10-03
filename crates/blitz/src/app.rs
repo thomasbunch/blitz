@@ -41,7 +41,7 @@ use crate::keymap::{self, Action};
 use crate::layout::{self, Dir, PaneId, Rect, Tab};
 use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
 use crate::render::chrome::{self, ChromeModel};
-use crate::render::d3d11::{Swapchain, is_device_lost};
+use crate::render::d3d11::{Gpu, Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
 use crate::session::{self, Geometry, PaneMeta};
 use crate::theme::Theme;
@@ -161,6 +161,9 @@ pub fn run(args: &[String]) -> i32 {
     {
         return 0;
     }
+    // Loading the graphics driver is most of the time to the first
+    // frame; it runs while the window is made.
+    let gpu = std::thread::spawn(|| Gpu::new(false));
     let keys = Rc::new(RefCell::new(Keys::default()));
     let hook_keys = keys.clone();
     let mut builder = EventLoop::<UserEvent>::with_user_event();
@@ -177,6 +180,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let mut app = App::new(args, keys, event_loop.create_proxy());
+    app.gpu = Some(gpu);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("blitz: {e}");
         return 1;
@@ -357,6 +361,9 @@ struct View {
     /// A restored Claude Code session: the line to type at the shell's
     /// first prompt, and when to type it anyway.
     resume: Option<(String, Instant)>,
+    /// When the program's open synchronized update times out, as of the
+    /// last look at its terminal.
+    sync_until: Option<Instant>,
 }
 
 struct App {
@@ -414,6 +421,8 @@ struct App {
     /// The terminal a running self-test reads: the focused pane's.
     watched: Option<Arc<selftest::Focus>>,
     started: Instant,
+    /// The device started at launch, until the first renderer takes it.
+    gpu: Option<std::thread::JoinHandle<windows::core::Result<Gpu>>>,
     counters: Counters,
     code: i32,
 }
@@ -526,6 +535,7 @@ impl App {
             placed: Geometry::default(),
             watched: None,
             started: Instant::now(),
+            gpu: None,
             counters: Counters::default(),
             code: 0,
         }
@@ -742,6 +752,7 @@ impl App {
             flashed: None,
             finding_branch: false,
             resume: None,
+            sync_until: None,
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
@@ -1096,7 +1107,12 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let built = Renderer::new(false, self.font_px()).and_then(|r| {
+        let early = self.gpu.take().and_then(|h| h.join().ok()?.ok());
+        let built = match early {
+            Some(gpu) => Renderer::with_gpu(gpu, self.font_px()),
+            None => Renderer::new(false, self.font_px()),
+        };
+        let built = built.and_then(|r| {
             let hwnd = HWND(self.hwnd as *mut c_void);
             let chain = Swapchain::new(&r.gpu, hwnd, size.width, size.height)?;
             Ok(Gfx { r, chain })
@@ -1424,7 +1440,13 @@ impl App {
             Note::Dirty => {
                 v.pane.dirty.store(false, Ordering::Release);
                 let mut events = Vec::new();
-                lock(&v.pane.term).take_events(&mut events);
+                let mut term = lock(&v.pane.term);
+                term.take_events(&mut events);
+                v.sync_until = term.sync_deadline();
+                drop(term);
+                // Output in a hidden tab only matters for what it tells
+                // the sidebar.
+                let shown = v.rect.is_some() || !events.is_empty();
                 for e in events {
                     self.on_term_event(id, e);
                 }
@@ -1436,7 +1458,9 @@ impl App {
                         self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
                     }
                 }
-                self.request_redraw();
+                if shown {
+                    self.request_redraw();
+                }
             }
             Note::Exit(code) => {
                 v.pane.exit_code = Some(code);
@@ -1706,8 +1730,9 @@ impl App {
         self.mouse.pos = pos;
         if let Some(anchor) = self.mouse.anchor {
             let here = self.cell_at(pos);
-            if self.selection.is_some() || here != anchor {
-                self.selection = Some((anchor, here));
+            let sel = Some((anchor, here));
+            if (self.selection.is_some() || here != anchor) && self.selection != sel {
+                self.selection = sel;
                 self.request_redraw();
             }
             return;
@@ -1775,9 +1800,14 @@ impl App {
             return;
         }
         self.ensure_gfx();
-        if self.gfx.is_none() {
+        let Some(g) = &self.gfx else {
             return;
-        }
+        };
+        // Wait for the swap chain before reading the panes, so the frame
+        // shows output that arrived during the wait.
+        g.chain.wait(100);
+        let started = Instant::now();
+        let mut waited = Duration::ZERO;
         let (cw, ch) = self.cell();
         let focus = self.focus_id();
         let cursor = self.current().map(|v| lock(&v.pane.term).cursor());
@@ -1807,16 +1837,15 @@ impl App {
             }
             v.rect = Some(rect);
             let sel = self.selection.filter(|_| Some(id) == focus);
-            if !refresh(&mut lock(&v.pane.term), &mut v.snap, &self.theme.pal, sel) {
+            let mut term = lock(&v.pane.term);
+            v.sync_until = term.sync_deadline();
+            if !refresh(&mut term, &mut v.snap, &self.theme.pal, sel) {
                 self.selection = None;
             }
             if Some(id) == focus {
                 v.snap.selection = self.selection;
             } else if split {
-                let mut s = v.snap.clone();
-                s.selection = None;
-                crate::render::dim(&mut s);
-                dimmed.push((id, s));
+                dimmed.push(id);
             }
         }
 
@@ -1826,7 +1855,6 @@ impl App {
         };
         let result = (|| {
             g.chain.resize(&g.r.gpu, size.width, size.height)?;
-            g.chain.wait(100);
             for _ in 0..2 {
                 g.r.begin();
                 for v in &self.views {
@@ -1834,8 +1862,11 @@ impl App {
                         continue;
                     };
                     let id = v.pane.id;
-                    let snap = dimmed.iter().find(|d| d.0 == id).map_or(&v.snap, |d| &d.1);
-                    g.r.snapshot(snap, &pal, at.x, at.y);
+                    if dimmed.contains(&id) {
+                        g.r.dimmed(&v.snap, &pal, at.x, at.y);
+                    } else {
+                        g.r.snapshot(&v.snap, &pal, at.x, at.y);
+                    }
                     if let Some(n) = &v.notice {
                         draw_notice(&mut g.r, &pal, at, v.grid, n);
                     }
@@ -1856,8 +1887,12 @@ impl App {
                     eprintln!("blitz: {}: {e}", path.display());
                 }
             }
-            g.chain.present()
+            let t = Instant::now();
+            let shown = g.chain.present();
+            waited += t.elapsed();
+            shown
         })();
+        self.counters.frame_cpu_ms += (started.elapsed() - waited).as_secs_f64() * 1000.0;
         match result {
             Ok(_) => {
                 self.counters.frames += 1;
@@ -1978,11 +2013,12 @@ impl App {
     /// The soonest time something on screen changes by itself.
     fn next_deadline(&self) -> Option<Instant> {
         let now = Instant::now();
-        let sync = self
-            .views
-            .iter()
-            .any(|v| lock(&v.pane.term).sync_pending(now))
-            .then(|| now + vt::modes::SYNC_TIMEOUT);
+        // Hidden panes are drawn when shown, timed out or not.
+        let sync = (self.views.iter())
+            .filter(|v| v.rect.is_some())
+            .filter_map(|v| v.sync_until)
+            .filter(|&t| t > now)
+            .min();
         let notice = self
             .views
             .iter()
@@ -2139,7 +2175,10 @@ fn refresh(
     pal: &Palette,
     sel: Option<((u16, u16), (u16, u16))>,
 ) -> bool {
-    let before = sel.map(|s| selection_text(snap, s));
+    // Only a terminal with news can change the selected text.
+    let before = sel
+        .filter(|_| term.is_changed())
+        .map(|s| selection_text(snap, s));
     !term.snapshot(snap, pal) || sel.map(|s| selection_text(snap, s)) == before
 }
 
@@ -2275,7 +2314,11 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                // Keys queued behind this paint go out before its vsync wait.
+                self.drain_keys(el);
+                self.redraw();
+            }
             WindowEvent::Resized(_) => self.request_redraw(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;

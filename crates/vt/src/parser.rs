@@ -159,6 +159,19 @@ impl Parser {
                 State::Ground => self.ground(h, bytes, i),
                 State::Osc => self.osc_run(h, bytes, i),
                 State::DcsPass | State::DcsIgnore | State::SosPmApc => self.string_run(h, bytes, i),
+                // Parameter bytes are most of every CSI; take them in a run.
+                State::CsiParam => {
+                    let mut i = i;
+                    while let Some(&b @ 0x30..=0x3B) = bytes.get(i) {
+                        self.param(b);
+                        i += 1;
+                    }
+                    if let Some(&b) = bytes.get(i) {
+                        self.byte(h, b);
+                        i += 1;
+                    }
+                    i
+                }
                 _ => {
                     self.byte(h, bytes[i]);
                     i + 1
