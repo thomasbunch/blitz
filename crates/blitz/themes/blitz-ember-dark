@@ -1,0 +1,23 @@
+# blitz ember dark
+# blitz original (MIT)
+background = #16130f
+foreground = #e6dfd2
+cursor-color = #efe7da
+selection-background = #3a3129
+palette = 0=#2a241e
+palette = 1=#e2674f
+palette = 2=#a6b66c
+palette = 3=#e5b25c
+palette = 4=#86a3c2
+palette = 5=#c98ca8
+palette = 6=#82b5a4
+palette = 7=#cfc6b6
+palette = 8=#6e6458
+palette = 9=#f0866d
+palette = 10=#bdcb88
+palette = 11=#f1c97c
+palette = 12=#a0bad6
+palette = 13=#d8a5bd
+palette = 14=#a0cbbd
+palette = 15=#f3ece0
+accent = #f2994a

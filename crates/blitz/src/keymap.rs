@@ -27,6 +27,8 @@ pub enum Action {
     ToggleSidebar,
     /// Install the newer release. Without one the key goes to the program.
     Update,
+    /// Open the theme picker, or close it unchanged.
+    ThemePicker,
 }
 
 const CTRL: u8 = 1;
@@ -59,6 +61,7 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, b'J' as u16, Action::JumpToAttention),
     (CTRL | SHIFT, b'B' as u16, Action::ToggleSidebar),
     (CTRL | SHIFT, b'U' as u16, Action::Update),
+    (CTRL | SHIFT, b'K' as u16, Action::ThemePicker),
 ];
 
 /// The shortcut a key press triggers, if any. Modifiers must match

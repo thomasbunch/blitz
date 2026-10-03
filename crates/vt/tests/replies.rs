@@ -122,7 +122,14 @@ fn device_status() {
 fn theme_query() {
     assert_eq!(ask("\x1b[?996n"), "\x1b[?997;1n");
     let mut t = Terminal::new(opts());
-    t.set_theme(false);
+    let pal = vt::Palette {
+        fg: 0,
+        bg: 0xffffff,
+        cursor: 0,
+        selection_bg: 0,
+        ansi: [0; 16],
+    };
+    t.set_theme(false, &pal);
     assert_eq!(ask_on(&mut t, "\x1b[?996n"), "\x1b[?997;2n");
     t.feed(b"\x1bc");
     assert_eq!(ask_on(&mut t, "\x1b[?996n"), "\x1b[?997;2n", "RIS keeps it");

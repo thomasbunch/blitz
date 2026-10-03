@@ -30,7 +30,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{UserAttentionType, Window, WindowId};
 
 use crate::attention::{Attn, Ev};
-use crate::config::{Config, ThemeMode};
+use crate::config::Config;
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
 use crate::layout::{self, Dir, PaneId, Rect, Tab};
@@ -39,10 +39,17 @@ use crate::render::chrome::{self, ChromeModel};
 use crate::render::d3d11::{Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
 use crate::session::{self, Geometry, PaneMeta};
+use crate::theme::Theme;
 
 const VK_PROCESSKEY: u16 = 0xe5;
 const VK_PACKET: u16 = 0xe7;
 const VK_RETURN: u16 = 0x0d;
+const VK_ESCAPE: u16 = 0x1b;
+const VK_BACK: u16 = 0x08;
+const VK_PRIOR: u16 = 0x21;
+const VK_NEXT: u16 = 0x22;
+const VK_UP: u16 = 0x26;
+const VK_DOWN: u16 = 0x28;
 const VK_F4: u16 = 0x73;
 
 /// How long a multi-line paste waits for a second Ctrl+V, and closing a
@@ -78,6 +85,8 @@ pub enum UserEvent {
     Installed(Result<(), String>),
     /// Another launch handed this folder over to open in a new tab.
     OpenHere(PathBuf),
+    /// Something in `%APPDATA%\blitz` was written: settings or a theme.
+    Settings,
 }
 
 /// Command-line options of the GUI.
@@ -353,8 +362,9 @@ struct App {
     window: Option<Window>,
     hwnd: isize,
     gfx: Option<Gfx>,
-    dark: bool,
-    pal: Palette,
+    theme: Theme,
+    /// The theme picker, while it is open.
+    picker: Option<Picker>,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -403,14 +413,74 @@ struct App {
     code: i32,
 }
 
+/// The open theme picker.
+struct Picker {
+    themes: Vec<Theme>,
+    /// Typed text; themes whose names contain it, ignoring case, match.
+    filter: String,
+    /// The highlighted theme, among the matching ones.
+    sel: usize,
+}
+
+impl Picker {
+    fn matches(&self) -> Vec<&Theme> {
+        let f = self.filter.to_lowercase();
+        (self.themes.iter())
+            .filter(|t| t.name.to_lowercase().contains(&f))
+            .collect()
+    }
+}
+
+/// Sends [`UserEvent::Settings`] whenever a file in `%APPDATA%\blitz`, or
+/// its themes folder, is written. Creates the themes folder, so there is
+/// a place to drop theme files.
+fn watch_settings(proxy: EventLoopProxy<UserEvent>) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindFirstChangeNotificationW,
+        FindNextChangeNotification,
+    };
+    use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+    use windows::core::PCWSTR;
+
+    let (Some(dir), Some(themes)) = (crate::config::dir(), crate::theme::dir()) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(themes);
+    std::thread::spawn(move || {
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        let Ok(h) = (unsafe {
+            FindFirstChangeNotificationW(
+                PCWSTR(wide.as_ptr()),
+                true,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
+            )
+        }) else {
+            return;
+        };
+        // SAFETY: `h` stays open for the life of the thread, which is the
+        // life of the process.
+        while unsafe { WaitForSingleObject(h, INFINITE) } == WAIT_OBJECT_0 {
+            // Editors save in several writes; take them as one.
+            std::thread::sleep(Duration::from_millis(100));
+            // SAFETY: as above.
+            let next = unsafe { FindNextChangeNotification(h) };
+            if next.is_err() || proxy.send_event(UserEvent::Settings).is_err() {
+                return;
+            }
+        }
+    });
+}
+
 impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
         let config = Config::load();
-        let dark = match config.theme {
-            ThemeMode::System => !crate::theme::system_is_light(),
-            ThemeMode::Dark => true,
-            ThemeMode::Light => false,
-        };
+        let mut theme = crate::theme::current(&config.theme);
+        if let Some(a) = config.accent {
+            theme.ui.set_accent(a);
+        }
         let a = &args;
         let persist = !a.new_window
             && a.cmd.is_none()
@@ -425,12 +495,8 @@ impl App {
             window: None,
             hwnd: 0,
             gfx: None,
-            dark,
-            pal: if dark {
-                crate::theme::dark()
-            } else {
-                crate::theme::light()
-            },
+            theme,
+            picker: None,
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -499,16 +565,8 @@ impl App {
         if !self.args.new_window {
             crate::handoff::install(self.hwnd, self.proxy.clone());
         }
-        let dark = windows::core::BOOL::from(self.dark);
-        // SAFETY: a live window and a BOOL-sized value.
-        let _ = unsafe {
-            DwmSetWindowAttribute(
-                HWND(self.hwnd as *mut c_void),
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                (&raw const dark).cast(),
-                size_of_val(&dark) as u32,
-            )
-        };
+        watch_settings(self.proxy.clone());
+        self.frame_theme();
         self.window = Some(window);
         self.ensure_gfx();
 
@@ -653,7 +711,8 @@ impl App {
                 cols: grid.0,
                 rows: grid.1,
                 scrollback: self.config.scrollback_lines,
-                dark: self.dark,
+                dark: !self.theme.light,
+                pal: self.theme.pal,
                 parent: Some(self.hwnd),
                 token: &token,
                 restored: &restored,
@@ -825,8 +884,7 @@ impl App {
         ChromeModel {
             win,
             sessions,
-            light: !self.dark,
-            accent: self.config.accent.unwrap_or(crate::theme::ACCENT),
+            ui: self.theme.ui,
             size: (size.width as i32, size.height as i32),
             scale: self.scale as f32,
             text_cell: self.gfx.as_ref().map_or((6, 12), |g| g.r.small_cell()),
@@ -834,6 +892,130 @@ impl App {
             now: Instant::now(),
             banner: self.update.as_ref().map(|u| u.1.as_str()),
             preedit,
+            picker: self.picker.as_ref().map(|p| chrome::Picker {
+                filter: &p.filter,
+                items: p.matches(),
+                sel: p.sel,
+            }),
+        }
+    }
+
+    /// Dark or light window frame, to match the theme.
+    fn frame_theme(&self) {
+        let dark = windows::core::BOOL::from(!self.theme.light);
+        // SAFETY: a live window and a BOOL-sized value.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                HWND(self.hwnd as *mut c_void),
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                (&raw const dark).cast(),
+                size_of_val(&dark) as u32,
+            )
+        };
+    }
+
+    /// Shows `t` everywhere: panes, chrome, window frame, and what colour
+    /// queries report.
+    fn apply_theme(&mut self, mut t: Theme) {
+        if let Some(a) = self.config.accent {
+            t.ui.set_accent(a);
+        }
+        if t == self.theme {
+            return;
+        }
+        let frame = t.light != self.theme.light;
+        self.theme = t;
+        if frame {
+            self.frame_theme();
+        }
+        for v in &self.views {
+            lock(&v.pane.term).set_theme(!self.theme.light, &self.theme.pal);
+        }
+        self.request_redraw();
+    }
+
+    /// The theme the settings pick, as opposed to one the picker shows.
+    fn set_theme_from_config(&mut self) {
+        self.apply_theme(crate::theme::current(&self.config.theme));
+    }
+
+    /// Opens the theme picker on the theme in use.
+    fn open_picker(&mut self) {
+        let themes = crate::theme::all();
+        let sel = (themes.iter())
+            .position(|t| t.name == self.theme.name)
+            .unwrap_or(0);
+        self.picker = Some(Picker {
+            themes,
+            filter: String::new(),
+            sel,
+        });
+        self.request_redraw();
+    }
+
+    /// A key while the picker is open: arrows show another theme, typing
+    /// narrows the list, Enter keeps the theme and Esc goes back.
+    fn picker_key(&mut self, k: &KeyInput) {
+        let Some(pk) = &mut self.picker else {
+            return;
+        };
+        let n = pk.matches().len();
+        let m = &k.mods;
+        // Ctrl and Alt together are AltGr when the layout gives a character.
+        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+        let chord = ctrl != alt || (ctrl && k.uc == 0);
+        let step = |by: isize| {
+            let last = n.saturating_sub(1) as isize;
+            (pk.sel as isize + by).clamp(0, last) as usize
+        };
+        match k.vk {
+            VK_ESCAPE => {
+                self.picker = None;
+                self.set_theme_from_config();
+                return;
+            }
+            VK_RETURN => {
+                let picked = pk.matches().get(pk.sel).map(|t| (*t).clone());
+                self.picker = None;
+                match picked {
+                    Some(t) => {
+                        let light = crate::theme::system_is_light();
+                        let setting = crate::theme::pick(&self.config.theme, &t.name, light);
+                        if let Err(e) = crate::config::save_theme(&setting)
+                            && let Some(id) = self.focus_id()
+                        {
+                            let text = format!("Cannot save the theme to config.toml: {e}");
+                            self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                        }
+                        self.config.theme = setting;
+                        self.apply_theme(t);
+                    }
+                    None => self.set_theme_from_config(),
+                }
+                return;
+            }
+            VK_UP => pk.sel = step(-1),
+            VK_DOWN => pk.sel = step(1),
+            VK_PRIOR => pk.sel = step(-(chrome::PICKER_ROWS as isize)),
+            VK_NEXT => pk.sel = step(chrome::PICKER_ROWS as isize),
+            VK_BACK if pk.filter.pop().is_some() => pk.sel = 0,
+            VK_BACK => return,
+            _ if !chord && !k.text.is_empty() => {
+                pk.filter.push_str(k.text);
+                pk.sel = 0;
+            }
+            _ => return,
+        }
+        self.preview();
+    }
+
+    /// Shows the theme highlighted in the picker.
+    fn preview(&mut self) {
+        let shown =
+            (self.picker.as_ref()).and_then(|p| p.matches().get(p.sel).map(|t| (*t).clone()));
+        match shown {
+            Some(t) => self.apply_theme(t),
+            None => self.request_redraw(),
         }
     }
 
@@ -944,7 +1126,14 @@ impl App {
         let inputs = std::mem::take(&mut self.keys.borrow_mut().queue);
         for input in inputs {
             match input {
-                Input::Text(t) => self.typed(t.into_bytes()),
+                Input::Text(t) => match &mut self.picker {
+                    Some(p) => {
+                        p.filter.push_str(&t);
+                        p.sel = 0;
+                        self.preview();
+                    }
+                    None => self.typed(t.into_bytes()),
+                },
                 Input::Key(k, text) => {
                     let k = KeyInput { text: &text, ..k };
                     self.key(el, &k);
@@ -956,6 +1145,19 @@ impl App {
     fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput) {
         if !k.down && self.eaten == Some(k.vk) {
             self.eaten = None;
+            return;
+        }
+        if self.picker.is_some() {
+            // Every key is the picker's; so is the release of the last.
+            if k.down {
+                self.eaten = Some(k.vk);
+                if keymap::action(k) == Some(Action::ThemePicker) {
+                    self.picker = None;
+                    self.set_theme_from_config();
+                } else {
+                    self.picker_key(k);
+                }
+            }
             return;
         }
         if let Some(a) = keymap::action(k)
@@ -1124,6 +1326,7 @@ impl App {
                 self.win.sidebar_expanded = !self.win.sidebar_expanded;
                 self.request_redraw();
             }
+            Action::ThemePicker => self.open_picker(),
             Action::Focus(dir) => {
                 let (area, active) = (self.tab_area(), self.win.active);
                 if let Some(t) = self.win.tabs.get_mut(active) {
@@ -1574,7 +1777,7 @@ impl App {
             }
             v.rect = Some(rect);
             let sel = self.selection.filter(|_| Some(id) == focus);
-            if !refresh(&mut lock(&v.pane.term), &mut v.snap, &self.pal, sel) {
+            if !refresh(&mut lock(&v.pane.term), &mut v.snap, &self.theme.pal, sel) {
                 self.selection = None;
             }
             if Some(id) == focus {
@@ -1587,7 +1790,7 @@ impl App {
             }
         }
 
-        let pal = self.pal;
+        let pal = self.theme.pal;
         let Some(g) = &mut self.gfx else {
             return;
         };
@@ -2062,7 +2265,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // Like typed characters, committed text carries no controls
                 // that could run or escape anything.
                 text.retain(|c| !c.is_control());
-                self.typed(text.into_bytes());
+                if let Some(p) = &mut self.picker {
+                    p.filter.push_str(&text);
+                    p.sel = 0;
+                    self.preview();
+                } else {
+                    self.typed(text.into_bytes());
+                }
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
                 self.preedit = text;
@@ -2077,6 +2286,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.on_mouse_button(el, state, button);
             }
             WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
+            // Windows switched between light and dark mode.
+            WindowEvent::ThemeChanged(_) => {
+                // winit has just set the frame to the system's mode.
+                self.frame_theme();
+                if self.picker.is_none() {
+                    self.set_theme_from_config();
+                }
+            }
             _ => {}
         }
     }
@@ -2102,6 +2319,15 @@ impl ApplicationHandler<UserEvent> for App {
                 let text = format!("blitz {v} is available \u{b7} Ctrl+Shift+U to {how}");
                 self.update = Some((v, text));
                 self.request_redraw();
+            }
+            UserEvent::Settings => {
+                if let Some(c) = Config::reload() {
+                    self.config = c;
+                }
+                // The picker puts the configured theme back when it closes.
+                if self.picker.is_none() {
+                    self.set_theme_from_config();
+                }
             }
             UserEvent::Installed(Ok(())) => el.exit(),
             UserEvent::Installed(Err(e)) => {

@@ -70,6 +70,7 @@ pub struct Spawn<'a> {
     pub rows: u16,
     pub scrollback: usize,
     pub dark: bool,
+    pub pal: vt::Palette,
     /// The window, which becomes the owner of the console's hidden window.
     pub parent: Option<isize>,
     /// From [`crate::pty::pane_token`]; exported as `BLITZ_PANE_TOKEN`.
@@ -91,7 +92,7 @@ impl Pane {
             scrollback_lines: s.scrollback,
             ..Default::default()
         });
-        term.set_theme(s.dark);
+        term.set_theme(s.dark, &s.pal);
         term.set_prompt_token(s.token);
         term.feed(s.restored);
         let term = Arc::new(Mutex::new(term));
@@ -359,6 +360,7 @@ mod tests {
                 rows: 5,
                 scrollback: 100,
                 dark: true,
+                pal: crate::theme::dark(),
                 parent: None,
                 token: "t",
                 restored: &[],
@@ -399,6 +401,7 @@ mod tests {
                 rows: 5,
                 scrollback: 100,
                 dark: true,
+                pal: crate::theme::dark(),
                 parent: None,
                 token: "t",
                 restored: &[],

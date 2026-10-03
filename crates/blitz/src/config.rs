@@ -1,16 +1,7 @@
-//! Settings: built-in defaults, with a few switches read from
+//! Settings: built-in defaults, with a few read from
 //! `%APPDATA%\blitz\config.toml`.
 
 use std::path::{Path, PathBuf};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ThemeMode {
-    /// Follow the Windows app theme.
-    #[default]
-    System,
-    Dark,
-    Light,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -20,8 +11,9 @@ pub struct Config {
     /// Points; pixels = pt * dpi / 72.
     pub font_size: f32,
     pub line_height: f32,
-    pub theme: ThemeMode,
-    /// `0xRRGGBB`; `None` uses the theme's accent.
+    /// A theme name, or `light:NAME,dark:NAME` to follow the Windows app
+    /// theme; see [`crate::theme::choose`].
+    pub theme: String,
     pub accent: Option<u32>,
     /// Empty means detect: pwsh, then Windows PowerShell, then cmd.
     pub shell: String,
@@ -53,7 +45,7 @@ impl Default for Config {
             font_fallback: "Consolas".into(),
             font_size: 11.0,
             line_height: 1.0,
-            theme: ThemeMode::System,
+            theme: crate::theme::DEFAULT.into(),
             accent: None,
             shell: String::new(),
             shell_args: Vec::new(),
@@ -73,13 +65,27 @@ impl Default for Config {
 
 impl Config {
     /// The defaults with the settings from a `config.toml` applied: one
-    /// `key = true` or `key = false` per line, `#` starts a comment. Lines
-    /// it doesn't understand are skipped, so a typo never stops blitz from
-    /// starting.
+    /// `key = value` per line, `#` starts a comment. Lines it doesn't
+    /// understand are skipped, so a typo never stops blitz from starting.
     pub fn parse(text: &str) -> Config {
         let mut c = Config::default();
         // Notepad may save with a byte order mark.
         for line in text.trim_start_matches('\u{feff}').lines() {
+            // A quoted theme name may hold a `#`.
+            if let Some((key, value)) = line.split_once('=')
+                && key.trim() == "theme"
+            {
+                let value = value.trim_start();
+                let name = match value.strip_prefix('"') {
+                    Some(quoted) => quoted.split('"').next(),
+                    None => value.split('#').next(),
+                };
+                let name = name.unwrap_or_default().trim();
+                if !name.is_empty() {
+                    c.theme = name.into();
+                }
+                continue;
+            }
             let line = line.split('#').next().unwrap_or_default();
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -105,17 +111,74 @@ impl Config {
 
     /// Reads `%APPDATA%\blitz\config.toml`, or gives the defaults.
     pub fn load() -> Config {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .map_or_else(Config::default, |d| {
-                Config::read(&d.join("blitz").join("config.toml"))
-            })
+        dir().map_or_else(Config::default, |d| Config::read(&d.join(FILE)))
+    }
+
+    /// Reads `config.toml` again while blitz runs. `None` when the file is
+    /// there but cannot be read now, as while an editor saves it.
+    pub fn reload() -> Option<Config> {
+        let Some(d) = dir() else {
+            return Some(Config::default());
+        };
+        match std::fs::read_to_string(d.join(FILE)) {
+            Ok(text) => Some(Config::parse(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Config::default()),
+            Err(_) => None,
+        }
     }
 
     /// A missing or unreadable file gives the defaults.
     fn read(path: &Path) -> Config {
         Config::parse(&std::fs::read_to_string(path).unwrap_or_default())
     }
+}
+
+const FILE: &str = "config.toml";
+
+/// `%APPDATA%\blitz`, which holds `config.toml` and the themes folder.
+pub fn dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("blitz"))
+}
+
+/// Sets `theme = "NAME"` in `config.toml`, keeping the rest of the file.
+/// Writes a new file and moves it over the old one, so a failed save
+/// never leaves half a file.
+pub fn save_theme(name: &str) -> std::io::Result<()> {
+    let dir = dir().ok_or_else(|| std::io::Error::other("no APPDATA"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(FILE);
+    let old = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        r => r?,
+    };
+    let tmp = dir.join("config.toml.new");
+    std::fs::write(&tmp, with_theme(&old, name))?;
+    std::fs::rename(tmp, path)
+}
+
+/// `text` with its last `theme` line, the one that counts, set to `name`,
+/// or one added at the end.
+fn with_theme(text: &str, name: &str) -> String {
+    let line = format!("theme = \"{name}\"");
+    let is_theme = |l: &String| {
+        let code = l.trim_start_matches('\u{feff}').split('#').next();
+        code.and_then(|c| c.split_once('='))
+            .is_some_and(|(k, _)| k.trim() == "theme")
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    match lines.iter().rposition(is_theme) {
+        Some(i) => {
+            // Keep a byte order mark on the first line.
+            let bom = if lines[i].starts_with('\u{feff}') {
+                "\u{feff}"
+            } else {
+                ""
+            };
+            lines[i] = format!("{bom}{line}");
+        }
+        None => lines.push(line),
+    }
+    lines.join("\n") + "\n"
 }
 
 #[cfg(test)]
@@ -150,6 +213,31 @@ mod tests {
         );
         assert_eq!(c, Config::default());
         assert_eq!(Config::parse(""), Config::default());
+    }
+
+    #[test]
+    fn config_reads_theme() {
+        assert_eq!(Config::parse("theme = \"Rose Pine\"\n").theme, "Rose Pine");
+        assert_eq!(
+            Config::parse("theme=Tokyo Night # mine").theme,
+            "Tokyo Night"
+        );
+        assert_eq!(Config::parse("theme = \"\"").theme, crate::theme::DEFAULT);
+        let c = Config::parse("theme = \"No #1\" # mine\n# theme = x");
+        assert_eq!(c.theme, "No #1");
+    }
+
+    #[test]
+    fn saving_a_theme_keeps_the_rest_of_the_file() {
+        assert_eq!(with_theme("", "A"), "theme = \"A\"\n");
+        assert_eq!(
+            with_theme("flash = false\r\n# theme = old\n", "A"),
+            "flash = false\n# theme = old\ntheme = \"A\"\n"
+        );
+        let saved = with_theme("\u{feff}theme = old\nflash = false", "B C");
+        assert_eq!(saved, "\u{feff}theme = \"B C\"\nflash = false\n");
+        let saved = with_theme("theme = a\ntheme = b # mine\n", "C");
+        assert_eq!(Config::parse(&saved).theme, "C", "the last line counts");
     }
 
     #[test]
