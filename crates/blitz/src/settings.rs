@@ -1,0 +1,291 @@
+//! The settings panel: which settings match what was typed, what each one
+//! shows, and the value the arrow keys move it to.
+
+use crate::config::{Config, Kind, SETTINGS, Setting, quote};
+use crate::render::chrome::SettingRow;
+
+/// Font sizes offered, in points.
+const FONT_SIZES: &[f32] = &[
+    8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0,
+];
+/// Scrollback lengths offered.
+const SCROLLBACK: &[usize] = &[1000, 5000, 10_000, 20_000, 50_000, 100_000];
+
+/// The open settings panel.
+#[derive(Debug, Default)]
+pub struct Panel {
+    /// Typed text; settings that contain each typed word match.
+    pub filter: String,
+    /// The highlighted setting, among the matching ones.
+    pub sel: usize,
+    /// The first list line shown in the last frame, so the list scrolls
+    /// only when the highlight leaves it.
+    pub top: usize,
+    /// Fixed-width fonts installed, sorted.
+    pub fonts: Vec<String>,
+    /// Shells to choose from, as (name, path); an empty path is automatic.
+    pub shells: Vec<(String, String)>,
+    /// Why the last change was not saved.
+    pub error: Option<String>,
+}
+
+impl Panel {
+    pub fn new(fonts: Vec<String>, shells: Vec<(String, String)>) -> Panel {
+        Panel {
+            fonts,
+            shells,
+            ..Panel::default()
+        }
+    }
+
+    /// The settings that match the filter, in panel order. The filter's
+    /// words are looked for in each setting's group, label, key and help.
+    pub fn matches(&self) -> Vec<&'static Setting> {
+        let words: Vec<String> = (self.filter.split_whitespace())
+            .map(str::to_lowercase)
+            .collect();
+        (SETTINGS.iter())
+            .filter(|s| {
+                let text = format!("{} {} {} {}", s.group, s.label, s.key, s.help).to_lowercase();
+                words.iter().all(|w| text.contains(w.as_str()))
+            })
+            .collect()
+    }
+
+    pub fn selected(&self) -> Option<&'static Setting> {
+        self.matches().get(self.sel).copied()
+    }
+
+    /// Moves the highlight `by` rows, stopping at either end.
+    pub fn move_by(&mut self, by: isize) {
+        let last = self.matches().len().saturating_sub(1);
+        self.sel = self.sel.saturating_add_signed(by).min(last);
+    }
+
+    /// The values a choice can take, as (shown, as written), in order.
+    /// A value from `config.toml` that is not among them is added, so the
+    /// panel can always show what is set.
+    fn choices(&self, s: &Setting, c: &Config) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = match s.key {
+            "font_family" => (self.fonts.iter()).map(|f| (f.clone(), quote(f))).collect(),
+            "font_size" => (FONT_SIZES.iter())
+                .map(|n| (format!("{n} pt"), n.to_string()))
+                .collect(),
+            "scrollback_lines" => (SCROLLBACK.iter())
+                .map(|&n| (format!("{} lines", thousands(n)), n.to_string()))
+                .collect(),
+            "shell" => (self.shells.iter())
+                .map(|(name, path)| (name.clone(), quote(path)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let now = c.get(s.key);
+        if !out.iter().any(|(_, v)| v.eq_ignore_ascii_case(&now)) {
+            let shown = match s.key {
+                "font_size" => format!("{} pt", c.font_size),
+                "scrollback_lines" => format!("{} lines", thousands(c.scrollback_lines)),
+                "shell" => c
+                    .shell
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or_default()
+                    .into(),
+                _ => c.get(s.key).trim_matches(['"', '\'']).into(),
+            };
+            out.push((shown, now));
+            // Numbers stay in order; names go at the end.
+            out.sort_by(|a, b| {
+                let n = |v: &str| v.parse::<f64>().unwrap_or(f64::MAX);
+                n(&a.1).total_cmp(&n(&b.1))
+            });
+        }
+        out
+    }
+
+    /// What `s` shows for its value in `c`.
+    pub fn shown(&self, s: &Setting, c: &Config) -> String {
+        match s.kind {
+            Kind::Toggle => if c.get(s.key) == "true" { "on" } else { "off" }.into(),
+            Kind::Theme => {
+                crate::theme::choose(&c.theme, crate::theme::system_is_light()).to_string()
+            }
+            Kind::Choice => {
+                let now = c.get(s.key);
+                (self.choices(s, c).into_iter())
+                    .find(|(_, v)| v.eq_ignore_ascii_case(&now))
+                    .map(|(shown, _)| shown)
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// The value of `s` as written, `by` steps on from the one in `c`:
+    /// on for a step right and off for a step left, or the choice that
+    /// many places on. With `wrap`, a toggle flips and a choice goes round
+    /// from the last to the first. `None` when nothing would change.
+    pub fn step(&self, s: &Setting, c: &Config, by: isize, wrap: bool) -> Option<String> {
+        let now = c.get(s.key);
+        let next = match s.kind {
+            Kind::Toggle if wrap => (now != "true").to_string(),
+            Kind::Toggle => (by > 0).to_string(),
+            Kind::Theme => return None,
+            Kind::Choice => {
+                let list = self.choices(s, c);
+                let i = list
+                    .iter()
+                    .position(|(_, v)| v.eq_ignore_ascii_case(&now))?;
+                let n = list.len() as isize;
+                let j = if wrap {
+                    (i as isize + by).rem_euclid(n)
+                } else {
+                    (i as isize + by).clamp(0, n - 1)
+                };
+                list[j as usize].1.clone()
+            }
+        };
+        (next != now).then_some(next)
+    }
+
+    /// The rows the chrome draws: each matching setting with its value.
+    pub fn rows(&self, c: &Config) -> Vec<SettingRow> {
+        let d = Config::default();
+        (self.matches().into_iter())
+            .map(|s| SettingRow {
+                group: s.group,
+                label: s.label,
+                help: s.help,
+                applies: s.applies,
+                on: (s.kind == Kind::Toggle).then(|| c.get(s.key) == "true"),
+                value: self.shown(s, c),
+                less: s.kind == Kind::Theme || self.step(s, c, -1, false).is_some(),
+                more: s.kind == Kind::Theme || self.step(s, c, 1, false).is_some(),
+                default: self.shown(s, &d),
+                changed: c.get(s.key) != d.get(s.key),
+            })
+            .collect()
+    }
+}
+
+/// `10000` as `10,000`.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel() -> Panel {
+        Panel::new(
+            vec!["Cascadia Mono".into(), "Consolas".into()],
+            vec![
+                ("Automatic (PowerShell 7)".into(), String::new()),
+                (
+                    "Command Prompt".into(),
+                    r"C:\Windows\System32\cmd.exe".into(),
+                ),
+            ],
+        )
+    }
+
+    fn setting(key: &str) -> &'static Setting {
+        SETTINGS.iter().find(|s| s.key == key).expect(key)
+    }
+
+    #[test]
+    fn typing_narrows_the_list_by_every_word() {
+        let mut p = panel();
+        assert_eq!(p.matches().len(), SETTINGS.len());
+        p.filter = "FONT".into();
+        let keys: Vec<_> = p.matches().iter().map(|s| s.key).collect();
+        assert_eq!(keys, ["font_family", "font_size"]);
+        // Help text counts: the scrollback warning mentions secrets.
+        p.filter = "secrets".into();
+        assert_eq!(p.selected().map(|s| s.key), Some("restore_scrollback"));
+        p.filter = "font size".into();
+        assert_eq!(p.matches().len(), 1);
+        p.filter = "zzz".into();
+        assert!(p.selected().is_none());
+    }
+
+    #[test]
+    fn the_highlight_stops_at_either_end() {
+        let mut p = panel();
+        p.move_by(-1);
+        assert_eq!(p.sel, 0);
+        p.move_by(100);
+        assert_eq!(p.sel, SETTINGS.len() - 1);
+    }
+
+    #[test]
+    fn toggles_go_on_to_the_right_and_flip_with_enter() {
+        let (p, c) = (panel(), Config::default());
+        let flash = setting("flash");
+        assert_eq!(p.step(flash, &c, 1, false), None, "already on");
+        assert_eq!(p.step(flash, &c, -1, false).as_deref(), Some("false"));
+        assert_eq!(p.step(flash, &c, 1, true).as_deref(), Some("false"));
+        assert_eq!(p.shown(flash, &c), "on");
+    }
+
+    #[test]
+    fn choices_step_in_order_and_stop_or_wrap_at_the_ends() {
+        let (p, mut c) = (panel(), Config::default());
+        let size = setting("font_size");
+        assert_eq!(p.step(size, &c, 1, false).as_deref(), Some("12"));
+        assert_eq!(p.step(size, &c, -1, false).as_deref(), Some("10"));
+        c.font_size = 32.0;
+        assert_eq!(p.step(size, &c, 1, false), None);
+        assert_eq!(p.step(size, &c, 1, true).as_deref(), Some("8"));
+        // A size set by hand sits in order among the presets.
+        c.font_size = 11.5;
+        assert_eq!(p.shown(size, &c), "11.5 pt");
+        assert_eq!(p.step(size, &c, 1, false).as_deref(), Some("12"));
+        assert_eq!(p.step(size, &c, -1, false).as_deref(), Some("11"));
+    }
+
+    #[test]
+    fn shells_and_fonts_show_names() {
+        let (p, mut c) = (panel(), Config::default());
+        let shell = setting("shell");
+        assert_eq!(p.shown(shell, &c), "Automatic (PowerShell 7)");
+        let next = p.step(shell, &c, 1, false).expect("a next shell");
+        assert!(c.set("shell", &next));
+        assert_eq!(c.shell, r"C:\Windows\System32\cmd.exe");
+        assert_eq!(p.shown(shell, &c), "Command Prompt");
+        // A shell set by hand shows its file name.
+        c.shell = r"D:\tools\nu.exe".into();
+        assert_eq!(p.shown(shell, &c), "nu.exe");
+        // Font names match whatever their case in config.toml.
+        c.font_family = "consolas".into();
+        assert_eq!(p.shown(setting("font_family"), &c), "Consolas");
+        assert_eq!(thousands(100_000), "100,000");
+        assert_eq!(thousands(999), "999");
+    }
+
+    #[test]
+    fn rows_mark_changed_settings_and_where_they_can_move() {
+        let p = panel();
+        let c = Config {
+            restore_scrollback: true,
+            ..Config::default()
+        };
+        let rows = p.rows(&c);
+        assert_eq!(rows.len(), SETTINGS.len());
+        let row = |label| rows.iter().find(|r| r.label == label).expect(label);
+        let out = row("Restore output");
+        assert!(out.changed && out.on == Some(true) && out.default == "off");
+        let size = row("Font size");
+        assert!(!size.changed && size.on.is_none() && size.value == "11 pt");
+        assert!(size.less && size.more);
+        let font = row("Font");
+        assert!(!font.less && font.more, "Cascadia Mono comes first");
+    }
+}

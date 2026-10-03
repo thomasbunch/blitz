@@ -178,15 +178,26 @@ mod gpu {
         pending: bool,
     }
 
+    /// The terminal font and the chrome font: `family`, or the first of
+    /// the defaults installed.
+    fn fonts(family: &str, px: f32) -> Result<(Font, Font)> {
+        let families: Vec<&str> = (std::iter::once(family).filter(|f| !f.is_empty()))
+            .chain(DEFAULT_FAMILIES.iter().copied())
+            .collect();
+        Ok((
+            Font::new(&families, px)?,
+            Font::new(&families, px * CHROME_TEXT)?,
+        ))
+    }
+
     impl Renderer {
         pub fn new(warp: bool, px: f32) -> Result<Self> {
-            Self::with_gpu(Gpu::new(warp)?, px)
+            Self::with_gpu(Gpu::new(warp)?, "", px)
         }
 
-        /// [`Self::new`] on a device made elsewhere.
-        pub fn with_gpu(mut gpu: Gpu, px: f32) -> Result<Self> {
-            let font = Font::new(DEFAULT_FAMILIES, px)?;
-            let small = Font::new(DEFAULT_FAMILIES, px * CHROME_TEXT)?;
+        /// [`Self::new`] on a device made elsewhere, in font `family`.
+        pub fn with_gpu(mut gpu: Gpu, family: &str, px: f32) -> Result<Self> {
+            let (font, small) = fonts(family, px)?;
             gpu.set_text_params(font.gamma, font.contrast);
             Ok(Self {
                 gpu,
@@ -200,10 +211,9 @@ mod gpu {
             })
         }
 
-        /// Reloads the font at a new size, e.g. after a DPI change.
-        pub fn set_font_px(&mut self, px: f32) -> Result<()> {
-            self.font = Font::new(DEFAULT_FAMILIES, px)?;
-            self.small = Font::new(DEFAULT_FAMILIES, px * CHROME_TEXT)?;
+        /// Loads another font, or the same at a new size after a DPI change.
+        pub fn set_font(&mut self, family: &str, px: f32) -> Result<()> {
+            (self.font, self.small) = fonts(family, px)?;
             self.atlas.clear();
             Ok(())
         }
@@ -621,14 +631,15 @@ mod gpu {
 
     /// Renders a made-up window of five sessions, four of them split in
     /// one tab, for checking the chrome. With `--demo`, `--cols` and
-    /// `--rows` give the window size in pixels, and `--picker` opens the
-    /// theme picker filtered to `--picker`'s value.
+    /// `--rows` give the window size in pixels, `--picker` opens the
+    /// theme picker filtered to `--picker`'s value, and `--settings N`
+    /// opens the settings panel with row N highlighted.
     fn render_demo(
         r: &mut Renderer,
         theme: &crate::theme::Theme,
         collapsed: bool,
         banner: Option<&str>,
-        picker: Option<&str>,
+        (picker, settings): (Option<&str>, Option<usize>),
         (w, h): (u32, u32),
         scale: f32,
     ) -> Result<Vec<u8>> {
@@ -795,7 +806,25 @@ mod gpu {
             banner,
             preedit: None,
             picker: None,
+            settings: None,
         };
+        // One setting changed, to show its mark and a switch that is off.
+        let config = crate::config::Config {
+            flash: false,
+            ..Default::default()
+        };
+        let mut panel =
+            crate::settings::Panel::new(super::font::monospace_families(), crate::shell::choices());
+        if let Some(sel) = settings {
+            panel.sel = sel;
+            model.settings = Some(chrome::Settings {
+                filter: "",
+                rows: panel.rows(&config),
+                sel,
+                top: 0,
+                error: None,
+            });
+        }
         let themes = crate::theme::all();
         if let Some(f) = picker {
             let f = f.to_lowercase();
@@ -852,7 +881,7 @@ mod gpu {
         let mut text_file = None;
         let mut bmp = None;
         let (mut warp, mut light, mut demo, mut collapsed) = (false, false, false, false);
-        let (mut banner, mut theme, mut picker) = (None, None, None);
+        let (mut banner, mut theme, mut picker, mut settings) = (None, None, None, None);
         let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
         let mut px = DEFAULT_PX;
         let mut it = args.iter();
@@ -873,6 +902,7 @@ mod gpu {
                 "--banner" => banner = Some(val()?.clone()),
                 "--theme" => theme = Some(val()?.clone()),
                 "--picker" => picker = Some(val()?.clone()),
+                "--settings" => settings = Some(usize::from(num(val()?)?)),
                 "--script" => {
                     return Err("--script is not supported yet; pass --vt FILE".into());
                 }
@@ -899,7 +929,7 @@ mod gpu {
                 &theme,
                 collapsed,
                 banner.as_deref(),
-                picker.as_deref(),
+                (picker.as_deref(), settings),
                 (w, h),
                 scale,
             )

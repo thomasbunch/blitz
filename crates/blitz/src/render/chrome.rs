@@ -47,6 +47,7 @@ pub struct ChromeModel<'a> {
     /// IME composition in the focused pane: column, row and text.
     pub preedit: Option<(u16, u16, &'a str)>,
     pub picker: Option<Picker<'a>>,
+    pub settings: Option<Settings<'a>>,
 }
 
 /// The theme picker, drawn over everything.
@@ -61,6 +62,50 @@ pub struct Picker<'a> {
 
 /// Rows the picker shows at once.
 pub const PICKER_ROWS: usize = 12;
+
+/// The settings panel, drawn over everything but the theme picker.
+pub struct Settings<'a> {
+    /// What was typed to narrow the list.
+    pub filter: &'a str,
+    /// The settings that match it.
+    pub rows: Vec<SettingRow>,
+    /// The highlighted row.
+    pub sel: usize,
+    /// The first list line shown in the last frame.
+    pub top: usize,
+    /// Why the last change was not saved.
+    pub error: Option<&'a str>,
+}
+
+/// One setting as the panel shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettingRow {
+    pub group: &'static str,
+    pub label: &'static str,
+    pub help: &'static str,
+    /// When a change takes effect.
+    pub applies: &'static str,
+    /// A switch's state; `None` shows `value` between arrows instead.
+    pub on: Option<bool>,
+    pub value: String,
+    /// Whether a step left or right would change the value.
+    pub less: bool,
+    pub more: bool,
+    /// The default value, as shown.
+    pub default: String,
+    /// The value is not the default.
+    pub changed: bool,
+}
+
+/// Where the settings panel went, for clicks.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SettingsHits {
+    pub panel: Rect,
+    /// Each row shown: its index, the whole row, and its switch or value.
+    pub rows: Vec<(usize, Rect, Rect)>,
+    /// The first list line shown.
+    pub top: usize,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prim {
@@ -97,6 +142,7 @@ pub struct Chrome {
     pub rows: Vec<(PaneId, Rect)>,
     /// The banner strip, for clicks.
     pub banner: Option<Rect>,
+    pub settings: Option<SettingsHits>,
 }
 
 /// Width of the expanded sidebar and of the collapsed rail at 96 DPI,
@@ -534,6 +580,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
         };
         extra.push(Prim::Rect(line, c.term_fg));
     }
+    if let Some(st) = &m.settings {
+        out.settings = Some(settings(&mut extra, st, c, m.size, s, (tw, th)));
+    }
     if let Some(pk) = &m.picker {
         picker(&mut extra, pk, c, m.size, s, (tw, th));
     }
@@ -648,6 +697,262 @@ fn picker(
     let hint = "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel";
     let hy = panel.bottom() - row_h - s(2.0);
     text(p, left, ty(hy), fit(hint, right - left, tw), c.dim, false);
+}
+
+/// The settings panel: a search line, the settings under group headings,
+/// each with a switch or a value between arrows, help for the highlighted
+/// one and a key hint. The list scrolls only as far as it must to show the
+/// highlighted row and its heading.
+fn settings(
+    p: &mut Vec<Prim>,
+    st: &Settings,
+    c: &Ui,
+    (w, h): (i32, i32),
+    s: impl Fn(f32) -> i32,
+    (tw, th): (i32, i32),
+) -> SettingsHits {
+    enum Line {
+        Head(&'static str),
+        Row(usize),
+    }
+    let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
+        p.push(Prim::Text {
+            x,
+            y,
+            text: t,
+            color,
+            bold,
+            term: false,
+        });
+    };
+    let dot = |p: &mut Vec<Prim>, r: Rect, color| {
+        p.push(Prim::Shape {
+            r,
+            radius: r.h as f32 / 2.0,
+            stroke: 0.0,
+            color,
+        });
+    };
+    let mut lines = Vec::new();
+    for (i, r) in st.rows.iter().enumerate() {
+        if i == 0 || st.rows[i - 1].group != r.group {
+            lines.push(Line::Head(r.group));
+        }
+        lines.push(Line::Row(i));
+    }
+
+    let (pad, line_h, one, gap) = (s(16.0), th + s(12.0), s(1.0).max(1), s(4.0));
+    let head_h = line_h + gap;
+    let help_line = th + s(4.0);
+    let help_h = s(10.0) + 3 * help_line + gap;
+    // Everything but the list: border, search line, rules, help and hint.
+    let fixed = 2 * one + head_h + one + 2 * gap + one + help_h + line_h;
+    let room = (h - s(48.0) - fixed) / line_h.max(1);
+    let shown = room.clamp(1, lines.len().max(1) as i32) as usize;
+    // Scroll as little as shows the highlight, and its group's heading
+    // when there is room.
+    let at = (lines.iter())
+        .position(|l| matches!(l, Line::Row(i) if *i == st.sel))
+        .unwrap_or(0);
+    let head = if at > 0 && matches!(lines[at - 1], Line::Head(_)) && shown > 1 {
+        at - 1
+    } else {
+        at
+    };
+    let first = (st.top.min(lines.len().saturating_sub(shown)).min(head))
+        .max((at + 1).saturating_sub(shown));
+
+    let pw = s(600.0).min(w - s(32.0)).max(0);
+    let ph = fixed + shown as i32 * line_h;
+    let panel = Rect {
+        x: (w - pw) / 2,
+        y: s(48.0).min((h - ph) / 2).max(0),
+        w: pw,
+        h: ph,
+    };
+    let mut hits = SettingsHits {
+        panel,
+        rows: Vec::new(),
+        top: first,
+    };
+    p.push(Prim::Rect(panel, c.border));
+    let inner = Rect {
+        x: panel.x + one,
+        y: panel.y + one,
+        w: (panel.w - 2 * one).max(0),
+        h: (panel.h - 2 * one).max(0),
+    };
+    p.push(Prim::Rect(inner, c.side_bg));
+    let (left, right) = (inner.x + pad, inner.right() - pad);
+    let mid = |y: i32, hh: i32| y + (hh - th) / 2;
+    let rule = |p: &mut Vec<Prim>, y| {
+        let r = Rect {
+            x: inner.x,
+            y,
+            w: inner.w,
+            h: one,
+        };
+        p.push(Prim::Rect(r, c.rule));
+    };
+
+    let mut y = inner.y;
+    text(p, left, mid(y, head_h), "Settings".into(), c.name, true);
+    let fx = left + 10 * tw;
+    let (filter, color) = if st.filter.is_empty() {
+        ("type to search", c.dim)
+    } else {
+        (st.filter, c.msg)
+    };
+    text(
+        p,
+        fx,
+        mid(y, head_h),
+        fit(filter, right - fx, tw),
+        color,
+        false,
+    );
+    y += head_h;
+    rule(p, y);
+    y += one + gap;
+    let list_y = y;
+
+    if lines.is_empty() {
+        text(
+            p,
+            left,
+            mid(y, line_h),
+            "No setting matches".into(),
+            c.dim,
+            false,
+        );
+    }
+    for line in lines.iter().skip(first).take(shown) {
+        match *line {
+            Line::Head(g) => {
+                let ty = y + line_h - th - s(3.0);
+                text(p, left, ty, g.to_uppercase(), c.dim, false);
+            }
+            Line::Row(i) => {
+                let r = &st.rows[i];
+                let row = Rect {
+                    x: inner.x,
+                    y,
+                    w: inner.w,
+                    h: line_h,
+                };
+                let sel = i == st.sel;
+                if sel {
+                    p.push(Prim::Rect(row, c.row_focus));
+                    p.push(Prim::Rect(Rect { w: s(2.0), ..row }, c.accent));
+                }
+                // Changed from the default.
+                if r.changed {
+                    let d = s(5.0);
+                    let mark = Rect {
+                        x: inner.x + (pad - d) / 2,
+                        y: y + (line_h - d) / 2,
+                        w: d,
+                        h: d,
+                    };
+                    dot(p, mark, c.accent);
+                }
+                let (lc, ty) = (if sel { c.name } else { c.msg }, mid(y, line_h));
+                text(p, left, ty, fit(r.label, pw / 2 - pad, tw), lc, sel);
+                let control = match r.on {
+                    Some(on) => {
+                        let (sw, sh, knob) = (s(30.0), s(16.0), s(12.0));
+                        let track = Rect {
+                            x: right - sw,
+                            y: y + (line_h - sh) / 2,
+                            w: sw,
+                            h: sh,
+                        };
+                        dot(p, track, if on { c.accent } else { c.track });
+                        let inset = (sh - knob) / 2;
+                        let kx = if on {
+                            track.right() - inset - knob
+                        } else {
+                            track.x + inset
+                        };
+                        let k = Rect {
+                            x: kx,
+                            y: track.y + inset,
+                            w: knob,
+                            h: knob,
+                        };
+                        dot(p, k, if on { c.chip_fg } else { c.dim });
+                        track
+                    }
+                    None => {
+                        let value = fit(&r.value, pw / 2 - pad, tw);
+                        let sp = s(8.0);
+                        let cw = tw + sp + text_w(&value, tw) + sp + tw;
+                        let cx = right - cw;
+                        let arrow = |ok| if ok { c.dim } else { c.rule };
+                        text(p, cx, ty, "\u{2039}".into(), arrow(r.less), false);
+                        text(p, cx + tw + sp, ty, value, lc, false);
+                        text(p, right - tw, ty, "\u{203a}".into(), arrow(r.more), false);
+                        Rect {
+                            x: cx,
+                            y,
+                            w: cw,
+                            h: line_h,
+                        }
+                    }
+                };
+                hits.rows.push((i, row, control));
+            }
+        }
+        y += line_h;
+    }
+
+    y = list_y + shown as i32 * line_h + gap;
+    rule(p, y);
+    y += one + s(10.0);
+    let meta_y = y + 2 * help_line;
+    if let Some(r) = st.rows.get(st.sel) {
+        for (k, l) in wrap(r.help, right - left, tw, 2).into_iter().enumerate() {
+            text(p, left, y + k as i32 * help_line, l, c.msg, false);
+        }
+        if st.error.is_none() {
+            let meta = format!("{} \u{b7} default {}", r.applies, r.default);
+            text(p, left, meta_y, fit(&meta, right - left, tw), c.dim, false);
+        }
+    }
+    if let Some(e) = st.error {
+        text(p, left, meta_y, fit(e, right - left, tw), c.error, false);
+    }
+    let hint = "\u{2191}\u{2193} choose  \u{b7}  \u{2190}\u{2192} change  \u{b7}  Del default  \u{b7}  Esc close";
+    let hy = inner.bottom() - line_h;
+    text(
+        p,
+        left,
+        mid(hy, line_h),
+        fit(hint, right - left, tw),
+        c.dim,
+        false,
+    );
+    hits
+}
+
+/// `t` broken at spaces into at most `n` lines of `max` pixels; the last
+/// ends in an ellipsis when the text goes on.
+fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in t.split_whitespace() {
+        match lines.last_mut() {
+            Some(l) if text_w(l, cw) + cw + text_w(word, cw) <= max => {
+                l.push(' ');
+                l.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    if lines.len() > n {
+        let rest = lines.split_off(n.saturating_sub(1)).join(" ");
+        lines.push(fit(&rest, max, cw));
+    }
+    lines.into_iter().map(|l| fit(&l, max, cw)).collect()
 }
 
 /// The state shown on the right of a sidebar row.
@@ -844,6 +1149,7 @@ mod tests {
             banner: None,
             preedit: None,
             picker: None,
+            settings: None,
         }
     }
 
@@ -986,6 +1292,100 @@ mod tests {
             c.prims
                 .contains(&Prim::Rect(line, crate::theme::blitz(false).ui.term_fg))
         );
+    }
+
+    fn setting_rows() -> Vec<SettingRow> {
+        let row = |group, label, on: Option<bool>| SettingRow {
+            group,
+            label,
+            help: "Help for this setting.",
+            applies: "Applies now",
+            on,
+            value: if on.is_none() {
+                "11 pt".into()
+            } else {
+                String::new()
+            },
+            less: true,
+            more: true,
+            default: "on".into(),
+            changed: false,
+        };
+        vec![
+            row("Appearance", "Font", None),
+            row("Appearance", "Font size", None),
+            row("Sessions", "Reopen tabs", Some(true)),
+            row("Sessions", "Restore output", Some(false)),
+            row("Updates", "Check for updates", Some(true)),
+        ]
+    }
+
+    #[test]
+    fn settings_panel_groups_rows_and_marks_where_to_click() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.settings = Some(Settings {
+            filter: "",
+            rows: setting_rows(),
+            sel: 1,
+            top: 0,
+            error: None,
+        });
+        let c = build(&m);
+        let hits = c.settings.clone().expect("settings hits");
+        let t = texts(&c);
+        for want in ["Settings", "APPEARANCE", "SESSIONS", "Font size", "11 pt"] {
+            assert!(t.contains(&want), "missing {want:?} in {t:?}");
+        }
+        assert!(t.contains(&"Help for this setting."));
+        // Every row is shown, inside the panel, with its control on it.
+        let inside = |a: Rect, b: Rect| {
+            a.x >= b.x && a.y >= b.y && a.right() <= b.right() && a.bottom() <= b.bottom()
+        };
+        let shown: Vec<usize> = hits.rows.iter().map(|r| r.0).collect();
+        assert_eq!(shown, [0, 1, 2, 3, 4]);
+        assert!(
+            hits.rows
+                .iter()
+                .all(|&(_, row, ctl)| { inside(row, hits.panel) && inside(ctl, row) && ctl.w > 0 })
+        );
+        assert_eq!(hits.top, 0);
+    }
+
+    #[test]
+    fn settings_list_scrolls_only_as_far_as_the_highlight() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        // Room for a few lines only.
+        m.size = (900, 330);
+        let mut show = |sel, top| {
+            m.settings = Some(Settings {
+                filter: "",
+                rows: setting_rows(),
+                sel,
+                top,
+                error: Some("Cannot save to config.toml: denied"),
+            });
+            build(&m).settings.expect("settings hits")
+        };
+        let first = show(0, 0);
+        let n = first.rows.len();
+        assert!(n < 5, "the list must not fit: {n} rows");
+        // The last row scrolls in at the bottom.
+        let last = show(4, first.top);
+        assert_eq!(last.rows.last().map(|r| r.0), Some(4));
+        // Moving up by one keeps the list where it is while the row shows.
+        let up = show(3, last.top);
+        assert_eq!(up.top, last.top);
+        // Going back to the top shows the first heading again.
+        assert_eq!(show(0, up.top).top, 0);
+    }
+
+    #[test]
+    fn help_wraps_at_spaces() {
+        assert_eq!(wrap("aa bb cc", 35, 7, 2), ["aa bb", "cc"]);
+        assert_eq!(wrap("aa bb cc dd ee", 35, 7, 2), ["aa bb", "cc d\u{2026}"]);
+        assert!(wrap("", 35, 7, 2).is_empty());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_MEASURING_MODE_NATURAL, DWRITE_READING_DIRECTION,
     DWRITE_READING_DIRECTION_LEFT_TO_RIGHT, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
     DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, DWRITE_TEXTURE_ALIASED_1x1, DWriteCreateFactory,
-    IDWriteFactory2, IDWriteFontCollection, IDWriteFontFace, IDWriteFontFallback,
+    IDWriteFactory2, IDWriteFont1, IDWriteFontCollection, IDWriteFontFace, IDWriteFontFallback,
     IDWriteRenderingParams1, IDWriteTextAnalysisSource,
 };
 use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, w};
@@ -76,6 +76,42 @@ fn weight_style(style: u8) -> (DWRITE_FONT_WEIGHT, DWRITE_FONT_STYLE) {
         DWRITE_FONT_STYLE_NORMAL
     };
     (weight, slant)
+}
+
+/// The names of the fixed-width font families installed, sorted. Empty
+/// when DirectWrite cannot list them.
+pub fn monospace_families() -> Vec<String> {
+    // SAFETY: COM calls with valid out-pointers and buffers of the length
+    // passed.
+    let list = || unsafe {
+        let factory: IDWriteFactory2 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+        let mut collection = None;
+        factory.GetSystemFontCollection(&mut collection, false)?;
+        let collection = collection.ok_or(windows::core::Error::from(E_FAIL))?;
+        let mut out = Vec::new();
+        for i in 0..collection.GetFontFamilyCount() {
+            let fam = collection.GetFontFamily(i)?;
+            let font = fam.GetFont(0)?;
+            let mono = font.cast::<IDWriteFont1>()?.IsMonospacedFont().as_bool();
+            if !mono || font.IsSymbolFont().as_bool() {
+                continue;
+            }
+            let names = fam.GetFamilyNames()?;
+            let (mut index, mut exists) = (0u32, BOOL(0));
+            names.FindLocaleName(w!("en-us"), &mut index, &mut exists)?;
+            if !exists.as_bool() {
+                index = 0;
+            }
+            let mut name = vec![0u16; names.GetStringLength(index)? as usize + 1];
+            names.GetString(index, &mut name)?;
+            name.pop();
+            out.push(String::from_utf16_lossy(&name));
+        }
+        out.sort_by_key(|n| n.to_lowercase());
+        out.dedup();
+        Result::Ok(out)
+    };
+    list().unwrap_or_default()
 }
 
 fn glyph_index(face: &IDWriteFontFace, c: char) -> u16 {

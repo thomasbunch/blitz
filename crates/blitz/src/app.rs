@@ -35,7 +35,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Icon, UserAttentionType, Window, WindowId};
 
 use crate::attention::{Attn, Ev};
-use crate::config::Config;
+use crate::config::{Config, Kind};
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
 use crate::layout::{self, Dir, PaneId, Rect, Tab};
@@ -44,6 +44,7 @@ use crate::render::chrome::{self, ChromeModel};
 use crate::render::d3d11::{Gpu, Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
 use crate::session::{self, Geometry, PaneMeta};
+use crate::settings::Panel;
 use crate::theme::Theme;
 
 const VK_PROCESSKEY: u16 = 0xe5;
@@ -53,8 +54,11 @@ const VK_ESCAPE: u16 = 0x1b;
 const VK_BACK: u16 = 0x08;
 const VK_PRIOR: u16 = 0x21;
 const VK_NEXT: u16 = 0x22;
+const VK_LEFT: u16 = 0x25;
 const VK_UP: u16 = 0x26;
+const VK_RIGHT: u16 = 0x27;
 const VK_DOWN: u16 = 0x28;
+const VK_DELETE: u16 = 0x2e;
 const VK_F4: u16 = 0x73;
 
 /// How long a multi-line paste waits for a second Ctrl+V, and closing a
@@ -377,6 +381,10 @@ struct App {
     theme: Theme,
     /// The theme picker, while it is open.
     picker: Option<Picker>,
+    /// The settings panel, while it is open. The theme picker opens over it.
+    settings: Option<Panel>,
+    /// Where the settings panel was in the last frame, for clicks.
+    settings_hits: Option<chrome::SettingsHits>,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -511,6 +519,8 @@ impl App {
             gfx: None,
             theme,
             picker: None,
+            settings: None,
+            settings_hits: None,
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -916,6 +926,13 @@ impl App {
                 items: p.matches(),
                 sel: p.sel,
             }),
+            settings: self.settings.as_ref().map(|p| chrome::Settings {
+                filter: &p.filter,
+                rows: p.rows(&self.config),
+                sel: p.sel,
+                top: p.top,
+                error: p.error.as_deref(),
+            }),
         }
     }
 
@@ -1022,11 +1039,17 @@ impl App {
                     Some(t) => {
                         let light = crate::theme::system_is_light();
                         let setting = crate::theme::pick(&self.config.theme, &t.name, light);
-                        if let Err(e) = crate::config::save_theme(&setting)
-                            && let Some(id) = self.focus_id()
-                        {
+                        let value = crate::config::quote(&setting);
+                        if let Err(e) = crate::config::save("theme", Some(&value)) {
                             let text = format!("Cannot save the theme to config.toml: {e}");
-                            self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                            let focus = self.focus_id();
+                            match (&mut self.settings, focus) {
+                                (Some(p), _) => p.error = Some(text),
+                                (None, Some(id)) => {
+                                    self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                                }
+                                (None, None) => {}
+                            }
                         }
                         self.config.theme = setting;
                         self.apply_theme(t);
@@ -1058,6 +1081,169 @@ impl App {
             Some(t) => self.apply_theme(t),
             None => self.request_redraw(),
         }
+    }
+
+    /// Opens the settings panel on its first setting.
+    fn open_settings(&mut self) {
+        let fonts = crate::render::font::monospace_families();
+        self.settings = Some(Panel::new(fonts, crate::shell::choices()));
+        self.request_redraw();
+    }
+
+    /// A key while the settings panel is open: up and down choose a
+    /// setting, left and right change it, Enter flips a switch or goes to
+    /// the next value, Delete puts the default back, typing narrows the
+    /// list, and Esc clears what was typed, then closes.
+    fn settings_key(&mut self, k: &KeyInput) {
+        let Some(p) = &mut self.settings else {
+            return;
+        };
+        let m = &k.mods;
+        // Ctrl and Alt together are AltGr when the layout gives a character.
+        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+        let chord = ctrl != alt || (ctrl && k.uc == 0);
+        match k.vk {
+            VK_ESCAPE if !p.filter.is_empty() => {
+                p.filter.clear();
+                p.sel = 0;
+            }
+            VK_ESCAPE => self.settings = None,
+            VK_UP => p.move_by(-1),
+            VK_DOWN => p.move_by(1),
+            VK_LEFT => self.change_setting(-1, false),
+            VK_RIGHT => self.change_setting(1, false),
+            VK_RETURN => self.change_setting(1, true),
+            VK_DELETE => {
+                if let Some(s) = p.selected() {
+                    self.set_setting(s.key, None);
+                }
+            }
+            VK_BACK if p.filter.pop().is_some() => p.sel = 0,
+            VK_BACK => return,
+            _ if !chord && !k.text.is_empty() => {
+                p.filter.push_str(k.text);
+                p.sel = 0;
+            }
+            _ => return,
+        }
+        self.request_redraw();
+    }
+
+    /// A left click while the settings panel is open: a switch flips, the
+    /// left or right half of a value steps it, a click elsewhere on a row
+    /// highlights it, and one outside the panel closes it.
+    fn settings_click(&mut self) {
+        let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
+        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let Some(h) = &self.settings_hits else {
+            return;
+        };
+        if !inside(&h.panel) {
+            self.settings = None;
+            self.request_redraw();
+            return;
+        }
+        let Some(&(i, _, control)) = h.rows.iter().find(|r| inside(&r.1)) else {
+            return;
+        };
+        let Some(p) = &mut self.settings else {
+            return;
+        };
+        p.sel = i;
+        match p.selected().map(|s| s.kind) {
+            Some(Kind::Toggle) => self.change_setting(1, true),
+            Some(Kind::Theme) => self.open_picker(),
+            Some(Kind::Choice) if inside(&control) => {
+                let by = if x < control.x + control.w / 2 { -1 } else { 1 };
+                self.change_setting(by, false);
+            }
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
+    /// Steps the highlighted setting as [`Panel::step`] does; the theme
+    /// opens the theme picker instead.
+    fn change_setting(&mut self, by: isize, wrap: bool) {
+        let Some(p) = &self.settings else {
+            return;
+        };
+        let Some(s) = p.selected() else {
+            return;
+        };
+        if s.kind == Kind::Theme {
+            self.open_picker();
+            return;
+        }
+        if let Some(v) = p.step(s, &self.config, by, wrap) {
+            self.set_setting(s.key, Some(v));
+        }
+    }
+
+    /// Sets `key` to `value` as `config.toml` holds it, or with none to its
+    /// default, saves it, and shows the change.
+    fn set_setting(&mut self, key: &str, value: Option<String>) {
+        let mut c = self.config.clone();
+        c.set(
+            key,
+            &value.clone().unwrap_or_else(|| Config::default().get(key)),
+        );
+        let saved = crate::config::save(key, value.as_deref());
+        if let Some(p) = &mut self.settings {
+            p.error = saved
+                .err()
+                .map(|e| format!("Cannot save to config.toml: {e}"));
+        }
+        self.apply_config(c);
+    }
+
+    /// Takes new settings and shows the font and theme they pick. The
+    /// rest are read where they are used.
+    fn apply_config(&mut self, c: Config) {
+        let font =
+            (&c.font_family, c.font_size) != (&self.config.font_family, self.config.font_size);
+        self.config = c;
+        if font {
+            self.reload_font();
+        }
+        // The picker puts the configured theme back when it closes.
+        if self.picker.is_none() {
+            self.set_theme_from_config();
+        }
+        self.request_redraw();
+    }
+
+    /// Loads the configured font at the size the window's DPI needs, and
+    /// tells each terminal its new cell size.
+    fn reload_font(&mut self) {
+        let px = self.font_px();
+        if let Some(g) = &mut self.gfx
+            && let Err(e) = g.r.set_font(&self.config.font_family, px)
+        {
+            eprintln!("blitz: font: {e}");
+        }
+        let (cw, ch) = self.cell();
+        for v in &self.views {
+            lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
+        }
+        self.request_redraw();
+    }
+
+    /// Typed text for the filter of the theme picker or the settings
+    /// panel. False when neither is open.
+    fn filter_text(&mut self, t: &str) -> bool {
+        if let Some(p) = &mut self.picker {
+            p.filter.push_str(t);
+            p.sel = 0;
+            self.preview();
+        } else if let Some(p) = &mut self.settings {
+            p.filter.push_str(t);
+            p.sel = 0;
+            self.request_redraw();
+        } else {
+            return false;
+        }
+        true
     }
 
     /// The size in cells of each pane `win` would show now.
@@ -1108,10 +1294,12 @@ impl App {
         };
         let size = window.inner_size();
         let early = self.gpu.take().and_then(|h| h.join().ok()?.ok());
+        let (family, px) = (&self.config.font_family, self.font_px());
         let built = match early {
-            Some(gpu) => Renderer::with_gpu(gpu, self.font_px()),
-            None => Renderer::new(false, self.font_px()),
-        };
+            Some(gpu) => Ok(gpu),
+            None => Gpu::new(false),
+        }
+        .and_then(|gpu| Renderer::with_gpu(gpu, family, px));
         let built = built.and_then(|r| {
             let hwnd = HWND(self.hwnd as *mut c_void);
             let chain = Swapchain::new(&r.gpu, hwnd, size.width, size.height)?;
@@ -1172,14 +1360,11 @@ impl App {
         let inputs = std::mem::take(&mut self.keys.borrow_mut().queue);
         for input in inputs {
             match input {
-                Input::Text(t) => match &mut self.picker {
-                    Some(p) => {
-                        p.filter.push_str(&t);
-                        p.sel = 0;
-                        self.preview();
+                Input::Text(t) => {
+                    if !self.filter_text(&t) {
+                        self.typed(t.into_bytes());
                     }
-                    None => self.typed(t.into_bytes()),
-                },
+                }
                 Input::Key(k, text) => {
                     let k = KeyInput { text: &text, ..k };
                     self.key(el, &k);
@@ -1202,6 +1387,21 @@ impl App {
                     self.set_theme_from_config();
                 } else {
                     self.picker_key(k);
+                }
+            }
+            return;
+        }
+        if self.settings.is_some() {
+            // Every key is the panel's too, but the theme picker opens over it.
+            if k.down {
+                self.eaten = Some(k.vk);
+                match keymap::action(k) {
+                    Some(Action::Settings) => {
+                        self.settings = None;
+                        self.request_redraw();
+                    }
+                    Some(Action::ThemePicker) => self.open_picker(),
+                    _ => self.settings_key(k),
                 }
             }
             return;
@@ -1373,6 +1573,7 @@ impl App {
                 self.request_redraw();
             }
             Action::ThemePicker => self.open_picker(),
+            Action::Settings => self.open_settings(),
             Action::Focus(dir) => {
                 let (area, active) = (self.tab_area(), self.win.active);
                 if let Some(t) = self.win.tabs.get_mut(active) {
@@ -1681,6 +1882,14 @@ impl App {
         };
         let mods = mods_now();
         let pressed = state == ElementState::Pressed;
+        // Presses go to the settings panel; a release still goes wherever
+        // its press went.
+        if pressed && self.settings.is_some() && self.picker.is_none() {
+            if b == 0 {
+                self.settings_click();
+            }
+            return;
+        }
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
         let on_banner = (self.banner)
             .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
@@ -1755,6 +1964,11 @@ impl App {
         if steps == 0.0 {
             return;
         }
+        if let Some(p) = self.settings.as_mut().filter(|_| self.picker.is_none()) {
+            p.move_by(-steps as isize);
+            self.request_redraw();
+            return;
+        }
         // Over another pane, the wheel scrolls that pane's history without
         // moving focus.
         // Programs in unfocused panes never get wheel reports;
@@ -1818,6 +2032,10 @@ impl App {
         let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
         self.rows = std::mem::take(&mut chrome.rows);
         self.banner = chrome.banner;
+        self.settings_hits = chrome.settings.take();
+        if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
+            p.top = h.top;
+        }
 
         let split = chrome.panes.len() >= 2;
         let mut dimmed = Vec::new();
@@ -2324,13 +2542,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.scale = scale_factor;
                 // The cursor's cell stays, but its pixels move.
                 self.ime_at = None;
-                let px = self.font_px();
-                if let Some(g) = &mut self.gfx
-                    && let Err(e) = g.r.set_font_px(px)
-                {
-                    eprintln!("blitz: font: {e}");
-                }
-                self.request_redraw();
+                self.reload_font();
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
@@ -2346,11 +2558,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Like typed characters, committed text carries no controls
                 // that could run or escape anything.
                 text.retain(|c| !c.is_control());
-                if let Some(p) = &mut self.picker {
-                    p.filter.push_str(&text);
-                    p.sel = 0;
-                    self.preview();
-                } else {
+                if !self.filter_text(&text) {
                     self.typed(text.into_bytes());
                 }
             }
@@ -2401,15 +2609,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.update = Some((v, text));
                 self.request_redraw();
             }
-            UserEvent::Settings => {
-                if let Some(c) = Config::reload() {
-                    self.config = c;
-                }
-                // The picker puts the configured theme back when it closes.
-                if self.picker.is_none() {
-                    self.set_theme_from_config();
-                }
-            }
+            UserEvent::Settings => match Config::reload() {
+                Some(c) => self.apply_config(c),
+                // A theme file changed, or config.toml is busy being saved.
+                None if self.picker.is_none() => self.set_theme_from_config(),
+                None => {}
+            },
             UserEvent::Installed(Ok(())) => el.exit(),
             UserEvent::Installed(Err(e)) => {
                 eprintln!("blitz: update: {e}");

@@ -16,6 +16,31 @@ pub fn detect() -> PathBuf {
 
 /// [`detect`] with the environment supplied by the caller.
 pub fn detect_with(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    let root = system_root(&var);
+    if let Some(exe) = pwsh(&var) {
+        return exe;
+    }
+    let ps = windows_powershell(&root);
+    if ps.is_file() {
+        return ps;
+    }
+    var("ComSpec").map_or_else(|| root.join("System32").join("cmd.exe"), PathBuf::from)
+}
+
+fn system_root(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    PathBuf::from(var("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+}
+
+fn windows_powershell(root: &Path) -> PathBuf {
+    root.join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
+}
+
+/// PowerShell 7: `pwsh.exe` on PATH, else the newest
+/// `%ProgramFiles%\PowerShell\<n>\pwsh.exe`.
+fn pwsh(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     // Walk PATH ourselves: SearchPathW would also look in the current
     // directory, and spawning where.exe would flash a console window.
     if let Some(path) = var("PATH") {
@@ -27,40 +52,61 @@ pub fn detect_with(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
             }
             let exe = dir.join("pwsh.exe");
             if exe.is_file() {
-                return exe;
+                return Some(exe);
             }
         }
     }
-    if let Some(pf) = var("ProgramFiles") {
-        let newest = std::fs::read_dir(Path::new(&pf).join("PowerShell"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let major: u32 = name
-                    .split(|c: char| !c.is_ascii_digit())
-                    .next()?
-                    .parse()
-                    .ok()?;
-                let exe = e.path().join("pwsh.exe");
-                exe.is_file().then_some((major, exe))
-            })
-            .max_by_key(|(major, _)| *major);
-        if let Some((_, exe)) = newest {
-            return exe;
-        }
-    }
-    let root = PathBuf::from(var("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()));
-    let ps = root
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    if ps.is_file() {
-        return ps;
-    }
-    var("ComSpec").map_or_else(|| root.join("System32").join("cmd.exe"), PathBuf::from)
+    let pf = var("ProgramFiles")?;
+    std::fs::read_dir(Path::new(&pf).join("PowerShell"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let major: u32 = name
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()?;
+            let exe = e.path().join("pwsh.exe");
+            exe.is_file().then_some((major, exe))
+        })
+        .max_by_key(|(major, _)| *major)
+        .map(|(_, exe)| exe)
+}
+
+/// The shells the settings panel offers, as (name, path): first the
+/// automatic choice, whose path is empty, then each one installed.
+pub fn choices() -> Vec<(String, String)> {
+    let found = installed_with(|k| std::env::var_os(k));
+    let auto = detect();
+    let name = (found.iter())
+        .find(|(_, p)| Path::new(p) == auto)
+        .map_or_else(|| auto.to_string_lossy().into_owned(), |(n, _)| n.clone());
+    let mut out = vec![(format!("Automatic ({name})"), String::new())];
+    out.extend(found);
+    out
+}
+
+/// Shells found with the environment supplied by the caller, as (name,
+/// path).
+fn installed_with(var: impl Fn(&str) -> Option<OsString>) -> Vec<(String, String)> {
+    let root = system_root(&var);
+    let sys = root.join("System32");
+    let git = var("ProgramFiles").map(|pf| Path::new(&pf).join("Git").join("bin").join("bash.exe"));
+    [
+        ("PowerShell 7", pwsh(&var)),
+        ("Windows PowerShell", Some(windows_powershell(&root))),
+        ("Command Prompt", Some(sys.join("cmd.exe"))),
+        ("WSL", Some(sys.join("wsl.exe"))),
+        ("Git Bash", git),
+    ]
+    .into_iter()
+    .filter_map(|(name, exe)| {
+        let exe = exe.filter(|e| e.is_file())?;
+        Some((name.to_string(), exe.to_string_lossy().into_owned()))
+    })
+    .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -336,6 +382,13 @@ mod tests {
         assert_eq!(got, pf.join("PowerShell").join("7").join("pwsh.exe"));
         touch(on_path.join("pwsh.exe"));
         assert_eq!(detect_with(env), on_path.join("pwsh.exe"));
+
+        // The settings panel lists only shells that are there.
+        touch(pf.join("Git").join("bin").join("bash.exe"));
+        let found = installed_with(env);
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["PowerShell 7", "Windows PowerShell", "Git Bash"]);
+        assert_eq!(found[0].1, on_path.join("pwsh.exe").to_string_lossy());
 
         let _ = std::fs::remove_dir_all(&root);
     }
