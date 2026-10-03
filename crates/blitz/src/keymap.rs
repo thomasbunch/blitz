@@ -48,6 +48,9 @@ pub enum Action {
     Fullscreen,
     /// Open or close the command palette.
     Palette,
+    /// Scroll to the previous (1) or next (-1) prompt. With none that way,
+    /// or on the alternate screen, the key goes to the program.
+    JumpToPrompt(i8),
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -88,6 +91,8 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::FontSize(0), "font_size_reset", "Font size from the settings"),
     (Action::Fullscreen, "fullscreen", "Full screen"),
     (Action::Palette, "command_palette", "Command palette"),
+    (Action::JumpToPrompt(1), "previous_prompt", "Scroll to the previous prompt"),
+    (Action::JumpToPrompt(-1), "next_prompt", "Scroll to the next prompt"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
@@ -144,6 +149,8 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     // F11.
     (0, 0x7a, Action::Fullscreen),
     (CTRL | SHIFT, b'P' as u16, Action::Palette),
+    (CTRL | SHIFT, 0x26, Action::JumpToPrompt(1)),
+    (CTRL | SHIFT, 0x28, Action::JumpToPrompt(-1)),
 ];
 
 /// Key names for chords, matched ignoring case. The first name of each
@@ -1180,5 +1187,17 @@ mod msg_to_key_tests {
             &mut t,
         );
         assert_eq!((k.key, k.uc, k.text), (Key::Char(' '), 32, " "));
+    }
+
+    #[test]
+    fn keymap_prompt_jumps() {
+        const LCTRL: usize = 0xa2;
+        const LSHIFT: usize = 0xa0;
+        assert_eq!(press(0x26, &[LCTRL, LSHIFT]), Some(Action::JumpToPrompt(1)));
+        assert_eq!(
+            press(0x28, &[LCTRL, LSHIFT]),
+            Some(Action::JumpToPrompt(-1))
+        );
+        assert_eq!(press(0x26, &[LCTRL]), None);
     }
 }

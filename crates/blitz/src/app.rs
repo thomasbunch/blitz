@@ -2080,6 +2080,15 @@ impl App {
                     w.set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
                 }
             }
+            Action::JumpToPrompt(dir) => {
+                let moved =
+                    (self.current()).is_some_and(|v| lock(&v.pane.term).jump_to_prompt(dir > 0));
+                if !moved {
+                    return false;
+                }
+                self.selection = None;
+                self.request_redraw();
+            }
         }
         true
     }
