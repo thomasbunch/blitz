@@ -58,6 +58,7 @@ pub fn text_snapshot(text: &str, cols: u16, rows: u16, pal: &Palette) -> Snapsho
     let blank = RenderCell {
         fg: pal.fg,
         bg: pal.bg,
+        ul: pal.fg,
         width: 1,
         ..RenderCell::default()
     };
@@ -139,7 +140,7 @@ mod gpu {
 
     use super::atlas::{Atlas, GlyphKey, Slot};
     use super::chrome::{Chrome, Prim, branch_mask, shape_mask};
-    use super::d3d11::{ATLAS_SIZE, GLYPH, Gpu, MASK, Quad, SOLID, rgba};
+    use super::d3d11::{ATLAS_SIZE, CURLY, DASHED, DOTTED, GLYPH, Gpu, MASK, Quad, SOLID, rgba};
     use super::font::{BOLD, DEFAULT_FAMILIES, E_PENDING, Font, ITALIC};
     use super::{builtin, text_snapshot, write_bmp};
 
@@ -155,6 +156,9 @@ mod gpu {
 
     /// Fallback font lookups per frame; the rest wait for the next one.
     const LOOKUPS: u32 = 256;
+
+    /// [`RenderCell::attrs`] bits drawn as lines.
+    const LINES: u16 = attr::UNDERLINE | attr::STRIKE | attr::OVERLINE;
 
     pub struct Renderer {
         pub gpu: Gpu,
@@ -287,6 +291,7 @@ mod gpu {
             let blank = RenderCell {
                 fg: pal.fg,
                 bg: pal.bg,
+                ul: pal.fg,
                 width: 1,
                 ..RenderCell::default()
             };
@@ -352,6 +357,7 @@ mod gpu {
                     let mut cl = cell(c, r);
                     if dim {
                         cl.fg = super::toward(cl.fg, cl.bg);
+                        cl.ul = super::toward(cl.ul, cl.bg);
                     }
                     let under_block = cursor.is_some_and(|(cc, cr, s)| {
                         (usize::from(cc), usize::from(cr)) == (c, r) && s == CursorShape::Block
@@ -368,16 +374,18 @@ mod gpu {
                     } else {
                         cl.fg
                     };
-                    let w = u32::from(cl.width.max(1)) * cw;
-                    let f = &self.font;
-                    for (bit, y, h) in [
-                        (attr::UNDERLINE, f.underline_y, f.underline_h),
-                        (attr::STRIKE, f.strike_y, f.strike_h),
-                        (attr::OVERLINE, 0, f.underline_h),
-                    ] {
-                        if cl.attrs & bit != 0 {
-                            self.rect(px(c), py(r) + y, w, h, fg);
-                        }
+                    // The right half of a wide character is drawn with
+                    // its left.
+                    if cl.width > 0 && cl.attrs & LINES != 0 {
+                        // An underline of its own colour keeps it, except
+                        // on the block cursor.
+                        let ul = if under_block || cl.ul == cl.fg {
+                            fg
+                        } else {
+                            cl.ul
+                        };
+                        let w = u32::from(cl.width) * cw;
+                        self.lines(cl.attrs, px(c), py(r), w, fg, ul);
                     }
                     if cl.width == 0 || cl.len == 0 {
                         continue;
@@ -401,6 +409,49 @@ mod gpu {
             // keep it inside the grid so it cannot draw over another pane.
             for q in &mut self.quads[first..] {
                 clip(q, x, y, px(cols), py(rows));
+            }
+        }
+
+        /// Queues the lines `attrs` asks for across a cell, or both of a wide
+        /// character's, `w` pixels wide with its top-left corner at (`x`,
+        /// `y`): the underline in `ul`, overline and strikethrough in `fg`.
+        /// They are as thick as the font's own, so they follow its size.
+        fn lines(&mut self, attrs: u16, x: i32, y: i32, w: u32, fg: u32, ul: u32) {
+            let f = &self.font;
+            let (cw, ch, t) = (f.cell_w, f.cell_h, f.underline_h);
+            let (uy, sy, sh) = (f.underline_y, f.strike_y, f.strike_h);
+            match (attrs & attr::UNDERLINE) >> attr::UNDERLINE_SHIFT {
+                0 => {}
+                2 => {
+                    // Two lines a line apart, raised to fit in the cell.
+                    let top = uy.min(ch as i32 - 3 * t as i32).max(0);
+                    self.rect(x, y + top, w, t, ul);
+                    self.rect(x, y + top + 2 * t as i32, w, t, ul);
+                }
+                kind @ 3..=5 => {
+                    // A wave needs room to swing; dots and dashes do not.
+                    let h = if kind == 3 { (4 * t).max(ch / 5) } else { t }.min(ch);
+                    let top = (uy + t as i32 / 2 - h as i32 / 2).clamp(0, (ch - h) as i32);
+                    self.quads.push(Quad {
+                        pos: [x as i16, (y + top) as i16],
+                        size: [w as u16, h as u16],
+                        uv: [cw as u16, t as u16],
+                        color: rgba(ul),
+                        flags: match kind {
+                            3 => CURLY,
+                            4 => DOTTED,
+                            _ => DASHED,
+                        },
+                    });
+                }
+                // Single, and kinds no program can send.
+                _ => self.rect(x, y + uy, w, t, ul),
+            }
+            if attrs & attr::STRIKE != 0 {
+                self.rect(x, y + sy, w, sh, fg);
+            }
+            if attrs & attr::OVERLINE != 0 {
+                self.rect(x, y, w, t, fg);
             }
         }
 
@@ -1231,7 +1282,7 @@ mod tests {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("_中x", 4, 2, &p);
-        snap.cells[0].attrs = vt::snapshot::attr::UNDERLINE;
+        snap.cells[0].attrs = 1 << vt::snapshot::attr::UNDERLINE_SHIFT;
         snap.cells[0].text[0] = b'a';
         snap.cells[3].bg = p.ansi[1];
         snap.selection = Some(((1, 1), (0, 1)));
@@ -1254,6 +1305,54 @@ mod tests {
         // The wide character's ink reaches into its second cell.
         let ink = (0..ch).any(|y| (2 * cw..3 * cw).any(|x| at(x, y) != p.bg));
         assert!(ink, "wide glyph spans two cells");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_lines_and_underline_colours() {
+        use vt::snapshot::attr;
+
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let red = p.ansi[1];
+        let mut snap = text_snapshot("", 6, 1, &p);
+        let kind = |k: u16| k << attr::UNDERLINE_SHIFT;
+        for (c, attrs) in [kind(2), kind(3), kind(3), kind(4)].into_iter().enumerate() {
+            snap.cells[c].attrs = attrs;
+            snap.cells[c].ul = red;
+        }
+        snap.cells[3].ul = p.fg;
+        snap.cells[4].attrs = attr::STRIKE | attr::OVERLINE;
+        snap.cells[5].attrs = kind(5);
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        let (uy, t) = (r.font.underline_y as u32, r.font.underline_h);
+        let top = uy.min(ch - 3 * t);
+        let double = (at(1, top), at(1, top + t), at(1, top + 2 * t));
+        assert_eq!(double, (red, p.bg, red), "double, in its own colour");
+        // The wave runs on from each column to the next, across the two
+        // cells and where they meet.
+        let ink = |x| (0..ch).filter(move |&y| at(x, y) != p.bg);
+        for x in cw..3 * cw - 1 {
+            assert!(
+                ink(x).any(|y| ink(x + 1).any(|y2| y.abs_diff(y2) <= 1)),
+                "{x}"
+            );
+        }
+        for c in [3, 5] {
+            let row: Vec<u32> = (c * cw..(c + 1) * cw).map(|x| at(x, uy)).collect();
+            assert!(row.contains(&p.fg) && row.contains(&p.bg), "dots, dashes");
+        }
+        assert_eq!(
+            at(4 * cw + 1, r.font.strike_y as u32),
+            p.fg,
+            "strikethrough"
+        );
+        assert_eq!(at(4 * cw + 1, 0), p.fg, "overline");
     }
 
     #[cfg(windows)]
