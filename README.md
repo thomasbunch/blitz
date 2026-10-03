@@ -12,6 +12,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   Ctrl+Shift+B collapses it to a narrow rail of status dots.
 - Claude Code hooks tell blitz when a session needs input or has
   finished, and the taskbar button flashes if blitz is in the background.
+- Progress a program reports (OSC 9;4) shows in the sidebar and on the
+  taskbar button.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
   format.
 - A settings panel on Ctrl+, for the font, shell, sessions and more.
