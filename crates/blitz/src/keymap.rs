@@ -29,6 +29,8 @@ pub enum Action {
     Update,
     /// Open the theme picker, or close it unchanged.
     ThemePicker,
+    /// Open or close the settings panel.
+    Settings,
 }
 
 const CTRL: u8 = 1;
@@ -62,6 +64,8 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, b'B' as u16, Action::ToggleSidebar),
     (CTRL | SHIFT, b'U' as u16, Action::Update),
     (CTRL | SHIFT, b'K' as u16, Action::ThemePicker),
+    // VK_OEM_COMMA: the comma key on every layout.
+    (CTRL, 0xbc, Action::Settings),
 ];
 
 /// The shortcut a key press triggers, if any. Modifiers must match
