@@ -92,6 +92,8 @@ pub struct Snapshot {
     pub wrapped: Vec<bool>,
     /// Column, row and shape; `None` when hidden or scrolled out of view.
     pub cursor: Option<(u16, u16, CursorShape)>,
+    /// The cursor colour the program set with OSC 12, if any.
+    pub cursor_color: Option<u32>,
     pub alt_screen: bool,
     /// Start and end (column, row), inclusive.
     pub selection: Option<((u16, u16), (u16, u16))>,

@@ -276,13 +276,14 @@ fn programs_can_set_and_reset_colours() {
     let mut s = Snapshot::default();
     t.snapshot(&mut s, &PAL);
     assert_eq!((s.cells[0].fg, s.cells[0].bg), (PAL.fg, 0x102030));
+    assert_eq!(s.cursor_color, Some(0xff0000));
     assert_eq!(
         replies(&mut t, "\x1b]11;?\x07\x1b]12;?\x07"),
         "\x1b]11;rgb:1010/2020/3030\x07\x1b]12;rgb:ffff/0000/0000\x07"
     );
     t.feed(b"\x1b]111\x07\x1b]112\x07");
     assert!(t.snapshot(&mut s, &PAL));
-    assert_eq!(s.cells[0].bg, PAL.bg);
+    assert_eq!((s.cells[0].bg, s.cursor_color), (PAL.bg, None));
     assert_eq!(
         replies(&mut t, "\x1b]11;?\x07"),
         "\x1b]11;rgb:2222/2222/2222\x07"

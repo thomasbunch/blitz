@@ -352,6 +352,7 @@ impl Terminal {
         };
         out.cols = cols;
         out.rows = rows;
+        out.cursor_color = cursor;
         out.alt_screen = self.alt;
         out.cells.clear();
         out.cells.reserve(n);
