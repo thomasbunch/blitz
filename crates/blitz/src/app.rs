@@ -21,7 +21,9 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetKeyState, GetKeyboardState,
+};
 use windows::Win32::UI::Shell::{
     ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
     TaskbarList,
@@ -433,11 +435,21 @@ struct Mouse {
     drag: Option<Drag>,
     /// When the drag next scrolls, while the pointer is outside its pane.
     scroll_at: Option<Instant>,
+    /// The last press that went to selection: when, on which cell, and
+    /// how many clicks it made.
+    click: Option<(Instant, Pos, u8)>,
 }
 
 /// A cell as a line number and a column. Line numbers stay with their
 /// text while output scrolls it into scrollback; see [`vt::Terminal::lines`].
 type Pos = vt::terminal::LineCol;
+
+/// Characters a double click takes as part of a word besides letters and
+/// digits, so it takes a whole path or URL.
+const WORD: &str = "_-./\\:~@?=&%+#";
+
+/// Rows either side of a cell that [`Logical`] reads at most.
+const LOGICAL_ROWS: usize = 64;
 
 /// How a selection grows while the button is held, fixed by the press.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -445,14 +457,48 @@ struct Drag {
     /// [`vt::Terminal::line_epoch`] at the press: line numbers from
     /// another epoch name other text.
     epoch: u32,
-    /// The cell pressed.
-    anchor: Pos,
+    /// What the press took, first and last cell: the cell pressed, or the
+    /// word or line around it.
+    anchor: (Pos, Pos),
+    /// Clicks of the press: 1 grows the selection by cells, 2 by words, 3
+    /// by lines.
+    unit: u8,
+    /// Alt was held: the same columns of every row between the corners.
+    block: bool,
+}
+
+impl Drag {
+    /// A press on `at` that made `unit` clicks.
+    fn new(term: &vt::Terminal, pal: &Palette, at: Pos, unit: u8, block: bool) -> Drag {
+        let anchor = match unit {
+            2 => word_at(term, pal, at),
+            3 => line_at(term, at),
+            _ => char_at(term, pal, at),
+        };
+        Drag {
+            epoch: term.line_epoch(),
+            anchor,
+            unit,
+            block,
+        }
+    }
+}
+
+/// Clicks a press on `at` makes: one more than the last press when that
+/// was on the same cell within the double-click time `within`, and after
+/// three, one again.
+fn clicks(last: Option<(Instant, Pos, u8)>, at: Pos, now: Instant, within: Duration) -> u8 {
+    match last {
+        Some((t, p, n)) if p == at && now.saturating_duration_since(t) <= within => n % 3 + 1,
+        _ => 1,
+    }
 }
 
 /// Selected cells in the focused pane.
 struct Selection {
     drag: Drag,
-    /// The first and last cell, in reading order.
+    /// The first and last cell in reading order; a block's top-left and
+    /// bottom-right corners.
     start: Pos,
     end: Pos,
     /// The screen's top line at the last look, and the selected text from
@@ -464,23 +510,14 @@ struct Selection {
 impl Selection {
     /// What `drag` selects with the pointer on `head`.
     fn new(term: &vt::Terminal, pal: &Palette, drag: Drag, head: Pos) -> Selection {
-        let (mut start, mut end) = (drag.anchor.min(head), drag.anchor.max(head));
-        // Half of a wide character takes in all of it, so what is
-        // highlighted is what is copied.
-        let mut cells = Vec::new();
-        let width = |cells: &[vt::RenderCell], x: u16| cells.get(usize::from(x)).map(|c| c.width);
-        if term.line_cells(start.0, pal, &mut cells).is_some()
-            && start.1 > 0
-            && width(&cells, start.1) == Some(0)
-        {
-            start.1 -= 1;
-        }
-        if term.line_cells(end.0, pal, &mut cells).is_some()
-            && width(&cells, end.1) == Some(2)
-            && width(&cells, end.1 + 1).is_some()
-        {
-            end.1 += 1;
-        }
+        let (a, b) = drag.anchor;
+        let (start, end) = if drag.block {
+            let (top, bottom) = (a.0.min(head.0), a.0.max(head.0));
+            ((top, a.1.min(head.1)), (bottom, a.1.max(head.1)))
+        } else {
+            let h = Drag::new(term, pal, head, drag.unit, false).anchor;
+            (a.min(h.0), b.max(h.1))
+        };
         let mut s = Selection {
             drag,
             start,
@@ -514,11 +551,13 @@ impl Selection {
     }
 }
 
-/// The cells from `start` to `end` that a view of `rows` by `cols` cells
-/// from line `top` shows, as (column, row) of the first and last.
+/// The cells from `start` to `end`, or the block they are the corners
+/// of, that a view of `cols` by `rows` cells from line `top` shows, as
+/// (column, row) of the first and last.
 fn in_view(
     start: Pos,
     end: Pos,
+    block: bool,
     top: usize,
     (cols, rows): (u16, u16),
 ) -> Option<((u16, u16), (u16, u16))> {
@@ -527,17 +566,118 @@ fn in_view(
         return None;
     }
     let row = |n: usize| (n - top) as u16;
-    let a = if start.0 < top {
-        (0, 0)
-    } else {
-        (start.1, row(start.0))
+    let a = match start.0 < top {
+        true if block => (start.1, 0),
+        true => (0, 0),
+        false => (start.1, row(start.0)),
     };
-    let b = if end.0 >= bottom {
-        (cols - 1, rows - 1)
-    } else {
-        (end.1, row(end.0))
+    let b = match end.0 >= bottom {
+        true if block => (end.1, rows - 1),
+        true => (cols - 1, rows - 1),
+        false => (end.1, row(end.0)),
     };
     Some((a, b))
+}
+
+/// The drawn text of a logical line, its rows joined where they wrap.
+struct Logical {
+    text: String,
+    /// Each cell's place in `text`, the cell, and its width.
+    cells: Vec<(usize, Pos, u8)>,
+}
+
+impl Logical {
+    /// The logical line through line `n`, at most [`LOGICAL_ROWS`] rows
+    /// either side of it.
+    fn new(term: &vt::Terminal, pal: &Palette, n: usize) -> Logical {
+        let first = term.lines().start;
+        let mut top = n;
+        while top > first && n - top < LOGICAL_ROWS && term.wraps(top - 1) {
+            top -= 1;
+        }
+        let mut l = Logical {
+            text: String::new(),
+            cells: Vec::new(),
+        };
+        let mut row = Vec::new();
+        let mut line = top;
+        while let Some(wraps) = term.line_cells(line, pal, &mut row) {
+            for (col, c) in row.iter().enumerate().filter(|(_, c)| c.width > 0) {
+                l.cells.push((l.text.len(), (line, col as u16), c.width));
+                push_cells(&mut l.text, &row, col, col);
+            }
+            if !wraps || line >= n + LOGICAL_ROWS {
+                break;
+            }
+            line += 1;
+        }
+        l
+    }
+
+    /// Which of `cells` covers `at`.
+    fn index(&self, at: Pos) -> Option<usize> {
+        (self.cells.iter())
+            .position(|&(_, (n, c), w)| n == at.0 && (c..c + u16::from(w)).contains(&at.1))
+    }
+
+    /// The first and last cell that hold `text[range]`; the last cell's
+    /// last column for a wide one.
+    fn span(&self, range: std::ops::Range<usize>) -> (Pos, Pos) {
+        let i = self.cells.partition_point(|c| c.0 <= range.start);
+        let j = self.cells.partition_point(|c| c.0 < range.end);
+        let (_, (n, c), w) = self.cells[j.max(1) - 1];
+        (self.cells[i.max(1) - 1].1, (n, c + u16::from(w) - 1))
+    }
+}
+
+/// The cells of the character at `at`: both halves of a wide one, so
+/// what is highlighted is what is copied.
+fn char_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
+    let mut cells = Vec::new();
+    if term.line_cells(at.0, pal, &mut cells).is_none() {
+        return (at, at);
+    }
+    let width = |x: u16| cells.get(usize::from(x)).map(|c| c.width);
+    match width(at.1) {
+        Some(0) if at.1 > 0 => ((at.0, at.1 - 1), at),
+        Some(2) if width(at.1 + 1).is_some() => (at, (at.0, at.1 + 1)),
+        _ => (at, at),
+    }
+}
+
+/// The word around `at`, following soft wraps: a run of word characters
+/// or of blanks, or any other character alone.
+fn word_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
+    let l = Logical::new(term, pal, at.0);
+    let Some(i) = l.index(at) else {
+        return (at, at);
+    };
+    let class = |k: usize| match l.text[l.cells[k].0..].chars().next() {
+        Some(c) if c.is_alphanumeric() || WORD.contains(c) => 1,
+        Some(' ') => 2,
+        _ => 0,
+    };
+    let (mut a, mut b, me) = (i, i, class(i));
+    while me != 0 && a > 0 && class(a - 1) == me {
+        a -= 1;
+    }
+    while me != 0 && b + 1 < l.cells.len() && class(b + 1) == me {
+        b += 1;
+    }
+    l.span(l.cells[a].0..l.cells[b].0 + 1)
+}
+
+/// The logical line through `at`: every row joined to it by soft wraps.
+fn line_at(term: &vt::Terminal, at: Pos) -> (Pos, Pos) {
+    let lines = term.lines();
+    let (mut a, mut b) = (at.0, at.0);
+    while a > lines.start && term.wraps(a - 1) {
+        a -= 1;
+    }
+    while b + 1 < lines.end && term.wraps(b) {
+        b += 1;
+    }
+    ((a, 0), (b, u16::MAX))
 }
 
 /// A session and what the window keeps to draw it.
@@ -2735,7 +2875,11 @@ impl App {
             return;
         }
         if pressed {
-            self.press();
+            // With mouse reporting on, Shift is what brought the click
+            // here, so it does not extend.
+            let shift = mods.lshift || mods.rshift;
+            let extend = shift && self.modes().mouse == MouseMode::Off;
+            self.press(&mods, extend);
         } else {
             self.mouse.drag = None;
             self.mouse.scroll_at = None;
@@ -2751,20 +2895,41 @@ impl App {
         Some((t.line_epoch(), (t.view_top() + usize::from(row), col)))
     }
 
-    /// A left press that goes to selection: starts a drag from the cell
-    /// under the pointer.
-    fn press(&mut self) {
-        let Some((epoch, anchor)) = self.line_cell(self.mouse.pos) else {
+    /// A left press that goes to selection. Starts a drag from the cell
+    /// under the pointer: by words after a double click, by lines after a
+    /// triple click, and a block with Alt held. With `extend`, moves the
+    /// end of the selection there instead.
+    fn press(&mut self, mods: &Mods, extend: bool) {
+        let Some((epoch, here)) = self.line_cell(self.mouse.pos) else {
             return;
         };
-        self.mouse.drag = Some(Drag { epoch, anchor });
+        let held = self.selection.as_ref().map(|s| s.drag);
+        if let Some(drag) = held.filter(|d| extend && d.epoch == epoch) {
+            self.mouse.drag = Some(drag);
+            self.extend_drag();
+            return;
+        }
+        // SAFETY: a plain query.
+        let within = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+        let now = Instant::now();
+        let n = clicks(self.mouse.click, here, now, within);
+        self.mouse.click = Some((now, here, n));
+        let block = mods.lalt || mods.ralt;
+        let unit = if block { 1 } else { n };
+        let Some(v) = self.current() else {
+            return;
+        };
+        let drag = Drag::new(&lock(&v.pane.term), &self.theme.pal, here, unit, block);
+        self.mouse.drag = Some(drag);
         if self.selection.take().is_some() {
             self.request_redraw();
         }
+        // A double or triple click selects at once.
+        self.extend_drag();
     }
 
     /// Grows the selection being dragged to the cell under the pointer. A
-    /// drag shows nothing until the pointer leaves the cell pressed.
+    /// single click shows nothing until the pointer leaves its cell.
     fn extend_drag(&mut self) {
         let Some(drag) = self.mouse.drag else {
             return;
@@ -2780,7 +2945,7 @@ impl App {
             return;
         }
         let head = (term.view_top() + usize::from(row), col);
-        if self.selection.is_none() && head == drag.anchor {
+        if self.selection.is_none() && drag.unit == 1 && head == drag.anchor.0 {
             return;
         }
         let s = Selection::new(&term, &self.theme.pal, drag, head);
@@ -3008,8 +3173,10 @@ impl App {
             }
             if Some(id) == focus {
                 let (top, size) = (term.view_top(), (v.snap.cols, v.snap.rows));
+                let sel = self.selection.as_ref();
                 v.snap.selection =
-                    (self.selection.as_ref()).and_then(|s| in_view(s.start, s.end, top, size));
+                    sel.and_then(|s| in_view(s.start, s.end, s.drag.block, top, size));
+                v.snap.block = sel.is_some_and(|s| s.drag.block);
             } else if split {
                 dimmed.push(id);
             }
@@ -3488,7 +3655,7 @@ fn refresh(
 
 /// The text of the selected cells from line `from` on, in reading order:
 /// trailing blanks trimmed, rows joined by CRLF unless one wraps into the
-/// next.
+/// next. A block takes the same columns of each row.
 fn selection_text(term: &vt::Terminal, pal: &Palette, sel: &Selection, from: usize) -> String {
     let (a, b) = (sel.start, sel.end);
     let mut out = String::new();
@@ -3497,17 +3664,19 @@ fn selection_text(term: &vt::Terminal, pal: &Palette, sel: &Selection, from: usi
         let Some(wraps) = term.line_cells(n, pal, &mut cells) else {
             break;
         };
-        let first = if n == a.0 { usize::from(a.1) } else { 0 };
-        let last = if n == b.0 {
-            usize::from(b.1)
-        } else {
-            usize::MAX
+        let (first, last) = match (sel.drag.block, n == a.0, n == b.0) {
+            (true, ..) => (a.1, b.1),
+            (false, first, last) => (
+                if first { a.1 } else { 0 },
+                if last { b.1 } else { u16::MAX },
+            ),
         };
         let mut line = String::new();
-        let text_end = push_cells(&mut line, &cells, first, last);
+        let text_end = push_cells(&mut line, &cells, first.into(), last.into());
         // A row that wraps runs on into the next one: no line break, and
-        // only the empty cells at its end are dropped.
-        if n < b.0 && wraps {
+        // only the empty cells at its end are dropped. A block's rows
+        // always break.
+        if n < b.0 && wraps && !sel.drag.block {
             line.truncate(text_end);
             out.push_str(&line);
         } else {
@@ -4088,13 +4257,15 @@ mod tests {
         t
     }
 
+    /// A selection dragged from `a` to `b` after `unit` clicks.
+    fn drag(t: &vt::Terminal, a: Pos, b: Pos, unit: u8, block: bool) -> Selection {
+        let pal = crate::theme::dark();
+        Selection::new(t, &pal, Drag::new(t, &pal, a, unit, block), b)
+    }
+
     /// A selection dragged from `a` to `b`.
     fn select(t: &vt::Terminal, a: Pos, b: Pos) -> Selection {
-        let drag = Drag {
-            epoch: t.line_epoch(),
-            anchor: a,
-        };
-        Selection::new(t, &crate::theme::dark(), drag, b)
+        drag(t, a, b, 1, false)
     }
 
     /// What a copy of the selection dragged from `a` to `b` takes.
@@ -4229,14 +4400,75 @@ mod tests {
     #[test]
     fn app_selection_shows_the_part_in_view() {
         let size = (10, 3);
-        assert_eq!(in_view((5, 2), (6, 4), 5, size), Some(((2, 0), (4, 1))));
+        let view = |a, b| in_view(a, b, false, 5, size);
+        assert_eq!(view((5, 2), (6, 4)), Some(((2, 0), (4, 1))));
         assert_eq!(
-            in_view((1, 2), (9, 4), 5, size),
+            view((1, 2), (9, 4)),
             Some(((0, 0), (9, 2))),
-            "runs past both ends"
+            "past both ends"
         );
-        assert_eq!(in_view((1, 2), (4, 4), 5, size), None, "above");
-        assert_eq!(in_view((8, 0), (9, 4), 5, size), None, "below");
+        assert_eq!(view((1, 2), (4, 4)), None, "above");
+        assert_eq!(view((8, 0), (9, 4)), None, "below");
+        let block = in_view((1, 2), (9, 4), true, 5, size);
+        assert_eq!(block, Some(((2, 0), (4, 2))), "a block keeps its columns");
+    }
+
+    #[test]
+    fn app_double_click_takes_a_word_or_a_path() {
+        let t = fed(12, 3, "see src/foo.rs:42, (x)  y");
+        let pal = crate::theme::dark();
+        let word = |at| Drag::new(&t, &pal, at, 2, false).anchor;
+        assert_eq!(word((0, 8)), ((0, 4), (1, 4)), "a path, across the wrap");
+        assert_eq!(word((0, 1)), ((0, 0), (0, 2)));
+        assert_eq!(word((1, 7)), ((1, 7), (1, 7)), "punctuation alone");
+        assert_eq!(word((1, 10)), ((1, 10), (1, 11)), "a run of blanks");
+        let by_words = drag(&t, (0, 1), (1, 1), 2, false);
+        assert_eq!(selection_text(&t, &pal, &by_words, 0), "see src/foo.rs:42");
+        let t = fed(10, 1, "\u{4e2d}\u{6587} x");
+        let word = |at| Drag::new(&t, &pal, at, 2, false).anchor;
+        assert_eq!(word((0, 1)), ((0, 0), (0, 3)), "wide characters");
+    }
+
+    #[test]
+    fn app_triple_click_takes_the_logical_line() {
+        let t = fed(4, 4, "abcdef\r\ngh");
+        let pal = crate::theme::dark();
+        let line = |at| Drag::new(&t, &pal, at, 3, false).anchor;
+        assert_eq!(line((1, 0)), ((0, 0), (1, u16::MAX)));
+        assert_eq!(line((2, 1)), ((2, 0), (2, u16::MAX)));
+        let by_lines = drag(&t, (0, 2), (2, 0), 3, false);
+        assert_eq!(selection_text(&t, &pal, &by_lines, 0), "abcdef\r\ngh");
+    }
+
+    #[test]
+    fn app_block_copy_takes_the_same_columns_of_each_row() {
+        let pal = crate::theme::dark();
+        let t = fed(6, 3, "abcdef\r\ngh  \r\nijklmn");
+        let block = drag(&t, (0, 4), (2, 1), 1, true);
+        assert_eq!((block.start, block.end), ((0, 1), (2, 4)));
+        assert_eq!(selection_text(&t, &pal, &block, 0), "bcde\r\nh\r\njklm");
+        // Rows a wrap joined stay apart.
+        let t = fed(3, 2, "abcdef");
+        let block = drag(&t, (0, 0), (1, 1), 1, true);
+        assert_eq!(selection_text(&t, &pal, &block, 0), "ab\r\nde");
+    }
+
+    #[test]
+    fn app_clicks_count_on_the_same_cell_in_time() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let within = ms(500);
+        assert_eq!(clicks(None, (3, 1), t0, within), 1);
+        let last = Some((t0, (3, 1), 1));
+        assert_eq!(clicks(last, (3, 1), t0 + ms(400), within), 2);
+        assert_eq!(
+            clicks(last, (3, 2), t0 + ms(400), within),
+            1,
+            "another cell"
+        );
+        assert_eq!(clicks(last, (3, 1), t0 + ms(600), within), 1, "too late");
+        let third = Some((t0, (3, 1), 3));
+        assert_eq!(clicks(third, (3, 1), t0, within), 1, "after a triple click");
     }
 
     #[test]

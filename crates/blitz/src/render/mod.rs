@@ -318,7 +318,12 @@ mod gpu {
                         (b, a)
                     };
                     let p = (r as u16, c as u16);
-                    (a.1, a.0) <= p && p <= (b.1, b.0)
+                    if snap.block {
+                        let cols = a.0.min(b.0)..=a.0.max(b.0);
+                        (a.1..=b.1).contains(&p.0) && cols.contains(&p.1)
+                    } else {
+                        (a.1, a.0) <= p && p <= (b.1, b.0)
+                    }
                 })
             };
             // Search matches by cell: 1 for a match, 2 for the current one.
@@ -1500,6 +1505,25 @@ mod tests {
         assert_eq!(at(cw + 1), 0x1f2125, "halfway to the selection colour");
         assert_eq!(at(2 * cw + 1), p.bg, "between the matches");
         assert_eq!(at(5 * cw - 1), toward(p.selection_bg, p.fg), "current");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_block_selection_takes_the_same_columns_of_each_row() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("", 3, 2, &p);
+        snap.selection = Some(((1, 0), (1, 1)));
+        snap.block = true;
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        assert_eq!(at(cw + 1, 1), p.selection_bg);
+        assert_eq!(at(cw + 1, ch + 1), p.selection_bg);
+        assert_eq!(at(2 * cw + 1, 1), p.bg, "not the rest of the first row");
     }
 
     #[cfg(windows)]

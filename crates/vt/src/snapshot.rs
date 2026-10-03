@@ -113,6 +113,9 @@ pub struct Snapshot {
     pub top: usize,
     /// Search matches to mark, in reading order.
     pub highlights: Vec<Highlight>,
+    /// The selection is a block: start and end are its corners, and it
+    /// takes the same columns of every row between them.
+    pub block: bool,
 }
 
 impl Snapshot {
