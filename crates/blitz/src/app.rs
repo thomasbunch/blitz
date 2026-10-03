@@ -3163,7 +3163,12 @@ impl App {
             for _ in 0..steps.abs() as u32 {
                 self.mouse_report(id, kind, 0, mods);
             }
-        } else if !self.modes().alt_screen {
+        } else if self.modes().alt_screen {
+            // As in xterm's alternateScroll: pagers such as less and man
+            // have no scrollback to show, but scroll by the arrow keys.
+            let keys = wheel_keys(steps as isize * WHEEL_LINES, &self.modes());
+            self.send(keys);
+        } else {
             self.scroll(steps as isize * WHEEL_LINES);
         }
     }
@@ -3633,6 +3638,35 @@ fn reveal(term: &mut vt::Terminal, m: Found, rows: u16) -> bool {
     }
     term.scroll_to(m.start.0.saturating_sub(rows / 2));
     term.view_top() != top
+}
+
+/// `n` presses of Up, or of Down for a negative `n`, each with its
+/// release, as the program asked keys to be sent.
+fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
+    let (vk, scan, key) = if n > 0 {
+        (VK_UP, 0x48, vt::Key::Up)
+    } else {
+        (VK_DOWN, 0x50, vt::Key::Down)
+    };
+    let mut out = Vec::new();
+    for down in std::iter::repeat_n([true, false], n.unsigned_abs()).flatten() {
+        let k = KeyInput {
+            vk,
+            scan,
+            extended: true,
+            down,
+            repeat: 1,
+            mods: Mods::default(),
+            locks: vt::Locks::default(),
+            text: "",
+            uc: 0,
+            cs: 0,
+            key,
+            us_base: None,
+        };
+        vt::encode_key(&k, m, &mut out);
+    }
+    out
 }
 
 /// Draws a notice over the bottom row of the pane whose grid is at `at`.
@@ -4548,6 +4582,21 @@ mod tests {
         let (range, found) = crate::links::scan(&l.text).remove(0);
         assert_eq!(found, Link::Url("https://e.com/abc".into()));
         assert_eq!(l.span(range), ((0, 3), (1, 9)), "across the wrap");
+    }
+
+    #[test]
+    fn app_wheel_on_the_alternate_screen_sends_arrow_keys() {
+        let legacy = InputModes::default();
+        assert_eq!(wheel_keys(3, &legacy), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(wheel_keys(-1, &legacy), b"\x1b[B");
+        let app = InputModes {
+            decckm: true,
+            ..legacy
+        };
+        assert_eq!(wheel_keys(2, &app), b"\x1bOA\x1bOA", "DECCKM");
+        // Kitty flags 1 and 2: releases are reported too.
+        let kitty = InputModes { kitty: 3, ..legacy };
+        assert_eq!(wheel_keys(1, &kitty), b"\x1b[A\x1b[1;1:3A");
     }
 
     #[test]
