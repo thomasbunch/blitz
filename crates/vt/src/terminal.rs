@@ -152,11 +152,9 @@ pub struct Terminal {
     at_prompt: bool,
 }
 
-/// Foreground, background and cursor colours of the default dark and
-/// light themes, used for colour queries until a snapshot gives the
-/// host's own palette.
+/// Foreground, background and cursor colours of the default dark theme,
+/// used for colour queries until the host sets its own.
 const DARK: [u32; 3] = [0xD6D7D9, 0x131417, 0xECECEA];
-const LIGHT: [u32; 3] = [0x2F3135, 0xFCFCFB, 0x141518];
 
 /// Longest window title and notification texts kept, in characters.
 const MAX_TITLE: usize = 256;
@@ -367,9 +365,12 @@ impl Terminal {
         self.changed = true;
     }
 
-    pub fn set_theme(&mut self, dark: bool) {
+    /// The host's theme: whether it is dark, for `CSI ? 996 n`, and its
+    /// colours, for colour queries. The next snapshot recolours every cell.
+    pub fn set_theme(&mut self, dark: bool, pal: &Palette) {
         self.dark = dark;
-        self.pal = if dark { DARK } else { LIGHT };
+        self.pal = [pal.fg, pal.bg, pal.cursor];
+        self.changed = true;
     }
 
     /// The user confirmed a multi-line paste. While bracketed paste stays

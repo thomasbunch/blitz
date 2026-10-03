@@ -1,0 +1,23 @@
+# blitz ember light
+# blitz original (MIT)
+background = #f8f4ec
+foreground = #2e2822
+cursor-color = #2e2822
+selection-background = #e4d9c6
+palette = 0=#2e2822
+palette = 1=#b23a2a
+palette = 2=#5b7728
+palette = 3=#93600f
+palette = 4=#3b61a0
+palette = 5=#93447a
+palette = 6=#2c766a
+palette = 7=#8a8076
+palette = 8=#6b6258
+palette = 9=#c24a35
+palette = 10=#66842f
+palette = 11=#a26c14
+palette = 12=#4a72b4
+palette = 13=#a2558a
+palette = 14=#35887b
+palette = 15=#b8afa3
+accent = #e8892f

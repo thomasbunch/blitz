@@ -601,14 +601,15 @@ mod gpu {
 
     /// Renders a made-up window of five sessions, four of them split in
     /// one tab, for checking the chrome. With `--demo`, `--cols` and
-    /// `--rows` give the window size in pixels.
+    /// `--rows` give the window size in pixels, and `--picker` opens the
+    /// theme picker filtered to `--picker`'s value.
     fn render_demo(
         r: &mut Renderer,
-        light: bool,
+        theme: &crate::theme::Theme,
         collapsed: bool,
         banner: Option<&str>,
-        w: u32,
-        h: u32,
+        picker: Option<&str>,
+        (w, h): (u32, u32),
         scale: f32,
     ) -> Result<Vec<u8>> {
         use std::time::{Duration, Instant};
@@ -617,11 +618,7 @@ mod gpu {
         use crate::layout::{Dir, PaneId, Rect, Tab, Window};
         use crate::render::chrome::{self, ChromeModel, Session};
 
-        let pal = if light {
-            crate::theme::light()
-        } else {
-            crate::theme::dark()
-        };
+        let (pal, light) = (theme.pal, theme.light);
         let area = Rect {
             x: 0,
             y: 0,
@@ -769,8 +766,7 @@ mod gpu {
         let mut model = ChromeModel {
             win: &win,
             sessions: &sessions,
-            light,
-            accent: crate::theme::ACCENT,
+            ui: theme.ui,
             size: (w as i32, h as i32),
             scale,
             text_cell: r.small_cell(),
@@ -778,7 +774,21 @@ mod gpu {
             now,
             banner,
             preedit: None,
+            picker: None,
         };
+        let themes = crate::theme::all();
+        if let Some(f) = picker {
+            let f = f.to_lowercase();
+            let items: Vec<_> = (themes.iter())
+                .filter(|t| t.name.to_lowercase().contains(&f))
+                .collect();
+            let sel = items.iter().position(|t| t.name == theme.name).unwrap_or(0);
+            model.picker = Some(chrome::Picker {
+                filter: picker.unwrap_or_default(),
+                items,
+                sel,
+            });
+        }
         let mut snaps = Vec::new();
         for &(id, rect) in &chrome::build(&model).panes {
             let cols = (rect.w.max(0) as u32 / cw).max(1) as u16;
@@ -822,7 +832,7 @@ mod gpu {
         let mut text_file = None;
         let mut bmp = None;
         let (mut warp, mut light, mut demo, mut collapsed) = (false, false, false, false);
-        let mut banner = None;
+        let (mut banner, mut theme, mut picker) = (None, None, None);
         let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
         let mut px = DEFAULT_PX;
         let mut it = args.iter();
@@ -841,6 +851,8 @@ mod gpu {
                 "--demo" => demo = true,
                 "--collapsed" => collapsed = true,
                 "--banner" => banner = Some(val()?.clone()),
+                "--theme" => theme = Some(val()?.clone()),
+                "--picker" => picker = Some(val()?.clone()),
                 "--script" => {
                     return Err("--script is not supported yet; pass --vt FILE".into());
                 }
@@ -848,11 +860,13 @@ mod gpu {
             }
         }
         let bmp = bmp.ok_or("--bmp OUT is required")?;
-        let pal = if light {
-            crate::theme::light()
-        } else {
-            crate::theme::dark()
+        let theme = match theme {
+            Some(name) => (crate::theme::all().into_iter())
+                .find(|t| t.name.eq_ignore_ascii_case(&name))
+                .ok_or(format!("no theme {name:?}"))?,
+            None => crate::theme::blitz(light),
         };
+        let pal = theme.pal;
         if demo {
             let mut r = Renderer::new(warp, px).map_err(|e| format!("renderer: {e}"))?;
             let (w, h) = (
@@ -860,8 +874,16 @@ mod gpu {
                 u32::from(rows.unwrap_or(868)),
             );
             let scale = px / DEFAULT_PX;
-            let pixels = render_demo(&mut r, light, collapsed, banner.as_deref(), w, h, scale)
-                .map_err(|e| format!("render: {e}"))?;
+            let pixels = render_demo(
+                &mut r,
+                &theme,
+                collapsed,
+                banner.as_deref(),
+                picker.as_deref(),
+                (w, h),
+                scale,
+            )
+            .map_err(|e| format!("render: {e}"))?;
             write_bmp(&bmp, w, h, &pixels).map_err(|e| format!("{}: {e}", bmp.display()))?;
             return Ok(format!("{}: {w}x{h} demo", bmp.display()));
         }

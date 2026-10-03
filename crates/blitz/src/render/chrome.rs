@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::attention::Attn;
 use crate::layout::{PaneId, Rect, Tab, Window};
+use crate::theme::{Theme, Ui};
 
 /// One session as the chrome shows it.
 #[derive(Clone, Debug)]
@@ -30,8 +31,7 @@ pub struct ChromeModel<'a> {
     /// Tabs, the active tab and whether the sidebar is expanded.
     pub win: &'a Window,
     pub sessions: &'a [Session],
-    pub light: bool,
-    pub accent: u32,
+    pub ui: Ui,
     /// Window client size in pixels.
     pub size: (i32, i32),
     /// DPI scale, 1.0 at 96 DPI.
@@ -46,7 +46,21 @@ pub struct ChromeModel<'a> {
     pub banner: Option<&'a str>,
     /// IME composition in the focused pane: column, row and text.
     pub preedit: Option<(u16, u16, &'a str)>,
+    pub picker: Option<Picker<'a>>,
 }
+
+/// The theme picker, drawn over everything.
+pub struct Picker<'a> {
+    /// What was typed to narrow the list.
+    pub filter: &'a str,
+    /// The themes that match it.
+    pub items: Vec<&'a Theme>,
+    /// The highlighted item, which is the theme being shown.
+    pub sel: usize,
+}
+
+/// Rows the picker shows at once.
+pub const PICKER_ROWS: usize = 12;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prim {
@@ -92,96 +106,9 @@ pub const RAIL_W: f32 = 15.0;
 /// Height of the banner strip at 96 DPI.
 pub const BANNER_H: f32 = 22.0;
 
-struct Colors {
-    term_bg: u32,
-    term_fg: u32,
-    side_bg: u32,
-    border: u32,
-    rule: u32,
-    row_focus: u32,
-    name: u32,
-    dim: u32,
-    msg: u32,
-    chip_fg: u32,
-    track: u32,
-    fill: u32,
-    error: u32,
-    hdr_bg: u32,
-    hdr_line: u32,
-    hdr_name: u32,
-    hdr_cwd: u32,
-    rail_focus: u32,
-    rail_work: u32,
-    idle: u32,
-    label: u32,
-    label_focus: u32,
-    top_track: u32,
-}
-
-fn colors(light: bool) -> Colors {
-    let pal = if light {
-        crate::theme::light()
-    } else {
-        crate::theme::dark()
-    };
-    if light {
-        Colors {
-            term_bg: pal.bg,
-            term_fg: pal.fg,
-            side_bg: 0xf3f3f1,
-            border: 0xdcdcd8,
-            rule: 0xdfdfdb,
-            row_focus: 0xe6e6e3,
-            name: 0x141518,
-            dim: 0x5c5f65,
-            msg: 0x2f3135,
-            chip_fg: 0x17140d,
-            track: 0xd4d4d0,
-            fill: 0x6f7278,
-            error: 0xc8382f,
-            hdr_bg: 0xefefec,
-            hdr_line: 0xe8e8e4,
-            hdr_name: 0x45484d,
-            hdr_cwd: 0x686b71,
-            rail_focus: 0xe0e0dc,
-            rail_work: 0x6b6f76,
-            idle: 0xc3c5c8,
-            label: 0x63676e,
-            label_focus: 0x5c6067,
-            top_track: 0xebebe8,
-        }
-    } else {
-        Colors {
-            term_bg: pal.bg,
-            term_fg: pal.fg,
-            side_bg: 0x0f1013,
-            border: 0x222429,
-            rule: 0x26282d,
-            row_focus: 0x1c1d21,
-            name: 0xececea,
-            dim: 0x8f9298,
-            msg: 0xc8c9cc,
-            chip_fg: 0x17140d,
-            track: 0x2c2e33,
-            fill: 0x9a9da3,
-            error: 0xe5534b,
-            hdr_bg: 0x17181c,
-            hdr_line: 0x1b1d21,
-            hdr_name: 0xa9abb0,
-            hdr_cwd: 0x7d8087,
-            rail_focus: 0x1c1d21,
-            rail_work: 0x8d9199,
-            idle: 0x3a3d43,
-            label: 0x7e828a,
-            label_focus: 0x8f939a,
-            top_track: 0x1e2024,
-        }
-    }
-}
-
 /// Lays out the chrome for one frame.
 pub fn build(m: &ChromeModel) -> Chrome {
-    let c = colors(m.light);
+    let c = &m.ui;
     let s = |v: f32| (v * m.scale).round() as i32;
     let (tw, th) = (m.text_cell.0 as i32, m.text_cell.1 as i32);
     let (w, h) = m.size;
@@ -290,7 +217,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             }
             let cy = r.y + (hh - 1) / 2;
             match state {
-                Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, 0.0, m.accent),
+                Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, 0.0, c.accent),
                 Attn::DoneUnseen => mark(p, right - s(4.0), cy, 7.0, 1.5, c.name),
                 Attn::Error => mark(p, right - s(4.0), cy, 7.0, 0.0, c.error),
                 Attn::Working => {
@@ -340,7 +267,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                         h: r.h - 2 * b,
                     },
                 ] {
-                    p.push(Prim::Rect(e, m.accent));
+                    p.push(Prim::Rect(e, c.accent));
                 }
             }
         }
@@ -426,7 +353,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let (mx, my) = (row.x + s(12.0), y + s(7.0) + s(5.0) + s(4.0));
                 match x.state {
-                    Attn::NeedsYou => mark(p, mx, my, 8.0, 0.0, m.accent),
+                    Attn::NeedsYou => mark(p, mx, my, 8.0, 0.0, c.accent),
                     Attn::DoneUnseen => mark(p, mx, my, 8.0, 1.5, c.name),
                     Attn::Error => mark(p, mx, my, 8.0, 0.0, c.error),
                     Attn::Working | Attn::Idle => {}
@@ -450,7 +377,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                         r: chip,
                         radius: 4.0 * m.scale,
                         stroke: 0.0,
-                        color: m.accent,
+                        color: c.accent,
                     });
                     let cy = chip.y + (chip_h - th) / 2;
                     text(p, chip.x + s(6.0), cy, &word, c.chip_fg, true);
@@ -543,7 +470,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let (cx, cy) = (row.w / 2, y + row.h / 2);
                 match x.state {
-                    Attn::NeedsYou => mark(p, cx, cy, 7.0, 0.0, m.accent),
+                    Attn::NeedsYou => mark(p, cx, cy, 7.0, 0.0, c.accent),
                     Attn::DoneUnseen => mark(p, cx, cy, 8.0, 1.5, c.name),
                     Attn::Error => mark(p, cx, cy, 7.0, 0.0, c.error),
                     Attn::Idle => mark(p, cx, cy, 3.0, 0.0, c.idle),
@@ -607,8 +534,120 @@ pub fn build(m: &ChromeModel) -> Chrome {
         };
         extra.push(Prim::Rect(line, c.term_fg));
     }
+    if let Some(pk) = &m.picker {
+        picker(&mut extra, pk, c, m.size, s, (tw, th));
+    }
     out.prims.extend(extra);
     out
+}
+
+/// The theme picker: a panel near the top with the filter, a window of
+/// matching themes, each with a strip of its colours, and a key hint.
+fn picker(
+    p: &mut Vec<Prim>,
+    pk: &Picker,
+    c: &Ui,
+    (w, h): (i32, i32),
+    s: impl Fn(f32) -> i32,
+    (tw, th): (i32, i32),
+) {
+    let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
+        p.push(Prim::Text {
+            x,
+            y,
+            text: t,
+            color,
+            bold,
+            term: false,
+        });
+    };
+    let (pad, row_h, one) = (s(12.0), th + s(10.0), s(1.0).max(1));
+    let shown = pk.items.len().clamp(1, PICKER_ROWS) as i32;
+    let pw = s(380.0).min(w - s(32.0)).max(0);
+    let ph = 2 * row_h + shown * row_h + s(12.0);
+    let panel = Rect {
+        x: (w - pw) / 2,
+        y: s(56.0).min((h - ph) / 2).max(0),
+        w: pw,
+        h: ph,
+    };
+    let inset = |r: Rect| Rect {
+        x: r.x + one,
+        y: r.y + one,
+        w: (r.w - 2 * one).max(0),
+        h: (r.h - 2 * one).max(0),
+    };
+    p.push(Prim::Rect(panel, c.border));
+    let inner = inset(panel);
+    p.push(Prim::Rect(inner, c.side_bg));
+    let (left, right) = (inner.x + pad, inner.right() - pad);
+    let ty = |row_y: i32| row_y + (row_h - th) / 2;
+
+    let mut y = inner.y + s(4.0);
+    text(p, left, ty(y), "Theme".into(), c.name, true);
+    let fx = left + 7 * tw;
+    let (filter, color) = if pk.filter.is_empty() {
+        ("type to filter", c.dim)
+    } else {
+        (pk.filter, c.msg)
+    };
+    text(p, fx, ty(y), fit(filter, right - fx, tw), color, false);
+    y += row_h;
+    let rule = Rect {
+        x: inner.x,
+        y,
+        w: inner.w,
+        h: one,
+    };
+    p.push(Prim::Rect(rule, c.rule));
+    y += s(4.0);
+
+    if pk.items.is_empty() {
+        text(p, left, ty(y), "no theme matches".into(), c.dim, false);
+    }
+    // Six of the theme's colours on its own background.
+    let (sq, gap) = (s(8.0), s(4.0));
+    let strip_w = 6 * sq + 7 * gap;
+    let first = (pk.sel + 1).saturating_sub(PICKER_ROWS);
+    for (i, t) in pk.items.iter().enumerate().skip(first).take(PICKER_ROWS) {
+        let row = Rect {
+            x: inner.x,
+            y,
+            w: inner.w,
+            h: row_h,
+        };
+        let sel = i == pk.sel;
+        if sel {
+            p.push(Prim::Rect(row, c.row_focus));
+            p.push(Prim::Rect(Rect { w: s(2.0), ..row }, c.accent));
+        }
+        let strip = Rect {
+            x: right - strip_w,
+            y: y + (row_h - sq - 2 * gap) / 2,
+            w: strip_w,
+            h: sq + 2 * gap,
+        };
+        let color = if sel { c.name } else { c.msg };
+        let name = fit(&t.name, strip.x - s(8.0) - left, tw);
+        text(p, left, ty(y), name, color, sel);
+        p.push(Prim::Rect(strip, c.border));
+        p.push(Prim::Rect(inset(strip), t.pal.bg));
+        for (k, &col) in t.pal.ansi[1..7].iter().enumerate() {
+            let x = strip.x + gap + k as i32 * (sq + gap);
+            let r = Rect {
+                x,
+                y: strip.y + gap,
+                w: sq,
+                h: sq,
+            };
+            p.push(Prim::Rect(r, col));
+        }
+        y += row_h;
+    }
+
+    let hint = "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel";
+    let hy = panel.bottom() - row_h - s(2.0);
+    text(p, left, ty(hy), fit(hint, right - left, tw), c.dim, false);
 }
 
 /// The state shown on the right of a sidebar row.
@@ -796,8 +835,7 @@ mod tests {
         ChromeModel {
             win,
             sessions,
-            light: false,
-            accent: 0xf2b84b,
+            ui: crate::theme::blitz(false).ui,
             size: (AREA.w, AREA.h),
             scale: 1.0,
             text_cell: (7, 15),
@@ -805,6 +843,7 @@ mod tests {
             now,
             banner: None,
             preedit: None,
+            picker: None,
         }
     }
 
@@ -943,7 +982,10 @@ mod tests {
             w: 27,
             h: 1,
         };
-        assert!(c.prims.contains(&Prim::Rect(line, colors(false).term_fg)));
+        assert!(
+            c.prims
+                .contains(&Prim::Rect(line, crate::theme::blitz(false).ui.term_fg))
+        );
     }
 
     #[test]

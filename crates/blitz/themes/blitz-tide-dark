@@ -1,0 +1,23 @@
+# blitz tide dark
+# blitz original (MIT)
+background = #0d1418
+foreground = #d3dde2
+cursor-color = #e6eef1
+selection-background = #22323a
+palette = 0=#1c262c
+palette = 1=#e8697a
+palette = 2=#7fc79a
+palette = 3=#e3c27a
+palette = 4=#6aaee8
+palette = 5=#a99be8
+palette = 6=#5cc8c8
+palette = 7=#b9c6cc
+palette = 8=#566771
+palette = 9=#f28a97
+palette = 10=#9ad8b0
+palette = 11=#eed59a
+palette = 12=#8dc2f0
+palette = 13=#c0b4f0
+palette = 14=#85dada
+palette = 15=#e8f0f3
+accent = #ff8f6b

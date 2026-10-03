@@ -230,7 +230,13 @@ fn colour_queries_follow_the_host_palette() {
         replies(&mut t, "\x1b]11;?\x07"),
         "\x1b]11;rgb:1313/1414/1717\x07"
     );
-    t.set_theme(false);
+    let light = Palette {
+        fg: 0x2f3135,
+        bg: 0xfcfcfb,
+        cursor: 0x141518,
+        ..PAL
+    };
+    t.set_theme(false, &light);
     assert_eq!(
         replies(&mut t, "\x1b]10;?\x1b\\"),
         "\x1b]10;rgb:2f2f/3131/3535\x1b\\"
