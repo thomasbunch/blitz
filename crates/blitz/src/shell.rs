@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 /// stats every entry, and each new pane would repeat it.
 pub fn detect() -> PathBuf {
     static SHELL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    SHELL.get_or_init(|| detect_with(|k| std::env::var_os(k))).clone()
+    SHELL
+        .get_or_init(|| detect_with(|k| std::env::var_os(k)))
+        .clone()
 }
 
 /// [`detect`] with the environment supplied by the caller.

@@ -1155,7 +1155,10 @@ impl Handler for Terminal {
         }
         let mut rest = s.as_bytes();
         while !rest.is_empty() {
-            let n = rest.iter().position(|b| !b.is_ascii()).unwrap_or(rest.len());
+            let n = rest
+                .iter()
+                .position(|b| !b.is_ascii())
+                .unwrap_or(rest.len());
             let (ascii, tail) = rest.split_at(n);
             if !ascii.is_empty() {
                 self.print_ascii(ascii);

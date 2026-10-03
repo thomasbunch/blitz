@@ -2176,7 +2176,9 @@ fn refresh(
     sel: Option<((u16, u16), (u16, u16))>,
 ) -> bool {
     // Only a terminal with news can change the selected text.
-    let before = sel.filter(|_| term.is_changed()).map(|s| selection_text(snap, s));
+    let before = sel
+        .filter(|_| term.is_changed())
+        .map(|s| selection_text(snap, s));
     !term.snapshot(snap, pal) || sel.map(|s| selection_text(snap, s)) == before
 }
 
