@@ -7,7 +7,6 @@ pub mod keys;
 pub mod modes;
 pub mod osc;
 pub mod parser;
-pub mod reflow;
 pub mod snapshot;
 pub mod style;
 pub mod terminal;

@@ -239,6 +239,24 @@ impl Terminal {
         if (cols, rows) == (self.cols(), self.rows()) {
             return;
         }
+        // Output on the main screen rewraps to the new width; programs on
+        // the alternate screen redraw it themselves. The bundled ConPTY
+        // leaves this to the terminal and repaints nothing.
+        let reflow = cols != self.cols() && cols >= 2;
+        if reflow {
+            let (grid, cur) = if self.alt {
+                (&mut self.other.grid, self.other.saved.as_mut())
+            } else {
+                (&mut self.screen.grid, Some(&mut self.cur))
+            };
+            let at = cur
+                .as_ref()
+                .map_or((0, 0, false), |c| (c.x, c.y, c.pending_wrap));
+            let (x, y, pending) = grid.reflow(cols, at);
+            if let Some(c) = cur {
+                (c.x, c.y, c.pending_wrap) = (x, y, pending);
+            }
+        }
         self.cur.y = self.screen.grid.resize(cols, rows, self.cur.y);
         let other_y = self.other.saved.map_or(0, |c| c.y);
         let other_y = self.other.grid.resize(cols, rows, other_y);
@@ -246,7 +264,7 @@ impl Terminal {
             c.y = other_y;
         }
         if cols != self.cols() {
-            self.cur.pending_wrap = false;
+            self.cur.pending_wrap &= reflow && !self.alt;
             self.cur.x = self.cur.x.min(cols - 1);
             self.tabs = default_tabs(cols);
         }
