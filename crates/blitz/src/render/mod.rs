@@ -95,6 +95,14 @@ pub fn text_snapshot(text: &str, cols: u16, rows: u16, pal: &Palette) -> Snapsho
     }
 }
 
+/// The colour halfway between two `0xRRGGBB` colours.
+fn mix(a: u32, b: u32) -> u32 {
+    let [_, ar, ag, ab] = a.to_be_bytes();
+    let [_, br, bg, bb] = b.to_be_bytes();
+    let m = |x: u8, y: u8| u32::from(x.midpoint(y));
+    m(ar, br) << 16 | m(ag, bg) << 8 | m(ab, bb)
+}
+
 /// `fg` a quarter of the way to `bg`: text in a pane without focus.
 #[cfg(windows)]
 fn toward(fg: u32, bg: u32) -> u32 {
@@ -385,7 +393,7 @@ mod gpu {
                     } else if selected(c, r) {
                         pal.fg
                     } else if cl.attrs & attr::DIM != 0 {
-                        mix(cl.fg, cl.bg)
+                        super::mix(cl.fg, cl.bg)
                     } else {
                         cl.fg
                     };
@@ -689,14 +697,6 @@ mod gpu {
         }
     }
 
-    /// The colour halfway between two `0xRRGGBB` colours.
-    fn mix(a: u32, b: u32) -> u32 {
-        let [_, ar, ag, ab] = a.to_be_bytes();
-        let [_, br, bg, bb] = b.to_be_bytes();
-        let m = |x: u8, y: u8| u32::from(x.midpoint(y));
-        m(ar, br) << 16 | m(ag, bg) << 8 | m(ab, bb)
-    }
-
     fn is_builtin(text: &[u8]) -> bool {
         let mut chars = std::str::from_utf8(text).unwrap_or("").chars();
         matches!((chars.next(), chars.next()), (Some(c), None) if builtin::is_builtin(c))
@@ -787,7 +787,10 @@ mod gpu {
                 "Edit src/routes/users.rs?",
             ),
             Session {
-                progress: Some(42),
+                progress: Some(chrome::Progress {
+                    state: 1,
+                    pct: Some(42),
+                }),
                 ..session(
                     web,
                     "web",

@@ -22,9 +22,33 @@ pub struct Session {
     pub since: Instant,
     /// Latest one-line message: the hook message, else the title.
     pub msg: String,
-    /// Percent done, when the program reports it.
-    pub progress: Option<u8>,
+    /// What the program last reported of its progress.
+    pub progress: Option<Progress>,
     pub exit_code: Option<u32>,
+}
+
+/// A program's progress, as OSC 9;4 reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    /// 1 normal, 2 error, 3 indeterminate, 4 paused or warning.
+    pub state: u8,
+    /// Percent done, when known.
+    pub pct: Option<u8>,
+}
+
+impl Progress {
+    /// The progress after a report of `state` and `pct`, which was `prev`.
+    /// State 0 removes it. As in ConEmu, an error or a pause without a
+    /// value keeps the last one, and an indeterminate state has none.
+    pub fn next(prev: Option<Progress>, state: u8, pct: Option<u8>) -> Option<Progress> {
+        let pct = match state {
+            0 => return None,
+            1 => Some(pct.unwrap_or(0)),
+            3 => None,
+            _ => pct.or(prev.and_then(|p| p.pct)),
+        };
+        Some(Progress { state, pct })
+    }
 }
 
 pub struct ChromeModel<'a> {
@@ -249,11 +273,21 @@ pub fn build(m: &ChromeModel) -> Chrome {
             color,
         });
     };
-    // A 2 px line: the track, then `pct` of it filled.
-    let progress = |p: &mut Vec<Prim>, r: Rect, pct: Option<u8>, track: Option<u32>, fill| {
+    // A 2 px line: the track, then the part done filled, or all of it
+    // when the program has not said. An error or a pause colours it, and
+    // a program that cannot tell how far it is gets a dimmer full line:
+    // nothing here moves.
+    let progress = |p: &mut Vec<Prim>, r: Rect, pr: Option<Progress>, track: Option<u32>, fill| {
         if let Some(track) = track {
             p.push(Prim::Rect(r, track));
         }
+        let (pct, fill) = match pr {
+            Some(Progress { state: 2, pct }) => (pct, c.error),
+            Some(Progress { state: 3, .. }) => (None, super::mix(track.unwrap_or(c.track), fill)),
+            Some(Progress { state: 4, pct }) => (pct, c.accent),
+            Some(Progress { pct, .. }) => (pct, fill),
+            None => (None, fill),
+        };
         let pct = i32::from(pct.unwrap_or(100).min(100));
         p.push(Prim::Rect(
             Rect {
@@ -272,6 +306,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
     for &(id, r) in &rects {
         let sess = session(id);
         let state = sess.map_or(Attn::Idle, |x| x.state);
+        let reported = sess.and_then(|x| x.progress);
         let focused = id == tab.focus;
         if multi && expanded {
             let hh = s(HEADER_H);
@@ -306,21 +341,20 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, 0.0, c.accent),
                 Attn::DoneUnseen => mark(p, right - s(4.0), cy, 7.0, 1.5, c.name),
                 Attn::Error => mark(p, right - s(4.0), cy, 7.0, 0.0, c.error),
-                Attn::Working => {
-                    let line = Rect {
-                        y: r.y + hh - 2,
-                        h: s(2.0),
-                        ..r
-                    };
-                    progress(p, line, sess.and_then(|x| x.progress), None, c.fill);
-                }
-                Attn::Idle => {}
+                Attn::Working | Attn::Idle => {}
+            }
+            if state == Attn::Working || reported.is_some() {
+                let line = Rect {
+                    y: r.y + hh - 2,
+                    h: s(2.0),
+                    ..r
+                };
+                progress(p, line, reported, None, c.fill);
             }
         }
-        if fleet && !expanded && state == Attn::Working {
+        if fleet && !expanded && (state == Attn::Working || reported.is_some()) {
             let line = Rect { h: s(2.0), ..r };
-            let pct = sess.and_then(|x| x.progress);
-            progress(p, line, pct, Some(c.top_track), c.rail_work);
+            progress(p, line, reported, Some(c.top_track), c.rail_work);
         }
         if multi && !expanded {
             if let Some(x) = sess {
@@ -415,7 +449,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let focused = ti == m.win.active && x.id == t.focus;
                 let (l1, l2, l3, gap) = (s(18.0).max(th), s(16.0).max(th), s(17.0).max(th), s(2.0));
-                let working = x.state == Attn::Working;
+                let bar = x.state == Attn::Working || x.progress.is_some();
                 // Every row has room for a message and a progress bar, so
                 // output that changes a title or state cannot move the
                 // rows below it under the pointer.
@@ -510,7 +544,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     text(p, left, ly + (l3 - th) / 2, &msg, c.msg, false);
                 }
                 ly += l3;
-                if working {
+                if bar {
                     let line = Rect {
                         x: left,
                         y: ly + gap + s(5.0),
@@ -1366,6 +1400,55 @@ mod tests {
         let c = build(&model(&win, &sessions, now));
         // Needs you, working with no message, idle with one.
         assert!(c.rows.windows(2).all(|w| w[0].1.h == w[1].1.h));
+    }
+
+    #[test]
+    fn progress_reports_keep_or_drop_their_value() {
+        let p = |state, pct| Some(Progress { state, pct });
+        let steps = [
+            (1, Some(40), p(1, Some(40))),
+            // An error without a value keeps the last one.
+            (2, None, p(2, Some(40))),
+            (3, Some(9), p(3, None)),
+            (4, None, p(4, None)),
+            (1, None, p(1, Some(0))),
+            (0, None, None),
+        ];
+        let mut now = None;
+        for (state, pct, want) in steps {
+            now = Progress::next(now, state, pct);
+            assert_eq!(now, want, "{state} {pct:?}");
+        }
+    }
+
+    #[test]
+    fn reported_progress_shows_on_any_session_and_stands_still() {
+        let (win, mut sessions, now) = fleet(true);
+        let ui = crate::theme::blitz(false).ui;
+        sessions[0].progress = Some(Progress {
+            state: 2,
+            pct: Some(50),
+        });
+        // Idle, in the other tab.
+        sessions[2].progress = Some(Progress {
+            state: 3,
+            pct: None,
+        });
+        let c = build(&model(&win, &sessions, now));
+        let bars = |color| -> Vec<i32> {
+            (c.prims.iter())
+                .filter_map(|p| match p {
+                    Prim::Rect(r, rgb) if *rgb == color && r.h == 2 => Some(r.w),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Half of the header line and of the sidebar row's track.
+        let half = bars(ui.error);
+        assert!(half.len() == 2 && half.contains(&94), "{half:?}");
+        // No telling how far: the whole track, dimmer than progress.
+        let dim = crate::render::mix(ui.track, ui.fill);
+        assert_eq!(bars(dim), [188]);
     }
 
     #[test]

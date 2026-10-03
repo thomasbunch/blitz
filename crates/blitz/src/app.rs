@@ -19,7 +19,12 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DwmSetWindowAttribute,
 };
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState};
+use windows::Win32::UI::Shell::{
+    ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
+    TaskbarList,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage, WM_CHAR,
     WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -445,6 +450,8 @@ struct View {
     sync_until: Option<Instant>,
     /// Names the session's saved output; kept across restarts.
     key: String,
+    /// The progress the program last reported, and when.
+    progress: Option<(chrome::Progress, Instant)>,
 }
 
 struct App {
@@ -528,6 +535,10 @@ struct App {
     started: Instant,
     /// The device started at launch, until the first renderer takes it.
     gpu: Option<std::thread::JoinHandle<windows::core::Result<Gpu>>>,
+    /// The taskbar button, for progress; made the first time it is needed.
+    taskbar: Option<ITaskbarList3>,
+    /// The progress the taskbar button shows.
+    taskbar_shows: Option<chrome::Progress>,
     counters: Counters,
     code: i32,
 }
@@ -707,6 +718,8 @@ impl App {
             watched: None,
             started: Instant::now(),
             gpu: None,
+            taskbar: None,
+            taskbar_shows: None,
             counters: Counters::default(),
             code: 0,
         }
@@ -949,6 +962,7 @@ impl App {
             resume: None,
             sync_until: None,
             key,
+            progress: None,
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
@@ -993,6 +1007,7 @@ impl App {
         self.mouse.divider = None;
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
+        self.taskbar_progress();
         if self.views.is_empty() {
             // Nothing is left open, so there is nothing to restore.
             if self.persist {
@@ -1562,7 +1577,7 @@ impl App {
                     } else {
                         p.msg.clone()
                     },
-                    progress: None,
+                    progress: v.progress.map(|p| p.0),
                     exit_code: p.exit_code,
                 }
             })
@@ -2101,6 +2116,8 @@ impl App {
             }
             Note::Exit(code) => {
                 v.pane.exit_code = Some(code);
+                v.progress = None;
+                self.taskbar_progress();
                 self.attention(id, Ev::from_exit(code));
                 // A clean exit or Ctrl+C closes the session; anything else
                 // stays up so the output can be read.
@@ -2167,6 +2184,12 @@ impl App {
                     }
                 }
             }
+            Event::Progress { state, pct } => {
+                let next = chrome::Progress::next(v.progress.map(|p| p.0), state, pct);
+                v.progress = next.map(|p| (p, Instant::now()));
+                self.taskbar_progress();
+                self.request_redraw();
+            }
             // Like a question from Claude Code: it needs the user, unless
             // they are already looking at the pane.
             Event::Bell if self.config.bell_attention => {
@@ -2205,6 +2228,48 @@ impl App {
             self.request_redraw();
         } else {
             self.find_branch(id);
+        }
+    }
+
+    /// Shows on the taskbar button the progress of the session that
+    /// reported last, of those still reporting one, or clears it.
+    fn taskbar_progress(&mut self) {
+        let latest = (self.views.iter())
+            .filter_map(|v| v.progress)
+            .max_by_key(|p| p.1)
+            .map(|p| p.0);
+        if latest == self.taskbar_shows {
+            return;
+        }
+        if self.taskbar.is_none() {
+            // SAFETY: COM calls on the window's thread, where winit has
+            // started OLE for drag and drop.
+            self.taskbar = unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) }
+                .ok()
+                .filter(|t: &ITaskbarList3| unsafe { t.HrInit() }.is_ok());
+        }
+        let Some(t) = &self.taskbar else {
+            return;
+        };
+        self.taskbar_shows = latest;
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        let (flag, pct) = match latest {
+            None => (TBPF_NOPROGRESS, None),
+            Some(p) => match p.state {
+                2 => (TBPF_ERROR, p.pct),
+                3 => (TBPF_INDETERMINATE, None),
+                4 => (TBPF_PAUSED, p.pct),
+                _ => (TBPF_NORMAL, p.pct),
+            },
+        };
+        // SAFETY: a live window. A value set after the state keeps its
+        // error or pause colour; with none known the bar is full, as in
+        // the sidebar.
+        unsafe {
+            let _ = t.SetProgressState(hwnd, flag);
+            if flag != TBPF_NOPROGRESS && flag != TBPF_INDETERMINATE {
+                let _ = t.SetProgressValue(hwnd, u64::from(pct.unwrap_or(100)), 100);
+            }
         }
     }
 
