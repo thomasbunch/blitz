@@ -110,6 +110,8 @@ pub struct Modes {
     /// set. Any program's output can set it, so until then it does not show
     /// that a program reading pastes safely is listening.
     pub paste_confirmed: bool,
+    /// Mode 2031: report dark/light changes unasked, as `CSI ? 997 ; n n`.
+    pub theme_reports: bool,
 }
 
 impl Modes {
@@ -142,6 +144,7 @@ impl Modes {
                 self.sync.get_or_insert_with(Instant::now);
             }
             2026 => self.sync = None,
+            2031 => self.theme_reports = on,
             9001 => i.w32im = on,
             _ => return false,
         }
@@ -161,6 +164,7 @@ impl Modes {
             1006 => i.mouse_sgr,
             2004 => i.bracketed,
             2026 => self.sync.is_some(),
+            2031 => self.theme_reports,
             9001 => i.w32im,
             _ => return None,
         })
@@ -168,8 +172,9 @@ impl Modes {
 
     /// Clears the input modes a program can leave behind when it dies
     /// without restoring them: both kitty stacks, modifyOtherKeys, mouse
-    /// tracking, bracketed paste and synchronized output. Otherwise the
-    /// next program gets CSI-u keys or mouse reports it never asked for.
+    /// tracking, bracketed paste, synchronized output and theme reports.
+    /// Otherwise the next program gets CSI-u keys or reports it never asked
+    /// for.
     pub fn reset_input(&mut self) {
         self.kitty = Default::default();
         self.mok = 0;
@@ -178,6 +183,7 @@ impl Modes {
         self.input.bracketed = false;
         self.paste_confirmed = false;
         self.sync = None;
+        self.theme_reports = false;
     }
 
     /// True while a synchronized update is open and younger than

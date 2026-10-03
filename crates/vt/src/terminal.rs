@@ -367,10 +367,19 @@ impl Terminal {
 
     /// The host's theme: whether it is dark, for `CSI ? 996 n`, and its
     /// colours, for colour queries. The next snapshot recolours every cell.
+    /// A program that set mode 2031 is told of any change, so it can query
+    /// the new colours.
     pub fn set_theme(&mut self, dark: bool, pal: &Palette) {
+        let pal = [pal.fg, pal.bg, pal.cursor];
+        let differs = (dark, pal) != (self.dark, self.pal);
         self.dark = dark;
-        self.pal = [pal.fg, pal.bg, pal.cursor];
+        self.pal = pal;
         self.changed = true;
+        if differs && self.modes.theme_reports {
+            // The user's doing, not the program's, so it is not charged.
+            let theme = if dark { 1 } else { 2 };
+            let _ = write!(self.replies, "[?997;{theme}n");
+        }
     }
 
     /// The user confirmed a multi-line paste. While bracketed paste stays

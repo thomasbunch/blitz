@@ -950,7 +950,16 @@ impl App {
         self.theme = t;
         self.frame_theme();
         for v in &self.views {
-            lock(&v.pane.term).set_theme(!self.theme.light, &self.theme.pal);
+            let mut term = lock(&v.pane.term);
+            term.set_theme(!self.theme.light, &self.theme.pal);
+            // A mode 2031 report; sent now, as an idle program writes
+            // nothing that would carry it out with the replies.
+            let mut report = Vec::new();
+            term.take_replies(&mut report);
+            drop(term);
+            if !report.is_empty() {
+                v.pane.send(report);
+            }
         }
         self.request_redraw();
     }

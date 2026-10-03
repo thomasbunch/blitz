@@ -137,6 +137,28 @@ fn theme_query() {
 }
 
 #[test]
+fn theme_change_reports() {
+    let mut t = Terminal::new(opts());
+    let light = vt::Palette {
+        fg: 0,
+        bg: 0xffffff,
+        cursor: 0,
+        selection_bg: 0,
+        ansi: [0; 16],
+    };
+    t.set_theme(false, &light);
+    assert_eq!(replies_of(&mut t), "", "not asked for");
+    t.feed(b"\x1b[?2031h");
+    t.set_theme(false, &light);
+    assert_eq!(replies_of(&mut t), "", "nothing changed");
+    t.set_theme(true, &light);
+    assert_eq!(replies_of(&mut t), "\x1b[?997;1n");
+    t.feed(b"\x1b[?2031l");
+    t.set_theme(false, &light);
+    assert_eq!(replies_of(&mut t), "");
+}
+
+#[test]
 fn size_reports() {
     let mut t = Terminal::new(opts());
     t.set_cell_px(9, 19);
