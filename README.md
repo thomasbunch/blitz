@@ -14,6 +14,7 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   finished, and the taskbar button flashes if blitz is in the background.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
   format.
+- A settings panel on Ctrl+, for the font, shell, sessions and more.
 - Direct3D 11 and DirectWrite rendering, with a software fallback.
 
 ## Install
@@ -82,13 +83,26 @@ Saved state lives in `%LOCALAPPDATA%\blitz`.
 
 ## Settings
 
-Optional, in `%APPDATA%\blitz\config.toml`, one `key = value` per line.
-The theme follows the file as soon as it is saved; the rest is read when
-blitz starts.
+Ctrl+, opens the settings panel. Up and down choose a setting, left and
+right change it, and Enter flips a switch or moves to the next value; a
+click does the same. Typing searches the names and descriptions, Del puts
+a setting back to its default, and Esc closes the panel. The font, its
+size and the theme change at once; the panel says when the others take
+effect. A dot marks each setting changed from its default.
+
+The panel saves to `%APPDATA%\blitz\config.toml`, which you can also edit
+yourself: one `key = value` per line, `#` starts a comment. blitz reads
+the file again whenever it is saved, and keeps your comments when it
+writes it.
 
 | Key | Default | |
 |---|---|---|
 | `theme` | `"light:blitz light,dark:blitz dark"` | A theme name, or a light and a dark one to follow the Windows app mode. See [Themes](#themes) |
+| `font_family` | `"Cascadia Mono"` | Falls back to Cascadia Mono, then Consolas, when not installed |
+| `font_size` | `11` | In points, 4 to 72 |
+| `shell` | `""` | Path of the program new panes run; empty picks PowerShell 7, then Windows PowerShell, then cmd |
+| `shell_integration` | `true` | Let PowerShell and cmd report their folder and prompts to blitz |
+| `scrollback_lines` | `10000` | Lines of history each new pane keeps, up to 100000 |
 | `restore_session` | `true` | Reopen the last window's tabs, splits and folders |
 | `restore_claude` | `true` | Resume the Claude Code sessions they were running |
 | `restore_scrollback` | `false` | Save each pane's last 1000 lines when blitz closes and show them again above the new prompt. Off by default because old output can contain secrets |
@@ -153,6 +167,7 @@ good place to start.
 | Ctrl+Shift+B | Expand or collapse the sidebar |
 | Ctrl+Shift+U | Update, when a newer release is available |
 | Ctrl+Shift+K | Pick a theme |
+| Ctrl+, | Settings |
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
