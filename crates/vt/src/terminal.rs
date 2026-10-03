@@ -280,8 +280,10 @@ impl Terminal {
     /// Scrolls the view of the main screen; positive is up into scrollback.
     pub fn scroll_viewport(&mut self, delta: isize) {
         let max = self.screen.grid.scrollback_len();
-        self.viewport = self.viewport.saturating_add_signed(delta).min(max);
-        self.changed = true;
+        let v = self.viewport.saturating_add_signed(delta).min(max);
+        // Every keystroke asks to follow the cursor; only a move redraws.
+        self.changed |= v != self.viewport;
+        self.viewport = v;
     }
 
     pub fn input_modes(&self) -> InputModes {
@@ -307,6 +309,16 @@ impl Terminal {
     /// the host should look again once it times out.
     pub fn sync_pending(&self, now: Instant) -> bool {
         self.modes.sync_pending(now)
+    }
+
+    /// Something changed since the last [`Self::snapshot`] took the screen.
+    pub fn is_changed(&self) -> bool {
+        self.changed
+    }
+
+    /// When the open synchronized update times out, if one is open.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.modes.sync.map(|t| t + crate::modes::SYNC_TIMEOUT)
     }
 
     /// Fills `out` with the visible screen. Returns whether anything changed

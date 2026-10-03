@@ -357,6 +357,9 @@ struct View {
     /// A restored Claude Code session: the line to type at the shell's
     /// first prompt, and when to type it anyway.
     resume: Option<(String, Instant)>,
+    /// When the program's open synchronized update times out, as of the
+    /// last look at its terminal.
+    sync_until: Option<Instant>,
 }
 
 struct App {
@@ -742,6 +745,7 @@ impl App {
             flashed: None,
             finding_branch: false,
             resume: None,
+            sync_until: None,
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
@@ -1424,7 +1428,13 @@ impl App {
             Note::Dirty => {
                 v.pane.dirty.store(false, Ordering::Release);
                 let mut events = Vec::new();
-                lock(&v.pane.term).take_events(&mut events);
+                let mut term = lock(&v.pane.term);
+                term.take_events(&mut events);
+                v.sync_until = term.sync_deadline();
+                drop(term);
+                // Output in a hidden tab only matters for what it tells
+                // the sidebar.
+                let shown = v.rect.is_some() || !events.is_empty();
                 for e in events {
                     self.on_term_event(id, e);
                 }
@@ -1436,7 +1446,9 @@ impl App {
                         self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
                     }
                 }
-                self.request_redraw();
+                if shown {
+                    self.request_redraw();
+                }
             }
             Note::Exit(code) => {
                 v.pane.exit_code = Some(code);
@@ -1706,8 +1718,9 @@ impl App {
         self.mouse.pos = pos;
         if let Some(anchor) = self.mouse.anchor {
             let here = self.cell_at(pos);
-            if self.selection.is_some() || here != anchor {
-                self.selection = Some((anchor, here));
+            let sel = Some((anchor, here));
+            if (self.selection.is_some() || here != anchor) && self.selection != sel {
+                self.selection = sel;
                 self.request_redraw();
             }
             return;
@@ -1807,16 +1820,15 @@ impl App {
             }
             v.rect = Some(rect);
             let sel = self.selection.filter(|_| Some(id) == focus);
-            if !refresh(&mut lock(&v.pane.term), &mut v.snap, &self.theme.pal, sel) {
+            let mut term = lock(&v.pane.term);
+            v.sync_until = term.sync_deadline();
+            if !refresh(&mut term, &mut v.snap, &self.theme.pal, sel) {
                 self.selection = None;
             }
             if Some(id) == focus {
                 v.snap.selection = self.selection;
             } else if split {
-                let mut s = v.snap.clone();
-                s.selection = None;
-                crate::render::dim(&mut s);
-                dimmed.push((id, s));
+                dimmed.push(id);
             }
         }
 
@@ -1834,8 +1846,11 @@ impl App {
                         continue;
                     };
                     let id = v.pane.id;
-                    let snap = dimmed.iter().find(|d| d.0 == id).map_or(&v.snap, |d| &d.1);
-                    g.r.snapshot(snap, &pal, at.x, at.y);
+                    if dimmed.contains(&id) {
+                        g.r.dimmed(&v.snap, &pal, at.x, at.y);
+                    } else {
+                        g.r.snapshot(&v.snap, &pal, at.x, at.y);
+                    }
                     if let Some(n) = &v.notice {
                         draw_notice(&mut g.r, &pal, at, v.grid, n);
                     }
@@ -1978,11 +1993,12 @@ impl App {
     /// The soonest time something on screen changes by itself.
     fn next_deadline(&self) -> Option<Instant> {
         let now = Instant::now();
-        let sync = self
-            .views
-            .iter()
-            .any(|v| lock(&v.pane.term).sync_pending(now))
-            .then(|| now + vt::modes::SYNC_TIMEOUT);
+        // Hidden panes are drawn when shown, timed out or not.
+        let sync = (self.views.iter())
+            .filter(|v| v.rect.is_some())
+            .filter_map(|v| v.sync_until)
+            .filter(|&t| t > now)
+            .min();
         let notice = self
             .views
             .iter()
@@ -2139,7 +2155,8 @@ fn refresh(
     pal: &Palette,
     sel: Option<((u16, u16), (u16, u16))>,
 ) -> bool {
-    let before = sel.map(|s| selection_text(snap, s));
+    // Only a terminal with news can change the selected text.
+    let before = sel.filter(|_| term.is_changed()).map(|s| selection_text(snap, s));
     !term.snapshot(snap, pal) || sel.map(|s| selection_text(snap, s)) == before
 }
 
