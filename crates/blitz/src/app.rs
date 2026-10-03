@@ -15,7 +15,10 @@ use vt::{
     Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
 };
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage, WM_CHAR,
@@ -905,18 +908,34 @@ impl App {
         }
     }
 
-    /// Dark or light window frame, to match the theme.
+    /// Window frame in the theme's colours: dark or light everywhere, and
+    /// on Windows 11 the title bar, title text and border too (older
+    /// Windows refuses those and keeps the dark or light frame).
     fn frame_theme(&self) {
+        let hwnd = HWND(self.hwnd as *mut c_void);
         let dark = windows::core::BOOL::from(!self.theme.light);
         // SAFETY: a live window and a BOOL-sized value.
         let _ = unsafe {
             DwmSetWindowAttribute(
-                HWND(self.hwnd as *mut c_void),
+                hwnd,
                 DWMWA_USE_IMMERSIVE_DARK_MODE,
                 (&raw const dark).cast(),
                 size_of_val(&dark) as u32,
             )
         };
+        let ui = &self.theme.ui;
+        for (attr, rgb) in [
+            (DWMWA_CAPTION_COLOR, ui.term_bg),
+            (DWMWA_TEXT_COLOR, ui.term_fg),
+            (DWMWA_BORDER_COLOR, ui.border),
+        ] {
+            // COLORREF is 0x00BBGGRR.
+            let c = rgb.swap_bytes() >> 8;
+            // SAFETY: a live window and a COLORREF-sized value.
+            let _ = unsafe {
+                DwmSetWindowAttribute(hwnd, attr, (&raw const c).cast(), size_of_val(&c) as u32)
+            };
+        }
     }
 
     /// Shows `t` everywhere: panes, chrome, window frame, and what colour
@@ -928,13 +947,19 @@ impl App {
         if t == self.theme {
             return;
         }
-        let frame = t.light != self.theme.light;
         self.theme = t;
-        if frame {
-            self.frame_theme();
-        }
+        self.frame_theme();
         for v in &self.views {
-            lock(&v.pane.term).set_theme(!self.theme.light, &self.theme.pal);
+            let mut term = lock(&v.pane.term);
+            term.set_theme(!self.theme.light, &self.theme.pal);
+            // A mode 2031 report; sent now, as an idle program writes
+            // nothing that would carry it out with the replies.
+            let mut report = Vec::new();
+            term.take_replies(&mut report);
+            drop(term);
+            if !report.is_empty() {
+                v.pane.send(report);
+            }
         }
         self.request_redraw();
     }
