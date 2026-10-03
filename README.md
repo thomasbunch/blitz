@@ -165,6 +165,20 @@ and `top-track`. The
 [blitz dark](crates/blitz/themes/blitz-dark) file sets every key and is a
 good place to start.
 
+## Find and prompts
+
+Ctrl+Shift+F opens a find bar at the top right of the focused pane. It
+searches the pane's scrollback and screen as you type, ignoring case
+unless what you type has a capital letter, and tints every match in
+view. Enter or F3 goes to the next match up, Shift+Enter or Shift+F3 to
+the next one down, and Esc closes the bar, leaving the view where it is.
+A full-screen program is searched on its screen only.
+
+With shell integration on, Ctrl+Shift+Up and Ctrl+Shift+Down scroll to
+the previous and next prompt; down from the last one goes back to the
+bottom. With no prompt that way, or in a full-screen program, the keys
+go to the program.
+
 ## Default keys
 
 | Keys | Action |
@@ -190,6 +204,8 @@ good place to start.
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
+| Ctrl+Shift+F | Find in the scrollback |
+| Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
 A zoomed pane stays zoomed until you zoom again, move focus to another
 pane, split or resize.
@@ -226,8 +242,8 @@ The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
 `settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
 `resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
 `equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
-`fullscreen` and `command_palette`. Typing a name in the command palette
-finds its action.
+`fullscreen`, `command_palette`, `find`, `previous_prompt` and
+`next_prompt`. Typing a name in the command palette finds its action.
 
 ## License
 
