@@ -34,6 +34,10 @@ pub struct Pane {
     /// The pane's `BLITZ_PANE_TOKEN`. Only hook notifications and prompt
     /// marks that carry it are believed.
     pub token: String,
+    /// The Claude Code session running in the pane, from its hook
+    /// notifications. Kept until Claude ends the session, so a window closed
+    /// mid-session can resume it.
+    pub claude: Option<String>,
     /// Set once the child has exited.
     pub exit_code: Option<u32>,
     /// Set by the reader thread when there is new output to draw.
@@ -70,6 +74,8 @@ pub struct Spawn<'a> {
     pub parent: Option<isize>,
     /// From [`crate::pty::pane_token`]; exported as `BLITZ_PANE_TOKEN`.
     pub token: &'a str,
+    /// Fed to the screen before the child starts: [`restored`] output.
+    pub restored: &'a [u8],
 }
 
 impl Pane {
@@ -87,6 +93,7 @@ impl Pane {
         });
         term.set_theme(s.dark);
         term.set_prompt_token(s.token);
+        term.feed(s.restored);
         let term = Arc::new(Mutex::new(term));
         let dirty = Arc::new(AtomicBool::new(false));
         let (t, d) = (term.clone(), dirty.clone());
@@ -155,6 +162,7 @@ impl Pane {
             branch: None,
             msg: String::new(),
             token: s.token.into(),
+            claude: None,
             exit_code: None,
             dirty,
         })
@@ -176,6 +184,25 @@ impl Pane {
             self.pty.writer().send(bytes);
         }
     }
+}
+
+/// What a new screen is fed before its shell starts, to show `text`, a
+/// pane's saved output, above a dim `restored · <stamp>` line. All of it
+/// goes into scrollback, leaving a blank screen with the cursor at the
+/// top: the console host in Windows clears the screen when it starts, and
+/// the bundled one writes over it as if it were blank. Control characters
+/// are dropped, since a query in the text would be answered to the new
+/// shell.
+pub fn restored(text: &str, stamp: &str, rows: u16) -> Vec<u8> {
+    let mut s = String::with_capacity(text.len() + 64 + usize::from(rows));
+    for line in text.lines() {
+        s.extend(line.chars().filter(|c| !c.is_control()));
+        s.push_str("\r\n");
+    }
+    s.push_str(&format!("\x1b[2m── restored · {stamp} ──\x1b[m\r\n"));
+    s.push_str(&"\n".repeat(rows.into()));
+    s.push_str("\x1b[H");
+    s.into_bytes()
 }
 
 /// The program a command line runs, without directory or extension:
@@ -247,6 +274,37 @@ mod tests {
     }
 
     #[test]
+    fn pane_restored_text_goes_into_scrollback() {
+        for (text, last) in [("one\ntwo\n", "two"), (&"line\n".repeat(50), "line")] {
+            let mut term = vt::Terminal::new(vt::Options {
+                cols: 40,
+                rows: 5,
+                scrollback_lines: 100,
+                ..Default::default()
+            });
+            term.feed(&restored(text, "14:32", 5));
+            let sb = term.scrollback_text();
+            assert!(sb.starts_with(text.lines().next().unwrap()), "{sb:?}");
+            assert!(
+                sb.contains(&format!("{last}\n── restored · 14:32 ──")),
+                "{sb:?}"
+            );
+            assert_eq!(term.screen_text().trim(), "");
+            assert_eq!(term.cursor(), (0, 0, true));
+        }
+    }
+
+    #[test]
+    fn pane_restored_text_drops_control_characters() {
+        let mut term = vt::Terminal::new(vt::Options::default());
+        term.feed(&restored("a\x1b[cb\x07\x1b]0;t\x07\r\n", "14:32", 24));
+        let mut replies = Vec::new();
+        term.take_replies(&mut replies);
+        assert!(replies.is_empty(), "{replies:?}");
+        assert!(term.scrollback_text().starts_with("a[cb]0;t\n"));
+    }
+
+    #[test]
     fn pane_git_branch_from_head() {
         let root = std::env::temp_dir().join(format!("blitz-branch-{}", std::process::id()));
         let sub = root.join("repo").join("src").join("deep");
@@ -303,6 +361,7 @@ mod tests {
                 dark: true,
                 parent: None,
                 token: "t",
+                restored: &[],
             },
             move |id, n| {
                 let _ = tx.send((id, n));
@@ -342,6 +401,7 @@ mod tests {
                 dark: true,
                 parent: None,
                 token: "t",
+                restored: &[],
             },
             move |_, n| {
                 // Stands in for a parser panic, once all output is on screen.

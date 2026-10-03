@@ -31,9 +31,40 @@ OutputBaseFilename=blitz-{#AppVersion}-windows-x64-setup
 
 [Tasks]
 Name: desktopicon; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: explorermenu; Description: "Add ""Open in blitz"" to the folder right-click menu"
 
 [Files]
 Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
+
+[Registry]
+; Right-click menu entries. HKA is HKCU on a per-user install and HKLM on an
+; all-users one. Windows 11 shows them under "Show more options". The second
+; verb is Extended: it only shows on Shift+right-click.
+; Right-click on a folder.
+Root: HKA; Subkey: "Software\Classes\Directory\shell\blitz"; ValueType: string; ValueData: "Open in blitz"; Flags: uninsdeletekey; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Directory\shell\blitz\command"; ValueType: string; ValueData: """{app}\blitz.exe"" --cwd ""%V"""; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Directory\shell\blitz.window"; ValueType: string; ValueData: "Open in new blitz window"; Flags: uninsdeletekey; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Directory\shell\blitz.window"; ValueType: string; ValueName: "Extended"; ValueData: ""; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Directory\shell\blitz.window\command"; ValueType: string; ValueData: """{app}\blitz.exe"" --new-window --cwd ""%V"""; Tasks: explorermenu
+; Right-click on the empty space in a folder.
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz"; ValueType: string; ValueData: "Open in blitz"; Flags: uninsdeletekey; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz\command"; ValueType: string; ValueData: """{app}\blitz.exe"" --cwd ""%V"""; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz.window"; ValueType: string; ValueData: "Open in new blitz window"; Flags: uninsdeletekey; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz.window"; ValueType: string; ValueName: "Extended"; ValueData: ""; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz.window\command"; ValueType: string; ValueData: """{app}\blitz.exe"" --new-window --cwd ""%V"""; Tasks: explorermenu
+; Right-click on a drive.
+Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz"; ValueType: string; ValueData: "Open in blitz"; Flags: uninsdeletekey; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz\command"; ValueType: string; ValueData: """{app}\blitz.exe"" --cwd ""%V"""; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz.window"; ValueType: string; ValueData: "Open in new blitz window"; Flags: uninsdeletekey; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz.window"; ValueType: string; ValueName: "Extended"; ValueData: ""; Tasks: explorermenu
+Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz.window\command"; ValueType: string; ValueData: """{app}\blitz.exe"" --new-window --cwd ""%V"""; Tasks: explorermenu
+; Unticking the task on a reinstall removes the entries.
+Root: HKA; Subkey: "Software\Classes\Directory\shell\blitz"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
+Root: HKA; Subkey: "Software\Classes\Directory\shell\blitz.window"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz.window"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
+Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
+Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz.window"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
 
 [Icons]
 Name: "{autoprograms}\blitz"; Filename: "{app}\blitz.exe"

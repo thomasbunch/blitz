@@ -6,6 +6,7 @@ pub mod hook;
 pub mod keymap;
 pub mod layout;
 pub mod render;
+pub mod session;
 pub mod shell;
 pub mod theme;
 
@@ -15,6 +16,8 @@ pub mod app;
 pub mod clipboard;
 #[cfg(windows)]
 pub mod debug;
+#[cfg(windows)]
+pub mod handoff;
 #[cfg(windows)]
 pub mod pane;
 #[cfg(windows)]

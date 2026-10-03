@@ -32,22 +32,31 @@ impl Ev {
     /// `blitz:<token>:done`, as written by `blitz-hook` with the pane's
     /// token. Other titles, and any without that token, are not attention
     /// events: program output can print them too.
-    pub fn from_notify(title: &str, token: &str) -> Option<Ev> {
-        let state = title
+    ///
+    /// Newer hooks add the Claude Code session id, `blitz:<token>:done:<id>`,
+    /// which comes back too. A title whose id is not a valid one is dropped.
+    pub fn from_notify<'a>(title: &'a str, token: &str) -> Option<(Ev, Option<&'a str>)> {
+        let rest = title
             .strip_prefix("blitz:")?
             .strip_prefix(token)?
             .strip_prefix(':')?;
         if token.is_empty() {
             return None;
         }
-        Some(match state {
+        let (state, session) = match rest.split_once(':') {
+            Some((state, id)) if crate::hook::is_session_id(id) => (state, Some(id)),
+            Some(_) => return None,
+            None => (rest, None),
+        };
+        let ev = match state {
             "needs-you" => Ev::NeedsYou,
             "working" => Ev::Working,
             "done" => Ev::Done,
             "error" => Ev::Error { sticky: false },
             "idle" => Ev::Idle,
             _ => return None,
-        })
+        };
+        Some((ev, session))
     }
 
     /// The event for the session's root process exiting with `code`.
@@ -279,7 +288,7 @@ mod tests {
 
     #[test]
     fn notify_titles() {
-        let ev = |s: &str| Ev::from_notify(s, TOKEN);
+        let ev = |s: &str| Ev::from_notify(s, TOKEN).map(|(ev, _)| ev);
         assert_eq!(ev("blitz:0f1e2d3c:needs-you"), Some(Ev::NeedsYou));
         assert_eq!(ev("blitz:0f1e2d3c:working"), Some(Ev::Working));
         assert_eq!(ev("blitz:0f1e2d3c:done"), Some(Ev::Done));
@@ -291,6 +300,33 @@ mod tests {
         assert_eq!(ev("blitz:0f1e2d3c:bogus"), None);
         assert_eq!(ev("Build finished"), None);
         assert_eq!(ev(""), None);
+    }
+
+    const SESSION: &str = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
+
+    #[test]
+    fn notify_titles_with_a_session() {
+        fn ev(s: &str) -> Option<(Ev, Option<&str>)> {
+            Ev::from_notify(s, TOKEN)
+        }
+        assert_eq!(ev("blitz:0f1e2d3c:done"), Some((Ev::Done, None)));
+        assert_eq!(
+            ev(&format!("blitz:0f1e2d3c:done:{SESSION}")),
+            Some((Ev::Done, Some(SESSION)))
+        );
+        assert_eq!(
+            ev(&format!("blitz:0f1e2d3c:idle:{SESSION}")),
+            Some((Ev::Idle, Some(SESSION)))
+        );
+        for bad in [
+            "blitz:0f1e2d3c:done:",
+            "blitz:0f1e2d3c:done:abc",
+            &format!("blitz:0f1e2d3c:done:{SESSION}:x"),
+            &format!("blitz:0f1e2d3c:done:{}", SESSION.replacen('0', ";", 1)),
+            &format!("blitz:0f1e2d3c:bogus:{SESSION}"),
+        ] {
+            assert_eq!(ev(bad), None, "{bad}");
+        }
     }
 
     /// Output can print the hook's sequence, but not the pane's token.
@@ -345,7 +381,7 @@ mod tests {
         t.take_events(&mut evs);
         evs.into_iter()
             .filter_map(|e| match e {
-                vt::Event::Notify { title, .. } => Ev::from_notify(&title, TOKEN),
+                vt::Event::Notify { title, .. } => Ev::from_notify(&title, TOKEN).map(|(ev, _)| ev),
                 _ => None,
             })
             .collect()

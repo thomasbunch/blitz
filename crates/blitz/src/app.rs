@@ -11,19 +11,21 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vt::{Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, Snapshot};
+use vt::{
+    Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
+};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState};
 use windows::Win32::UI::WindowsAndMessaging::{
-    MSG, TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    MSG, SetForegroundWindow, TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP,
+    WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::platform::windows::EventLoopBuilderExtWindows;
+use winit::platform::windows::{EventLoopBuilderExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{UserAttentionType, Window, WindowId};
 
@@ -36,6 +38,7 @@ use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
 use crate::render::chrome::{self, ChromeModel};
 use crate::render::d3d11::{Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
+use crate::session::{self, Geometry, PaneMeta};
 
 const VK_PROCESSKEY: u16 = 0xe5;
 const VK_PACKET: u16 = 0xe7;
@@ -53,6 +56,11 @@ const UPDATE_FIRST: Duration = Duration::from_secs(10);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
+/// How long a restored pane waits for its shell's first prompt before it
+/// types the Claude Code resume command anyway.
+const RESUME_AFTER: Duration = Duration::from_secs(3);
+/// Lines of output saved per pane when `restore_scrollback` is on.
+const SAVED_LINES: usize = 1000;
 /// Lines scrolled per wheel notch when the program takes no mouse input.
 const WHEEL_LINES: isize = 3;
 
@@ -68,6 +76,8 @@ pub enum UserEvent {
     Update(String),
     /// The installer started, so blitz exits; or why it did not.
     Installed(Result<(), String>),
+    /// Another launch handed this folder over to open in a new tab.
+    OpenHere(PathBuf),
 }
 
 /// Command-line options of the GUI.
@@ -80,6 +90,8 @@ struct Args {
     /// Save the last frame here before exiting.
     capture: Option<PathBuf>,
     exit_after: Option<Duration>,
+    /// Open a window of its own, even if blitz is already running.
+    new_window: bool,
 }
 
 impl Args {
@@ -87,10 +99,19 @@ impl Args {
         let mut a = Args::default();
         let mut it = args.iter();
         while let Some(flag) = it.next() {
+            if flag == "--new-window" {
+                a.new_window = true;
+                continue;
+            }
             let v = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--cmd" => a.cmd = Some(v.clone()),
-                "--cwd" => a.cwd = Some(v.into()),
+                // Explorer passes a drive root as "C:\", and argv parsing
+                // reads the \" as an escaped quote, so it arrives as C:".
+                "--cwd" => match v.strip_suffix('"') {
+                    Some(root) => a.cwd = Some(format!("{root}\\").into()),
+                    None => a.cwd = Some(v.into()),
+                },
                 "--selftest" => a.selftest = Some(v.into()),
                 "--capture" => a.capture = Some(v.into()),
                 "--exit-after" => {
@@ -113,6 +134,19 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // A folder opens as a tab in the blitz already running. Scripted and
+    // test launches always get a window of their own.
+    let scripted = args.cmd.is_some()
+        || args.selftest.is_some()
+        || args.exit_after.is_some()
+        || args.capture.is_some();
+    if let Some(dir) = &args.cwd
+        && !args.new_window
+        && !scripted
+        && crate::handoff::send(dir)
+    {
+        return 0;
+    }
     let keys = Rc::new(RefCell::new(Keys::default()));
     let hook_keys = keys.clone();
     let mut builder = EventLoop::<UserEvent>::with_user_event();
@@ -306,6 +340,9 @@ struct View {
     flashed: Option<Instant>,
     /// A thread is reading the git branch of the session's directory.
     finding_branch: bool,
+    /// A restored Claude Code session: the line to type at the shell's
+    /// first prompt, and when to type it anyway.
+    resume: Option<(String, Instant)>,
 }
 
 struct App {
@@ -352,6 +389,13 @@ struct App {
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
     capture_then_exit: bool,
+    /// This is the main window, whose layout is saved for the next start.
+    /// Separate windows and scripted runs leave the saved one alone.
+    persist: bool,
+    /// The session as last saved.
+    saved: Option<session::State>,
+    /// Where the window last was while neither minimized nor maximized.
+    placed: Geometry,
     /// The terminal a running self-test reads: the focused pane's.
     watched: Option<Arc<selftest::Focus>>,
     started: Instant,
@@ -361,12 +405,18 @@ struct App {
 
 impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
-        let config = Config::default();
+        let config = Config::load();
         let dark = match config.theme {
             ThemeMode::System => !crate::theme::system_is_light(),
             ThemeMode::Dark => true,
             ThemeMode::Light => false,
         };
+        let a = &args;
+        let persist = !a.new_window
+            && a.cmd.is_none()
+            && a.selftest.is_none()
+            && a.exit_after.is_none()
+            && a.capture.is_none();
         App {
             args,
             config,
@@ -400,6 +450,9 @@ impl App {
             ime_at: None,
             checked_conpty: false,
             capture_then_exit: false,
+            persist,
+            saved: None,
+            placed: Geometry::default(),
             watched: None,
             started: Instant::now(),
             counters: Counters::default(),
@@ -413,9 +466,28 @@ impl App {
 
     /// Creates the window and starts the first session.
     fn start(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("blitz")
             .with_inner_size(LogicalSize::new(980.0, 620.0));
+        // Only the main window takes folders from other launches.
+        if !self.args.new_window {
+            attrs = attrs.with_class_name(crate::handoff::CLASS);
+        }
+        let saved = (self.persist && self.config.restore_session)
+            .then(session::load)
+            .flatten();
+        if let Some(g) = saved
+            .as_ref()
+            .map(|s| s.window)
+            .filter(|g| g.w > 0 && g.h > 0)
+        {
+            let g = on_screen(el, g);
+            self.placed = g;
+            attrs = attrs
+                .with_position(PhysicalPosition::new(g.x, g.y))
+                .with_inner_size(PhysicalSize::new(g.w, g.h))
+                .with_maximized(g.maximized);
+        }
         let window = el.create_window(attrs).map_err(|e| e.to_string())?;
         window.set_ime_allowed(true);
         self.scale = window.scale_factor();
@@ -423,6 +495,9 @@ impl App {
             && let RawWindowHandle::Win32(h) = h.as_raw()
         {
             self.hwnd = h.hwnd.get();
+        }
+        if !self.args.new_window {
+            crate::handoff::install(self.hwnd, self.proxy.clone());
         }
         let dark = windows::core::BOOL::from(self.dark);
         // SAFETY: a live window and a BOOL-sized value.
@@ -437,12 +512,25 @@ impl App {
         self.window = Some(window);
         self.ensure_gfx();
 
-        let cwd = (self.args.cwd.clone()).or_else(|| std::env::current_dir().ok());
-        let id = PaneId(self.next_id);
         let mut win = layout::Window::default();
-        win.tabs.push(Tab::new(tab_name(cwd.as_deref()), id));
-        let cmd = self.args.cmd.clone();
-        self.open(win, id, cmd.as_deref(), cwd)?;
+        if let Some(s) = &saved {
+            match self.restore(s) {
+                Ok(()) => win = self.win.clone(),
+                Err(e) => eprintln!("blitz: restoring the last session: {e}"),
+            }
+        }
+        // A folder from Explorer gets a tab of its own after the restored ones.
+        if self.views.is_empty() || self.args.cwd.is_some() {
+            let cwd = match &self.args.cwd {
+                Some(dir) => start_dir(dir),
+                None => std::env::current_dir().ok(),
+            };
+            let id = PaneId(self.next_id);
+            win.tabs.push(Tab::new(tab_name(cwd.as_deref()), id));
+            win.active = win.tabs.len() - 1;
+            let cmd = self.args.cmd.clone();
+            self.open(win, id, cmd.as_deref(), cwd)?;
+        }
 
         if let Some(script) = self.args.selftest.clone() {
             self.start_selftest(script);
@@ -488,11 +576,60 @@ impl App {
         if !self.views.is_empty() && grids.iter().any(small) {
             return Err("no room for another pane".into());
         }
+        self.spawn(id, &grids, cmd, cwd, None)?;
+        self.install(win);
+        Ok(())
+    }
+
+    /// Starts every pane of a saved session, each in its folder, and shows
+    /// its layout. Starts none if one fails.
+    fn restore(&mut self, s: &session::State) -> Result<(), String> {
+        let (win, panes) = s.layout(self.next_id);
+        let grids = self.grids(&win);
+        let keys = leaf_keys(&win);
+        for (id, meta) in panes {
+            let old = (self.config.restore_scrollback)
+                .then(|| keys.iter().find(|k| k.0 == id))
+                .flatten()
+                .and_then(|&(_, tab, leaf)| session::load_output(tab, leaf));
+            if let Err(e) = self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()) {
+                self.views.clear();
+                return Err(e);
+            }
+            if let Some(line) = resume_line(self.config.restore_claude, meta.claude.as_deref())
+                && let Some(v) = self.views.last_mut()
+            {
+                // Known from the start, so closing blitz again before the
+                // first prompt still resumes it next time.
+                v.pane.claude = meta.claude.clone();
+                v.resume = Some((line, Instant::now() + RESUME_AFTER));
+            }
+        }
+        self.install(win);
+        Ok(())
+    }
+
+    /// Starts a session for pane `id`, sized as `grids` lays it out (or
+    /// 80x24 while hidden), running `cmd` or else the shell, below `old`,
+    /// output saved by [`session::save_output`].
+    fn spawn(
+        &mut self,
+        id: PaneId,
+        grids: &[(PaneId, (i32, i32))],
+        cmd: Option<&str>,
+        cwd: Option<PathBuf>,
+        old: Option<&str>,
+    ) -> Result<(), String> {
         let fit = |n: i32| n.clamp(1, i32::from(u16::MAX)) as u16;
         let grid = grids
             .iter()
             .find(|g| g.0 == id)
             .map_or((80, 24), |&(_, (c, r))| (fit(c), fit(r)));
+        // The first line of saved output says when it was saved.
+        let restored = old.map_or_else(Vec::new, |o| {
+            let (stamp, text) = o.split_once('\n').unwrap_or(("", o));
+            crate::pane::restored(text, stamp, grid.1)
+        });
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         let launch = match cmd {
             Some(c) => crate::shell::Launch {
@@ -519,6 +656,7 @@ impl App {
                 dark: self.dark,
                 parent: Some(self.hwnd),
                 token: &token,
+                restored: &restored,
             },
             move |id, note| {
                 let _ = proxy.send_event(UserEvent::Pane(id, note));
@@ -536,20 +674,29 @@ impl App {
             notice: None,
             flashed: None,
             finding_branch: false,
+            resume: None,
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
-        let before = self.focus_id();
-        self.win = win;
-        self.focus_moved(before);
         Ok(())
     }
 
+    /// Shows `win`, a layout whose panes all have sessions.
+    fn install(&mut self, win: layout::Window) {
+        let before = self.focus_id();
+        self.win = win;
+        self.focus_moved(before);
+    }
+
     /// Opens a pane in a copy of the layout that `place` changes; tells the
-    /// user in the focused pane when that fails. New panes start where the
-    /// focused one is.
-    fn add(&mut self, place: impl FnOnce(&mut layout::Window, PaneId, Option<&Path>) -> bool) {
-        let cwd = start_dir(self.current().map_or("", |v| v.pane.cwd.as_str()));
+    /// user in the focused pane when that fails. The pane starts in `dir`,
+    /// or else where the focused one is.
+    fn add(
+        &mut self,
+        dir: Option<PathBuf>,
+        place: impl FnOnce(&mut layout::Window, PaneId, Option<&Path>) -> bool,
+    ) {
+        let cwd = dir.or_else(|| start_dir(self.current().map_or("", |v| v.pane.cwd.as_str())));
         let id = PaneId(self.next_id);
         let mut win = self.win.clone();
         if !place(&mut win, id, cwd.as_deref()) {
@@ -569,6 +716,11 @@ impl App {
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
         if self.views.is_empty() {
+            // Nothing is left open, so there is nothing to restore.
+            if self.persist {
+                session::clear();
+                self.persist = false;
+            }
             el.exit();
             return;
         }
@@ -908,11 +1060,7 @@ impl App {
                 let page = rows.saturating_sub(1).max(1) as isize;
                 self.scroll(page * isize::from(dir));
             }
-            Action::NewTab => self.add(|win, id, cwd| {
-                win.tabs.push(Tab::new(tab_name(cwd), id));
-                win.active = win.tabs.len() - 1;
-                true
-            }),
+            Action::NewTab => self.add(None, new_tab),
             Action::ClosePane => {
                 let Some(v) = self.current() else {
                     return true;
@@ -957,7 +1105,7 @@ impl App {
                 } else {
                     Dir::Down
                 };
-                self.add(|win, id, _| {
+                self.add(None, |win, id, _| {
                     // Only the pane minimum matters, and `open` checks that
                     // against the real window.
                     let any = Rect {
@@ -1102,8 +1250,21 @@ impl App {
                 v.pane.cwd = dir;
                 self.find_branch(id);
             }
+            // The shell is ready for input: bring back its Claude session.
+            Event::Prompt(PromptMark::A { blitz: true }) => {
+                if let Some((line, _)) = v.resume.take() {
+                    v.pane.send(line);
+                }
+            }
             Event::Notify { title, body } => {
-                if let Some(ev) = Ev::from_notify(&title, &v.pane.token) {
+                if let Some((ev, session)) = Ev::from_notify(&title, &v.pane.token) {
+                    // `idle` is SessionEnd: the user quit Claude, so there is
+                    // nothing left to resume.
+                    if ev == Ev::Idle {
+                        v.pane.claude = None;
+                    } else if let Some(id) = session {
+                        v.pane.claude = Some(id.to_owned());
+                    }
                     let changed = self.attention(id, ev);
                     if relabels(ev, changed)
                         && let Some(v) = self.view_mut(id)
@@ -1502,6 +1663,85 @@ impl App {
         }
     }
 
+    /// Saves the session when its tabs, splits or folders changed since
+    /// the last save, or always with `force`. The window's place alone
+    /// does not count, so dragging the window writes nothing until exit.
+    fn save_session(&mut self, force: bool) {
+        if !self.persist || self.views.is_empty() {
+            return;
+        }
+        let meta = |id| {
+            let v = self.view(id);
+            PaneMeta {
+                cwd: v.map(|v| v.pane.cwd.clone()).unwrap_or_default(),
+                claude: v.and_then(|v| v.pane.claude.clone()),
+            }
+        };
+        let mut s = session::State::capture(&self.win, self.placed, meta);
+        // Output changes all the time, so it is saved only at exit.
+        if force {
+            self.save_output();
+        }
+        let same = self.saved.as_ref().is_some_and(|old| {
+            (old.sidebar_expanded, old.active, &old.tabs) == (s.sidebar_expanded, s.active, &s.tabs)
+        });
+        if same && !force {
+            return;
+        }
+        if let Some(w) = &self.window {
+            let maximized = w.is_maximized();
+            if !maximized
+                && w.is_minimized() != Some(true)
+                && let Ok(p) = w.outer_position()
+            {
+                let size = w.inner_size();
+                self.placed = Geometry {
+                    x: p.x,
+                    y: p.y,
+                    w: size.width,
+                    h: size.height,
+                    maximized: false,
+                };
+            }
+            s.window = Geometry {
+                maximized,
+                ..self.placed
+            };
+        }
+        if let Err(e) = session::save(&s) {
+            eprintln!("blitz: saving the session: {e}");
+        }
+        // Kept even when the write failed, so it is not retried every turn.
+        self.saved = Some(s);
+    }
+
+    /// Saves each pane's recent output when `restore_scrollback` is on, and
+    /// deletes what an earlier run saved when it is off.
+    fn save_output(&self) {
+        let stamp = local_stamp();
+        let keys = if self.config.restore_scrollback {
+            leaf_keys(&self.win)
+        } else {
+            Vec::new()
+        };
+        let panes: Vec<_> = (keys.into_iter())
+            .filter_map(|(id, tab, leaf)| {
+                let term = lock(&self.view(id)?.pane.term);
+                let mut text = term.scrollback_text();
+                // A full-screen program's screen is not output.
+                if !term.input_modes().alt_screen {
+                    text.push('\n');
+                    text += &term.screen_text();
+                }
+                let text = last_lines(&text, SAVED_LINES);
+                (!text.is_empty()).then(|| (tab, leaf, format!("{stamp}\n{text}")))
+            })
+            .collect();
+        if let Err(e) = session::save_output(&panes) {
+            eprintln!("blitz: saving output: {e}");
+        }
+    }
+
     /// The soonest time something on screen changes by itself.
     fn next_deadline(&self) -> Option<Instant> {
         let now = Instant::now();
@@ -1524,7 +1764,10 @@ impl App {
                 since + Duration::from_secs(now.saturating_duration_since(since).as_secs() + 1)
             })
             .min();
-        [sync, notice, timer].into_iter().flatten().min()
+        let resume = (self.views.iter())
+            .filter_map(|v| Some(v.resume.as_ref()?.1))
+            .min();
+        [sync, notice, timer, resume].into_iter().flatten().min()
     }
 }
 
@@ -1570,14 +1813,68 @@ fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &
     r.snapshot(&s, &banner, at.x, y);
 }
 
+/// `g`, moved onto the primary monitor when no monitor shows enough of it.
+fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
+    let rect = |m: winit::monitor::MonitorHandle| Rect {
+        x: m.position().x,
+        y: m.position().y,
+        w: m.size().width as i32,
+        h: m.size().height as i32,
+    };
+    let monitors: Vec<Rect> = el.available_monitors().map(rect).collect();
+    match el.primary_monitor().map(rect).or(monitors.first().copied()) {
+        Some(primary) => session::on_screen(g, &monitors, primary),
+        None => g,
+    }
+}
+
+/// What to type into a restored pane's shell to bring back the Claude Code
+/// session it was running, if anything. The id comes from a file on disk,
+/// so only a well-formed one is ever typed.
+fn resume_line(enabled: bool, claude: Option<&str>) -> Option<String> {
+    let id = claude.filter(|id| enabled && crate::hook::is_session_id(id))?;
+    Some(format!("claude --resume {id}\r"))
+}
+
+/// Every pane of `win` with its tab and leaf index, which its saved output
+/// is filed under.
+fn leaf_keys(win: &layout::Window) -> Vec<(PaneId, usize, usize)> {
+    (win.tabs.iter().enumerate())
+        .flat_map(|(t, tab)| (tab.panes().into_iter().enumerate()).map(move |(l, id)| (id, t, l)))
+        .collect()
+}
+
+/// The last `n` lines of `text`, without blank lines at either end.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.trim_matches('\n').lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// The local time as `2026-10-02 14:32`.
+fn local_stamp() -> String {
+    // SAFETY: plain Win32 call with no arguments.
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute
+    )
+}
+
 /// Where a new pane starts: `cwd` if it is still a directory, else the
 /// user's profile folder.
-fn start_dir(cwd: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(cwd);
-    if !cwd.is_empty() && dir.is_dir() {
-        return Some(dir);
+fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
+    let dir = cwd.as_ref();
+    if !dir.as_os_str().is_empty() && dir.is_dir() {
+        return Some(dir.to_path_buf());
     }
     std::env::var_os("USERPROFILE").map(PathBuf::from)
+}
+
+/// Puts pane `id` in a new tab after the others and shows that tab.
+fn new_tab(win: &mut layout::Window, id: PaneId, cwd: Option<&Path>) -> bool {
+    win.tabs.push(Tab::new(tab_name(cwd), id));
+    win.active = win.tabs.len() - 1;
+    true
 }
 
 /// A new tab is named after the folder it starts in.
@@ -1723,6 +2020,10 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     v.notice = None;
                 }
+                // No prompt mark came: shell integration is off or failed.
+                if let Some((line, _)) = v.resume.take_if(|r| r.1 <= now) {
+                    v.pane.send(line);
+                }
             }
             // A synchronized update timed out, a notice expired, or a
             // working timer ticked.
@@ -1810,11 +2111,22 @@ impl ApplicationHandler<UserEvent> for App {
                     self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
                 }
             }
+            UserEvent::OpenHere(dir) => {
+                // First, since a minimized window has no room for a pane.
+                if let Some(w) = &self.window {
+                    w.set_minimized(false);
+                }
+                // SAFETY: our own window; the launch that sent the folder
+                // allowed this process to take the foreground.
+                let _ = unsafe { SetForegroundWindow(HWND(self.hwnd as *mut c_void)) };
+                self.add(Some(dir), new_tab);
+            }
         }
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.drain_keys(el);
+        self.save_session(false);
         let flow = match self.next_deadline() {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,
@@ -1823,6 +2135,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
+        // Closing the window, Alt+F4 and an update all keep the layout.
+        self.save_session(true);
         if let Err(e) = self.counters.write_trace() {
             eprintln!("blitz: BLITZ_TRACE: {e}");
         }
@@ -2263,7 +2577,7 @@ mod tests {
     #[test]
     fn app_new_panes_start_in_the_focused_directory() {
         let here = std::env::temp_dir();
-        assert_eq!(start_dir(&here.display().to_string()), Some(here));
+        assert_eq!(start_dir(here.display().to_string()), Some(here));
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
         assert_eq!(start_dir(r"Z:\gone"), home);
         assert_eq!(start_dir(""), home);
@@ -2316,5 +2630,68 @@ mod tests {
         assert_eq!(a.exit_after, Some(Duration::from_millis(4000)));
         assert!(Args::parse(&["--bogus".into(), "1".into()]).is_err());
         assert!(Args::parse(&["--cmd".into()]).is_err());
+        assert!(!a.new_window);
+    }
+
+    #[test]
+    fn open_here_options() {
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            Args::parse(&args).expect("parse")
+        };
+        assert_eq!(parse(&["--cwd", "C:\""]).cwd, Some(r"C:\".into()));
+        assert_eq!(parse(&["--cwd", r"C:\foo"]).cwd, Some(r"C:\foo".into()));
+        let a = parse(&["--new-window", "--cwd", r"C:\foo"]);
+        assert!(a.new_window);
+        assert_eq!(a.cwd, Some(r"C:\foo".into()));
+        let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
+        assert!(a.new_window);
+        assert_eq!(a.cwd, Some(r"C:\foo".into()));
+    }
+
+    #[test]
+    fn resume_line_types_only_a_session_id() {
+        const ID: &str = "3f2a9c1e-0b7d-4e5f-9a8b-1c2d3e4f5a6b";
+        assert_eq!(
+            resume_line(true, Some(ID)).as_deref(),
+            Some("claude --resume 3f2a9c1e-0b7d-4e5f-9a8b-1c2d3e4f5a6b\r")
+        );
+        assert_eq!(resume_line(false, Some(ID)), None);
+        assert_eq!(resume_line(true, None), None);
+        for bad in [
+            "",
+            "x; rm -rf ~",
+            "3f2a9c1e-0b7d-4e5f-9a8b-1c2d3e4f5a6b\rcalc",
+        ] {
+            assert_eq!(resume_line(true, Some(bad)), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn saved_output_keeps_the_last_lines() {
+        assert_eq!(last_lines("\n\na\nb\nc\n\n\n", 2), "b\nc");
+        assert_eq!(last_lines("a\n\nb", 10), "a\n\nb");
+        assert_eq!(last_lines("  a\n", 10), "  a");
+        assert_eq!(last_lines("\n\n", 10), "");
+    }
+
+    #[test]
+    fn leaf_keys_follow_tabs_and_tree_order() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut a = Tab::new("a".into(), PaneId(1));
+        assert!(a.split(layout::Dir::Right, PaneId(2), area, (1, 1)));
+        let win = layout::Window {
+            tabs: vec![a, Tab::new("b".into(), PaneId(3))],
+            ..Default::default()
+        };
+        assert_eq!(
+            leaf_keys(&win),
+            [(PaneId(1), 0, 0), (PaneId(2), 0, 1), (PaneId(3), 1, 0)]
+        );
     }
 }
