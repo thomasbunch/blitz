@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, GetKeyboardState, GetLastInputInfo, LASTINPUTINFO,
 };
@@ -32,7 +33,7 @@ use windows::Win32::UI::Shell::{
     TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, GetCursorPos, GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow,
+    DestroyIcon, GetCursorPos, GetSystemMetrics, MB_OK, MSG, SM_CXSMICON, SetForegroundWindow,
     TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR,
     WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
@@ -3968,8 +3969,15 @@ impl App {
             crate::notify::flash(self.hwnd, a.flashes);
         }
         // Never from a test run.
-        if a.toast && !self.scripted() {
+        if self.scripted() {
+            return;
+        }
+        if a.toast {
             self.toast(id);
+        }
+        if a.beep {
+            // SAFETY: a plain call.
+            let _ = unsafe { MessageBeep(MB_OK) };
         }
     }
 
@@ -3980,8 +3988,7 @@ impl App {
         };
         let lines = toast_text(&s);
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-        // blitz makes no sound unless asked to.
-        let xml = crate::notify::toast_xml(&lines, true);
+        let xml = crate::notify::toast_xml(&lines, !self.config.sound);
         match crate::notify::toast(id, &xml, &self.proxy) {
             Ok(t) => {
                 if let Some(v) = self.view_mut(id) {
@@ -5588,22 +5595,27 @@ struct Alert {
     flashes: u32,
     /// Show a Windows notification.
     toast: bool,
+    /// Beep, as no notification makes the sound.
+    beep: bool,
 }
 
 /// How to tell the user about a session that just changed to `state`
 /// while the window is in the background: three flashes when it needs
 /// the user or failed, one when it finished, a notification as `toasts`
-/// says, and at most once per session every `ALERT_GAP`. `last` is when
-/// this session last alerted.
+/// says, with `sound` the notification's sound or else a beep, and at
+/// most once per session every `ALERT_GAP`. `last` is when this session
+/// last alerted.
 fn alert(state: Attn, c: &Config, last: &mut Option<Instant>, now: Instant) -> Option<Alert> {
     let (flashes, urgent) = match state {
         Attn::NeedsYou | Attn::Error => (3, true),
         Attn::DoneUnseen => (1, false),
         Attn::Working | Attn::Idle => return None,
     };
+    let toast = c.toasts == "all" || urgent && c.toasts == "needs-you";
     let a = Alert {
         flashes: if c.flash { flashes } else { 0 },
-        toast: c.toasts == "all" || urgent && c.toasts == "needs-you",
+        toast,
+        beep: c.sound && !toast,
     };
     if a == Alert::default() || last.is_some_and(|t| now.saturating_duration_since(t) < ALERT_GAP) {
         return None;
@@ -8316,6 +8328,7 @@ mod tests {
         let urgent = Some(Alert {
             flashes: 3,
             toast: true,
+            beep: false,
         });
         assert_eq!(alert(Attn::NeedsYou, &mut last, 0), urgent);
         assert_eq!(alert(Attn::Error, &mut last, 9), None);
@@ -8325,6 +8338,7 @@ mod tests {
             Some(Alert {
                 flashes: 1,
                 toast: false,
+                beep: false,
             })
         );
         // Another session has its own limit.
@@ -8385,6 +8399,35 @@ mod tests {
         };
         let a = alert(Attn::NeedsYou, &quiet, &mut None, now);
         assert_eq!(a.map(|a| (a.flashes, a.toast)), Some((0, true)));
+    }
+
+    #[test]
+    fn app_sounds_once_and_only_when_asked() {
+        let now = Instant::now();
+        let alert = |toasts: &str, sound, state| {
+            let c = Config {
+                toasts: toasts.into(),
+                sound,
+                ..Config::default()
+            };
+            alert(state, &c, &mut None, now)
+        };
+        assert!(!alert("off", false, Attn::NeedsYou).is_some_and(|a| a.beep));
+        assert!(alert("off", true, Attn::NeedsYou).is_some_and(|a| a.beep));
+        // The notification makes it.
+        let a = alert("all", true, Attn::DoneUnseen);
+        assert!(a.is_some_and(|a| a.toast && !a.beep));
+        let a = alert("needs-you", true, Attn::DoneUnseen);
+        assert!(a.is_some_and(|a| !a.toast && a.beep));
+        // A sound is enough of an alert by itself.
+        let c = Config {
+            flash: false,
+            toasts: "off".into(),
+            sound: true,
+            ..Config::default()
+        };
+        let a = super::alert(Attn::Error, &c, &mut None, now);
+        assert!(a.is_some_and(|a| a.beep && a.flashes == 0));
     }
 
     #[test]

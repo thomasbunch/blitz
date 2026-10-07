@@ -24,6 +24,8 @@ pub struct Config {
     /// Which sessions get a Windows notification while blitz is in the
     /// background; one of [`TOASTS`].
     pub toasts: String,
+    /// Make a sound when a session needs attention.
+    pub sound: bool,
     /// Whether BEL, or a notification without the pane's token, in an
     /// unfocused pane asks for attention.
     pub bell_attention: bool,
@@ -67,6 +69,7 @@ impl Default for Config {
             scrollback_lines: 10_000,
             flash: true,
             toasts: "needs-you".into(),
+            sound: false,
             bell_attention: true,
             check_updates: true,
             restore_session: true,
@@ -242,6 +245,16 @@ pub const SETTINGS: &[Setting] = &[
         applies: NOW,
     },
     Setting {
+        key: "sound",
+        group: "Notifications",
+        label: "Sound",
+        help: "Play a sound when a session needs you while blitz is in the \
+               background: the notification's, or the Windows default beep \
+               without one.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
         key: "bell_attention",
         group: "Notifications",
         label: "Bell needs you",
@@ -320,6 +333,7 @@ impl Config {
             "restore_scrollback" => flag(self.restore_scrollback),
             "flash" => flag(self.flash),
             "toasts" => quote(&self.toasts),
+            "sound" => flag(self.sound),
             "bell_attention" => flag(self.bell_attention),
             "check_updates" => flag(self.check_updates),
             "scenery" => quote(&self.scenery),
@@ -397,6 +411,7 @@ impl Config {
             "restore_claude" => &mut self.restore_claude,
             "restore_scrollback" => &mut self.restore_scrollback,
             "flash" => &mut self.flash,
+            "sound" => &mut self.sound,
             "bell_attention" => &mut self.bell_attention,
             "check_updates" => &mut self.check_updates,
             "mascot" => &mut self.mascot,
@@ -871,6 +886,7 @@ scenery = stars
             ("restore_scrollback", "true"),
             ("flash", "false"),
             ("toasts", "\"all\""),
+            ("sound", "true"),
             ("bell_attention", "false"),
             ("check_updates", "false"),
             ("scenery", "\"snow\""),
