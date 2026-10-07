@@ -2159,6 +2159,10 @@ impl App {
                 });
             }
         }
+        // blitz run covers the panes, so programs see no motion under it.
+        if self.game.is_some() {
+            return;
+        }
         let mods = mods_now();
         if let Some(m) = self.mouse_to_program(&mods) {
             let held = (0..3).find(|b| self.mouse.reported & 1 << b != 0);
