@@ -130,6 +130,79 @@ jobs:
           if (-not (Test-Path $iscc)) { throw "Inno Setup 6 is not on this runner image" }
           & $iscc "/DAppVersion=$env:VERSION" "/DSrcDir=$PWD\dist\blitz-$env:VERSION-windows-x64" "/DOutDir=$PWD\out" .github\blitz.iss
 
+      # What users get, run before anything is uploaded: the zip as unpacked,
+      # then the installer over the last published release, the installed
+      # blitz, its Explorer menu and the uninstaller. A broken installer would
+      # also break the updater, which could then not fix itself.
+      - name: Smoke test
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $t = $env:RUNNER_TEMP
+          $name = "blitz-$env:VERSION-windows-x64"
+          # Waits for GUI-subsystem programs too, since the output is piped.
+          function Run {
+            $exe, $rest = $args
+            & $exe @rest | Out-Host
+            if ($LASTEXITCODE) { throw "$exe $rest exited with $LASTEXITCODE" }
+          }
+          # A session through `blitz debug run`, which must use the ConPTY
+          # next to the exe; the counters it writes to BLITZ_TRACE say which
+          # one ran. The text to wait for is not in the command line.
+          function Session([string]$dir, [string]$tag) {
+            Set-Content "$t\smoke-$tag.txt" "waitfor 20000 AMD64-smoke`nwaitexit 20000"
+            $env:BLITZ_TRACE = "$t\smoke-$tag.json"
+            Run "$dir\blitz.exe" debug run --cmd 'cmd /d /c echo %PROCESSOR_ARCHITECTURE%-smoke' --script "$t\smoke-$tag.txt" --timeout 60000
+            Remove-Item Env:BLITZ_TRACE
+            $counters = Get-Content "$t\smoke-$tag.json" -Raw
+            if ($counters -notmatch '"inbox":false') { throw "$dir\blitz.exe ran on the system's ConPTY: $counters" }
+            $v = (& "$dir\blitz.exe" --version | Out-String).Trim()
+            if ($v -ne "blitz $env:VERSION") { throw "$dir\blitz.exe says $v" }
+          }
+          try {
+            Expand-Archive "out\$name.zip" "$t\zip"
+            $files = Get-ChildItem "$t\zip\$name" -Name
+            $want = 'blitz.exe', 'blitz-hook.exe', 'conpty.dll', 'OpenConsole.exe', 'LICENSE.txt', 'THIRD-PARTY-NOTICES.txt'
+            if (Compare-Object $want $files) { throw "the zip holds $($files -join ', ')" }
+            foreach ($exe in 'blitz.exe', 'blitz-hook.exe') {
+              $text = [IO.File]::ReadAllText("$t\zip\$name\$exe", [Text.Encoding]::ASCII)
+              if ($text -match 'vcruntime140|api-ms-win-crt-') { throw "$exe needs the Visual C++ runtime" }
+            }
+            Session "$t\zip\$name" zip
+
+            $app = "$env:LOCALAPPDATA\Programs\blitz"
+            $quiet = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+            gh release download --repo $env:GITHUB_REPOSITORY --pattern '*-setup.exe' --dir "$t\prev"
+            if ($LASTEXITCODE) { throw "could not fetch the last published installer" }
+            Run (Get-ChildItem "$t\prev\*-setup.exe").FullName @quiet "/LOG=$t\install-prev.log"
+            if (-not (Test-Path "$app\blitz.exe")) { throw "the last release did not install to $app" }
+            Run "$PWD\out\$name-setup.exe" @quiet "/LOG=$t\install.log"
+            Session $app installed
+            $menu = 'Directory', 'Directory\Background', 'Drive' | ForEach-Object {
+              "HKCU:\Software\Classes\$_\shell\blitz", "HKCU:\Software\Classes\$_\shell\blitz.window"
+            }
+            foreach ($key in $menu) {
+              $flag = if ($key.EndsWith('.window')) { '--new-window ' } else { '' }
+              $want = "`"$app\blitz.exe`" $flag--cwd `"%V`""
+              $got = (Get-ItemProperty "$key\command").'(default)'
+              if ($got -ne $want) { throw "$key runs $got" }
+            }
+            $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\blitz.lnk"
+            if (-not (Test-Path $lnk)) { throw "no Start menu shortcut" }
+
+            # The uninstaller hands over to a copy of itself and returns.
+            $entry = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{1DA65EB8-E92D-465A-9531-C4B72BB72597}_is1'
+            Run (Get-ItemProperty $entry).UninstallString.Trim('"') @quiet "/LOG=$t\uninstall.log"
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Test-Path $app) -and (Get-Date) -lt $deadline) { Start-Sleep 1 }
+            $left = @($app, $lnk, $entry) + $menu | Where-Object { Test-Path $_ }
+            if ($left) { throw "the uninstaller left $($left -join ', ')" }
+          } finally {
+            Get-ChildItem "$t\*.log" | ForEach-Object { "::group::$($_.Name)"; Get-Content $_; '::endgroup::' }
+          }
+
       - name: Checksums
         working-directory: out
         run: sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt
