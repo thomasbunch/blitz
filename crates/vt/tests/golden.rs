@@ -419,6 +419,29 @@ fn clusters_that_change_width() {
 }
 
 #[test]
+fn resize_rewraps_clusters_whole() {
+    let mut t = run(4, 3, "ae\u{301}bce\u{301}d");
+    assert_eq!(t.screen_text(), "ae\u{301}bc\ne\u{301}d\n");
+    t.resize(3, 3);
+    assert_eq!(t.screen_text(), "ae\u{301}b\nce\u{301}d\n");
+    t.resize(6, 3);
+    assert_eq!(t.screen_text(), "ae\u{301}bce\u{301}d\n\n");
+    let s = snap(&mut t);
+    assert_eq!(
+        (text(&cell(&s, 1, 0)), text(&cell(&s, 4, 0))),
+        ("e\u{301}", "e\u{301}")
+    );
+
+    // A mark on a wide character that wrapped early, past its spacer.
+    let mut t = run(5, 2, "abcd中\u{301}x");
+    t.resize(7, 2);
+    assert_eq!(t.screen_text(), "abcd中\u{301}x\n");
+    t.resize(6, 2);
+    assert_eq!(t.screen_text(), "abcd中\u{301}\nx");
+    assert_eq!(text(&cell(&snap(&mut t), 4, 0)), "中\u{301}");
+}
+
+#[test]
 fn insert_mode() {
     let mut t = run(6, 1, "abc\x1b[4h\x1b[1GXY");
     assert_eq!(t.screen_text(), "XYabc");

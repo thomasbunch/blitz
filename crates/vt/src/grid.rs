@@ -451,6 +451,11 @@ impl Grid {
                 out.push_back(row);
                 continue;
             }
+            // Tails in column order, taken as their cells are, so a line
+            // of many clusters costs no more than one of plain text.
+            let mut tails = row.extra.take().map(|e| e.graphemes).unwrap_or_default();
+            tails.sort_unstable_by_key(|g| g.0);
+            let mut tails = tails.into_iter().peekable();
             for (x, c) in row.cells.iter().enumerate() {
                 if i == cy && x == usize::from(cur.0) {
                     cursor = Some(line.len());
@@ -459,9 +464,11 @@ impl Grid {
                 if c.has(cf::SPACER_HEAD) {
                     continue;
                 }
-                if c.has(cf::GRAPHEME) {
-                    let g = row.grapheme(x as u16).unwrap_or_default();
-                    graphemes.push((line.len(), g.to_string()));
+                while tails.next_if(|g| usize::from(g.0) < x).is_some() {}
+                if let Some((_, g)) = tails.next_if(|g| usize::from(g.0) == x)
+                    && c.has(cf::GRAPHEME)
+                {
+                    graphemes.push((line.len(), g));
                 }
                 line.push(*c);
             }
@@ -474,6 +481,7 @@ impl Grid {
             line.resize(keep.max(cursor.map_or(0, |c| c + 1)), Cell::default());
             let mut row = self.fresh(Cell::default());
             let mut x = 0;
+            let mut tails = graphemes.drain(..).peekable();
             for (k, &c) in line.iter().enumerate() {
                 if x == new || (c.has(cf::WIDE) && x + 1 == new) {
                     if x < new {
@@ -485,9 +493,9 @@ impl Grid {
                     x = 0;
                 }
                 row.cells[x] = c;
-                if let Some(g) = graphemes.iter_mut().find(|g| g.0 == k) {
+                if let Some((_, g)) = tails.next_if(|g| g.0 == k) {
                     let ex = row.extra.get_or_insert_with(Default::default);
-                    ex.graphemes.push((x as u16, std::mem::take(&mut g.1)));
+                    ex.graphemes.push((x as u16, g));
                 }
                 if cursor == Some(k) {
                     at = (out.len(), x);
@@ -496,7 +504,6 @@ impl Grid {
             }
             out.push_back(row);
             line.clear();
-            graphemes.clear();
             cursor = None;
         }
 
@@ -623,6 +630,38 @@ mod tests {
         assert_eq!(g.resize(2, 2, 2), 1);
         assert_eq!(text(&g), ["a", "b", ""]);
         assert_eq!(g.scrollback_len(), 1);
+    }
+
+    /// A long line full of clusters rewraps in time linear in its length,
+    /// each mark staying on its own character.
+    #[test]
+    fn reflow_of_a_long_clustered_line_is_linear() {
+        let mark = |k: usize| {
+            if k.is_multiple_of(3) {
+                "\u{300}"
+            } else {
+                "\u{301}"
+            }
+        };
+        let mut g = Grid::new(100, 4000, 0);
+        for y in 0..4000u16 {
+            let r = g.row_mut(y);
+            r.put_ascii(0, &[b'e'; 100], 0);
+            for x in 0..100u16 {
+                let k = usize::from(y) * 100 + usize::from(x);
+                r.push_grapheme(x, mark(k).chars().next().unwrap());
+            }
+            r.flags |= rf::WRAPPED;
+        }
+        let t0 = std::time::Instant::now();
+        g.reflow(99, (0, 0, false));
+        assert!(t0.elapsed().as_secs() < 5, "{:?}", t0.elapsed());
+        for y in 0..4000u16 {
+            for x in 0..99u16 {
+                let k = usize::from(y) * 99 + usize::from(x);
+                assert_eq!(g.row(y).grapheme(x), Some(mark(k)), "{x},{y}");
+            }
+        }
     }
 
     /// A tail never passes 28 bytes, so with the first code point a cluster
