@@ -2914,9 +2914,8 @@ impl App {
                 let Some(id) = before else {
                     return false;
                 };
-                let cwd = (self.current()).map(|v| PathBuf::from(&v.pane.cwd));
-                let name = tab_name(cwd.as_deref().filter(|p| !p.as_os_str().is_empty()));
-                if !self.win.pane_to_new_tab(id, name) {
+                // Unnamed, the new tab goes by the pane's folder.
+                if !self.win.pane_to_new_tab(id, String::new()) {
                     return false;
                 }
                 // A divider being dragged is known by its place in the old
