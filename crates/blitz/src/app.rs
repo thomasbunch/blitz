@@ -1729,8 +1729,9 @@ impl App {
                 }
             });
         }
-        // Told once, in the window, as a release build has no console.
-        if !self.scripted()
+        // Told once, in the window, as a release build has no console; a
+        // test run, a capture say, leaves it for the user's next start.
+        if !self.args.scripted()
             && let Some(id) = self.focus_id()
             && let Some(file) = session::take_crash()
         {
@@ -9437,6 +9438,14 @@ mod tests {
         assert!(Args::parse(&["--bogus".into(), "1".into()]).is_err());
         assert!(Args::parse(&["--cmd".into()]).is_err());
         assert!(!a.new_window);
+        assert!(a.scripted());
+        // A capture is a test run too, and the user's own launches are not.
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            Args::parse(&args).expect("parse")
+        };
+        assert!(parse(&["--capture", "f.bmp"]).scripted());
+        assert!(!parse(&["--cwd", "C:\\", "--new-window"]).scripted());
     }
 
     #[test]
