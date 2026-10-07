@@ -1375,20 +1375,30 @@ struct Quick {
 type QuickItem = (Found, String, Option<Target>);
 
 /// The URLs, paths and commit hashes in the `rows` high view of `term`, at
-/// most one for each letter, from the bottom up: as [`Quick::items`]. A
-/// path counts when `resolve` finds the file.
+/// most one for each letter, from the bottom up: as [`Quick::items`]; and
+/// the line epoch they were read at. A path counts when `resolve` finds
+/// the file, which looks at the disk, so only once `term` is unlocked:
+/// the pane's output never waits on a slow drive.
 fn quick_items(
-    term: &vt::Terminal,
+    term: &Mutex<vt::Terminal>,
     pal: &Palette,
     rows: u16,
     resolve: impl Fn(&str) -> Option<PathBuf>,
-) -> Vec<QuickItem> {
-    let top = term.view_top();
+) -> (Vec<QuickItem>, u32) {
+    let t = lock(term);
+    let top = t.view_top();
     let shown = top..top + usize::from(rows);
-    let mut out = Vec::new();
+    let mut lines = Vec::new();
     let mut n = top;
     while shown.contains(&n) {
-        let l = Logical::new(term, pal, n);
+        let l = Logical::new(&t, pal, n);
+        n = l.cells.last().map_or(n, |c| c.1.0.max(n)) + 1;
+        lines.push(l);
+    }
+    let epoch = t.line_epoch();
+    drop(t);
+    let mut out = Vec::new();
+    for l in lines {
         let mut found: Vec<(Range<usize>, Option<Target>)> = Vec::new();
         for (range, link) in crate::links::scan(&l.text) {
             let target = match link {
@@ -1415,11 +1425,10 @@ fn quick_items(
                 out.push((Found { start, end }, l.text[range].to_owned(), target));
             }
         }
-        n = l.cells.last().map_or(n, |c| c.1.0.max(n)) + 1;
     }
     out.reverse();
     out.truncate(26);
-    out
+    (out, epoch)
 }
 
 /// The label a key types for quick select, `a` as 0, and whether Shift
@@ -3354,12 +3363,10 @@ impl App {
                 let Some(v) = self.current() else {
                     return false;
                 };
-                let term = lock(&v.pane.term);
                 let cwd = &v.pane.cwd;
                 let resolve = |p: &str| crate::links::resolve(p, cwd);
-                let items = quick_items(&term, &self.theme.pal, v.grid.1, resolve);
-                let (id, epoch) = (v.pane.id, term.line_epoch());
-                drop(term);
+                let (items, epoch) = quick_items(&v.pane.term, &self.theme.pal, v.grid.1, resolve);
+                let id = v.pane.id;
                 if items.is_empty() {
                     let until = Some(Instant::now() + NOTICE);
                     self.set_notice(id, "No links, paths or hashes in view", until, true);
@@ -7510,13 +7517,18 @@ mod tests {
     #[test]
     fn app_quick_select_labels_urls_paths_and_hashes_from_the_bottom() {
         let pal = crate::theme::dark();
-        let t = fed(
+        let t = Mutex::new(fed(
             30,
             4,
             "see https://x.com/a\r\nat src/a.rs:3 and b/none.rs\r\ncommit 1a2b3c4d done\r\n",
-        );
-        let found = |p: &str| (p == "src/a.rs").then(|| PathBuf::from(r"C:\x\src\a.rs"));
-        let items = quick_items(&t, &pal, 4, found);
+        ));
+        // The disk is looked at only with the pane's output free to come.
+        let found = |p: &str| {
+            assert!(t.try_lock().is_ok(), "{p} looked up under the lock");
+            (p == "src/a.rs").then(|| PathBuf::from(r"C:\x\src\a.rs"))
+        };
+        let (items, epoch) = quick_items(&t, &pal, 4, found);
+        assert_eq!(epoch, lock(&t).line_epoch());
         let texts: Vec<&str> = items.iter().map(|i| i.1.as_str()).collect();
         assert_eq!(texts, ["1a2b3c4d", "src/a.rs:3", "https://x.com/a"]);
         assert_eq!(
@@ -7531,7 +7543,7 @@ mod tests {
         assert_eq!(items[1].2, Some(path));
         assert_eq!(items[2].2, Some(Target::Uri("https://x.com/a".into())));
         // Only what is in view.
-        assert_eq!(quick_items(&t, &pal, 1, found).len(), 1);
+        assert_eq!(quick_items(&t, &pal, 1, found).0.len(), 1);
     }
 
     #[test]
