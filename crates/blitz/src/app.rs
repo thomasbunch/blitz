@@ -803,6 +803,9 @@ struct App {
     taskbar: Option<ITaskbarList3>,
     /// The progress the taskbar button shows.
     taskbar_shows: Option<chrome::Progress>,
+    /// blitz's Claude Code plugin, which every pane loads; `None` when it
+    /// could not be written.
+    plugin: Option<String>,
     counters: Counters,
     code: i32,
 }
@@ -1044,6 +1047,7 @@ impl App {
             gpu: None,
             taskbar: None,
             taskbar_shows: None,
+            plugin: None,
             counters: Counters::default(),
             code: 0,
         }
@@ -1092,6 +1096,7 @@ impl App {
             crate::handoff::install(self.hwnd, self.proxy.clone());
         }
         watch_settings(self.proxy.clone());
+        self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
         self.frame_theme();
         self.window = Some(window);
         self.ensure_gfx();
@@ -1254,13 +1259,20 @@ impl App {
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         // Not the token, which is a secret between the pane and its child.
         let key = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
-        let launch = match cmd {
+        let mut launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
                 env: Vec::new(),
             },
             None => crate::shell::launch(&self.config.shell, self.config.shell_integration, &token),
         };
+        // Claude Code loads blitz's hooks from there, with nothing pasted
+        // into its settings.
+        if let Some(dir) = &self.plugin {
+            let inherited = std::env::var("CLAUDE_CODE_PLUGIN_DIRS").ok();
+            let dirs = crate::hook::plugin_dirs(inherited.as_deref(), dir);
+            launch.env.push(("CLAUDE_CODE_PLUGIN_DIRS".into(), dirs));
+        }
         let proxy = self.proxy.clone();
         let mut pane = Pane::spawn(
             id,

@@ -2,7 +2,8 @@
 //! `blitz setup claude` prints the hook settings to install.
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 /// Most payloads are a few KB, but a Write or Edit request carries the
 /// whole file, so the cap only stops a runaway stream. A payload cut at the
@@ -254,6 +255,72 @@ const CLAUDE_HOOKS: [(&str, &str); 8] = [
     ("SessionEnd", ""),
 ];
 
+/// The `blitz-hook` next to this exe.
+pub fn hook_exe() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(exe.with_file_name(format!("blitz-hook{}", std::env::consts::EXE_SUFFIX)))
+}
+
+const PLUGIN_JSON: &str = concat!(
+    "{\n  \"name\": \"blitz\",\n  \"version\": \"",
+    env!("CARGO_PKG_VERSION"),
+    "\",\n  \"description\": \"Tells blitz what each Claude Code session is doing\",\n  \
+     \"author\": { \"name\": \"blitz contributors\" }\n}\n"
+);
+
+/// Writes blitz's Claude Code plugin to `dir`: a manifest, and in
+/// `hooks/hooks.json` the hooks of [`claude_settings`], running `hook_exe`.
+/// Claude Code 2.1.280 and later load it in every pane through
+/// `CLAUDE_CODE_PLUGIN_DIRS`, so nothing needs pasting into its settings.
+/// A file that already holds what it should is left alone, so most starts
+/// write nothing, and one that changes is swapped in whole, so a Claude
+/// Code starting meanwhile never reads half of it.
+pub fn write_plugin(dir: &Path, hook_exe: &str) -> io::Result<()> {
+    for (name, text) in [
+        (".claude-plugin/plugin.json", PLUGIN_JSON.to_owned()),
+        ("hooks/hooks.json", claude_settings(hook_exe)),
+    ] {
+        let path = dir.join(name);
+        if std::fs::read(&path).is_ok_and(|old| old == text.as_bytes()) {
+            continue;
+        }
+        std::fs::create_dir_all(path.parent().unwrap_or(dir))?;
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        let swapped = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path));
+        if swapped.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        swapped?;
+    }
+    Ok(())
+}
+
+/// Writes the plugin where this blitz keeps its state, for the blitz-hook
+/// next to it, and returns its folder; `None` when that cannot be done.
+pub fn install_plugin() -> Option<PathBuf> {
+    let hook = hook_exe().ok().filter(|h| h.is_file())?;
+    let dir = crate::session::dir()?.join("claude-plugin");
+    match write_plugin(&dir, &hook.to_string_lossy()) {
+        Ok(()) => Some(dir),
+        Err(e) => {
+            eprintln!("blitz: writing the Claude Code plugin: {e}");
+            None
+        }
+    }
+}
+
+/// `CLAUDE_CODE_PLUGIN_DIRS` for a pane: the folders blitz itself was
+/// given, if any, and blitz's plugin once.
+pub fn plugin_dirs(inherited: Option<&str>, ours: &str) -> String {
+    let mut dirs: Vec<&str> = (inherited.unwrap_or("").split(';'))
+        .filter(|d| !d.is_empty())
+        .collect();
+    if !dirs.iter().any(|d| d.eq_ignore_ascii_case(ours)) {
+        dirs.push(ours);
+    }
+    dirs.join(";")
+}
+
 /// `blitz setup <app>`. Returns the process exit code.
 ///
 /// `blitz setup claude` prints the hooks to add to Claude Code's settings,
@@ -264,14 +331,13 @@ pub fn setup(args: &[String]) -> i32 {
         eprintln!("usage: blitz setup claude");
         return 2;
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
+    let hook = match hook_exe() {
+        Ok(hook) => hook,
         Err(e) => {
             eprintln!("blitz setup: cannot find blitz itself: {e}");
             return 1;
         }
     };
-    let hook = exe.with_file_name(format!("blitz-hook{}", std::env::consts::EXE_SUFFIX));
     if !hook.is_file() {
         eprintln!(
             "warning: {} is missing; keep it next to blitz",
@@ -939,6 +1005,60 @@ mod tests {
             panic!("Notification missing");
         };
         assert_eq!(groups[0].get("matcher"), None);
+    }
+
+    #[test]
+    fn plugin_is_written_once() {
+        let dir = std::env::temp_dir().join(format!("blitz-plugin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exe = r"C:\Program Files\blitz\blitz-hook.exe";
+        write_plugin(&dir, exe).expect("first write");
+        let manifest = std::fs::read_to_string(dir.join(".claude-plugin/plugin.json")).unwrap();
+        let manifest = Json::parse(&manifest).expect("manifest is JSON");
+        assert_eq!(manifest.get("name").and_then(Json::as_str), Some("blitz"));
+        let hooks = dir.join("hooks/hooks.json");
+        assert_eq!(
+            std::fs::read_to_string(&hooks).unwrap(),
+            claude_settings(exe)
+        );
+
+        // Unchanged, it is not written again: a read-only file would fail.
+        let readonly = |on: bool| {
+            for f in [&hooks, &dir.join(".claude-plugin/plugin.json")] {
+                let mut p = std::fs::metadata(f).unwrap().permissions();
+                p.set_readonly(on);
+                std::fs::set_permissions(f, p).unwrap();
+            }
+        };
+        readonly(true);
+        let again = write_plugin(&dir, exe);
+        readonly(false);
+        again.expect("nothing to write");
+
+        // blitz moved: the hooks follow, and no temporary file stays.
+        let moved = r"D:\tools\blitz\blitz-hook.exe";
+        write_plugin(&dir, moved).expect("rewrite");
+        assert_eq!(
+            std::fs::read_to_string(&hooks).unwrap(),
+            claude_settings(moved)
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.join("hooks")).unwrap().collect();
+        assert_eq!(left.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plugin_dirs_keep_the_users_own() {
+        let ours = r"C:\Users\me\AppData\Local\blitz\claude-plugin";
+        assert_eq!(plugin_dirs(None, ours), ours);
+        assert_eq!(plugin_dirs(Some(""), ours), ours);
+        assert_eq!(
+            plugin_dirs(Some(r"C:\mine;D:\more;"), ours),
+            format!(r"C:\mine;D:\more;{ours}")
+        );
+        // A blitz started in a blitz pane already has it.
+        let both = format!(r"C:\mine;{}", ours.to_uppercase());
+        assert_eq!(plugin_dirs(Some(&both), ours), both);
     }
 
     #[test]
