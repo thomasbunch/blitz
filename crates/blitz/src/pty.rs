@@ -805,6 +805,32 @@ mod tests {
     }
 
     #[test]
+    fn store_app_aliases_are_found_on_path() {
+        // pwsh or python from the Microsoft Store is a reparse point in
+        // WindowsApps that reads back as no file without std's fallback.
+        let apps = std::env::var_os("LOCALAPPDATA")
+            .map(|d| Path::new(&d).join(r"Microsoft\WindowsApps"))
+            .unwrap_or_default();
+        let alias = std::fs::read_dir(&apps)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|e| {
+                e.file_type().is_ok_and(|t| !t.is_dir())
+                    && e.path()
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("exe"))
+            });
+        let Some(alias) = alias else {
+            eprintln!("SKIPPED: no app execution alias in {}", apps.display());
+            return;
+        };
+        let name = alias.file_name().to_string_lossy().into_owned();
+        let var = |k: &str| (k == "PATH").then(|| apps.clone().into_os_string());
+        assert_eq!(find_program(&name, var).ok().flatten(), Some(alias.path()));
+    }
+
+    #[test]
     fn pane_tokens_are_random_hex() {
         let (a, b) = (pane_token().unwrap(), pane_token().unwrap());
         assert_eq!(a.len(), 32);
