@@ -386,18 +386,19 @@ pane, split or resize.
 
 The command palette lists every action with its keys. Typing narrows
 the list, the arrow keys choose, and Enter or a click runs the action;
-Esc closes it. Starting a new Claude Code session in a split, giving the
-panes equal space, closing a whole tab, reopening the last closed pane,
-moving a pane to a new tab, renaming a session or a tab, copying without
-indent, clearing the scrollback, resetting the terminal and Claude Code
-setup have no keys by default, so they are only in the palette; renaming
-takes the name on the palette's line. Double-clicking the line between
-panes also gives them equal space. Clearing the scrollback also clears
-the screen above the line the cursor is on, which moves to the top, so
-nothing cleared comes back when the pane is resized. Resetting the
-terminal turns off what a program that crashed can leave on, such as
-mouse reports, a hidden cursor or keys sent as escape codes; the text
-stays.
+Esc closes it. When no action matches, Enter looks for what you typed in
+the settings instead. Starting a new Claude Code session in a split,
+giving the panes equal space, closing a whole tab, reopening the last
+closed pane, moving a pane to a new tab, renaming a session or a tab,
+copying without indent, clearing the scrollback, resetting the terminal
+and Claude Code setup have no keys by default, so they are only in the
+palette; renaming takes the name on the palette's line. Double-clicking
+the line between panes also gives them equal space. Clearing the
+scrollback also clears the screen above the line the cursor is on, which
+moves to the top, so nothing cleared comes back when the pane is
+resized. Resetting the terminal turns off what a program that crashed
+can leave on, such as mouse reports, a hidden cursor or keys sent as
+escape codes; the text stays.
 
 ## Key bindings
 
