@@ -535,14 +535,20 @@ pub struct Launch {
 }
 
 /// The program and arguments of a `shell` setting. A path to a program
-/// that holds spaces needs no quotes, as the setting once took only a path.
+/// that holds spaces needs no quotes, as the setting once took only a path:
+/// the longest start of it, up to a space, that names a file is the
+/// program, and any arguments may follow.
 fn parts(shell: &str) -> (&str, &str) {
     let shell = shell.trim();
-    let whole = Path::new(shell);
-    if whole.is_absolute() && whole.is_file() {
-        (shell, "")
-    } else {
-        split_program(shell)
+    let spaces = shell.rmatch_indices([' ', '\t']).map(|m| m.0);
+    let file = |&i: &usize| {
+        let p = Path::new(&shell[..i]);
+        p.is_absolute() && p.is_file()
+    };
+    let unquoted = !shell.starts_with('"');
+    match (std::iter::once(shell.len()).chain(spaces)).find(|i| unquoted && file(i)) {
+        Some(i) => shell.split_at(i),
+        None => split_program(shell),
     }
 }
 
@@ -773,8 +779,13 @@ mod tests {
         let sh = dir.join("sh.exe");
         std::fs::write(&sh, b"").unwrap();
         let got = launch(&sh.to_string_lossy(), true, "t").cmdline;
+        // Arguments may follow it, and it still runs as one program.
+        let args = format!("{} --login -i", sh.display());
+        let (with, shown) = (launch(&args, true, "t").cmdline, label(&args));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, format!("\"{}\"", sh.display()));
+        assert_eq!(with, format!("\"{}\" --login -i", sh.display()));
+        assert_eq!(shown, "sh.exe --login -i");
     }
 
     #[test]
