@@ -529,6 +529,9 @@ struct Mouse {
     click: Option<(Instant, Pos, u8)>,
     /// The same for the last press on a divider, by its index.
     divider_click: Option<(Instant, Pos, u8)>,
+    /// The cell of the left press a program was sent, and whether a drag
+    /// from it may still show the Shift+drag hint.
+    program_press: Option<((u16, u16), bool)>,
 }
 
 /// A cell as a line number and a column. Line numbers stay with their
@@ -4037,6 +4040,10 @@ impl App {
             } else {
                 MouseKind::Release
             };
+            if b == 0 && pressed {
+                let plain = mods == Mods::default();
+                self.mouse.program_press = Some((self.cell_in(id, self.mouse.pos), plain));
+            }
             self.mouse_report(id, kind, b as u8, mods);
             // A click can pick an answer in the program's menu.
             if pressed {
@@ -4325,6 +4332,17 @@ impl App {
         let held = (0..3).find_map(|b| Some((b, self.mouse.reported[b]?)));
         if let Some((b, id)) = held {
             self.mouse_report(id, MouseKind::Move, b as u8, mods);
+            // The first time a plain drag goes to a program, say how to
+            // select instead.
+            let here = self.cell_in(id, pos);
+            let press = &mut self.mouse.program_press;
+            if b == 0 && press.take_if(|p| p.1 && p.0 != here).is_some() {
+                let hints = crate::session::dir().map(|d| d.join("hints"));
+                if first_time(hints.as_deref(), "shift-drag") {
+                    let text = "Shift+drag selects while the program uses the mouse";
+                    self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                }
+            }
         } else if self.mouse_to_program(&mods).is_some()
             && let Some(id) = self.focus_id()
             && self.grid_cell(id, pos).is_some()
@@ -4897,6 +4915,20 @@ fn right_click_does(on: bool, selected: bool) -> Option<Action> {
     } else {
         Action::Paste
     })
+}
+
+/// Whether the hint `name` shows: only the first time ever, as remembered
+/// by a file of that name in `dir`. With nowhere to remember it, never, so
+/// it cannot show at every start.
+fn first_time(dir: Option<&Path>, name: &str) -> bool {
+    let Some(dir) = dir else {
+        return false;
+    };
+    let file = dir.join(name);
+    !file.exists()
+        && std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(file, ""))
+            .is_ok()
 }
 
 /// The pointer's shape: a resize arrow on a `divider` between panes, the
@@ -6872,6 +6904,20 @@ mod tests {
         let (range, found) = crate::links::scan(&l.text).remove(0);
         assert_eq!(found, Link::Url("https://e.com/abc".into()));
         assert_eq!(l.span(range), ((0, 3), (1, 9)), "across the wrap");
+    }
+
+    #[test]
+    fn app_hints_show_once_ever() {
+        let dir = std::env::temp_dir().join(format!("blitz-hints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let seen = [
+            first_time(Some(&dir), "shift-drag"),
+            first_time(Some(&dir), "shift-drag"),
+            first_time(Some(&dir), "other"),
+        ];
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(seen, [true, false, true]);
+        assert!(!first_time(None, "shift-drag"), "nowhere to remember it");
     }
 
     #[test]
