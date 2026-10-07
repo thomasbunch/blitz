@@ -995,12 +995,25 @@ pub fn build(m: &ChromeModel) -> Chrome {
         out.field = out.field.or(to_commands.then_some(at));
     }
     if let (Some((_, _, t)), Some(f)) = (m.preedit, out.field) {
+        let f = ime_rect(f, text_w(t, tw));
         // Over the hint an empty field shows.
         extra.push(Prim::Rect(f, c.side_bg));
         composition(&mut extra, t, f, tw, false, (c.side_bg, c.msg), s(1.0));
     }
     out.prims.extend(extra);
     out
+}
+
+/// Where a composition `w` wide goes in a field whose typed text goes
+/// next at `f`: there, or over the right end of the typed text when that
+/// leaves too little room.
+fn ime_rect(f: Rect, w: i32) -> Rect {
+    let x = f.x.min(f.right() - w).max(0);
+    Rect {
+        x,
+        w: f.right() - x,
+        ..f
+    }
 }
 
 /// IME composition `t`, underlined, from the top left of `r` and cut at
@@ -2772,6 +2785,31 @@ mod tests {
             assert!(c.below.iter().all(|(_, b)| apart(b)), "{name}");
         }
         assert_eq!(c.below.len(), 2);
+    }
+
+    #[test]
+    fn a_composition_shows_in_a_full_field() {
+        let room = Rect {
+            x: 100,
+            y: 5,
+            w: 40,
+            h: 16,
+        };
+        assert_eq!(ime_rect(room, 24), room, "after the typed text");
+        let full = Rect {
+            x: 139,
+            w: 1,
+            ..room
+        };
+        assert_eq!(
+            ime_rect(full, 24),
+            Rect {
+                x: 116,
+                w: 24,
+                ..room
+            }
+        );
+        assert_eq!(ime_rect(full, 500).x, 0);
     }
 
     #[test]
