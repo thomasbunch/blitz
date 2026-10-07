@@ -18,6 +18,11 @@ pub enum Action {
     Paste,
     /// Scroll the main screen by a page; positive is up.
     ScrollPage(i8),
+    /// Scroll the main screen to the top of the scrollback (1) or to the
+    /// bottom (-1).
+    ScrollEnd(i8),
+    /// Drop the scrollback, and what the console host keeps of it.
+    ClearScrollback,
     NewTab,
     ClosePane,
     /// Close every pane of the active tab.
@@ -86,6 +91,9 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Paste, "paste", "Paste"),
     (Action::ScrollPage(1), "scroll_page_up", "Scroll up a page"),
     (Action::ScrollPage(-1), "scroll_page_down", "Scroll down a page"),
+    (Action::ScrollEnd(1), "scroll_to_top", "Scroll to the top"),
+    (Action::ScrollEnd(-1), "scroll_to_bottom", "Scroll to the bottom"),
+    (Action::ClearScrollback, "clear_scrollback", "Clear the scrollback and screen"),
     (Action::NewTab, "new_tab", "New tab"),
     (Action::ClosePane, "close_pane", "Close pane"),
     (Action::CloseTab, "close_tab", "Close tab"),
@@ -157,6 +165,9 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (SHIFT, 0x2d, Action::Paste),
     (SHIFT, 0x21, Action::ScrollPage(1)),
     (SHIFT, 0x22, Action::ScrollPage(-1)),
+    // Not Shift+Home and Shift+End: PSReadLine selects with them.
+    (CTRL | SHIFT, 0x24, Action::ScrollEnd(1)),
+    (CTRL | SHIFT, 0x23, Action::ScrollEnd(-1)),
     (CTRL | SHIFT, b'T' as u16, Action::NewTab),
     (CTRL | SHIFT, b'W' as u16, Action::ClosePane),
     (CTRL, 0x09, Action::CycleTab(1)),
@@ -1078,6 +1089,9 @@ mod msg_to_key_tests {
         assert_eq!(press(0x56, &[LCTRL, LSHIFT]), Some(Action::Paste));
         assert_eq!(press(0x2d, &[0xa1]), Some(Action::Paste));
         assert_eq!(press(0x21, &[LSHIFT]), Some(Action::ScrollPage(1)));
+        assert_eq!(press(0x24, &[LCTRL, LSHIFT]), Some(Action::ScrollEnd(1)));
+        assert_eq!(press(0x23, &[LCTRL, LSHIFT]), Some(Action::ScrollEnd(-1)));
+        assert_eq!(press(0x23, &[LSHIFT]), None, "PSReadLine selects");
         assert_eq!(press(0x52, &[LCTRL, LSHIFT]), Some(Action::SplitRight));
         assert_eq!(press(0x44, &[0xa3, LSHIFT]), Some(Action::SplitDown));
         assert_eq!(press(0x42, &[LCTRL, LSHIFT]), Some(Action::ToggleSidebar));

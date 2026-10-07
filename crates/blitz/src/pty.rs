@@ -49,6 +49,7 @@ type ResizeFn = unsafe extern "system" fn(isize, COORD) -> i32;
 type CloseFn = unsafe extern "system" fn(isize);
 type ReleaseFn = unsafe extern "system" fn(isize) -> i32;
 type ReparentFn = unsafe extern "system" fn(isize, isize) -> i32;
+type ClearFn = unsafe extern "system" fn(isize) -> i32;
 
 /// The pseudoconsole functions, from Microsoft's redistributable
 /// `conpty.dll` when it is present, else from the system.
@@ -59,6 +60,8 @@ struct Conpty {
     /// Lets the output pipe reach EOF once every client has exited.
     release: Option<ReleaseFn>,
     reparent: Option<ReparentFn>,
+    /// Clears the console host's buffer; only the redistributable has it.
+    clear: Option<ClearFn>,
     bundled: bool,
 }
 
@@ -128,6 +131,7 @@ fn resolve(m: HMODULE, prefix: &str, bundled: bool) -> Option<Conpty> {
             release: sym("ReleasePseudoConsole").map(|f| std::mem::transmute::<Proc, ReleaseFn>(f)),
             reparent: sym("ReparentPseudoConsole")
                 .map(|f| std::mem::transmute::<Proc, ReparentFn>(f)),
+            clear: sym("ClearPseudoConsole").map(|f| std::mem::transmute::<Proc, ClearFn>(f)),
             bundled,
         })
     }
@@ -403,6 +407,18 @@ impl Pty {
             // SAFETY: a live pseudoconsole; the lock keeps it from closing.
             unsafe { (c.resize)(*h, size) };
         }
+    }
+
+    /// Clears the console host's buffer but the cursor's line, which it
+    /// moves to the top and draws again, so no resize can bring cleared
+    /// text back. False when this ConPTY cannot.
+    pub fn clear(&self) -> bool {
+        let h = lock(&self.hpc);
+        let Some(clear) = conpty().and_then(|c| c.clear).filter(|_| *h != 0) else {
+            return false;
+        };
+        // SAFETY: a live pseudoconsole; the lock keeps it from closing.
+        unsafe { clear(*h) >= 0 }
     }
 
     /// Asks the child to exit (CTRL_CLOSE_EVENT) and kills it if it is still

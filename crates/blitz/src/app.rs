@@ -2788,6 +2788,25 @@ impl App {
                 let page = rows.saturating_sub(1).max(1) as isize;
                 self.scroll(page * isize::from(dir));
             }
+            Action::ScrollEnd(dir) => {
+                if self.modes().alt_screen {
+                    return false;
+                }
+                self.scroll(if dir > 0 { isize::MAX } else { isize::MIN });
+            }
+            // A full-screen program's screen would be cleared under it.
+            Action::ClearScrollback => {
+                let Some(v) = self.current().filter(|_| !self.modes().alt_screen) else {
+                    return false;
+                };
+                lock(&v.pane.term).clear_scrollback();
+                // The console host draws the screen again after this.
+                v.pane.pty.clear();
+                if let Some(f) = self.find.as_mut() {
+                    f.stale = true;
+                }
+                self.request_redraw();
+            }
             Action::NewTab => self.add(None, new_tab),
             Action::ClosePane => {
                 let Some(v) = self.current() else {
