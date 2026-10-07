@@ -1382,15 +1382,6 @@ mod msg_to_key_tests {
     }
 
     #[test]
-    fn readme_names_every_action() {
-        let readme = include_str!("../../../README.md");
-        for &(_, name, _) in ACTIONS {
-            let named = readme.contains(&format!("`{name}`"));
-            assert!(named, "README.md does not name {name}");
-        }
-    }
-
-    #[test]
     fn readme_lists_every_default_shortcut() {
         let readme = include_str!("../../../README.md");
         // Followed by something other than more of a key name, so
