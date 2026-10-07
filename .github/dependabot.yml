@@ -1,7 +1,8 @@
 # Weekly update PRs for the SHA-pinned actions and the `=` pinned crates.
-# A release must be a week old before it is offered, so a hijacked
-# version has time to be caught and yanked first. Security updates skip
-# the wait.
+# A bumped action or crate must be a week old before it is offered, so a
+# hijacked version has time to be caught and yanked first. Security
+# updates skip the wait. The wait does not cover crates Cargo newly pulls
+# into Cargo.lock with a bump, so read the whole lockfile diff.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -12,9 +13,12 @@ updates:
       default-days: 7
     commit-message:
       prefix: ci
+    # Major bumps come one per PR: most of these actions only run in
+    # release.yml, so PR CI never exercises them.
     groups:
       actions:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: cargo
     directory: /
