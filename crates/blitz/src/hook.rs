@@ -78,11 +78,15 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
         // What the user asked, so the sidebar says what the turn is about.
         "UserPromptSubmit" => ("working", field(ev, "prompt").to_owned()),
         "PermissionRequest" => {
-            let detail = match field(input, "command") {
-                "" => field(input, "file_path"),
-                c => c,
+            let detail = match field(input, "file_path") {
+                "" => (["command", "url", "pattern", "query"].into_iter())
+                    .map(|k| field(input, k))
+                    .find(|d| !d.is_empty())
+                    .unwrap_or(""),
+                path => relative(path, field(ev, "cwd")),
             };
-            let msg = match (tool, detail) {
+            let tool = tool_label(tool);
+            let msg = match (tool.as_str(), detail) {
                 (t, "") | ("", t) => t.to_owned(),
                 (t, d) => format!("{t}: {d}"),
             };
@@ -135,8 +139,14 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
                 return Some(("working", format!("waiting on {agents} agent{s}")));
             }
             let reply = field(ev, "last_assistant_message");
-            let first = reply.lines().map(str::trim).find(|l| !l.is_empty());
-            let msg = match (tasks.len(), first.unwrap_or("")) {
+            let mut lines = reply.lines().map(str::trim).filter(|l| !l.is_empty());
+            let first = lines.next();
+            // A reply that ends by asking something shows the question.
+            let line = match lines.next_back() {
+                Some(last) if last.ends_with('?') => Some(last),
+                _ => first,
+            };
+            let msg = match (tasks.len(), line.unwrap_or("")) {
                 (0, line) => line.to_owned(),
                 (n, "") => format!("{n} background"),
                 (n, line) => {
@@ -146,13 +156,35 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
             };
             ("done", msg)
         }
+        // Error codes in words: `server_error` reads "server error".
         "StopFailure" => match field(ev, "error") {
             "rate_limit" => ("done", USAGE_LIMIT.to_owned()),
-            e => ("error", e.to_owned()),
+            "max_output_tokens" => ("error", "reply too long".to_owned()),
+            "unknown" => ("error", "unknown error".to_owned()),
+            e => ("error", e.replace('_', " ")),
         },
         "SessionEnd" => ("idle", String::new()),
         _ => return None,
     })
+}
+
+/// A tool as people read it: `mcp__github__create_issue` is
+/// `github: create_issue`.
+fn tool_label(tool: &str) -> String {
+    match tool.strip_prefix("mcp__").and_then(|t| t.split_once("__")) {
+        Some((server, t)) => format!("{server}: {t}"),
+        None => tool.to_owned(),
+    }
+}
+
+/// `path` relative to `cwd` when it is inside it, so the end of a long
+/// path is what shows. Case is ignored, as Windows does.
+fn relative<'a>(path: &'a str, cwd: &str) -> &'a str {
+    let cwd = cwd.trim_end_matches(['\\', '/']);
+    let inside = (path.get(..cwd.len()))
+        .filter(|head| !cwd.is_empty() && head.eq_ignore_ascii_case(cwd))
+        .and_then(|_| path[cwd.len()..].strip_prefix(['\\', '/']));
+    inside.filter(|rest| !rest.is_empty()).unwrap_or(path)
 }
 
 /// `{"terminalSequence":"ESC]777;notify;blitz:<token>:<state>;<msg>BEL"}`
@@ -660,9 +692,34 @@ mod tests {
                 r#"{"hook_event_name":"PermissionRequest","tool_name":"Write","tool_input":{"file_path":"C:\\x\\a.rs"}}"#,
                 Some(("needs-you", "Write: C:\\x\\a.rs")),
             ),
+            // Inside the session's folder the path is relative to it.
+            (
+                r#"{"hook_event_name":"PermissionRequest","cwd":"C:\\Work\\app","tool_name":"Edit","tool_input":{"file_path":"c:\\work\\APP\\src\\main.rs"}}"#,
+                Some(("needs-you", "Edit: src\\main.rs")),
+            ),
+            (
+                r#"{"hook_event_name":"PermissionRequest","cwd":"C:\\work\\app","tool_name":"Edit","tool_input":{"file_path":"C:\\work\\apple\\a.rs"}}"#,
+                Some(("needs-you", "Edit: C:\\work\\apple\\a.rs")),
+            ),
             (
                 r#"{"hook_event_name":"PermissionRequest","tool_name":"mcp__x__y","tool_input":{"q":1}}"#,
-                Some(("needs-you", "mcp__x__y")),
+                Some(("needs-you", "x: y")),
+            ),
+            (
+                r#"{"hook_event_name":"PermissionRequest","tool_name":"mcp__github__create_issue","tool_input":{"title":"t"}}"#,
+                Some(("needs-you", "github: create_issue")),
+            ),
+            (
+                r#"{"hook_event_name":"PermissionRequest","tool_name":"WebFetch","tool_input":{"url":"https://example.com/a","prompt":"p"}}"#,
+                Some(("needs-you", "WebFetch: https://example.com/a")),
+            ),
+            (
+                r#"{"hook_event_name":"PermissionRequest","tool_name":"Grep","tool_input":{"pattern":"fn main","path":"src"}}"#,
+                Some(("needs-you", "Grep: fn main")),
+            ),
+            (
+                r#"{"hook_event_name":"PermissionRequest","tool_name":"WebSearch","tool_input":{"query":"conpty osc"}}"#,
+                Some(("needs-you", "WebSearch: conpty osc")),
             ),
             (
                 r#"{"hook_event_name":"PermissionRequest","tool_input":{"command":"git push"}}"#,
@@ -733,6 +790,15 @@ mod tests {
                 r#"{"hook_event_name":"Stop","last_assistant_message":"\n  Done: tests pass.\nMore detail."}"#,
                 Some(("done", "Done: tests pass.")),
             ),
+            // A reply that ends by asking shows the question.
+            (
+                r#"{"hook_event_name":"Stop","last_assistant_message":"Tests pass.\n\nShould I push?\n"}"#,
+                Some(("done", "Should I push?")),
+            ),
+            (
+                r#"{"hook_event_name":"Stop","last_assistant_message":"Why?\nBecause."}"#,
+                Some(("done", "Why?")),
+            ),
             (r#"{"hook_event_name":"Stop"}"#, Some(("done", ""))),
             (
                 r#"{"hook_event_name":"Stop","stop_hook_active":true}"#,
@@ -769,6 +835,18 @@ mod tests {
                 r#"{"hook_event_name":"StopFailure","error":"overloaded"}"#,
                 Some(("error", "overloaded")),
             ),
+            (
+                r#"{"hook_event_name":"StopFailure","error":"authentication_failed"}"#,
+                Some(("error", "authentication failed")),
+            ),
+            (
+                r#"{"hook_event_name":"StopFailure","error":"max_output_tokens"}"#,
+                Some(("error", "reply too long")),
+            ),
+            (
+                r#"{"hook_event_name":"StopFailure","error":"unknown"}"#,
+                Some(("error", "unknown error")),
+            ),
             // Not a string: still an error, without a message.
             (
                 r#"{"hook_event_name":"StopFailure","error":{"type":"x"}}"#,
@@ -789,6 +867,22 @@ mod tests {
             let got = state(payload);
             let got = got.as_ref().map(|(s, m)| (*s, m.as_str()));
             assert_eq!(got, *want, "{payload}");
+        }
+    }
+
+    #[test]
+    fn paths_relative_to_the_session() {
+        for (path, cwd, want) in [
+            (r"C:\a\b.rs", r"C:\", r"a\b.rs"),
+            (r"C:\a\b.rs", r"C:\a\", "b.rs"),
+            ("/home/me/x/y.rs", "/home/me", "x/y.rs"),
+            (r"C:\a", r"C:\a", r"C:\a"),
+            (r"C:\ab\c", r"C:\a", r"C:\ab\c"),
+            (r"D:\a\b", r"C:\a", r"D:\a\b"),
+            (r"C:\a\b", "", r"C:\a\b"),
+            ("é", "ab", "é"),
+        ] {
+            assert_eq!(relative(path, cwd), want, "{path} in {cwd}");
         }
     }
 
