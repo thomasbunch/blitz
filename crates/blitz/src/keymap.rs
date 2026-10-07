@@ -358,7 +358,7 @@ pub fn repeats(k: &KeyInput, user: &[Binding], panel: bool) -> bool {
 pub fn drops_repeat(k: &KeyInput, user: &[Binding], taken: bool, panel: bool) -> bool {
     let confirms = matches!(
         action(k, user),
-        Some(Action::Paste | Action::ClosePane | Action::Update)
+        Some(Action::Paste | Action::ClosePane | Action::CloseTab | Action::Update)
     );
     (taken || confirms) && !repeats(k, user, panel)
 }
@@ -1203,6 +1203,12 @@ mod msg_to_key_tests {
         for (vk, held) in [(0x56, &[0xa2][..]), (0x57, CS), (0x55, CS), (0x2d, &[0xa1])] {
             assert!(drops(vk, held, false), "{vk:#x}");
         }
+        // Closing a tab asks too, on whichever key it is bound to.
+        let close_tab = [binding("ctrl+shift+q=close_tab").unwrap()];
+        let mut t = String::new();
+        let again = lp(0, false, true, 1) | 1 << 30;
+        let k = msg_to_key(0x51, again, &state(CS, &[]), layout(US), &mut t);
+        assert!(drops_repeat(&k, &close_tab, false, false), "close_tab");
         // Copy with nothing selected passes its press on, so the program
         // gets every ^C of a held Ctrl+C; taken, it copies once.
         for (vk, held) in [(0x43, &[0xa2][..]), (0x2d, &[0xa2])] {
