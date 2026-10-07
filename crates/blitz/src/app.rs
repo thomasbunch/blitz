@@ -2586,6 +2586,33 @@ impl App {
         }
     }
 
+    /// Pastes `text` into pane `id`, the focused one, or asks first as
+    /// [`vt::keys::needs_paste_confirm`] says; `confirmed` when this is the
+    /// answer. A single line goes without its line break, so it is not run.
+    fn paste(&mut self, id: PaneId, text: &str, confirmed: bool) {
+        let text = trim_paste(text);
+        let Some(v) = self.view(id).filter(|_| !text.is_empty()) else {
+            return;
+        };
+        let claude = v.pane.claude.is_some();
+        let mut term = lock(&v.pane.term);
+        let bracketed = term.input_modes().bracketed;
+        let trusted = paste_trusted(&term, claude);
+        if confirmed {
+            term.confirm_paste();
+        }
+        drop(term);
+        if !confirmed && vt::keys::needs_paste_confirm(text, bracketed, trusted) {
+            let key = keymap::keys_for(Action::Paste, &self.config.keys);
+            let asked = paste_question(text, key.as_deref());
+            self.ask(id, asked, Ask::Paste(text.to_owned()));
+            return;
+        }
+        let mut out = Vec::new();
+        vt::encode_paste(text, bracketed, &mut out);
+        self.typed(out);
+    }
+
     /// Runs a shortcut. Returns false when it does not apply right now, in
     /// which case the key goes to the program.
     fn act(&mut self, el: &ActiveEventLoop, a: Action) -> bool {
@@ -2608,29 +2635,25 @@ impl App {
                 self.request_redraw();
             }
             Action::Paste => {
+                let Some(id) = before else {
+                    return false;
+                };
+                // The answer to a question pastes what it asked about.
+                let asked = (self.view_mut(id))
+                    .and_then(|v| v.notice.take_if(|n| matches!(n.ask, Ask::Paste(_))));
+                if let Some(Notice {
+                    ask: Ask::Paste(text),
+                    ..
+                }) = asked
+                {
+                    self.request_redraw();
+                    self.paste(id, &text, true);
+                    return true;
+                }
                 let Some(text) = crate::clipboard::get_text().filter(|t| !t.is_empty()) else {
                     return false;
                 };
-                let bracketed = self.modes().bracketed;
-                let trusted = (self.current())
-                    .is_some_and(|v| paste_trusted(&lock(&v.pane.term), v.pane.claude.is_some()));
-                if vt::keys::needs_paste_confirm(&text, bracketed, trusted) {
-                    let Some(id) = before else {
-                        return false;
-                    };
-                    if !self.confirmed(id, &Ask::Paste(text.clone())) {
-                        let lines = text.lines().count();
-                        let asked = format!("Paste {lines} lines? Press Ctrl+V again");
-                        self.ask(id, asked, Ask::Paste(text));
-                        return true;
-                    }
-                    if let Some(v) = self.view(id) {
-                        lock(&v.pane.term).confirm_paste();
-                    }
-                }
-                let mut out = Vec::new();
-                vt::encode_paste(&text, bracketed, &mut out);
-                self.typed(out);
+                self.paste(id, &text, false);
             }
             Action::ScrollPage(dir) => {
                 if self.modes().alt_screen {
@@ -4827,6 +4850,36 @@ fn paste_trusted(term: &vt::Terminal, claude: bool) -> bool {
     term.paste_trusted() || claude && term.input_modes().bracketed
 }
 
+/// `text` without the line break at its end when that is its only one: a
+/// command copied with its line break is pasted, not run.
+fn trim_paste(text: &str) -> &str {
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.contains(['\r', '\n']) {
+        text
+    } else {
+        line
+    }
+}
+
+/// What a paste that needs confirming asks: how many lines, how they
+/// start, and the paste `key`, when one is bound.
+fn paste_question(text: &str, key: Option<&str>) -> String {
+    let first = text.trim_start().lines().next().unwrap_or_default();
+    let mut chars = first.chars().filter(|c| !c.is_control());
+    let mut start: String = chars.by_ref().take(40).collect();
+    if chars.next().is_some() {
+        start.push('\u{2026}');
+    }
+    let lines = text.lines().count();
+    let s = if lines == 1 { "" } else { "s" };
+    let again = match key {
+        Some(k) => format!("Press {k} again"),
+        None => "Paste again".into(),
+    };
+    format!("Paste {lines} line{s} starting \"{start}\"? {again}")
+}
+
 /// Takes a fresh snapshot of `term` into `snap`. Returns false when that
 /// found output rewrote the text under `sel`; see [`Selection::still`].
 fn refresh(
@@ -6712,6 +6765,49 @@ mod tests {
         assert!(!paste_trusted(&t, false), "a shell asks once first");
         t.confirm_paste();
         assert!(paste_trusted(&t, false));
+    }
+
+    #[test]
+    fn app_one_line_pastes_without_its_line_break() {
+        for (text, pasted) in [
+            ("ls -la\r\n", "ls -la"),
+            ("ls -la\n", "ls -la"),
+            ("ls -la\r", "ls -la"),
+            ("ls -la", "ls -la"),
+            ("\r\n", ""),
+            // More than one line break: the text stays as copied.
+            ("a\r\nb\r\n", "a\r\nb\r\n"),
+            ("a\n\n", "a\n\n"),
+            ("a\nb", "a\nb"),
+        ] {
+            assert_eq!(trim_paste(text), pasted, "{text:?}");
+        }
+        assert!(!vt::keys::needs_paste_confirm(
+            trim_paste("git status\r\n"),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn app_paste_question_says_what_and_which_key() {
+        assert_eq!(
+            paste_question("\r\ngit status\r\ngit diff\r\n", Some("Ctrl+V")),
+            "Paste 3 lines starting \"git status\"? Press Ctrl+V again"
+        );
+        // The first 40 characters, without tabs or other controls.
+        let long = format!("{}\tyz", "x".repeat(39));
+        assert_eq!(
+            paste_question(&long, Some("Shift+Insert")),
+            format!(
+                "Paste 1 line starting \"{}y\u{2026}\"? Press Shift+Insert again",
+                "x".repeat(39)
+            )
+        );
+        assert_eq!(
+            paste_question("a\nb", None),
+            "Paste 2 lines starting \"a\"? Paste again"
+        );
     }
 
     #[test]
