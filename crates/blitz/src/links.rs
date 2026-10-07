@@ -575,6 +575,12 @@ mod tests {
         );
         let accent = "docs/cafe\u{301}.md";
         assert_eq!(found(accent), [(accent, path(accent))]);
+        // A Prepend letter joins no space or quote: only the bare name
+        // after it.
+        let prepend = "docs/a\u{D4E} b.txt rest";
+        assert_eq!(found(prepend), [("b.txt", path("b.txt"))]);
+        let prepend = "docs\\x\u{111C2}\"y.txt";
+        assert_eq!(found(prepend), [("y.txt", path("y.txt"))]);
         for none in [
             "a/b",
             "1/2 done, v1.2/3",
@@ -586,8 +592,6 @@ mod tests {
             ".env",
             "~ and ~x",
             "a.b(x)",
-            "docs/a\u{D4E} b.txt rest",
-            "docs\\x\u{111C2}\"y.txt",
         ] {
             assert_eq!(found(none), [], "{none}");
         }
