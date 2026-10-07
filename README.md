@@ -212,8 +212,8 @@ oh-my-posh or posh-git sets later. For bash in Git Bash or WSL,
 blitz setup shell bash
 ```
 
-prints lines to add to `~/.bashrc` (`zsh` prints them for `~/.zshrc`).
-They do nothing outside blitz. blitz follows only Windows folders, so in
+prints lines to add to the end of `~/.bashrc` (`zsh` prints them for
+`~/.zshrc`). They do nothing outside blitz. blitz follows only Windows folders, so in
 WSL only folders under `/mnt` are reported, and the lines need
 `BLITZ_PANE_TOKEN`, which reaches WSL only when `WSLENV` lists it.
 
