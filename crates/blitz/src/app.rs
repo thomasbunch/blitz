@@ -1949,6 +1949,7 @@ impl App {
         for v in &self.views {
             lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
         }
+        self.fit_min_size();
         self.request_redraw();
     }
 
@@ -2176,6 +2177,7 @@ impl App {
             Ok(g) => {
                 self.gfx = Some(g);
                 self.gfx_retry = None;
+                self.fit_min_size();
             }
             Err(e) => {
                 eprintln!("blitz: renderer: {e}");
@@ -3151,12 +3153,16 @@ impl App {
     /// `MIN_ROWS` cells in a tab of several panes, which is what dragging
     /// and resizing work on.
     fn min_pane(&self) -> (i32, i32) {
-        let (cw, ch) = self.cell();
-        let frame = chrome::pane_frame(self.scale as f32, self.win.sidebar_expanded, true);
-        (
-            layout::MIN_COLS * cw as i32 + frame.0,
-            layout::MIN_ROWS * ch as i32 + frame.1,
-        )
+        pane_min(self.cell(), self.scale as f32, self.win.sidebar_expanded)
+    }
+
+    /// Keeps the window from getting smaller than [`min_window`] for the
+    /// font and scale in use.
+    fn fit_min_size(&self) {
+        if let Some(w) = &self.window {
+            let min = min_window(self.cell(), self.scale as f32, self.win.sidebar_expanded);
+            w.set_min_inner_size(Some(min));
+        }
     }
 
     /// Brings a session to the front: its tab becomes the active one and
@@ -4238,6 +4244,25 @@ fn small_icon_size() -> PhysicalSize<u32> {
     // SAFETY: reads a system metric; no pointers.
     let n = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
     PhysicalSize::new(n, n)
+}
+
+/// The smallest pane, frame included, that holds `MIN_COLS` by `MIN_ROWS`
+/// cells of `cw` by `ch` pixels in a tab of several panes, at `scale`.
+fn pane_min((cw, ch): (u32, u32), scale: f32, expanded: bool) -> (i32, i32) {
+    let frame = chrome::pane_frame(scale, expanded, true);
+    (
+        layout::MIN_COLS * cw as i32 + frame.0,
+        layout::MIN_ROWS * ch as i32 + frame.1,
+    )
+}
+
+/// The smallest the window may get: the rail and one smallest pane. Any
+/// smaller and a pane shrinks to a column or two, and a program such as
+/// Claude Code redraws everything at that width.
+fn min_window(cell: (u32, u32), scale: f32, expanded: bool) -> PhysicalSize<u32> {
+    let (w, h) = pane_min(cell, scale, expanded);
+    let rail = (chrome::RAIL_W * scale).round() as i32;
+    PhysicalSize::new((w + rail) as u32, h as u32)
 }
 
 /// `g`, moved onto the primary monitor when no monitor shows enough of it.
@@ -5650,6 +5675,28 @@ mod tests {
         assert!(!c.matches().is_empty());
         let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
         assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
+    }
+
+    /// The smallest window still has room for the rail and one pane of
+    /// the smallest size, at any scale.
+    #[test]
+    fn app_the_window_never_gets_smaller_than_one_pane() {
+        let mut win = layout::Window {
+            sidebar_expanded: false,
+            ..Default::default()
+        };
+        win.tabs.push(Tab::new("a".into(), PaneId(1)));
+        win.tabs.push(Tab::new("b".into(), PaneId(2)));
+        for (cell, scale) in [((8, 16), 1.0), ((12, 24), 1.5), ((16, 32), 2.0)] {
+            let min = min_window(cell, scale, false);
+            let size = (min.width as i32, min.height as i32);
+            let area = chrome::area(&win, size, scale, false);
+            assert!(area.x > 0, "the rail is shown");
+            assert_eq!((area.w, area.h), pane_min(cell, scale, false), "{scale}");
+            let cols = (area.w - chrome::pane_frame(scale, false, true).0) / cell.0 as i32;
+            assert_eq!(cols, layout::MIN_COLS, "{scale}");
+        }
+        assert_eq!(min_window((8, 16), 1.0, true), PhysicalSize::new(123, 78));
     }
 
     #[test]
