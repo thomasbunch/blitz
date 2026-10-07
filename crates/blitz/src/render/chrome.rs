@@ -1298,7 +1298,7 @@ fn state_word(x: &Session, now: Instant) -> String {
             Some(d) => format!("done \u{b7} {}", elapsed(d)),
             None => "done".into(),
         },
-        (_, Some(n)) => format!("exited {}", n as i32),
+        (_, Some(n)) => crate::attention::exit_text(n),
         (Attn::Error, None) => "error".into(),
         (Attn::Idle, None) => "idle".into(),
     }
@@ -1666,6 +1666,20 @@ mod tests {
         assert_eq!(folder_name("/home/me/shop"), "shop");
         assert_eq!(folder_name(r"C:\"), r"C:\");
         assert_eq!(folder_name(""), "shell");
+    }
+
+    #[test]
+    fn sidebar_says_how_a_session_exited() {
+        let (win, mut sessions, now) = fleet(true);
+        sessions[1].state = Attn::Error;
+        sessions[1].exit_code = Some(0xC000_0005);
+        sessions[2].exit_code = Some(u32::MAX);
+        let c = build(&model(&win, &sessions, now));
+        let t = texts(&c);
+        assert!(
+            t.contains(&"access violation") && t.contains(&"exit -1"),
+            "{t:?}"
+        );
     }
 
     #[test]

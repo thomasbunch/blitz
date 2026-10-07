@@ -81,9 +81,8 @@ impl Ev {
 
     /// The event for the session's root process exiting with `code`.
     pub fn from_exit(code: u32) -> Ev {
-        // STATUS_CONTROL_C_EXIT: the user stopped it, which is not a failure.
-        const CTRL_C_EXIT: u32 = 0xC000_013A;
         match code {
+            // The user stopped it, which is not a failure.
             0 | CTRL_C_EXIT => Ev::Idle,
             _ => Ev::Error { sticky: true },
         }
@@ -111,6 +110,22 @@ pub fn notify_protocol(title: &str) -> (&str, u32) {
             (head, n.parse().unwrap_or(u32::MAX))
         }
         _ => (title, 1),
+    }
+}
+/// STATUS_CONTROL_C_EXIT: a console program stopped with Ctrl+C.
+pub const CTRL_C_EXIT: u32 = 0xC000_013A;
+
+/// An exit code as people read it: `exit 1` or `exit -1`, a Windows status
+/// code in hex, and the common ways a program dies by name.
+pub fn exit_text(code: u32) -> String {
+    match code {
+        CTRL_C_EXIT => "Ctrl+C".into(),
+        0xC000_0005 => "access violation".into(),
+        0xC000_00FD => "stack overflow".into(),
+        // A fast fail, which is how abort() and a Rust panic set to abort end.
+        0xC000_0409 => "aborted".into(),
+        _ if (code as i32).unsigned_abs() <= 0xFFFF => format!("exit {}", code as i32),
+        _ => format!("exit 0x{code:08X}"),
     }
 }
 
@@ -870,6 +885,20 @@ mod tests {
         assert!(events("\x1b]9;build done\x07").is_empty());
         assert!(events("\x07\x1b]0;done\x07").is_empty(), "a bell or title");
         assert_eq!(events(&notify("done")), [Ev::Done]);
+    }
+
+    #[test]
+    fn exit_codes_read_as_people_say_them() {
+        assert_eq!(exit_text(0), "exit 0");
+        assert_eq!(exit_text(101), "exit 101");
+        assert_eq!(exit_text(u32::MAX), "exit -1");
+        assert_eq!(exit_text(0xFFFF), "exit 65535");
+        assert_eq!(exit_text(0xC000_013A), "Ctrl+C");
+        assert_eq!(exit_text(0xC000_0005), "access violation");
+        assert_eq!(exit_text(0xC000_00FD), "stack overflow");
+        assert_eq!(exit_text(0xC000_0409), "aborted");
+        assert_eq!(exit_text(0xC000_0135), "exit 0xC0000135");
+        assert_eq!(exit_text(0x8007_0005), "exit 0x80070005");
     }
 
     #[test]

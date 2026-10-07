@@ -43,7 +43,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowId};
 
 use crate::arcade::run::{self, Run};
-use crate::attention::{Attn, Ev, claude_title};
+use crate::attention::{Attn, Ev, claude_title, exit_text};
 use crate::config::{Config, Kind};
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
@@ -2694,7 +2694,7 @@ impl App {
                 }
                 self.set_notice(
                     id,
-                    format!("exited with code {code} \u{b7} Enter close"),
+                    format!("{} \u{b7} Enter close", exit_text(code)),
                     None,
                     false,
                 );
