@@ -1727,10 +1727,7 @@ impl App {
             text_cell: self.text_cell(),
             term_cell: self.cell(),
             now: Instant::now(),
-            banner: banner_text(
-                self.update.as_ref(),
-                self.banner_note.as_ref().map(|n| n.0.as_str()),
-            ),
+            banner: self.banner(),
             preedit,
             picker: self.picker.as_ref().map(|p| chrome::Picker {
                 filter: &p.filter,
@@ -3281,12 +3278,15 @@ impl App {
             .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
         let size = (size.width as i32, size.height as i32);
         let tw = self.text_cell().0 as i32;
-        chrome::area(
-            &self.win,
-            size,
-            self.scale as f32,
-            self.update.as_ref().map(|u| u.1.as_str()),
-            tw,
+        chrome::area(&self.win, size, self.scale as f32, self.banner(), tw)
+    }
+
+    /// The text of the update strip or cue, which also decides whether
+    /// the strip takes room under the panes.
+    fn banner(&self) -> Option<&str> {
+        banner_text(
+            self.update.as_ref(),
+            self.banner_note.as_ref().map(|n| n.0.as_str()),
         )
     }
 
