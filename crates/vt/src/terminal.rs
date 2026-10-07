@@ -468,6 +468,18 @@ impl Terminal {
         self.changed = true;
     }
 
+    /// Drops the main screen's scrollback, as `CSI 3 J` there does.
+    pub fn clear_scrollback(&mut self) {
+        let main = if self.alt {
+            &mut self.other
+        } else {
+            &mut self.screen
+        };
+        main.grid.clear_scrollback();
+        self.viewport = 0;
+        self.changed = true;
+    }
+
     /// The host's theme: whether it is dark, for `CSI ? 996 n`, and its
     /// colours, for colour queries. The next snapshot recolours every cell.
     /// A program that set mode 2031 is told of any change, so it can query

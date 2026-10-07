@@ -218,6 +218,29 @@ fn scrollback_is_capped() {
 }
 
 #[test]
+fn the_host_clears_the_scrollback() {
+    let mut t = run(20, 3, "");
+    for i in 1..=10 {
+        feed(&mut t, &format!("line {i}\r\n"));
+    }
+    t.scroll_viewport(4);
+    let top = t.lines().start;
+    t.clear_scrollback();
+    assert_eq!(t.scrollback_text(), "");
+    assert_eq!(t.screen_text(), format!("{}\n", lines(9..=10)));
+    assert_eq!(t.view_top(), t.screen_top(), "the view follows the screen");
+    assert!(t.lines().start > top, "line numbers go on");
+    // From the alternate screen it is the main screen's that goes.
+    for i in 11..=15 {
+        feed(&mut t, &format!("line {i}\r\n"));
+    }
+    feed(&mut t, "\x1b[?1049h");
+    t.clear_scrollback();
+    feed(&mut t, "\x1b[?1049l");
+    assert_eq!(t.scrollback_text(), "");
+}
+
+#[test]
 fn alt_screen_round_trip() {
     let mut t = run(20, 5, "hello\r\nworld\x1b[31m");
     feed(&mut t, "\x1b[?1049h");
