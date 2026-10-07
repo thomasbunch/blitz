@@ -27,7 +27,7 @@ pub fn detect_with(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     var("ComSpec").map_or_else(|| root.join("System32").join("cmd.exe"), PathBuf::from)
 }
 
-fn system_root(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+pub(crate) fn system_root(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     PathBuf::from(var("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
 }
 

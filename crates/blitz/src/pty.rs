@@ -261,6 +261,7 @@ impl Pty {
         mut on_event: impl FnMut(PtyEvent<'_>, &Writer) + Send + 'static,
     ) -> io::Result<Pty> {
         let api = conpty().ok_or_else(|| io::Error::other("ConPTY is not available"))?;
+        let program = find_program(opts.cmdline, |k| std::env::var_os(k))?;
         let (in_r, in_w) = pipe()?;
         let (out_r, out_w) = pipe()?;
         let size = COORD {
@@ -285,7 +286,7 @@ impl Pty {
         drop((in_r, out_w));
         // Started before the handle goes into its mutex: a lock taken in the
         // match below would be held through it, and closing takes it again.
-        let process = start(opts, hpc);
+        let process = start(opts, program.as_deref(), hpc);
         let hpc = Arc::new(Mutex::new(hpc));
         let process = match process {
             Ok(p) => Arc::new(p),
@@ -455,8 +456,49 @@ pub fn kill_children_on_exit() -> io::Result<()> {
     Ok(())
 }
 
-/// Creates the child process attached to pseudoconsole `hpc`.
-fn start(opts: &SpawnOpts, hpc: isize) -> io::Result<OwnedHandle> {
+/// The program `cmdline` starts, found the way `CreateProcessW` would but
+/// never in blitz's own folder or its current directory: blitz starts
+/// wherever Explorer was, and a `cmd.exe` in a downloaded folder must not
+/// run in place of the real one. A program named with a folder is left to
+/// `CreateProcessW` (`None`). One named without is looked for in the system
+/// folders, then in each folder on PATH, with `.exe` added when it has no
+/// extension, as `CreateProcessW` does.
+pub fn find_program(
+    cmdline: &str,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> io::Result<Option<PathBuf>> {
+    let s = cmdline.trim_start_matches([' ', '\t']);
+    let name = match s.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => s.split([' ', '\t']).next().unwrap_or(s),
+    };
+    if name.is_empty() || name.contains(['\\', '/', ':']) {
+        return Ok(None);
+    }
+    let file = match Path::new(name).extension() {
+        Some(_) => name.to_owned(),
+        None => format!("{name}.exe"),
+    };
+    let root = crate::shell::system_root(&var);
+    let path = var("PATH").unwrap_or_default();
+    [root.join("System32"), root]
+        .into_iter()
+        // A relative entry is the current directory again.
+        .chain(std::env::split_paths(&path).filter(|d| d.is_absolute()))
+        .map(|d| d.join(&file))
+        .find(|p| p.is_file())
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{file} is not in the Windows folder or on PATH"),
+            )
+        })
+}
+
+/// Creates the child process attached to pseudoconsole `hpc`, running
+/// `program` when given, else the first word of the command line.
+fn start(opts: &SpawnOpts, program: Option<&Path>, hpc: isize) -> io::Result<OwnedHandle> {
     let mut size = 0;
     // SAFETY: a size query; it fails by design with the size filled in.
     let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
@@ -491,14 +533,16 @@ fn start(opts: &SpawnOpts, hpc: isize) -> io::Result<OwnedHandle> {
 
         let env = env_block(&child_env(std::env::vars_os(), opts.pane_id, opts.env));
         let mut cmd: Vec<u16> = opts.cmdline.encode_utf16().chain([0]).collect();
-        let cwd: Option<Vec<u16>> = opts
-            .cwd
-            .map(|p| p.as_os_str().encode_wide().chain([0]).collect());
+        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+        let cwd = opts.cwd.map(wide);
+        let program = program.map(wide);
         let mut pi = PROCESS_INFORMATION::default();
         // SAFETY: every pointer is valid for the duration of the call.
         unsafe {
             CreateProcessW(
-                PCWSTR::null(),
+                program
+                    .as_ref()
+                    .map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
                 Some(PWSTR(cmd.as_mut_ptr())),
                 None,
                 None,
@@ -684,6 +728,61 @@ mod tests {
         let got: Vec<Vec<u8>> = rx.try_iter().collect();
         assert_eq!(got.len(), 3);
         assert_eq!((&got[0][..], &got[2][..]), (&b"1"[..], &b"typed"[..]));
+    }
+
+    #[test]
+    fn programs_without_a_folder_are_looked_up_but_never_here() {
+        let root = std::env::temp_dir().join(format!("blitz-find-{}", std::process::id()));
+        let (win, bin, more) = (root.join("win"), root.join("bin"), root.join("more"));
+        for f in [
+            win.join("System32").join("cmd.exe"),
+            bin.join("pwsh.exe"),
+            bin.join("tool.com"),
+            more.join("pwsh.exe"),
+            more.join("late.exe"),
+        ] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"").unwrap();
+        }
+        // A relative entry, which would be the current directory.
+        let path = std::env::join_paths([Path::new("bin"), &bin, &more]).unwrap();
+        let var = |k: &str| match k {
+            "SystemRoot" => Some(win.clone().into_os_string()),
+            "PATH" => Some(path.clone()),
+            _ => None,
+        };
+        let find = |c: &str| find_program(c, var).map_err(|e| e.kind());
+        let found = [
+            (
+                "cmd /d /c echo hi",
+                Some(win.join("System32").join("cmd.exe")),
+            ),
+            ("pwsh -NoLogo", Some(bin.join("pwsh.exe"))),
+            ("\"pwsh\" -NoLogo", Some(bin.join("pwsh.exe"))),
+            (" \tpwsh", Some(bin.join("pwsh.exe"))),
+            ("late", Some(more.join("late.exe"))),
+            ("tool.com /x", Some(bin.join("tool.com"))),
+            // Named with a folder: what the user asked for, as given.
+            (r#""C:\Program Files\x\y.exe" -a"#, None),
+            (r".\pwsh.exe", None),
+            ("bin/pwsh", None),
+            ("C:pwsh", None),
+            ("", None),
+        ];
+        let missing = [
+            find("no-such-4b1d"),
+            // Only `.exe` is added, as CreateProcessW does.
+            find("tool"),
+        ];
+        let got: Vec<_> = found.iter().map(|(c, _)| find(c)).collect();
+        let _ = std::fs::remove_dir_all(&root);
+        for ((c, want), got) in found.iter().zip(got) {
+            assert_eq!(got.as_ref(), Ok(want), "{c:?}");
+        }
+        assert_eq!(
+            missing,
+            [Err(io::ErrorKind::NotFound), Err(io::ErrorKind::NotFound)]
+        );
     }
 
     #[test]
