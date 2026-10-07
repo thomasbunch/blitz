@@ -101,6 +101,26 @@ fn session_files_round_trip() {
     session::save(&two).expect("save");
     assert!(!other.exists(), "a stale one goes");
 
+    // A session saved before panes had keys filed their output by tab and
+    // leaf, which the first start after an update still reads.
+    let before_keys = "{\"v\":1,\"window\":{\"x\":0,\"y\":0,\"w\":800,\"h\":600,\
+        \"maximized\":false},\"sidebar_expanded\":true,\"active\":0,\"tabs\":[{\"name\":\"t\",\
+        \"focus\":0,\"zoom\":null,\"root\":{\"pane\":{\"cwd\":\"old\",\"claude\":null}}}]}";
+    std::fs::write(&file, before_keys).expect("write");
+    let scrollback = dir.join("scrollback");
+    std::fs::create_dir_all(&scrollback).expect("folder");
+    std::fs::write(scrollback.join("0-0.txt"), "from before").expect("write");
+    let old = session::load().expect("an old session reads");
+    assert!(old.layout(1).1.iter().all(|(_, p)| p.key.is_empty()));
+    assert_eq!(
+        session::load_legacy_output(0, 0).as_deref(),
+        Some("from before")
+    );
+    assert_eq!(session::load_legacy_output(0, 1), None);
+    // The next save of output files it by key, so it is read only once.
+    out(&[(A, "now")]);
+    assert_eq!(session::load_legacy_output(0, 0), None);
+
     session::clear();
     assert_eq!(session::load(), None);
     assert_eq!(session::load_output(A), None);

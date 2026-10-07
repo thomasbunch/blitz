@@ -819,8 +819,17 @@ impl App {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
         for (id, meta) in panes {
+            // A session saved before panes had keys filed output by tab
+            // and leaf; the pane's fresh key files it anew at the next exit.
             let old = (self.config.restore_scrollback)
-                .then(|| session::load_output(&meta.key))
+                .then(|| {
+                    if session::is_key(&meta.key) {
+                        session::load_output(&meta.key)
+                    } else {
+                        (leaf_index(&win, id))
+                            .and_then(|(tab, leaf)| session::load_legacy_output(tab, leaf))
+                    }
+                })
                 .flatten();
             // When the retry fails too, the first failure says why.
             let started = (self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()))
@@ -2802,6 +2811,13 @@ fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
     }
 }
 
+/// The tab and leaf index of pane `id` in `win`, by which output saved
+/// before panes had keys is filed.
+fn leaf_index(win: &layout::Window, id: PaneId) -> Option<(usize, usize)> {
+    (win.tabs.iter().enumerate())
+        .find_map(|(t, tab)| Some((t, tab.panes().iter().position(|&p| p == id)?)))
+}
+
 /// Why a pane failed to start in its folder and then again without one;
 /// once when both say the same.
 fn joined(first: String, then: String) -> String {
@@ -3955,6 +3971,26 @@ mod tests {
         let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
         assert!(a.new_window);
         assert_eq!(a.cwd, Some(r"C:\foo".into()));
+    }
+
+    #[test]
+    fn output_from_before_keys_is_found_by_tab_and_tree_order() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut a = Tab::new("a".into(), PaneId(1));
+        assert!(a.split(layout::Dir::Right, PaneId(2), area, (1, 1)));
+        let win = layout::Window {
+            tabs: vec![a, Tab::new("b".into(), PaneId(3))],
+            ..Default::default()
+        };
+        assert_eq!(
+            [1, 2, 3, 4].map(|i| leaf_index(&win, PaneId(i))),
+            [Some((0, 0)), Some((0, 1)), Some((1, 0)), None]
+        );
     }
 
     #[test]

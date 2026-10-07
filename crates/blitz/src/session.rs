@@ -242,6 +242,13 @@ pub fn load_output(key: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(format!("{key}.txt"))).ok()
 }
 
+/// Output saved before panes had keys, filed by tab and leaf index in the
+/// same session. Read on the first start after an update; the next save of
+/// output files it by key.
+pub fn load_legacy_output(tab: usize, leaf: usize) -> Option<String> {
+    std::fs::read_to_string(output_dir()?.join(format!("{tab}-{leaf}.txt"))).ok()
+}
+
 /// Replaces every pane's saved output with `panes`, as (key, text). None
 /// deletes it all.
 pub fn save_output(panes: &[(String, String)]) -> io::Result<()> {
