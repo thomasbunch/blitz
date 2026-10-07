@@ -525,6 +525,11 @@ impl Grid {
         }
         self.rows = out;
         self.trim();
+        // Narrowing built every rewrapped row before the excess went; keep
+        // only as many spare rows as the grid can hold.
+        self.pool.truncate(self.max_scrollback + lines);
+        self.pool.shrink_to_fit();
+        self.rows.shrink_to_fit();
         (x as u16, (at.0 - top) as u16, pending)
     }
 
@@ -662,6 +667,30 @@ mod tests {
                 assert_eq!(g.row(y).grapheme(x), Some(mark(k)), "{x},{y}");
             }
         }
+    }
+
+    /// Narrowing builds every rewrapped row before the excess is dropped;
+    /// none of that may stay allocated afterwards.
+    #[test]
+    fn narrow_then_wide_reflow_frees_the_temporary_rows() {
+        let mut g = Grid::new(200, 10, 1000);
+        for _ in 0..1010 {
+            g.row_mut(9).put_ascii(0, &[b'x'; 200], 0);
+            g.scroll_up(0, 9, 1, Cell::default(), true);
+        }
+        let before = g.bytes_used();
+        g.reflow(2, (0, 9, false));
+        assert!(
+            g.bytes_used() < 2 * before,
+            "{} vs {before}",
+            g.bytes_used()
+        );
+        g.reflow(200, (0, 9, false));
+        assert!(
+            g.bytes_used() < 2 * before,
+            "{} vs {before}",
+            g.bytes_used()
+        );
     }
 
     /// A tail never passes 28 bytes, so with the first code point a cluster
