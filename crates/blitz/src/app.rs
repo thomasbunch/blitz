@@ -6420,7 +6420,8 @@ fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
 /// by spaces, and whether to ask before pasting them. A name with anything
 /// but letters, digits and `_.-:\/` is quoted, so no shell reads one such
 /// as `a&calc.txt` as syntax. cmd gets double quotes, which only `"` ends
-/// and no Windows name holds; `%VAR%` still expands, as its prompt has no
+/// and no name Windows makes holds, so one that does asks first, as does
+/// one with `<>|` or a control; `%VAR%` still expands, as its prompt has no
 /// way to quote that. PowerShell expands `$` and a backtick inside them
 /// and ends them at a typographic double quote, so there such a name gets
 /// single quotes, with each of its single quote marks doubled. The shell
@@ -6449,7 +6450,11 @@ fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, bool) {
                 PowerShell => runs || s.contains('$'),
                 Other => true,
             };
-            asks |= shell == Cmd && runs || shell == PowerShell && single && s.contains('&');
+            // Win32 forbids these in a name, but NTFS written from Linux
+            // holds them, and no quoting keeps them in.
+            let odd = s.contains(['"', '<', '>', '|']) || s.chars().any(char::is_control);
+            asks |= shell == Cmd && (runs || odd)
+                || shell == PowerShell && (odd || single && s.contains('&'));
             if !single {
                 return format!("\"{s}\"");
             }
@@ -9723,6 +9728,12 @@ mod tests {
         assert_eq!(one(r"C:\a”&calc&”.txt", Cmd), r#""C:\a”&calc&”.txt""#);
         assert!(asks(r"C:\a”&calc&”.txt", Cmd));
         assert!(asks(r"C:\$(calc)&.txt", Cmd));
+        // Linux can write what Windows forbids in a name, and no quoting
+        // keeps those in; bash's single quotes do.
+        for name in [r#"C:\x"&calc&".txt"#, r"C:\a|b.txt", "C:\\a\nb.txt"] {
+            assert!(asks(name, Cmd) && asks(name, PowerShell), "{name}");
+            assert!(!asks(name, Other), "{name}");
+        }
         // bash: only `'` ends single quotes, and `'\''` puts one in.
         assert_eq!(one(r"C:\it's $x.txt", Other), r"'C:\it'\''s $x.txt'");
         assert_eq!(one(r"C:\a b\x!y.txt", Other), r"'C:\a b\x!y.txt'");
