@@ -3093,10 +3093,9 @@ impl App {
             self.set_notice(id, refused, None, false);
             return;
         }
-        let claude = v.pane.claude.is_some();
         let mut term = lock(&v.pane.term);
         let bracketed = term.input_modes().bracketed;
-        let trusted = paste_trusted(&term, claude);
+        let trusted = term.paste_trusted();
         if confirmed {
             term.confirm_paste();
         }
@@ -3785,6 +3784,7 @@ impl App {
                     v.hooks_seen = true;
                     v.pane.cmd.hooked = true;
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
+                    hook_confirms_paste(&mut lock(&v.pane.term), ev);
                     v.pane.hooked = ev != Ev::Idle;
                     if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
                         self.hooks_hint(id, true);
@@ -6079,12 +6079,15 @@ fn eats_copy_key(k: &KeyInput, m: &InputModes) -> bool {
     !vt::keys::is_interrupt(k) && vt::keys::interrupts(k, m)
 }
 
-/// Whether a paste into `term` goes in without asking; see
-/// [`vt::keys::needs_paste_confirm`]. Claude Code, known by its hook
-/// notifications (`claude`), reads every paste under bracketed paste as
-/// text, so there it needs no confirmed paste first.
-fn paste_trusted(term: &vt::Terminal, claude: bool) -> bool {
-    term.paste_trusted() || claude && term.input_modes().bracketed
+/// What a hook notification `ev` from Claude Code does to pastes into
+/// `term`: Claude Code reads every paste under bracketed paste as text, so
+/// one confirms bracketed paste as the user would. Like theirs, it lasts
+/// until bracketed paste is turned on anew, as by a shell left behind
+/// when Claude Code dies without saying so.
+fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
+    if ev != Ev::Idle {
+        term.confirm_paste();
+    }
 }
 
 /// Paths as a paste types them: joined by spaces, each in quotes when it
@@ -8831,12 +8834,17 @@ mod tests {
     #[test]
     fn app_claude_code_takes_bracketed_pastes_without_asking() {
         let mut t = fed(10, 2, "");
-        assert!(!paste_trusted(&t, true), "no bracketed paste");
+        hook_confirms_paste(&mut t, Ev::Ready);
+        assert!(!t.paste_trusted(), "no bracketed paste");
         t.feed(b"\x1b[?2004h");
-        assert!(paste_trusted(&t, true));
-        assert!(!paste_trusted(&t, false), "a shell asks once first");
-        t.confirm_paste();
-        assert!(paste_trusted(&t, false));
+        assert!(!t.paste_trusted(), "a shell asks once first");
+        hook_confirms_paste(&mut t, Ev::Busy);
+        assert!(t.paste_trusted());
+        // Claude Code died; a file printed turns bracketed paste on again.
+        t.feed(b"\x1b[?2004l\x1b[?2004h");
+        assert!(!t.paste_trusted(), "asks again");
+        hook_confirms_paste(&mut t, Ev::Idle);
+        assert!(!t.paste_trusted(), "Claude Code quit");
     }
 
     #[test]
