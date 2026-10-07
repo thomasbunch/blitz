@@ -2777,13 +2777,7 @@ impl App {
                     self.closed = Some((cwd, claude));
                 }
             }
-            Action::ToggleSidebar => {
-                if !self.win.toggle_sidebar() {
-                    return false;
-                }
-                self.fit_min_size();
-                self.request_redraw();
-            }
+            Action::ToggleSidebar => return self.toggle_sidebar(),
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
             Action::Palette => {
@@ -3352,6 +3346,17 @@ impl App {
         )
     }
 
+    /// Expands or collapses the sidebar, and with it the smallest the
+    /// window may get. False when there is none to change.
+    fn toggle_sidebar(&mut self) -> bool {
+        if !self.win.toggle_sidebar() {
+            return false;
+        }
+        self.fit_min_size();
+        self.request_redraw();
+        true
+    }
+
     /// Keeps the window from getting smaller than [`min_window`] for the
     /// layout, font and scale in use.
     fn fit_min_size(&self) {
@@ -3496,9 +3501,7 @@ impl App {
                 }
                 Some(Side::More(ids)) => self.show_hidden(&ids),
                 Some(Side::Rail) => {
-                    self.win.toggle_sidebar();
-                    self.fit_min_size();
-                    self.request_redraw();
+                    self.toggle_sidebar();
                 }
                 None => {}
             }
@@ -6592,6 +6595,23 @@ mod tests {
         let (w, h) = pane_min((8, 16), 16, 1.0, true);
         let min = min_window(&one, (8, 16), (4, 16), 1.0);
         assert_eq!(min, PhysicalSize::new(w as u32, h as u32), "no rail");
+    }
+
+    /// Expanding or collapsing the sidebar changes the smallest window,
+    /// which is why every way of toggling it goes through
+    /// `App::toggle_sidebar` and so `fit_min_size`.
+    #[test]
+    fn app_the_smallest_window_follows_the_sidebar() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("a".into(), PaneId(1)));
+        win.tabs.push(Tab::new("b".into(), PaneId(2)));
+        let min = |win: &layout::Window| min_window(win, (8, 16), (4, 16), 1.0).width;
+        let before = min(&win);
+        assert!(win.toggle_sidebar());
+        let after = min(&win);
+        assert_ne!(before, after);
+        assert!(win.toggle_sidebar());
+        assert_eq!(min(&win), before);
     }
 
     #[test]
