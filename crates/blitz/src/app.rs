@@ -5322,6 +5322,15 @@ mod tests {
             "Fix it".into(),
         );
         assert_eq!((msg.as_str(), claude.as_deref()), ("Fix it", Some(id)));
+        // Still working, now waiting on agents: the message says so.
+        note_hook(
+            &mut msg,
+            &mut claude,
+            Ev::Working,
+            None,
+            "waiting on 2 agents".into(),
+        );
+        assert_eq!(msg, "waiting on 2 agents");
         // The reply replaces it, whatever the state does.
         note_hook(&mut msg, &mut claude, Ev::Done, None, "Fixed.".into());
         assert_eq!((msg.as_str(), claude.as_deref()), ("Fixed.", Some(id)));
