@@ -259,9 +259,19 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.resize_keeping(cols, rows, &mut []);
+    }
+
+    /// [`Self::resize`], moving each of `marks`, cells of the screen shown
+    /// as [`Self::lines`] numbers them, to where its text goes when the
+    /// lines are wrapped again. Returns whether they all still name their
+    /// text under the new [`Self::line_epoch`]; on the alternate screen,
+    /// which the program draws again, a new width leaves them nothing to
+    /// name.
+    pub fn resize_keeping(&mut self, cols: u16, rows: u16, marks: &mut [LineCol]) -> bool {
         let (cols, rows) = (cols.max(1), rows.max(1));
         if (cols, rows) == (self.cols(), self.rows()) {
-            return;
+            return true;
         }
         // Output on the main screen rewraps to the new width; programs on
         // the alternate screen redraw it themselves. The bundled ConPTY
@@ -278,14 +288,17 @@ impl Terminal {
             },
             |c| (c.x, c.y, c.pending_wrap),
         );
+        let mut kept = !self.alt || cols == self.cols();
         if reflow {
             if self.alt {
-                other_at = self.other.grid.reflow(cols, other_at);
+                other_at = self.other.grid.reflow(cols, other_at, &mut []);
             } else {
                 let c = &mut self.cur;
                 (c.x, c.y, c.pending_wrap) =
-                    (self.screen.grid).reflow(cols, (c.x, c.y, c.pending_wrap));
+                    (self.screen.grid).reflow(cols, (c.x, c.y, c.pending_wrap), marks);
             }
+        } else if cols != self.cols() {
+            kept = false;
         }
         self.cur.y = self.screen.grid.resize(cols, rows, self.cur.y);
         other_at.1 = self.other.grid.resize(cols, rows, other_at.1);
@@ -307,6 +320,7 @@ impl Terminal {
         // not reach for it.
         self.cluster = None;
         self.changed = true;
+        kept && marks.iter().all(|m| self.lines().contains(&m.0))
     }
 
     /// Scrolls the view of the main screen; positive is up into scrollback.

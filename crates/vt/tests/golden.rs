@@ -978,6 +978,42 @@ fn resize_rewraps_the_main_screen() {
 }
 
 #[test]
+fn resize_moves_marks_with_their_text() {
+    // Line 0 wraps at 5 columns into line 1; line 2 is short.
+    let mut t = run(5, 4, "abcdefghij\r\nxy\r\n$ ");
+    // f, the end of the line taken whole, x, and the blank past y.
+    let mut marks = [(1, 0), (1, u16::MAX), (2, 0), (2, 4)];
+    assert!(t.resize_keeping(10, 4, &mut marks));
+    assert_eq!(marks, [(0, 5), (0, 9), (1, 0), (1, 4)]);
+    assert_eq!(line_text(&t, 0).as_deref(), Some("abcdefghij"));
+    // Narrower again: f is on the second row of three.
+    assert!(t.resize_keeping(4, 4, &mut marks));
+    assert_eq!(marks, [(1, 1), (2, 1), (3, 0), (3, 3)]);
+    // Only a new height keeps the numbers.
+    assert!(t.resize_keeping(4, 6, &mut marks));
+    assert_eq!(marks[0], (1, 1));
+}
+
+#[test]
+fn resize_loses_marks_whose_text_is_gone() {
+    let mut t = Terminal::new(Options {
+        cols: 5,
+        rows: 2,
+        scrollback_lines: 0,
+        ambiguous_wide: false,
+    });
+    feed(&mut t, "abcde\r\nfg");
+    // Narrower: a's line takes two rows, which leaves no room for a.
+    let mut marks = [(0, 0)];
+    assert!(!t.resize_keeping(3, 2, &mut marks));
+    // The program draws the alternate screen again at a new width.
+    feed(&mut t, "\x1b[?1049h");
+    let mut marks = [(0, 0)];
+    assert!(!t.resize_keeping(4, 2, &mut marks));
+    assert!(t.resize_keeping(4, 3, &mut marks), "a new height");
+}
+
+#[test]
 fn resize_rewraps_past_a_pending_wrap() {
     let mut t = run(5, 2, "abcde");
     t.resize(8, 2);
