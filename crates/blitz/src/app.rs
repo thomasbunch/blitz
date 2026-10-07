@@ -824,6 +824,9 @@ struct App {
     /// The installer is downloading, or Ctrl+Shift+U is looking for a
     /// release; this pane shows that.
     updating: Option<PaneId>,
+    /// The folder and Claude Code session of the pane closed last, which
+    /// the palette can reopen.
+    closed: Option<(String, Option<String>)>,
     /// The banner strip in the last frame, for clicks.
     banner: Option<Rect>,
     /// Keys whose releases belong to a shortcut or a panel and are not sent.
@@ -1082,6 +1085,7 @@ impl App {
             preedit: String::new(),
             update: None,
             updating: None,
+            closed: None,
             banner: None,
             eaten: Eaten::default(),
             ime_at: None,
@@ -1433,6 +1437,9 @@ impl App {
     /// Closes a session and its pane. The window closes with the last one.
     fn close(&mut self, el: &ActiveEventLoop, id: PaneId) {
         let before = self.focus_id();
+        if let Some(v) = self.view(id) {
+            self.closed = Some((v.pane.cwd.clone(), v.pane.claude.clone()));
+        }
         self.win.close_pane(id);
         // The divider being dragged may be gone, even when focus stays.
         self.mouse.divider = None;
@@ -2536,20 +2543,23 @@ impl App {
                 } else {
                     Dir::Down
                 };
-                self.add(None, |win, id| {
-                    // Only the pane minimum matters, and `open` checks that
-                    // against the real window.
-                    let any = Rect {
-                        x: 0,
-                        y: 0,
-                        w: 1 << 16,
-                        h: 1 << 16,
-                    };
-                    let active = win.active;
-                    win.tabs
-                        .get_mut(active)
-                        .is_some_and(|t| t.split(dir, id, any, (0, 0)))
-                });
+                self.add(None, split(dir));
+            }
+            Action::ReopenClosed => {
+                let Some((cwd, claude)) = self.closed.take() else {
+                    if let Some(id) = before {
+                        let until = Some(Instant::now() + NOTICE);
+                        self.set_notice(id, "No closed pane to reopen", until, true);
+                    }
+                    return true;
+                };
+                let id = PaneId(self.next_id);
+                self.add(start_dir(&cwd), split(Dir::Right));
+                if self.view(id).is_some() {
+                    self.resume(id, claude);
+                } else {
+                    self.closed = Some((cwd, claude));
+                }
             }
             Action::ToggleSidebar => {
                 self.win.sidebar_expanded = !self.win.sidebar_expanded;
@@ -4222,6 +4232,23 @@ fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
 
+/// Splits the focused pane of the active tab, putting the new one on the
+/// `dir` side; for [`App::add`].
+fn split(dir: Dir) -> impl FnOnce(&mut layout::Window, PaneId) -> bool {
+    move |win, id| {
+        // Only the pane minimum matters, and `open` checks that against the
+        // real window.
+        let any = Rect {
+            x: 0,
+            y: 0,
+            w: 1 << 16,
+            h: 1 << 16,
+        };
+        let active = win.active;
+        (win.tabs.get_mut(active)).is_some_and(|t| t.split(dir, id, any, (0, 0)))
+    }
+}
+
 /// Puts pane `id` in a new tab after the others and shows that tab. It
 /// goes by the folder of its focused pane until the user names it.
 fn new_tab(win: &mut layout::Window, id: PaneId) -> bool {
@@ -5757,6 +5784,21 @@ mod tests {
         assert!(alt_f4_passes(true, first));
         assert!(!alt_f4_passes(true, repeat));
         assert!(alt_f4_passes(false, up));
+    }
+
+    /// How a split, and a reopened pane, go in: beside the focused pane.
+    #[test]
+    fn a_split_goes_beside_the_focused_pane() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("t".into(), PaneId(1)));
+        assert!(split(Dir::Right)(&mut win, PaneId(2)));
+        let t = &win.tabs[0];
+        assert_eq!(
+            (t.panes(), t.focus),
+            (vec![PaneId(1), PaneId(2)], PaneId(2))
+        );
+        let mut none = layout::Window::default();
+        assert!(!split(Dir::Down)(&mut none, PaneId(3)), "no tab");
     }
 
     #[test]

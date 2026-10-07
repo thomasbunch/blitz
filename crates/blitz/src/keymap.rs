@@ -18,6 +18,9 @@ pub enum Action {
     ClosePane,
     /// Close every pane of the active tab.
     CloseTab,
+    /// Open the pane closed last again, beside the focused one, resuming
+    /// its Claude Code session.
+    ReopenClosed,
     /// Next (1) or previous (-1) tab.
     CycleTab(i8),
     /// Tab 1 to 9, 0-based.
@@ -78,6 +81,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::CloseTab, "close_tab", "Close tab"),
     (Action::RenameSession, "rename_session", "Rename session"),
     (Action::RenameTab, "rename_tab", "Rename tab"),
+    (Action::ReopenClosed, "reopen_closed", "Reopen the last closed pane"),
     (Action::CycleTab(1), "next_tab", "Next tab"),
     (Action::CycleTab(-1), "previous_tab", "Previous tab"),
     (Action::SplitRight, "split_right", "Split right"),
@@ -991,6 +995,10 @@ mod msg_to_key_tests {
         assert_eq!(
             binding("ctrl+shift+q=close_tab"),
             Some((CTRL | SHIFT, 0x51, Some(Action::CloseTab)))
+        );
+        assert_eq!(
+            binding("ctrl+shift+o=reopen_closed"),
+            Some((CTRL | SHIFT, 0x4f, Some(Action::ReopenClosed)))
         );
         // Punctuation by character or by name.
         let plus = Some((CTRL, 0xbb, Some(Action::Copy)));
