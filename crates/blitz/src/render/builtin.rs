@@ -38,9 +38,9 @@ struct Canvas {
 }
 
 impl Canvas {
-    /// Light line thickness.
+    /// Light line thickness, at least a pixel so lines never vanish.
     fn t(&self) -> i32 {
-        (self.w as i32 + 4) / 8
+        ((self.w as i32 + 4) / 8).max(1)
     }
 
     fn rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, v: u8) {
@@ -215,7 +215,8 @@ fn dashed(cv: &mut Canvas, arms: [u8; 4], n: i32) {
     let gap = (along / n / 3).max(1);
     for k in 0..n {
         let a0 = k * along / n + gap / 2;
-        let a1 = (k + 1) * along / n - (gap - gap / 2);
+        // At least a pixel per dash, so tiny cells still show a line.
+        let a1 = ((k + 1) * along / n - (gap - gap / 2)).max(a0 + 1);
         if vertical {
             cv.rect(c0, a0, c1, a1, 255);
         } else {
@@ -270,8 +271,15 @@ fn seg_dist(x: f32, y: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
 fn block(cv: &mut Canvas, cp: u32) {
     let (w, h) = (cv.w as i32, cv.h as i32);
     let (mx, my) = ((w + 1) / 2, (h + 1) / 2);
-    let eighth_h = |k: i32| (h * k + 4) / 8;
-    let eighth_w = |k: i32| (w * k + 4) / 8;
+    // k eighths of n pixels; a partial block keeps at least a pixel, and
+    // leaves one for its complement, so neither vanishes in a small cell.
+    let eighth = |n: i32, k: i32| match k {
+        0 => 0,
+        8 => n,
+        _ => ((n * k + 4) / 8).clamp(1, (n - 1).max(1)),
+    };
+    let eighth_h = |k| eighth(h, k);
+    let eighth_w = |k| eighth(w, k);
     // Quadrants: upper-left, upper-right, lower-left, lower-right.
     let quads = |cv: &mut Canvas, q: [bool; 4]| {
         let cells = [
@@ -288,12 +296,14 @@ fn block(cv: &mut Canvas, cp: u32) {
     };
     match cp {
         0x2580 => cv.rect(0, 0, w, my, 255),
-        0x2581..=0x2588 => cv.rect(0, h - eighth_h(cp as i32 - 0x2580), w, h, 255),
+        // Lower blocks start where the upper block that complements them
+        // ends, so the pair tiles the cell at any height.
+        0x2581..=0x2588 => cv.rect(0, eighth_h(0x2588 - cp as i32), w, h, 255),
         0x2589..=0x258F => cv.rect(0, 0, eighth_w(0x2590 - cp as i32), h, 255),
         0x2590 => cv.rect(mx, 0, w, h, 255),
         0x2591..=0x2593 => cv.rect(0, 0, w, h, (cp as i32 - 0x2590) as u8 * 64),
         0x2594 => cv.rect(0, 0, w, eighth_h(1), 255),
-        0x2595 => cv.rect(w - eighth_w(1), 0, w, h, 255),
+        0x2595 => cv.rect(eighth_w(7), 0, w, h, 255),
         0x2596 => quads(cv, [false, false, true, false]),
         0x2597 => quads(cv, [false, false, false, true]),
         0x2598 => quads(cv, [true, false, false, false]),
@@ -453,6 +463,76 @@ mod tests {
     }
 
     #[test]
+    fn complementary_blocks_meet_at_any_size() {
+        // Each pair splits the cell with no gap and no overlap.
+        let rows = |c, h| {
+            ascii(c, 4, h)
+                .iter()
+                .map(|r| r == "####")
+                .collect::<Vec<_>>()
+        };
+        let cols = |c, w| {
+            ascii(c, w, 1)[0]
+                .bytes()
+                .map(|b| b == b'#')
+                .collect::<Vec<_>>()
+        };
+        let disjoint = |a: Vec<bool>, b: Vec<bool>| a.iter().zip(&b).all(|(x, y)| x != y);
+        for n in 1..=24 {
+            for (a, b) in [('▀', '▄'), ('▔', '▇'), ('▘', '▖')] {
+                // The quadrant pair shares the left column only.
+                assert!(disjoint(rows(a, n), rows(b, n)) || a == '▘', "{a}{b} h={n}");
+            }
+            let left_col = |c, h| ascii(c, 4, h).iter().map(|r| r.starts_with('#')).collect();
+            assert!(disjoint(left_col('▘', n), left_col('▖', n)), "▘▖ h={n}");
+            assert_eq!(
+                left_col('▖', n),
+                rows('▄', n),
+                "▖ and ▄ start together, h={n}"
+            );
+            for (a, b) in [('▌', '▐'), ('▉', '▕')] {
+                assert!(disjoint(cols(a, n), cols(b, n)), "{a}{b} w={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_builtin_draws_at_tiny_and_odd_sizes() {
+        let all = ('\u{2500}'..='\u{259F}')
+            .chain('\u{2800}'..='\u{28FF}')
+            .chain('\u{E0B0}'..='\u{E0BF}');
+        for c in all {
+            assert!(is_builtin(c));
+            for (w, h) in [(1, 1), (2, 3), (1, 40), (40, 1)] {
+                assert_eq!(
+                    draw(c, w, h).expect("builtin").len(),
+                    w * h,
+                    "{c:?} {w}x{h}"
+                );
+            }
+            // Cells a font can have (a 4 pt font is about 3×6 px) all get
+            // ink, except the blank braille pattern.
+            for (w, h) in [(3, 6), (4, 9), (5, 11), (7, 15), (11, 23)] {
+                let a = draw(c, w, h).expect("builtin");
+                assert_eq!(a.len(), w * h, "{c:?} {w}x{h}");
+                assert_eq!(a.iter().any(|&v| v > 0), c != '\u{2800}', "{c:?} {w}x{h}");
+            }
+        }
+        // Light lines stay visible in cells narrower than 4 px.
+        for w in 1..=8 {
+            for c in ['─', '│', '┼', '╭', '╱', '┄', '\u{E0B1}'] {
+                assert!(
+                    draw(c, w, 12).expect("b").iter().any(|&v| v > 0),
+                    "{c} w={w}"
+                );
+            }
+        }
+        assert!(!is_builtin('\u{24FF}') && !is_builtin('\u{25A0}'));
+        assert!(!is_builtin('\u{27FF}') && !is_builtin('\u{2900}'));
+        assert!(!is_builtin('\u{E0AF}') && !is_builtin('\u{E0C0}'));
+    }
+
+    #[test]
     fn braille_dots() {
         let all = ascii('\u{28FF}', 8, 16);
         assert_eq!(all.iter().filter(|r| r.contains('#')).count(), 8);
@@ -468,10 +548,27 @@ mod tests {
         assert_eq!(tri[0], "#.......");
         assert!(draw('a', 8, 16).is_none());
         assert!(draw('─', 0, 16).is_none());
-        // Every builtin produces some ink at a small size.
-        for c in ('\u{2500}'..='\u{259F}').chain(['\u{E0B0}', '\u{E0B4}', '\u{E0BF}']) {
-            let a = draw(c, 7, 15).expect("builtin");
-            assert!(a.iter().any(|&v| v > 0), "{c}");
+        // Every powerline glyph, at a small and a large size.
+        for c in '\u{E0B0}'..='\u{E0BF}' {
+            for (w, h) in [(7, 15), (12, 26)] {
+                let a = draw(c, w, h).expect("builtin");
+                let ink = a.iter().filter(|&&v| v >= 128).count();
+                assert!(ink > 0 && ink < w * h, "{c:?} {w}x{h}: {ink}");
+            }
         }
+        // Solid arrows and triangles fill about half the cell; the left and
+        // right ones mirror each other.
+        let ink = |c| ascii(c, 8, 16).concat().matches('#').count();
+        for (a, b) in [
+            ('\u{E0B0}', '\u{E0B2}'),
+            ('\u{E0B8}', '\u{E0BA}'),
+            ('\u{E0BC}', '\u{E0BE}'),
+        ] {
+            assert!((48..=80).contains(&ink(a)), "{a:?} {}", ink(a));
+            assert_eq!(ink(a), ink(b), "{a:?} {b:?}");
+        }
+        let right = ascii('\u{E0B2}', 8, 16);
+        assert_eq!(right[0], ".......#");
+        assert!(right[8].ends_with("#######"));
     }
 }
