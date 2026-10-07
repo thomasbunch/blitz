@@ -6581,8 +6581,15 @@ fn paste_question(text: &str, names: bool, key: Option<&str>) -> String {
         None => "Paste again".into(),
     };
     if names && lines == 1 {
-        // Quoted already, as only a quoted name asks.
-        return format!("Paste {start}? A shell may run part of a file name. {again}");
+        // All of it, as the name that asks may be anywhere in a long line,
+        // with what the preview leaves out shown as left out. Quoted
+        // already, as only a quoted name asks.
+        let shown = |c: char| !vt::osc::clean(c.encode_utf8(&mut [0; 4]), 1).is_empty();
+        let all: String = text
+            .chars()
+            .map(|c| if shown(c) { c } else { '\u{fffd}' })
+            .collect();
+        return format!("Paste {all}? A shell may run part of a file name. {again}");
     }
     format!("Paste {lines} line{s} starting \"{start}\"? {again}")
 }
@@ -9824,6 +9831,26 @@ mod tests {
             "Paste \"C:\\a”;calc;”.txt\"? A shell may run part of a file name. \
              Press Ctrl+V again"
         );
+        // All of a long name, and of every name dropped with it, with
+        // what is left out of a preview shown as left out.
+        let long = r#""C:\Users\me\OneDrive - Contoso\Documents\Report “final” v2.docx""#;
+        assert_eq!(
+            paste_question(long, true, None),
+            format!("Paste {long}? A shell may run part of a file name. Paste again")
+        );
+        let many = "C:\\a.txt \"C:\\me\\b c.txt\" \"C:\\x\u{202e}”;calc;”\u{7}.txt\"";
+        assert_eq!(
+            paste_question(many, true, None),
+            "Paste C:\\a.txt \"C:\\me\\b c.txt\" \"C:\\x\u{fffd}”;calc;”\u{fffd}.txt\"? \
+             A shell may run part of a file name. Paste again"
+        );
+        // A pane too narrow for it goes on over more rows, the end of the
+        // name too.
+        let ask = paste_question(r#""C:\Downloads\a-long-folder\x&calc&.txt""#, true, None);
+        let rows = notice_rows(&ask, (16, 24));
+        let all: String = rows.iter().map(|r| r.trim_start()).collect();
+        assert!(all.contains(r"a-long-folder\x&calc&.txt"), "{rows:?}");
+        assert!(rows.iter().all(|r| r.chars().count() <= 16), "{rows:?}");
     }
 
     #[test]
