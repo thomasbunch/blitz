@@ -1646,6 +1646,7 @@ impl App {
             let cmd = self.args.cmd.clone();
             self.open(win, id, cmd.as_deref(), "", cwd)?;
         }
+        self.note_ignored();
 
         // A dev build is left alone; a scripted run and a separate window
         // have nothing to come back to.
@@ -2465,6 +2466,8 @@ impl App {
             self.update = None;
             self.at_close = kept_at_close(self.at_close.take(), self.updating.is_some());
         }
+        let skipped = c.ignored != self.config.ignored;
+
         self.config = c;
         if jump {
             self.global_jump();
@@ -2472,6 +2475,10 @@ impl App {
         self.keep_awake();
         if font {
             self.reload_font();
+        }
+        // Once per change, not each time the settings panel saves.
+        if skipped {
+            self.note_ignored();
         }
         // The picker puts the configured theme back when it closes.
         if self.picker.is_none() {
@@ -4909,6 +4916,14 @@ impl App {
     /// Opens a link, or says in the pane why not.
     fn open_link(&mut self, target: &Target) {
         self.tell(crate::links::open(target, &self.config.editor_uri).map_err(String::from));
+    }
+
+    /// Says, dimly in the focused pane, which lines of `config.toml` were
+    /// skipped, if any.
+    fn note_ignored(&mut self) {
+        if let (Some(text), Some(id)) = (self.config.ignored_notice(), self.focus_id()) {
+            self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+        }
     }
 
     /// Says in the focused pane why something did not open.

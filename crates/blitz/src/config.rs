@@ -64,6 +64,10 @@ pub struct Config {
     /// Variables from `env = NAME=VALUE` lines, one per name, for every
     /// new pane's environment.
     pub env: Vec<(String, String)>,
+    /// The lines of `config.toml` that set nothing, as (line number,
+    /// text): an unknown key, a value that does not fit, or no
+    /// `key = value` at all.
+    pub ignored: Vec<(usize, String)>,
 }
 
 impl Default for Config {
@@ -93,6 +97,7 @@ impl Default for Config {
             keys: Vec::new(),
             texts: Vec::new(),
             env: Vec::new(),
+            ignored: Vec::new(),
         }
     }
 }
@@ -336,16 +341,32 @@ pub const SETTINGS: &[Setting] = &[
 impl Config {
     /// The defaults with the settings from a `config.toml` applied: one
     /// `key = value` per line, `#` starts a comment. Lines it doesn't
-    /// understand are skipped, so a typo never stops blitz from starting.
+    /// understand are skipped, so a typo never stops blitz from starting,
+    /// and listed in `ignored`.
     pub fn parse(text: &str) -> Config {
         let mut c = Config::default();
         // Notepad may save with a byte order mark.
-        for line in split_lines(text.trim_start_matches('\u{feff}')).0 {
-            if let Some((key, value, _)) = entry(line) {
-                c.set(key, value);
+        let lines = split_lines(text.trim_start_matches('\u{feff}')).0;
+        for (i, line) in lines.into_iter().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if !entry(line).is_some_and(|(key, value, _)| c.set(key, value)) {
+                c.ignored.push((i + 1, line.into()));
             }
         }
         c
+    }
+
+    /// One line that tells the user which lines of `config.toml` were
+    /// skipped; `None` when none were.
+    pub fn ignored_notice(&self) -> Option<String> {
+        let ((n, line), more) = self.ignored.split_first()?;
+        Some(match more.len() {
+            0 => format!("config.toml line {n} was skipped: {line}"),
+            k => format!("config.toml line {n} and {k} more were skipped: {line}"),
+        })
     }
 
     /// Setting `key` as `config.toml` writes it: `true`, `11` or
@@ -738,8 +759,23 @@ mod tests {
              theme = \"unterminated\n\
              [section]\n",
         );
-        assert_eq!(c, Config::default());
+        // Each line but the comment, by number.
+        let lines: Vec<usize> = c.ignored.iter().map(|l| l.0).collect();
+        assert_eq!(lines, [1, 2, 3, 4, 5, 6, 7, 9, 10]);
+        let notice = "config.toml line 1 and 8 more were skipped: font_size = 300";
+        assert_eq!(c.ignored_notice().as_deref(), Some(notice));
+        assert_eq!(
+            Config {
+                ignored: Vec::new(),
+                ..c
+            },
+            Config::default()
+        );
         assert_eq!(Config::parse(""), Config::default());
+        let one = Config::parse("\u{feff}\n  # x = 1\nflash = false # ok\r\n  flash = maybe  \r\n");
+        let notice = "config.toml line 4 was skipped: flash = maybe";
+        assert_eq!(one.ignored_notice().as_deref(), Some(notice));
+        assert_eq!(Config::parse("flash = false # ok\n").ignored_notice(), None);
     }
 
     #[test]
@@ -1130,7 +1166,14 @@ scenery = stars
     fn parse_ignores_what_toml_would_not_read() {
         // Keys and booleans are lower case.
         let c = Config::parse("Flash = false\nbell_attention = False\n");
-        assert_eq!(c, Config::default());
+        assert_eq!(c.ignored.len(), 2);
+        assert_eq!(
+            Config {
+                ignored: Vec::new(),
+                ..c
+            },
+            Config::default()
+        );
         // A later line that does not read keeps the earlier one.
         assert!(!Config::parse("flash = false\nflash = maybe\n").flash);
         // A later line that reads wins.
