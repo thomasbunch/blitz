@@ -3019,11 +3019,20 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(f) => {
                 self.focused = f;
                 // A key still held goes up in the other window, so its
-                // release never comes back to clear `eaten`; so does the
-                // button ending a drag.
+                // release never comes back to clear `eaten`; so does a
+                // button, ending a drag or a selection. A program that saw
+                // the button go down sees it come up here, as it went where
+                // its press did.
                 if !f {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
+                    self.mouse.anchor = None;
+                    let mods = mods_now();
+                    for b in 0..3 {
+                        if let Some(id) = route_button(&mut self.mouse.reported, b, false, None) {
+                            self.mouse_report(id, MouseKind::Release, b as u8, mods);
+                        }
+                    }
                 }
                 let mut out = Vec::new();
                 vt::encode_focus(f, &self.modes(), &mut out);
