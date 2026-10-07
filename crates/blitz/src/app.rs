@@ -108,8 +108,6 @@ const AWAY_AFTER: Duration = Duration::from_secs(30);
 const RESUME_AFTER: Duration = Duration::from_secs(3);
 /// Lines of output saved per pane when `restore_scrollback` is on.
 const SAVED_LINES: usize = 1000;
-/// Lines scrolled per wheel notch when the program takes no mouse input.
-const WHEEL_LINES: isize = 3;
 /// How long a changed layout waits before it is saved, so dragging a
 /// divider or holding a resize key writes the file once, not every step.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
@@ -4324,7 +4322,7 @@ impl App {
         {
             let mut t = lock(&v.pane.term);
             if !t.input_modes().alt_screen {
-                t.scroll_viewport(steps as isize * WHEEL_LINES);
+                t.scroll_viewport(steps as isize * wheel_lines(scroll_lines(), v.grid.1));
                 self.request_redraw();
             }
             return;
@@ -4333,6 +4331,7 @@ impl App {
             return;
         };
         let m = lock(&v.pane.term).input_modes();
+        let lines = steps as isize * wheel_lines(scroll_lines(), v.grid.1);
         let shift = mods.lshift || mods.rshift;
         match wheel_does(&m, shift, v.pane.claude.is_some()) {
             Wheel::Report => {
@@ -4346,8 +4345,8 @@ impl App {
                     self.mouse_report(id, kind, 0, mods);
                 }
             }
-            Wheel::Arrows => self.send(wheel_keys(steps as isize * WHEEL_LINES, &m)),
-            Wheel::Scroll => self.scroll(steps as isize * WHEEL_LINES),
+            Wheel::Arrows => self.send(wheel_keys(lines, &m)),
+            Wheel::Scroll => self.scroll(lines),
             Wheel::Nothing => {}
         }
     }
@@ -5183,6 +5182,35 @@ fn wheel_does(m: &InputModes, shift: bool, claude: bool) -> Wheel {
     } else {
         Wheel::Nothing
     }
+}
+
+/// Lines a wheel notch scrolls with Windows' "lines to scroll" set to
+/// `setting`: that many, or a page of a `rows` high pane for "one screen
+/// at a time".
+fn wheel_lines(setting: u32, rows: u16) -> isize {
+    const WHEEL_PAGESCROLL: u32 = u32::MAX;
+    match setting {
+        WHEEL_PAGESCROLL => rows.saturating_sub(1).max(1) as isize,
+        n => n.min(100) as isize,
+    }
+}
+
+/// Windows' "lines to scroll" for each wheel notch; 3 if it cannot be read.
+fn scroll_lines() -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut n = 3u32;
+    // SAFETY: SPI_GETWHEELSCROLLLINES writes one UINT.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&raw mut n).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if read.is_ok() { n } else { 3 }
 }
 
 /// `n` presses of Up, or of Down for a negative `n`, each with its
@@ -6790,6 +6818,17 @@ mod tests {
         // Kitty flags 1 and 2: releases are reported too.
         let kitty = InputModes { kitty: 3, ..legacy };
         assert_eq!(wheel_keys(1, &kitty), b"\x1b[A\x1b[1;1:3A");
+    }
+
+    #[test]
+    fn app_wheel_follows_the_windows_lines_to_scroll() {
+        assert_eq!(wheel_lines(3, 40), 3);
+        assert_eq!(wheel_lines(1, 40), 1);
+        assert_eq!(wheel_lines(0, 40), 0, "no scrolling");
+        assert_eq!(wheel_lines(u32::MAX, 40), 39, "a page");
+        assert_eq!(wheel_lines(u32::MAX, 1), 1);
+        assert_eq!(wheel_lines(5000, 40), 100);
+        assert!(scroll_lines() <= 100 || scroll_lines() == u32::MAX);
     }
 
     #[test]
