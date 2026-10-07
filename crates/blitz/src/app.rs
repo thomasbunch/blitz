@@ -1534,11 +1534,9 @@ impl App {
             .with_inner_size(LogicalSize::new(980.0, 620.0))
             // Icon group 1, which build.rs links in.
             .with_window_icon(Icon::from_resource(1, Some(small_icon_size())).ok())
-            .with_taskbar_icon(Icon::from_resource(1, None).ok());
-        // Only the main window takes folders from other launches.
-        if !self.args.new_window {
-            attrs = attrs.with_class_name(crate::handoff::CLASS);
-        }
+            .with_taskbar_icon(Icon::from_resource(1, None).ok())
+            // Only the main window takes folders from other launches.
+            .with_class_name(crate::handoff::class(self.args.new_window));
         let saved = (self.persist && self.config.restore_session)
             .then(session::load)
             .flatten();
@@ -3549,22 +3547,19 @@ impl App {
                     }
                     return true;
                 }
-                // Updating restarts blitz, which ends every session.
+                // Updating restarts blitz, which ends every session, and
+                // the installer closes every other blitz window.
                 let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
                 let asked = self.banner_note.take_if(|n| n.1 == Ask::Update);
-                if busy > 0 && asked.is_none() {
-                    let what = if busy == 1 {
-                        "A session is"
-                    } else {
-                        "Sessions are"
-                    };
-                    let again = again(a, &self.config.keys);
-                    let text = format!("{what} busy, and updating restarts blitz. {again}");
+                let again = again(a, &self.config.keys);
+                let ask = crate::update::confirm(busy, crate::handoff::others(), &again);
+                if let Some(text) = ask.filter(|_| asked.is_none()) {
                     self.banner_note = Some((text, Ask::Update));
                     self.request_redraw();
                     return true;
                 }
                 // Asked for by hand: shown again if it fails.
+
                 if let Some(dir) = session::dir() {
                     crate::update::dismiss_in(&dir, None);
                 }

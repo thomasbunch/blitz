@@ -96,6 +96,24 @@ pub fn banner(
     })
 }
 
+/// What Ctrl+Shift+U says before an update that would end `busy` sessions
+/// or close `others` other blitz windows, or `None` to go ahead; `again`
+/// says how to confirm it.
+pub fn confirm(busy: usize, others: usize, again: &str) -> Option<String> {
+    let what = match (busy, others) {
+        (0, 0) => return None,
+        (0, _) => "Updating",
+        (1, _) => "A session is busy, and updating",
+        _ => "Sessions are busy, and updating",
+    };
+    let closes = match others {
+        0 => String::new(),
+        1 => " and closes another blitz window".into(),
+        n => format!(" and closes {n} other blitz windows"),
+    };
+    Some(format!("{what} restarts blitz{closes}. {again}"))
+}
+
 /// What Ctrl+Shift+U says when it looked for a release itself.
 pub fn found(r: &Result<Option<String>, String>) -> String {
     match r {
@@ -530,6 +548,31 @@ mod tests {
             notes("0.0.5"),
             "https://github.com/thomasbunch/blitz/releases/tag/v0.0.5"
         );
+    }
+
+    #[test]
+    fn an_update_that_ends_sessions_or_closes_windows_asks_first() {
+        let again = "Press Ctrl+Shift+U again";
+        assert_eq!(confirm(0, 0, again), None);
+        for (busy, others, text) in [
+            (1, 0, "A session is busy, and updating restarts blitz"),
+            (3, 0, "Sessions are busy, and updating restarts blitz"),
+            (
+                0,
+                1,
+                "Updating restarts blitz and closes another blitz window",
+            ),
+            (
+                2,
+                2,
+                "Sessions are busy, and updating restarts blitz and closes 2 other blitz windows",
+            ),
+        ] {
+            assert_eq!(
+                confirm(busy, others, again),
+                Some(format!("{text}. {again}"))
+            );
+        }
     }
 
     #[test]
