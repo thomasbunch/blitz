@@ -41,6 +41,7 @@ pub enum Action {
     PaneToNewTab,
     /// Tab 1 to 8, 0-based. With no such tab the key does nothing.
     GoToTab(u8),
+    /// The last tab, whatever its number.
     LastTab,
     SplitRight,
     SplitDown,
