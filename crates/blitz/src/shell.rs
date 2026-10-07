@@ -527,13 +527,49 @@ pub fn split_program(cmdline: &str) -> (&str, &str) {
 
 /// Whether PowerShell `args` already say what to run, which the
 /// integration's own `-Command` would take the place of. PowerShell takes
-/// any start of a parameter's name, and `-e` is `-EncodedCommand`.
+/// any start of a parameter's name, and `-e` is `-EncodedCommand`. A word
+/// that is no parameter, nor a parameter's value, runs too: PowerShell 7
+/// takes it as `-File`, Windows PowerShell as `-Command`.
 fn runs_command(args: &str) -> bool {
-    args.split_whitespace().any(|a| {
-        let a = a.trim_start_matches(['-', '/']).to_ascii_lowercase();
-        let names = ["command", "file", "encodedcommand", "commandwithargs"];
-        !a.is_empty() && (names.iter().any(|n| n.starts_with(&a)) || a == "ec" || a == "cwa")
-    })
+    let runs = ["command", "file", "encodedcommand", "commandwithargs"];
+    let valued = [
+        "configurationname",
+        "configurationfile",
+        "custompipename",
+        "encodedarguments",
+        "executionpolicy",
+        "inputformat",
+        "outputformat",
+        "psconsolefile",
+        "settingsfile",
+        "version",
+        "windowstyle",
+        "workingdirectory",
+    ];
+    let mut words = args.split_whitespace();
+    while let Some(w) = words.next() {
+        let Some(p) = w.strip_prefix(['-', '/']) else {
+            return true;
+        };
+        // `-wd:C:\x` holds its value.
+        let (p, value) = match p.trim_start_matches('-').split_once(':') {
+            Some((p, _)) => (p.to_ascii_lowercase(), true),
+            None => (p.trim_start_matches('-').to_ascii_lowercase(), false),
+        };
+        if p.is_empty() {
+            continue;
+        }
+        if runs.iter().any(|n| n.starts_with(&p)) || p == "ec" || p == "cwa" {
+            return true;
+        }
+        // Shorter starts are switches too, such as `-i` for -Interactive.
+        let aliases = ["ea", "ep", "ex", "if", "o", "of", "v", "w", "wd"];
+        let named = p.len() > 2 && valued.iter().any(|n| n.starts_with(&p));
+        if !value && (named || aliases.contains(&p.as_str())) {
+            words.next();
+        }
+    }
+    false
 }
 
 /// A command line ready for `CreateProcessW`, plus variables to add to the
@@ -868,8 +904,15 @@ mod tests {
             "pwsh -ec ZQBjAGgAbwA=",
             "pwsh -cwa x",
             "pwsh --command x",
+            r"pwsh C:\s\start.ps1",
+            "powershell Get-Date",
+            "pwsh -NoProfile -wd C: x.ps1",
         ] {
             assert_eq!(ps(s), s);
+        }
+        // A parameter's value is not what to run.
+        for s in ["pwsh -wd c", "pwsh -WorkingDirectory c", "pwsh -wd:c -ex f"] {
+            assert!(ps(s).contains(" -NoExit -Command "), "{s}");
         }
     }
 
