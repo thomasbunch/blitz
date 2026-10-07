@@ -13,9 +13,9 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 - Claude Code's title tells blitz when a session works and when it
   stops, and its hooks, which blitz sets up itself, when it needs input;
   the taskbar button flashes if blitz is in the background.
-- In PowerShell, a command that runs for 10 seconds or more and ends in
-  a pane you are not looking at marks it *done*, or *error* with its exit
-  code.
+- In PowerShell with PSReadLine (its default), a command that runs for 10
+  seconds or more and ends in a pane you are not looking at marks it
+  *done*, or *error* with its exit code.
 - Progress a program reports (OSC 9;4) shows in the sidebar and on the
   taskbar button.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
