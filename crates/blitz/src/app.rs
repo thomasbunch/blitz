@@ -2832,6 +2832,21 @@ impl App {
                 });
                 self.request_redraw();
             }
+            // Windows opens it on Alt+Space itself, but blitz takes every
+            // key before Windows sees it.
+            Action::SystemMenu => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    PostMessageW, SC_KEYMENU, WM_SYSCOMMAND,
+                };
+                let (menu, space) = (
+                    WPARAM(SC_KEYMENU as usize),
+                    LPARAM(i32::from(b' ') as isize),
+                );
+                let hwnd = HWND(self.hwnd as *mut c_void);
+                // SAFETY: our own window, and a message that carries no pointers.
+                let _ = unsafe { PostMessageW(Some(hwnd), WM_SYSCOMMAND, menu, space) };
+            }
         }
         true
     }
