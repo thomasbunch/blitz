@@ -83,7 +83,7 @@ fn blitz_hook_notifications() {
     else {
         panic!()
     };
-    assert_eq!((title.len(), body.len()), (64, 256));
+    assert_eq!((title.len(), body.len()), (128, 256));
     assert!(body.starts_with("ax"));
 }
 

@@ -284,46 +284,47 @@ mod tests {
         assert!(DoneUnseen < Error && Error < NeedsYou);
     }
 
-    const TOKEN: &str = "0f1e2d3c";
+    /// As long as a real pane token: 128 bits in hex.
+    const TOKEN: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
 
     #[test]
     fn notify_titles() {
-        let ev = |s: &str| Ev::from_notify(s, TOKEN).map(|(ev, _)| ev);
-        assert_eq!(ev("blitz:0f1e2d3c:needs-you"), Some(Ev::NeedsYou));
-        assert_eq!(ev("blitz:0f1e2d3c:working"), Some(Ev::Working));
-        assert_eq!(ev("blitz:0f1e2d3c:done"), Some(Ev::Done));
-        assert_eq!(
-            ev("blitz:0f1e2d3c:error"),
-            Some(Ev::Error { sticky: false })
-        );
-        assert_eq!(ev("blitz:0f1e2d3c:idle"), Some(Ev::Idle));
-        assert_eq!(ev("blitz:0f1e2d3c:bogus"), None);
-        assert_eq!(ev("Build finished"), None);
+        let ev = |s: &str| Ev::from_notify(&format!("blitz:{TOKEN}:{s}"), TOKEN).map(|(ev, _)| ev);
+        assert_eq!(ev("needs-you"), Some(Ev::NeedsYou));
+        assert_eq!(ev("working"), Some(Ev::Working));
+        assert_eq!(ev("done"), Some(Ev::Done));
+        assert_eq!(ev("error"), Some(Ev::Error { sticky: false }));
+        assert_eq!(ev("idle"), Some(Ev::Idle));
+        assert_eq!(ev("bogus"), None);
         assert_eq!(ev(""), None);
+        assert_eq!(Ev::from_notify("Build finished", TOKEN), None);
+        assert_eq!(Ev::from_notify("", TOKEN), None);
     }
 
     const SESSION: &str = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
 
     #[test]
     fn notify_titles_with_a_session() {
-        fn ev(s: &str) -> Option<(Ev, Option<&str>)> {
-            Ev::from_notify(s, TOKEN)
-        }
-        assert_eq!(ev("blitz:0f1e2d3c:done"), Some((Ev::Done, None)));
+        let ev = |s: &str| {
+            let title = format!("blitz:{TOKEN}:{s}");
+            Ev::from_notify(&title, TOKEN).map(|(ev, id)| (ev, id.map(str::to_owned)))
+        };
+        assert_eq!(ev("done"), Some((Ev::Done, None)));
         assert_eq!(
-            ev(&format!("blitz:0f1e2d3c:done:{SESSION}")),
-            Some((Ev::Done, Some(SESSION)))
+            ev(&format!("done:{SESSION}")),
+            Some((Ev::Done, Some(SESSION.to_owned())))
         );
         assert_eq!(
-            ev(&format!("blitz:0f1e2d3c:idle:{SESSION}")),
-            Some((Ev::Idle, Some(SESSION)))
+            ev(&format!("idle:{SESSION}")),
+            Some((Ev::Idle, Some(SESSION.to_owned())))
         );
         for bad in [
-            "blitz:0f1e2d3c:done:",
-            "blitz:0f1e2d3c:done:abc",
-            &format!("blitz:0f1e2d3c:done:{SESSION}:x"),
-            &format!("blitz:0f1e2d3c:done:{}", SESSION.replacen('0', ";", 1)),
-            &format!("blitz:0f1e2d3c:bogus:{SESSION}"),
+            "done:",
+            "done:abc",
+            &format!("done:{SESSION}:x"),
+            &format!("done:{}", SESSION.replacen('0', ";", 1)),
+            &format!("done:{}", &SESSION[..20]),
+            &format!("bogus:{SESSION}"),
         ] {
             assert_eq!(ev(bad), None, "{bad}");
         }
@@ -333,15 +334,16 @@ mod tests {
     #[test]
     fn notify_titles_need_the_token() {
         for title in [
-            "blitz:needs-you",
-            "blitz:working",
-            "blitz::done",
-            "blitz:0f1e2d3:done",
-            "blitz:0f1e2d3c0:done",
-            "blitz:0F1E2D3C:done",
-            "blitz:0f1e2d3cdone",
+            "blitz:needs-you".to_owned(),
+            "blitz:working".to_owned(),
+            "blitz::done".to_owned(),
+            format!("blitz:{}:done", &TOKEN[1..]),
+            format!("blitz:{}:done", &TOKEN[..TOKEN.len() - 1]),
+            format!("blitz:{TOKEN}0:done"),
+            format!("blitz:{}:done", TOKEN.to_uppercase()),
+            format!("blitz:{TOKEN}done"),
         ] {
-            assert_eq!(Ev::from_notify(title, TOKEN), None, "{title}");
+            assert_eq!(Ev::from_notify(&title, TOKEN), None, "{title}");
         }
         assert_eq!(Ev::from_notify("blitz::done", ""), None);
         assert_eq!(events("\x1b]777;notify;blitz:needs-you;Bash: x\x07"), []);
@@ -387,8 +389,9 @@ mod tests {
             .collect()
     }
 
+    /// The sequence blitz-hook prints for `state`, session id and all.
     fn notify(state: &str) -> String {
-        format!("\x1b]777;notify;blitz:{TOKEN}:{state};msg\x07")
+        format!("\x1b]777;notify;blitz:{TOKEN}:{state}:{SESSION};msg\x07")
     }
 
     /// Each attention rule, driven by hook notifications as a program

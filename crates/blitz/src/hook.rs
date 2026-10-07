@@ -684,14 +684,18 @@ mod tests {
         assert_eq!(setup(&["vim".into()]), 2);
     }
 
+    /// As long as a real pane token: 128 bits in hex.
+    const TOKEN: &str = "4b1d0123456789abcdef0123456789ab";
+    const SESSION: &str = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
+
     #[test]
     fn every_state_is_an_attention_event() {
         for s in ["working", "needs-you", "done", "error", "idle"] {
-            let title = format!("blitz:4b1d:{s}");
-            assert!(Ev::from_notify(&title, "4b1d").is_some(), "{s}");
-            let title = format!("blitz:4b1d:{s}:{SESSION}");
+            let title = format!("blitz:{TOKEN}:{s}");
+            assert!(Ev::from_notify(&title, TOKEN).is_some(), "{s}");
+            let title = format!("blitz:{TOKEN}:{s}:{SESSION}");
             assert_eq!(
-                Ev::from_notify(&title, "4b1d").and_then(|(_, id)| id),
+                Ev::from_notify(&title, TOKEN).and_then(|(_, id)| id),
                 Some(SESSION),
                 "{s}"
             );
@@ -701,24 +705,24 @@ mod tests {
     #[test]
     fn output_is_one_json_line() {
         assert_eq!(
-            notify_json("4b1d", "done", None, "All \"good\" \\ ok"),
-            "{\"terminalSequence\":\"\\u001b]777;notify;blitz:4b1d:done;All \\\"good\\\" \\\\ ok\\u0007\"}\n"
+            notify_json(TOKEN, "done", None, "All \"good\" \\ ok"),
+            format!(
+                "{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:done;All \\\"good\\\" \\\\ ok\\u0007\"}}\n"
+            )
         );
-        let out = claude_output("4b1d", r#"{"hook_event_name":"SessionEnd"}"#).unwrap();
+        let out = claude_output(TOKEN, r#"{"hook_event_name":"SessionEnd"}"#).unwrap();
         let v = Json::parse(&out).unwrap();
         assert_eq!(
             v.get("terminalSequence").and_then(Json::as_str),
-            Some("\x1b]777;notify;blitz:4b1d:idle;\x07")
+            Some(format!("\x1b]777;notify;blitz:{TOKEN}:idle;\x07").as_str())
         );
-        assert_eq!(claude_output("4b1d", "not json"), None);
+        assert_eq!(claude_output(TOKEN, "not json"), None);
     }
-
-    const SESSION: &str = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
 
     #[test]
     fn output_carries_the_session_id() {
         let seq = |payload: &str| {
-            let out = claude_output("4b1d", payload).unwrap();
+            let out = claude_output(TOKEN, payload).unwrap();
             let v = Json::parse(&out).unwrap();
             v.get("terminalSequence")
                 .and_then(Json::as_str)
@@ -729,16 +733,16 @@ mod tests {
             seq(&format!(
                 r#"{{"hook_event_name":"Stop","session_id":"{SESSION}","last_assistant_message":"ok"}}"#
             )),
-            format!("\x1b]777;notify;blitz:4b1d:done:{SESSION};ok\x07")
+            format!("\x1b]777;notify;blitz:{TOKEN}:done:{SESSION};ok\x07")
         );
         // A bad id is dropped; the state still gets through.
         assert_eq!(
             seq(r#"{"hook_event_name":"SessionEnd","session_id":"x;rm -rf ~"}"#),
-            "\x1b]777;notify;blitz:4b1d:idle;\x07"
+            format!("\x1b]777;notify;blitz:{TOKEN}:idle;\x07")
         );
         assert_eq!(
             seq(r#"{"hook_event_name":"SessionEnd","session_id":7}"#),
-            "\x1b]777;notify;blitz:4b1d:idle;\x07"
+            format!("\x1b]777;notify;blitz:{TOKEN}:idle;\x07")
         );
     }
 

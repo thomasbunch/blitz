@@ -158,7 +158,9 @@ const DARK: [u32; 3] = [0xD6D7D9, 0x131417, 0xECECEA];
 
 /// Longest window title and notification texts kept, in characters.
 const MAX_TITLE: usize = 256;
-const MAX_NOTIFY_TITLE: usize = 64;
+/// blitz-hook's titles run to 85: `blitz:`, a 32-digit token, the longest
+/// state and a 36-char session id. One cut short is not an attention event.
+const MAX_NOTIFY_TITLE: usize = 128;
 const MAX_NOTIFY_BODY: usize = 256;
 
 /// Replies may use a sixteenth of the output, plus a reserve of this

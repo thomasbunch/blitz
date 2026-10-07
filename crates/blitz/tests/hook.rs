@@ -5,16 +5,22 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use blitz::attention::Ev;
+use blitz::hook::Json;
+
 const HOOK: &str = env!("CARGO_BIN_EXE_blitz-hook");
 
-/// The pane token the tests run the hook with.
-const TOKEN: &str = "5eed";
+/// The pane token the tests run the hook with, as long as a real one: 128
+/// bits in hex.
+const TOKEN: &str = "5eed0123456789abcdef0123456789ab";
+
+/// A Claude Code session id, which every hook payload carries.
+const SESSION: &str = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
 
 /// Runs `blitz-hook claude` and returns (stdout, exit code).
 fn hook(payload: &str, token: Option<&str>) -> (String, i32) {
     let mut cmd = Command::new(HOOK);
     cmd.arg("claude")
-        .env("BLITZ_PANE_ID", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -105,6 +111,66 @@ fn hook_prints_each_event() {
     ];
     for (payload, want) in cases {
         assert_eq!(hook(payload, Some(TOKEN)), (want, 0), "{payload}");
+    }
+}
+
+/// The attention event and session a pane gets from the hook's output,
+/// read the way the app reads it: the `terminalSequence` Claude Code
+/// writes, through the terminal, then the title's state.
+fn in_pane(stdout: &str) -> Vec<(Ev, Option<String>)> {
+    let seq = Json::parse(stdout)
+        .expect("one JSON line")
+        .get("terminalSequence")
+        .and_then(Json::as_str)
+        .expect("a terminalSequence")
+        .to_owned();
+    let mut t = vt::Terminal::new(vt::Options::default());
+    t.feed(seq.as_bytes());
+    let mut evs = Vec::new();
+    t.take_events(&mut evs);
+    evs.into_iter()
+        .filter_map(|e| match e {
+            vt::Event::Notify { title, .. } => {
+                Ev::from_notify(&title, TOKEN).map(|(ev, id)| (ev, id.map(str::to_owned)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every state, with the session id every real payload carries, reaches
+/// the pane whole.
+#[test]
+fn hook_states_reach_the_pane_with_their_session() {
+    let cases = [
+        ("UserPromptSubmit", "", Ev::Working),
+        (
+            "PermissionRequest",
+            r#","tool_name":"Bash","tool_input":{"command":"git push"}"#,
+            Ev::NeedsYou,
+        ),
+        (
+            "Notification",
+            r#","notification_type":"permission_prompt","message":"m""#,
+            Ev::NeedsYou,
+        ),
+        ("Stop", r#","last_assistant_message":"ok""#, Ev::Done),
+        (
+            "StopFailure",
+            r#","error":"overloaded""#,
+            Ev::Error { sticky: false },
+        ),
+        ("SessionEnd", "", Ev::Idle),
+    ];
+    for (event, rest, want) in cases {
+        let payload = format!(r#"{{"hook_event_name":"{event}","session_id":"{SESSION}"{rest}}}"#);
+        let (out, code) = hook(&payload, Some(TOKEN));
+        assert_eq!(code, 0, "{event}");
+        assert_eq!(
+            in_pane(&out),
+            [(want, Some(SESSION.to_owned()))],
+            "{event}: {out}"
+        );
     }
 }
 
