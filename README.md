@@ -30,6 +30,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   and `config.toml` can bind any of them to other keys.
 - Selections that reach into scrollback, and Ctrl+click on links and
   file paths.
+- Files dropped on a pane paste as their paths, and Ctrl+V pastes a
+  screenshot into Claude Code.
 - Direct3D 11 and DirectWrite rendering, with a software fallback.
 
 ## Install
@@ -283,6 +285,17 @@ output scrolls; it ends when output rewrites the text. A double click
 takes a path or URL whole, and dragging after a double or triple click
 selects by words or lines.
 
+Ctrl+C copies the selection while it is in view; scrolled out of view,
+Ctrl+C goes to the program as usual. Ctrl+Shift+C and Ctrl+Insert copy
+it either way, and with nothing selected Ctrl+Shift+C never reaches the
+program as Ctrl+C. When output rewrites a selection, the next copy
+still takes the text as it was, and says so; anything else you do drops
+it. A dim line says how many lines were copied; if another program is
+holding the clipboard, the selection stays so you can copy again.
+**Copy without indent** in the command palette leaves out the marks
+Claude Code puts before replies and tool output, and the indent the
+lines share.
+
 Holding Ctrl underlines the link under the pointer: a hyperlink a
 program printed, a web address, or the path of a file that exists,
 relative ones from the pane's folder. Only web, mail and local file
@@ -292,6 +305,28 @@ script, shortcut or installer, is shown selected in Explorer instead.
 When a program takes the mouse itself, as Claude Code does in
 fullscreen, clicks go to it. Hold Shift as well to use blitz's
 selection: Shift+drag selects, and Ctrl+Shift+click opens a link.
+
+## Paste and drop
+
+Ctrl+V pastes text. One line copied with its line break comes without
+it, so it is not run. More lines, or over 5 KiB into a program that
+does not take pastes as such (bracketed paste), first show what they
+are and wait for a second Ctrl+V; Claude Code never asks. Nothing is
+pasted into a pane whose program has exited.
+
+Files copied in Explorer paste as their paths, in quotes when they hold
+a space, and so do files dropped on a pane. A folder dropped on the
+sidebar opens in a new tab. Windows does not let you drop from Explorer
+onto blitz running as administrator. With an image on the clipboard and
+no text, such as a screenshot, Ctrl+V in a Claude Code pane sends Alt+V,
+which pastes the image; other programs get Ctrl+V.
+
+In the find bar, the command palette, the theme picker and the settings
+panel, a paste adds the first line of the clipboard and Ctrl+Backspace
+deletes a word.
+
+Programs can copy to the clipboard with OSC 52, as tmux and Neovim do
+over SSH, and the pane says so. They cannot read it.
 
 ## Find and prompts
 
@@ -334,7 +369,7 @@ that, or typing, goes back to the bottom.
 | Ctrl+=, Ctrl+-, Ctrl+0 | Font size up, down, and back to the setting, until blitz restarts |
 | F11 | Full screen |
 | Alt+Space | Window menu: move, size, minimize, close |
-| Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
+| Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy the selection; Ctrl+C only while it is in view |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
 | Ctrl+Shift+F | Find in the scrollback |
@@ -346,10 +381,10 @@ pane, split or resize.
 The command palette lists every action with its keys. Typing narrows
 the list, the arrow keys choose, and Enter or a click runs the action;
 Esc closes it. Giving the panes equal space, closing a whole tab,
-reopening the last closed pane, renaming a session or a tab and Claude
-Code setup have no keys by default, so they are only in the palette;
-renaming takes the name on the palette's line. Double-clicking the line
-between panes also gives them equal space.
+reopening the last closed pane, renaming a session or a tab, copying
+without indent and Claude Code setup have no keys by default, so they
+are only in the palette; renaming takes the name on the palette's line.
+Double-clicking the line between panes also gives them equal space.
 
 ## Key bindings
 
@@ -371,17 +406,17 @@ exactly. A binding replaces the default on the same chord, and the other
 defaults stay; Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them.
 Lines blitz cannot read are skipped.
 
-The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
-`new_tab`, `close_pane`, `close_tab`, `reopen_closed`, `rename_session`,
-`rename_tab`, `next_tab`, `previous_tab`, `split_right`, `split_down`,
-`focus_left`, `focus_right`, `focus_up`, `focus_down`,
-`jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
-`settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
-`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
-`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
-`fullscreen`, `command_palette`, `find`, `previous_prompt`,
-`next_prompt`, `system_menu` and `claude_setup`. Typing a name in the
-command palette finds its action.
+The actions are `copy`, `copy_without_indent`, `paste`,
+`scroll_page_up`, `scroll_page_down`, `new_tab`, `close_pane`,
+`close_tab`, `reopen_closed`, `rename_session`, `rename_tab`,
+`next_tab`, `previous_tab`, `split_right`, `split_down`, `focus_left`,
+`focus_right`, `focus_up`, `focus_down`, `jump_to_attention`,
+`toggle_sidebar`, `update`, `theme_picker`, `settings`, `zoom`,
+`resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
+`swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
+`font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
+`find`, `previous_prompt`, `next_prompt`, `system_menu` and
+`claude_setup`. Typing a name in the command palette finds its action.
 
 ## License
 
