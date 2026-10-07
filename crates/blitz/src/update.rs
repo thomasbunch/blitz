@@ -261,14 +261,18 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
     Some(out.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Runs curl.exe over HTTPS only, redirects included, and returns what it
-/// downloaded. A bare name finds System32's copy: Rust searches blitz's
-/// own folder, then System32, before PATH, and never the current directory.
+/// Runs System32's curl.exe over HTTPS only, redirects included, and
+/// returns what it downloaded. Named by its full path: a bare name is
+/// looked for in blitz's own folder first, where a planted curl.exe would
+/// run instead.
 // ponytail: curl ignores the system proxy; WinHTTP if that bites.
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let ua = concat!("blitz/", env!("CARGO_PKG_VERSION"));
+    let exe = crate::shell::system_root(|k| std::env::var_os(k))
+        .join("System32")
+        .join("curl.exe");
     // A slow line still finishes the download; one that stalls gives up.
-    let out = Command::new("curl.exe")
+    let out = Command::new(exe)
         .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https"])
         .args(["--connect-timeout", "20", "--speed-limit", "1000"])
         .args(["--speed-time", "30", "-A", ua])
