@@ -526,6 +526,8 @@ struct Mouse {
     hidden: bool,
     /// A left-button drag is making a selection.
     drag: Option<Drag>,
+    /// The drag's pane showed the bottom of its text when it began.
+    drag_bottom: bool,
     /// When the drag next scrolls, while the pointer is outside its pane.
     scroll_at: Option<Instant>,
     /// The last press that went to selection: when, on which cell, and
@@ -691,6 +693,16 @@ impl Selection {
             self.drag.epoch = term.line_epoch();
             self.look(term, pal);
         }
+    }
+}
+
+/// Ends a drag in `term`, whose view it held. A click that selected
+/// nothing puts a view that showed the bottom (`bottom`) back there, which
+/// output that came meanwhile moved it off.
+fn let_go(term: &mut vt::Terminal, bottom: bool, selected: bool) {
+    term.hold(false);
+    if bottom && !selected {
+        term.scroll_viewport(isize::MIN);
     }
 }
 
@@ -2742,10 +2754,21 @@ impl App {
     /// whose view holds still meanwhile, so output does not slide the text
     /// out from under the pointer.
     fn set_drag(&mut self, drag: Option<Drag>) {
+        let (now, was) = (drag.is_some(), self.mouse.drag.is_some());
         self.mouse.drag = drag;
         let focus = self.focus_id();
         for v in &self.views {
-            lock(&v.pane.term).hold(drag.is_some() && Some(v.pane.id) == focus);
+            let mut term = lock(&v.pane.term);
+            let here = Some(v.pane.id) == focus;
+            if here && now && !was {
+                self.mouse.drag_bottom = term.viewport() == 0;
+            }
+            if here && was && !now {
+                let_go(&mut term, self.mouse.drag_bottom, v.selection.is_some());
+                self.request_redraw();
+            } else {
+                term.hold(now && here);
+            }
         }
     }
 
@@ -8866,6 +8889,21 @@ mod tests {
         assert!(!t.paste_trusted(), "asks again");
         hook_confirms_paste(&mut t, Ev::Idle);
         assert!(!t.paste_trusted(), "Claude Code quit");
+    }
+
+    #[test]
+    fn app_a_click_while_output_streams_leaves_the_view_following_it() {
+        let held = |bottom, selected| {
+            let mut t = fed(10, 2, "a\r\nb");
+            t.hold(true);
+            t.feed(b"\r\nc\r\nd");
+            let_go(&mut t, bottom, selected);
+            t.feed(b"\r\ne");
+            t.view_top() == t.screen_top()
+        };
+        assert!(held(true, false), "a click");
+        assert!(!held(true, true), "a selection keeps its text in view");
+        assert!(!held(false, false), "scrolled back before the click");
     }
 
     #[test]
