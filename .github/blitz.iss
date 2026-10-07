@@ -107,3 +107,20 @@ begin
       // Setup stopped before it knew the folder.
     end;
 end;
+
+// Hooks pasted into Claude Code's settings name blitz-hook.exe, which is
+// about to go, and Claude Code would report each of them failing.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Settings: String;
+  Text: AnsiString;
+begin
+  if (CurUninstallStep <> usUninstall) or UninstallSilent then
+    Exit;
+  Settings := GetEnv('CLAUDE_CONFIG_DIR');
+  if Settings = '' then
+    Settings := ExpandConstant('{%USERPROFILE}\.claude');
+  Settings := AddBackslash(Settings) + 'settings.json';
+  if LoadStringFromFile(Settings, Text) and (Pos('blitz-hook', Lowercase(String(Text))) > 0) then
+    MsgBox(Settings + ' still runs blitz-hook.exe. Remove those hooks, or Claude Code will report them failing on every event.', mbInformation, MB_OK);
+end;
