@@ -33,6 +33,10 @@ pub struct InputModes {
     pub mouse: MouseMode,
     /// Mode 1006.
     pub mouse_sgr: bool,
+    /// Mode 1007: the wheel on the alternate screen sends arrow keys. A
+    /// terminal starts with it on, as most do: pagers such as less never
+    /// ask for it.
+    pub alt_scroll: bool,
     pub alt_screen: bool,
 }
 
@@ -94,7 +98,7 @@ impl KittyStack {
 }
 
 /// Mode state that does not depend on which screen is showing.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Modes {
     /// Input modes. `kitty` and `alt_screen` are not kept here; the
     /// terminal fills them in from the active screen.
@@ -107,11 +111,32 @@ pub struct Modes {
     /// When the open synchronized update began.
     pub sync: Option<Instant>,
     /// The user confirmed a multi-line paste since bracketed paste was last
-    /// set. Any program's output can set it, so until then it does not show
-    /// that a program reading pastes safely is listening.
+    /// turned on. Any program's output can turn it on, so until then it does
+    /// not show that a program reading pastes safely is listening.
     pub paste_confirmed: bool,
+    /// A program that reads every paste as text said it listens while
+    /// bracketed paste was off: the next turn on is its own and counts as
+    /// confirmed.
+    pub paste_vouched: bool,
     /// Mode 2031: report dark/light changes unasked, as `CSI ? 997 ; n n`.
     pub theme_reports: bool,
+}
+
+impl Default for Modes {
+    fn default() -> Modes {
+        Modes {
+            input: InputModes {
+                alt_scroll: true,
+                ..InputModes::default()
+            },
+            kitty: Default::default(),
+            mok: 0,
+            sync: None,
+            paste_confirmed: false,
+            paste_vouched: false,
+            theme_reports: false,
+        }
+    }
 }
 
 impl Modes {
@@ -134,9 +159,14 @@ impl Modes {
             }
             1004 => i.focus = on,
             1006 => i.mouse_sgr = on,
+            1007 => i.alt_scroll = on,
+            // Programs such as Claude Code set it again on every redraw;
+            // only turning it on anew can mean another program reads keys.
             2004 => {
+                if on && !i.bracketed {
+                    self.paste_confirmed = std::mem::take(&mut self.paste_vouched);
+                }
                 i.bracketed = on;
-                self.paste_confirmed = false;
             }
             // A repeated begin keeps the first start time, so a program
             // that never ends its update is still shown every timeout.
@@ -162,6 +192,7 @@ impl Modes {
             1003 => i.mouse == MouseMode::Any,
             1004 => i.focus,
             1006 => i.mouse_sgr,
+            1007 => i.alt_scroll,
             2004 => i.bracketed,
             2026 => self.sync.is_some(),
             2031 => self.theme_reports,
@@ -172,7 +203,8 @@ impl Modes {
 
     /// Clears the input modes a program can leave behind when it dies
     /// without restoring them: both kitty stacks, modifyOtherKeys, mouse
-    /// tracking, bracketed paste, synchronized output and theme reports.
+    /// tracking, bracketed paste, synchronized output and theme reports,
+    /// and turns wheel arrows back on.
     /// Otherwise the next program gets CSI-u keys or reports it never asked
     /// for.
     pub fn reset_input(&mut self) {
@@ -180,8 +212,10 @@ impl Modes {
         self.mok = 0;
         self.input.mouse = MouseMode::Off;
         self.input.mouse_sgr = false;
+        self.input.alt_scroll = true;
         self.input.bracketed = false;
         self.paste_confirmed = false;
+        self.paste_vouched = false;
         self.sync = None;
         self.theme_reports = false;
     }
@@ -242,8 +276,10 @@ mod tests {
             ..Modes::default()
         };
         m.kitty[1].push(1);
+        m.set_dec(1007, false);
         m.reset_input();
         assert_eq!((m.mok, m.kitty[1].flags()), (0, 0));
+        assert!(m.input.alt_scroll, "the next pager scrolls by the wheel");
     }
 
     #[test]

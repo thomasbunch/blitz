@@ -49,6 +49,7 @@ type ResizeFn = unsafe extern "system" fn(isize, COORD) -> i32;
 type CloseFn = unsafe extern "system" fn(isize);
 type ReleaseFn = unsafe extern "system" fn(isize) -> i32;
 type ReparentFn = unsafe extern "system" fn(isize, isize) -> i32;
+type ClearFn = unsafe extern "system" fn(isize) -> i32;
 
 /// The pseudoconsole functions, from Microsoft's redistributable
 /// `conpty.dll` when it is present, else from the system.
@@ -59,6 +60,8 @@ struct Conpty {
     /// Lets the output pipe reach EOF once every client has exited.
     release: Option<ReleaseFn>,
     reparent: Option<ReparentFn>,
+    /// Clears the console host's buffer; only the redistributable has it.
+    clear: Option<ClearFn>,
     bundled: bool,
 }
 
@@ -128,6 +131,7 @@ fn resolve(m: HMODULE, prefix: &str, bundled: bool) -> Option<Conpty> {
             release: sym("ReleasePseudoConsole").map(|f| std::mem::transmute::<Proc, ReleaseFn>(f)),
             reparent: sym("ReparentPseudoConsole")
                 .map(|f| std::mem::transmute::<Proc, ReparentFn>(f)),
+            clear: sym("ClearPseudoConsole").map(|f| std::mem::transmute::<Proc, ClearFn>(f)),
             bundled,
         })
     }
@@ -261,7 +265,10 @@ impl Pty {
         mut on_event: impl FnMut(PtyEvent<'_>, &Writer) + Send + 'static,
     ) -> io::Result<Pty> {
         let api = conpty().ok_or_else(|| io::Error::other("ConPTY is not available"))?;
-        let program = find_program(opts.cmdline, |k| std::env::var_os(k))?;
+        // Worked out once: it reads the registry, and the program is found
+        // on the PATH the child gets.
+        let path = crate::shell::pane_var("PATH");
+        let program = find_program(opts.cmdline, crate::shell::pane_env(path.clone()))?;
         let (in_r, in_w) = pipe()?;
         let (out_r, out_w) = pipe()?;
         let size = COORD {
@@ -286,7 +293,7 @@ impl Pty {
         drop((in_r, out_w));
         // Started before the handle goes into its mutex: a lock taken in the
         // match below would be held through it, and closing takes it again.
-        let process = start(opts, program.as_deref(), hpc);
+        let process = start(opts, program.as_deref(), path, hpc);
         let hpc = Arc::new(Mutex::new(hpc));
         let process = match process {
             Ok(p) => Arc::new(p),
@@ -405,6 +412,18 @@ impl Pty {
         }
     }
 
+    /// Clears the console host's buffer but the cursor's line, which it
+    /// moves to the top and draws again, so no resize can bring cleared
+    /// text back. False when this ConPTY cannot.
+    pub fn clear(&self) -> bool {
+        let h = lock(&self.hpc);
+        let Some(clear) = conpty().and_then(|c| c.clear).filter(|_| *h != 0) else {
+            return false;
+        };
+        // SAFETY: a live pseudoconsole; the lock keeps it from closing.
+        unsafe { clear(*h) >= 0 }
+    }
+
     /// Asks the child to exit (CTRL_CLOSE_EVENT) and kills it if it is still
     /// running 6 s later. Returns at once; output keeps flowing to the reader
     /// until EOF. Also called on drop.
@@ -467,11 +486,7 @@ pub fn find_program(
     cmdline: &str,
     var: impl Fn(&str) -> Option<OsString>,
 ) -> io::Result<Option<PathBuf>> {
-    let s = cmdline.trim_start_matches([' ', '\t']);
-    let name = match s.strip_prefix('"') {
-        Some(rest) => rest.split('"').next().unwrap_or(rest),
-        None => s.split([' ', '\t']).next().unwrap_or(s),
-    };
+    let name = crate::shell::split_program(cmdline).0;
     if name.is_empty() || name.contains(['\\', '/', ':']) {
         return Ok(None);
     }
@@ -497,8 +512,14 @@ pub fn find_program(
 }
 
 /// Creates the child process attached to pseudoconsole `hpc`, running
-/// `program` when given, else the first word of the command line.
-fn start(opts: &SpawnOpts, program: Option<&Path>, hpc: isize) -> io::Result<OwnedHandle> {
+/// `program` when given, else the first word of the command line, with
+/// `path` as its PATH.
+fn start(
+    opts: &SpawnOpts,
+    program: Option<&Path>,
+    path: Option<OsString>,
+    hpc: isize,
+) -> io::Result<OwnedHandle> {
     let mut size = 0;
     // SAFETY: a size query; it fails by design with the size filled in.
     let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
@@ -531,7 +552,8 @@ fn start(opts: &SpawnOpts, program: Option<&Path>, hpc: isize) -> io::Result<Own
         si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
         si.lpAttributeList = list;
 
-        let env = env_block(&child_env(std::env::vars_os(), opts.pane_id, opts.env));
+        let parent = with_path(std::env::vars_os(), path);
+        let env = env_block(&child_env(parent, opts.pane_id, opts.env));
         let mut cmd: Vec<u16> = opts.cmdline.encode_utf16().chain([0]).collect();
         let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
         let cwd = opts.cwd.map(wide);
@@ -560,6 +582,18 @@ fn start(opts: &SpawnOpts, program: Option<&Path>, hpc: isize) -> io::Result<Own
     // SAFETY: initialized above and no longer used.
     unsafe { DeleteProcThreadAttributeList(list) };
     result
+}
+
+/// `vars` with `path`, when there is one, in place of their PATH, whatever
+/// its case.
+fn with_path(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+    path: Option<OsString>,
+) -> impl Iterator<Item = (OsString, OsString)> {
+    let fresh = path.is_some();
+    (vars.into_iter())
+        .filter(move |(k, _)| !fresh || !k.eq_ignore_ascii_case("PATH"))
+        .chain(path.map(|p| ("Path".into(), p)))
 }
 
 /// Variables that describe the terminal the parent runs in. A child that
@@ -595,6 +629,8 @@ const STRIP: &[&str] = &[
     "TERMINATOR_UUID",
     "XTERM_VERSION",
     "TMUX",
+    "TMUX_PANE",
+    "ZELLIJ",
     "STY",
     "COLORTERM",
     // Set when blitz itself was started from a Claude Code session. Each
@@ -615,6 +651,33 @@ const STRIP: &[&str] = &[
     "CLAUDE_ENV_FILE",
 ];
 
+/// What WSL passes from a pane into Linux: how blitz describes itself, and
+/// the pane's token, which goes both ways so that a Windows hook run from
+/// Linux gets it back.
+const WSLENV: &[&str] = &[
+    "BLITZ_PANE_TOKEN",
+    "TERM_PROGRAM/u",
+    "TERM_PROGRAM_VERSION/u",
+    "COLORTERM/u",
+    "FORCE_HYPERLINK/u",
+    "CLAUDE_CODE_FORCE_STRIKETHROUGH/u",
+];
+
+/// `WSLENV` for a pane: the user's own entries, then blitz's for the
+/// variables they leave out.
+pub fn wslenv(user: Option<&str>) -> String {
+    let name = |e: &str| e.split('/').next().unwrap_or("").to_owned();
+    let mut out: Vec<&str> = (user.unwrap_or("").split(':'))
+        .filter(|e| !e.is_empty())
+        .collect();
+    for ours in WSLENV {
+        if !out.iter().any(|e| name(e) == name(ours)) {
+            out.push(ours);
+        }
+    }
+    out.join(":")
+}
+
 /// The environment for a pane's child: `parent` minus other terminals'
 /// markers, plus blitz's own, plus `extra` (which wins). Names compare
 /// case-insensitively, and the result is sorted the way Windows expects.
@@ -634,16 +697,33 @@ pub fn child_env(
         })
         .collect();
     let id = pane_id.to_string();
+    // One `extra` sets joins blitz's too, or the token would not reach WSL.
+    let is_wslenv = |k: &str| k.eq_ignore_ascii_case("WSLENV");
+    let user_wslenv = (extra.iter().rev())
+        .find(|(k, _)| is_wslenv(k))
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            (env.iter())
+                .find(|(k, _)| upper(k) == "WSLENV")
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        });
+    let wslenv = wslenv(user_wslenv.as_deref());
     let ours = [
         ("TERM_PROGRAM", "blitz"),
         ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
         ("COLORTERM", "truecolor"),
         ("FORCE_HYPERLINK", "1"),
+        // Claude Code draws ~~text~~ struck through only in terminals it
+        // knows, and blitz draws strikethrough.
+        ("CLAUDE_CODE_FORCE_STRIKETHROUGH", "1"),
         ("BLITZ_PANE_ID", id.as_str()),
+        ("WSLENV", wslenv.as_str()),
     ];
-    let sets = ours
-        .into_iter()
-        .chain(extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let sets = ours.into_iter().chain(
+        (extra.iter())
+            .filter(|(k, _)| !is_wslenv(k))
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
     for (k, v) in sets {
         let ku = k.to_ascii_uppercase();
         env.retain(|(e, _)| upper(e) != ku);
@@ -688,7 +768,12 @@ mod tests {
             // From the blitz pane this blitz was started in: its token is
             // that pane's, and the token is a secret.
             ("BLITZ_PANE_TOKEN", "0f1e"),
-            ("PROMPT", crate::shell::cmd_prompt("0f1e").as_str()),
+            ("PROMPT", crate::shell::cmd_prompt("0f1e", "$P$G").as_str()),
+            // In tmux or zellij, Claude Code stops turning the mark in its
+            // title.
+            ("TMUX", "/tmp/tmux-1000/default,1,0"),
+            ("TMUX_PANE", "%3"),
+            ("ZELLIJ", "0"),
         ]
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         let extra = [("Path".to_owned(), r"C:\other".to_owned())];
@@ -706,12 +791,14 @@ mod tests {
             ("=C:", r"C:\work"),
             ("ANTHROPIC_MODEL", "m"),
             ("BLITZ_PANE_ID", "7"),
+            ("CLAUDE_CODE_FORCE_STRIKETHROUGH", "1"),
             ("CLAUDE_CONFIG_DIR", "c"),
             ("COLORTERM", "truecolor"),
             ("FORCE_HYPERLINK", "1"),
             ("Path", r"C:\other"),
             ("TERM_PROGRAM", "blitz"),
             ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
+            ("WSLENV", &WSLENV.join(":")),
         ]
         .map(|(k, v)| (k.to_owned(), v.to_owned()));
         assert_eq!(got, want);
@@ -728,9 +815,57 @@ mod tests {
                 .map(|(_, v)| v.to_string_lossy().into_owned())
         };
         assert_eq!(prompt("$P$G$_", &[]).as_deref(), Some("$P$G$_"));
-        let ours = crate::shell::cmd_prompt("5eed");
+        let ours = crate::shell::cmd_prompt("5eed", "$P$G");
         let set = [("PROMPT".to_owned(), ours.clone())];
-        assert_eq!(prompt(&crate::shell::cmd_prompt("0f1e"), &set), Some(ours));
+        assert_eq!(
+            prompt(&crate::shell::cmd_prompt("0f1e", "$P$G"), &set),
+            Some(ours)
+        );
+    }
+
+    /// The pane's token reaches Claude Code in WSL, and a hook it runs gets
+    /// it back; what the user passes stays as they set it.
+    #[test]
+    fn wslenv_keeps_the_users_own() {
+        let ours = WSLENV.join(":");
+        assert_eq!(wslenv(None), ours);
+        assert_eq!(wslenv(Some("")), ours);
+        assert!(ours.starts_with("BLITZ_PANE_TOKEN:"), "{ours}");
+        assert_eq!(
+            wslenv(Some("USERPROFILE/p:")),
+            format!("USERPROFILE/p:{ours}")
+        );
+        let mine = "COLORTERM:BLITZ_PANE_TOKEN/w";
+        let got = wslenv(Some(mine));
+        assert!(got.starts_with(&format!("{mine}:TERM_PROGRAM/u:")), "{got}");
+        assert_eq!(got.matches("COLORTERM").count(), 1, "{got}");
+        assert_eq!(got.matches("BLITZ_PANE_TOKEN").count(), 1, "{got}");
+        let env = child_env([("WSLENV".into(), "GOPATH/l".into())], 1, &[]);
+        let set = (env.iter())
+            .find(|(k, _)| k == "WSLENV")
+            .map(|(_, v)| v.clone());
+        assert_eq!(set, Some(format!("GOPATH/l:{ours}").into()));
+        // An `env` line in the settings joins them the same way.
+        let extra = [("wslenv".to_string(), "GOPATH/l".to_string())];
+        let env = child_env([("WSLENV".into(), "X".into())], 1, &extra);
+        let set: Vec<_> = (env.iter())
+            .filter(|(k, _)| k.eq_ignore_ascii_case("WSLENV"))
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(set, [OsString::from(format!("GOPATH/l:{ours}"))]);
+    }
+
+    #[test]
+    fn a_fresh_path_takes_the_place_of_blitz_own() {
+        let vars = || {
+            [("PATH", r"C:\old"), ("TEMP", r"C:\t")]
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        };
+        let got: Vec<_> = with_path(vars(), Some(r"C:\new".into())).collect();
+        let want = [("TEMP", r"C:\t"), ("Path", r"C:\new")];
+        assert_eq!(got, want.map(|(k, v)| (k.into(), v.into())));
+        let kept: Vec<_> = with_path(vars(), None).collect();
+        assert_eq!(kept, vars());
     }
 
     #[test]
