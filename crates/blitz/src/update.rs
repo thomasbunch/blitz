@@ -27,9 +27,18 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// GitHub could not say.
 pub fn check() -> Result<Option<String>, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    // Someone is waiting on this one, so it gives up sooner.
+    // Someone is waiting on this one, so it gives up sooner. The answer
+    // is a few kilobytes, and all of it is held in memory.
     let accept = "Accept: application/vnd.github+json";
-    let body = curl(&["--max-time", "30", "-H", accept, &url])?;
+    let body = curl(&[
+        "--max-time",
+        "30",
+        "--max-filesize",
+        "1M",
+        "-H",
+        accept,
+        &url,
+    ])?;
     latest(&body, env!("CARGO_PKG_VERSION"))
 }
 
@@ -302,7 +311,8 @@ fn installer_name(v: &str) -> String {
 pub fn fetch(v: &str) -> Result<PathBuf, String> {
     let base = format!("https://github.com/{REPO}/releases/download/v{v}");
     let name = installer_name(v);
-    let sums = curl(&[&format!("{base}/SHA256SUMS.txt")])?;
+    let sums_url = format!("{base}/SHA256SUMS.txt");
+    let sums = curl(&["--max-time", "60", "--max-filesize", "1M", &sums_url])?;
     let sums = String::from_utf8_lossy(&sums);
     let want = sum_for(&sums, &name).ok_or("the release has no checksum for its installer")?;
     // A line that trickles just above the stall floor still ends: 64 MB in
