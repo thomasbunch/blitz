@@ -4059,7 +4059,7 @@ impl App {
                 v.pane.cmd = Default::default();
                 v.progress = None;
                 self.taskbar_progress();
-                self.attention(id, Ev::from_exit(code));
+                self.attention_told(id, Ev::from_exit(code), true);
                 // A clean exit or Ctrl+C closes the session; anything else
                 // stays up so the output can be read.
                 if matches!(code, 0 | 0xC000_013A) && self.args.selftest.is_none() {
@@ -4087,7 +4087,7 @@ impl App {
                 self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
             }
             Note::Dead => {
-                self.attention(id, Ev::Error { sticky: true });
+                self.attention_told(id, Ev::Error { sticky: true }, true);
                 self.set_notice(
                     id,
                     "this session stopped updating after an internal error",
@@ -4175,7 +4175,7 @@ impl App {
                     if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
                         self.hooks_hint(id, true);
                     }
-                    self.attention(id, ev);
+                    self.attention_told(id, ev, true);
                     if turn_ends(ev) {
                         self.find_branch(id);
                     }
@@ -4318,7 +4318,10 @@ impl App {
     /// While `keep_awake` is on and a session works, keeps the PC from going
     /// to sleep by itself; `powercfg /requests` says why.
     fn keep_awake(&mut self) {
-        let states = self.views.iter().map(|v| v.pane.attn.state);
+        let states = self
+            .views
+            .iter()
+            .map(|v| (v.pane.attn.state, v.pane.hooked));
         let on = stays_awake(self.config.keep_awake, states);
         if on == self.awake {
             return;
@@ -4355,8 +4358,17 @@ impl App {
 
     /// Feeds a session's attention state; flashes the taskbar button when
     /// it changes to something the user should see while looking away.
-    /// Returns true when the state changed.
+    /// Returns true when the state changed. Program output raised `ev`, so
+    /// it shows no Windows notification; see [`App::attention_told`].
     fn attention(&mut self, id: PaneId, ev: Ev) -> bool {
+        self.attention_told(id, ev, false)
+    }
+
+    /// [`App::attention`], `told` when blitz itself or the pane's hooks,
+    /// which carry its token, raised `ev`. Only then may a Windows
+    /// notification tell of it: any program can ring a bell, or name its
+    /// pane with a title, which the notification would show as blitz's.
+    fn attention_told(&mut self, id: PaneId, ev: Ev, told: bool) -> bool {
         // Back to work: blitz run ends when a session starts needing the
         // user. It closes first, so the focused pane is in view again for
         // the event, as if the game had never been open.
@@ -4380,7 +4392,8 @@ impl App {
         let changed = v.pane.attn.apply(ev, attended, now);
         let alert = (changed && away)
             .then(|| alert(v.pane.attn.state, &self.config, &mut v.alerted, now))
-            .flatten();
+            .flatten()
+            .map(|a| if told { a } else { from_output(a) });
         if untoasts(attended || ev == Ev::Attended, v.pane.attn.state) && v.toast.take().is_some() {
             crate::notify::untoast(id);
         }
@@ -6162,10 +6175,17 @@ fn alert(state: Attn, c: &Config, last: &mut Option<Instant>, now: Instant) -> O
     Some(a)
 }
 
+/// An alert `a` for something program output did: the flash, the badge and
+/// the sound, but no notification, whose text that output would choose.
+fn from_output(a: Alert) -> Alert {
+    Alert { toast: false, ..a }
+}
+
 /// Whether blitz keeps the PC awake: `keep_awake` is on and one of
-/// `states` is working.
-fn stays_awake(keep_awake: bool, mut states: impl Iterator<Item = Attn>) -> bool {
-    keep_awake && states.any(|s| s == Attn::Working)
+/// `states` is working, as its pane's hooks say. A title alone says so
+/// too, but any program can print one and keep it up.
+fn stays_awake(keep_awake: bool, mut states: impl Iterator<Item = (Attn, bool)>) -> bool {
+    keep_awake && states.any(|(s, hooked)| hooked && s == Attn::Working)
 }
 
 /// The session a jump goes to: the one waiting longest among those that
@@ -9341,12 +9361,26 @@ mod tests {
     #[test]
     fn app_keeps_the_pc_awake_only_while_a_session_works_and_if_asked() {
         use Attn::*;
-        let awake = |on, s: &[Attn]| stays_awake(on, s.iter().copied());
+        let awake = |on, s: &[Attn]| stays_awake(on, s.iter().map(|&s| (s, true)));
         assert!(awake(true, &[Idle, Working, NeedsYou]));
         assert!(!awake(false, &[Working]), "off by default");
         assert!(!awake(true, &[]));
         // Waiting for the user is not working.
         assert!(!awake(true, &[NeedsYou, DoneUnseen, Error, Idle]));
+        // A title any output can print does not keep it awake by itself.
+        assert!(!stays_awake(true, [(Working, false)].into_iter()));
+    }
+
+    /// A bell, or a notification without the pane's token, flashes and
+    /// badges, but raises no Windows notification in blitz's name.
+    #[test]
+    fn app_output_alone_never_raises_a_notification() {
+        let now = Instant::now();
+        let a = alert(Attn::NeedsYou, &Config::default(), &mut None, now).expect("an alert");
+        assert!(a.toast);
+        let heard = from_output(a);
+        assert!(!heard.toast);
+        assert_eq!(heard.flashes, 3);
     }
 
     #[test]
