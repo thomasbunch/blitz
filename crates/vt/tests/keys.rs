@@ -486,6 +486,48 @@ fn kitty_keys_event_types() {
 fn kitty_keys_without_disambiguate_stay_legacy() {
     assert_eq!(enc(&k("c", Key::Char('c'), "c"), &kitty(4)), "\x03");
     assert_eq!(enc(&k("", Key::Escape, ""), &kitty(2)), "\x1b");
+    // And with win32-input-mode on they stay console records.
+    let a = key(0x41, 30, 97, "", Key::Char('a'), "a");
+    let both = InputModes {
+        kitty: 2 | 4,
+        ..W32IM
+    };
+    assert_eq!(enc(&a, &both), "\x1b[65;30;97;1;0;1_");
+}
+
+#[test]
+fn kitty_keys_releases_and_repeats() {
+    let all = kitty(1 | 2 | 8);
+    assert_eq!(enc(&up(k("s", Key::Enter, "")), &all), "\x1b[13;2:3u");
+    assert_eq!(enc(&up(k("c", Key::Backspace, "")), &all), "\x1b[127;5:3u");
+    assert_eq!(enc(&up(k("", Key::F(5), "")), &all), "\x1b[15;1:3~");
+    // KeyInput carries no repeat flag, so a repeat goes out as a press.
+    let mut held = k("c", Key::Char('a'), "a");
+    held.repeat = 3;
+    assert_eq!(enc(&held, &kitty(1 | 2)), "\x1b[97;5u");
+}
+
+#[test]
+fn kitty_keys_modifier_and_lock_keys() {
+    let m = kitty(8);
+    let mut ralt = key(0x12, 0x38, 0, "g", Key::Alt, "");
+    ralt.extended = true;
+    for (input, want) in [
+        (key(0x11, 0x1d, 0, "c", Key::Control, ""), "\x1b[57442;5u"),
+        (key(0xa2, 0x1d, 0, "c", Key::Control, ""), "\x1b[57442;5u"),
+        (key(0x12, 0x38, 0, "a", Key::Alt, ""), "\x1b[57443;3u"),
+        (ralt, "\x1b[57449;3u"),
+        (key(0x5b, 0x5b, 0, "w", Key::Super, ""), "\x1b[57444;9u"),
+        (key(0x5c, 0x5c, 0, "w", Key::Super, ""), "\x1b[57450;9u"),
+        (key(0xa1, 0x36, 0, "s", Key::Shift, ""), "\x1b[57447;2u"),
+        (key(0x91, 0x46, 0, "", Key::Other, ""), "\x1b[57359u"),
+        (key(0x90, 0x45, 0, "", Key::Other, ""), "\x1b[57360u"),
+        (key(0x5d, 0x5d, 0, "", Key::Other, ""), ""),
+    ] {
+        assert_eq!(enc(&input, &m), want, "{input:?}");
+        // Without all keys as escape codes they send nothing.
+        assert_eq!(enc(&input, &kitty(1)), "", "{input:?}");
+    }
 }
 
 #[test]
@@ -670,6 +712,13 @@ fn interrupt_keys_stay_console_records() {
         enc(&key(0x43, 46, 3, "ca", Key::Char('c'), ""), &both),
         "\x1b[99;7u"
     );
+    // Shift or Super on top still interrupts, as conhost sees Ctrl+C.
+    let cs_c = key(0x43, 46, 3, "cs", Key::Char('c'), "C");
+    assert_eq!(enc(&cs_c, &both), "\x1b[67;46;3;1;24;1_");
+    let cw_c = key(0x43, 46, 3, "cw", Key::Char('c'), "c");
+    assert_eq!(enc(&cw_c, &both), "\x1b[67;46;3;1;8;1_");
+    // Without win32-input-mode there is no console record to keep.
+    assert_eq!(enc(&ctrl_c, &kitty(1)), "\x1b[99;5u");
 }
 
 #[test]
@@ -699,6 +748,27 @@ fn win32_input_mode_keys_send_every_transition() {
     given.cs = 0x20;
     given.repeat = 3;
     assert_eq!(enc(&given, &W32IM), "\x1b[65;30;97;1;32;3_");
+
+    // Each control-key-state bit: RIGHT_ALT 1, LEFT_ALT 2, RIGHT_CTRL 4,
+    // LEFT_CTRL 8, SHIFT 16, NUMLOCK 32, SCROLLLOCK 64, CAPSLOCK 128,
+    // ENHANCED_KEY 256. A repeat count of 0 is sent as 1.
+    let mut right = key(0x41, 30, 97, "", Key::Char('a'), "a");
+    right.mods = Mods {
+        rctrl: true,
+        rshift: true,
+        ..Mods::default()
+    };
+    right.locks.scroll = true;
+    right.repeat = 0;
+    assert_eq!(enc(&right, &W32IM), "\x1b[65;30;97;1;84;1_");
+    right.mods = Mods {
+        ralt: true,
+        lalt: true,
+        ..Mods::default()
+    };
+    right.locks = Locks::default();
+    right.extended = true;
+    assert_eq!(enc(&right, &W32IM), "\x1b[65;30;97;1;259;1_");
 }
 
 #[test]
