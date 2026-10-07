@@ -4425,18 +4425,31 @@ fn changed(saved: Option<&session::State>, now: &session::State) -> bool {
 
 /// Where the window goes back to next time, after it moved or changed size
 /// from `was` to `now`. Minimized or full screen is no place to go back to.
-/// Maximized keeps the place it was maximized from, on the monitor it was
-/// maximized on.
+/// Maximized keeps the place it was maximized from, moved to the middle of
+/// the monitor it is maximized on when it is not there, as after
+/// Win+Shift+Arrow.
 fn placement(was: Geometry, now: Geometry, minimized: bool, fullscreen: bool) -> Geometry {
     if minimized || fullscreen {
-        was
-    } else if now.maximized {
-        Geometry {
-            maximized: true,
-            ..was
-        }
-    } else {
-        now
+        return was;
+    }
+    if !now.maximized {
+        return now;
+    }
+    let (cx, cy) = (was.x + was.w as i32 / 2, was.y + was.h as i32 / 2);
+    let there =
+        (now.x..now.x + now.w as i32).contains(&cx) && (now.y..now.y + now.h as i32).contains(&cy);
+    let was = Geometry {
+        maximized: true,
+        ..was
+    };
+    if there {
+        return was;
+    }
+    let mid = |at: i32, room: u32, size: u32| at + (room as i32 - size as i32).max(0) / 2;
+    Geometry {
+        x: mid(now.x, now.w, was.w),
+        y: mid(now.y, now.h, was.h),
+        ..was
     }
 }
 
@@ -6018,6 +6031,11 @@ mod tests {
         );
         let back = placement(maxed, at(2100, 100, 800, 600, false), false, false);
         assert_eq!(back, moved, "restored");
+        // Win+Shift+Left takes the maximized window to the first monitor.
+        let left = placement(maxed, at(-8, -8, 1936, 1056, true), false, false);
+        assert_eq!(left, at(560, 220, 800, 600, true));
+        let again = placement(left, at(-8, -8, 1936, 1056, true), false, false);
+        assert_eq!(again, left, "already there");
     }
 
     /// The smallest window still has room for the rail or the sidebar and
