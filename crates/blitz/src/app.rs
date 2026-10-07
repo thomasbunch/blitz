@@ -2246,7 +2246,8 @@ impl App {
     }
 
     /// Says `text` dimly in pane `id`, which nobody asked for, until
-    /// `until`, unless a question or an error waits there. Whether it did.
+    /// `until`, unless a question, an error or a plain notice waits there.
+    /// Whether it did.
     fn hint(&mut self, id: PaneId, text: impl Into<String>, until: Instant) -> bool {
         let shown =
             (self.view_mut(id)).is_some_and(|v| hint_into(&mut v.notice, text.into(), until));
@@ -4286,9 +4287,10 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
 
 /// Puts a hint nobody asked for in a pane's notice `slot`, dim until
 /// `until`, unless a question or an error waits there, which it would
-/// take the place of. Whether it did.
+/// take the place of. Whether it did. Only another dim hint gives way:
+/// a plain notice may be the one word that a session was lost.
 fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
-    let fits = slot.as_ref().is_none_or(|n| n.ask == Ask::Nothing);
+    let fits = slot.as_ref().is_none_or(|n| n.ask == Ask::Nothing && n.dim);
     if fits {
         *slot = Some(Notice {
             text,
@@ -6055,9 +6057,9 @@ mod tests {
         }
     }
 
-    /// A passing hint leaves a question or an error where it is, and says
-    /// so, to be tried again; an exited program's line comes back once a
-    /// notice over it goes.
+    /// A passing hint leaves a question, an error or a plain notice where
+    /// it is, and says so, to be tried again; an exited program's line
+    /// comes back once a notice over it goes.
     #[test]
     fn notices_over_questions_and_exits() {
         let notice = |ask, dim| Notice {
@@ -6075,7 +6077,7 @@ mod tests {
                 ("hint", Some(until), true)
             );
         }
-        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit] {
+        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit, Ask::Nothing] {
             let mut slot = Some(notice(ask.clone(), false));
             assert!(!hint_into(&mut slot, "hint".into(), until));
             assert!(slot.is_some_and(|n| n.ask == ask && n.text == "n"));
