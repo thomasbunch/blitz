@@ -300,12 +300,13 @@ Ctrl+C copies the selection while it is in view; scrolled out of view,
 Ctrl+C goes to the program as usual. Ctrl+Shift+C and Ctrl+Insert copy
 it either way, and with nothing selected Ctrl+Shift+C never reaches the
 program as Ctrl+C. When output rewrites a selection, the next copy
-still takes the text as it was, and says so; anything else you do drops
-it. A dim line says how many lines were copied; if another program is
-holding the clipboard, the selection stays so you can copy again.
-**Copy without indent** in the command palette leaves out the marks
-Claude Code puts before replies and tool output, and the indent the
-lines share.
+still takes the text as it was, and says so, though plain Ctrl+C goes
+to the program, as nothing shows; anything else you do drops it. A dim
+line says how many lines were copied; if another program is holding
+the clipboard, the selection stays so you can copy again. **Copy
+without indent** in the command palette leaves out the marks Claude
+Code puts before replies and tool output, and the indent the lines
+share.
 
 Holding Ctrl underlines the link under the pointer: a hyperlink a
 program printed, a web address, or the path of a file that exists,
@@ -326,7 +327,7 @@ fullscreen, clicks and the wheel go to it, and the pointer is an arrow
 rather than an I-beam. Hold Shift as well to use blitz's: Shift+drag
 selects, Ctrl+Shift+click opens a link, and Shift+right-click copies or
 pastes. Over a full-screen program, such as less or man, the wheel
-presses the arrow keys when the program asks for that, but never in
+presses the arrow keys unless the program turns that off, but never in
 Claude Code, where they would bring back an earlier prompt.
 
 ## Paste and drop
@@ -339,19 +340,20 @@ that does not. Claude Code never asks once its hooks have reported.
 Nothing is pasted into a pane whose program has exited.
 
 Files copied in Explorer paste as their paths, in quotes when they hold
-a space, and so do files dropped on a pane. A folder dropped on the
-sidebar opens in a new tab. Windows does not let you drop from Explorer
-onto blitz running as administrator. With an image on the clipboard and
-no text, such as a screenshot, Ctrl+V in a Claude Code pane whose hooks
-have reported sends Alt+V, which pastes the image; other programs get
-Ctrl+V.
+a space or anything else a shell would read, and so do files dropped on
+a pane. A folder dropped on the sidebar opens in a new tab. Windows
+does not let you drop from Explorer onto blitz running as
+administrator. With an image on the clipboard and no text, such as a
+screenshot, Ctrl+V in a Claude Code pane whose hooks have reported
+sends Alt+V, which pastes the image; other programs get Ctrl+V.
 
 In the find bar, the command palette, the theme picker and the settings
 panel, a paste adds the first line of the clipboard and Ctrl+Backspace
 deletes a word.
 
 Programs can copy to the clipboard with OSC 52, as tmux and Neovim do
-over SSH, and the pane says so. They cannot read it.
+over SSH, and the pane says so. Only the pane you are in can, while
+blitz is in front, and no program can read the clipboard.
 
 ## Find and prompts
 
@@ -362,7 +364,8 @@ ignoring case unless what you type has a capital letter, and shows every
 match in view in the selection colour, the current one outlined. Enter
 or F3 goes to the next match up, Shift+Enter or Shift+F3 to the next one
 down, and Esc closes the bar, leaving the view where it is and the match
-selected, so Ctrl+C copies it. Any other shortcut does what it does and
+selected, so Ctrl+C copies it. Esc before you type or move puts the view
+back and selects nothing. Any other shortcut does what it does and
 closes the bar, unless it scrolls, and a click in the pane closes it
 too. A full-screen program is searched on its screen only, as the bar
 says.
@@ -473,7 +476,7 @@ The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
 
 A binding can also type text into the focused pane: `text:` and the
 text, with `\e` for Esc, `\r` for Enter, `\n`, `\t`, `\s` for a space,
-`\` for a backslash and `\xNN` for any byte. Put the line in single
+`\\` for a backslash and `\xNN` for any byte. Put the line in single
 quotes to keep a `#` in the text.
 
 ```
