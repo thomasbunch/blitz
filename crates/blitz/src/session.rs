@@ -36,6 +36,7 @@ pub struct Geometry {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TabState {
+    /// The name the user gave the tab; empty for none.
     pub name: String,
     /// Leaf indexes in tree order, `a` before `b`, since PaneIds are new
     /// every run.
@@ -266,7 +267,13 @@ pub fn to_json(s: &State) -> String {
         }
         out.push_str("{\"name\":\"");
         escape_json(&t.name, &mut out);
-        let _ = write!(out, "\",\"focus\":{},\"zoom\":", t.focus);
+        out.push('"');
+        // Files from before tabs could be named hold the folder a tab
+        // started in, which is no name the user gave.
+        if !t.name.is_empty() {
+            out.push_str(",\"named\":true");
+        }
+        let _ = write!(out, ",\"focus\":{},\"zoom\":", t.focus);
         match t.zoom {
             Some(z) => {
                 let _ = write!(out, "{z}");
@@ -357,8 +364,10 @@ pub fn from_json(s: &str) -> Option<State> {
         if focus >= n || zoom.is_some_and(|z| z >= n) {
             return None;
         }
+        let name = t.get("name")?.as_str()?;
+        let named = flag(t.get("named")) == Some(true);
         tabs.push(TabState {
-            name: t.get("name")?.as_str()?.into(),
+            name: if named { name.into() } else { String::new() },
             focus,
             zoom,
             root,
@@ -640,6 +649,21 @@ mod tests {
         let lines = json.replace(r#"Fixed the \"login\" bug."#, r"one\ntwo\u0007");
         let read = from_json(&lines).expect("still a session");
         assert_eq!(done(&read)[2].as_deref(), Some("one two"));
+    }
+
+    /// A tab keeps a name the user gave it; one from an older file, which
+    /// is only the folder it started in, is dropped so the tab follows its
+    /// pane.
+    #[test]
+    fn only_names_the_user_gave_stay() {
+        let mut s = sample();
+        s.tabs[0].name = String::new();
+        let json = to_json(&s);
+        assert!(json.contains(r#""name":"","focus""#), "{json}");
+        assert_eq!(from_json(&json), Some(s.clone()));
+        let old = to_json(&sample()).replace(",\"named\":true", "");
+        let read = from_json(&old).expect("reads");
+        assert!(read.tabs.iter().all(|t| t.name.is_empty()));
     }
 
     #[test]

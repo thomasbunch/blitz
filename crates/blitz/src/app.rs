@@ -1099,7 +1099,7 @@ impl App {
                 None => std::env::current_dir().ok(),
             };
             let id = PaneId(self.next_id);
-            win.tabs.push(Tab::new(tab_name(cwd.as_deref()), id));
+            win.tabs.push(Tab::new(String::new(), id));
             win.active = win.tabs.len() - 1;
             let cmd = self.args.cmd.clone();
             self.open(win, id, cmd.as_deref(), cwd)?;
@@ -1299,12 +1299,12 @@ impl App {
     fn add(
         &mut self,
         dir: Option<PathBuf>,
-        place: impl FnOnce(&mut layout::Window, PaneId, Option<&Path>) -> bool,
+        place: impl FnOnce(&mut layout::Window, PaneId) -> bool,
     ) {
         let cwd = dir.or_else(|| start_dir(self.current().map_or("", |v| v.pane.cwd.as_str())));
         let id = PaneId(self.next_id);
         let mut win = self.win.clone();
-        if !place(&mut win, id, cwd.as_deref()) {
+        if !place(&mut win, id) {
             return;
         }
         if let Err(e) = self.open(win, id, None, cwd)
@@ -1933,15 +1933,14 @@ impl App {
 
     /// Every session as the sidebar shows it.
     fn sessions(&self) -> Vec<chrome::Session> {
-        self.views
-            .iter()
+        let mut list: Vec<chrome::Session> = (self.views.iter())
             .map(|v| {
                 let p = &v.pane;
+                let (name, msg) = label(&p.name, &p.title, p.claude_title.is_some(), &p.msg);
                 chrome::Session {
                     id: p.id,
-                    // Programs set the rest of the row, so the session's
-                    // number is what tells two look-alike sessions apart.
-                    name: format!("{} {}", p.name, p.id.0),
+                    name,
+                    num: None,
                     cwd: p.cwd.clone(),
                     branch: p.branch.clone(),
                     state: p.attn.state,
@@ -1949,19 +1948,14 @@ impl App {
                     turn: p.attn.turn,
                     took: p.attn.took,
                     seen: p.attn.seen,
-                    msg: if p.msg.is_empty() {
-                        // Without the mark Claude Code puts in front.
-                        claude_title(&p.title)
-                            .map_or(&p.title[..], |c| c.1)
-                            .to_owned()
-                    } else {
-                        p.msg.clone()
-                    },
+                    msg,
                     progress: v.progress.map(|p| p.0),
                     exit_code: p.exit_code,
                 }
             })
-            .collect()
+            .collect();
+        chrome::number_twins(&mut list);
+        list
     }
 
     /// Builds the renderer and swap chain if there are none. Never panics:
@@ -2339,7 +2333,7 @@ impl App {
                 } else {
                     Dir::Down
                 };
-                self.add(None, |win, id, _| {
+                self.add(None, |win, id| {
                     // Only the pane minimum matters, and `open` checks that
                     // against the real window.
                     let any = Rect {
@@ -3876,22 +3870,33 @@ fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
 
-/// Puts pane `id` in a new tab after the others and shows that tab.
-fn new_tab(win: &mut layout::Window, id: PaneId, cwd: Option<&Path>) -> bool {
-    win.tabs.push(Tab::new(tab_name(cwd), id));
+/// Puts pane `id` in a new tab after the others and shows that tab. It
+/// goes by the folder of its focused pane until the user names it.
+fn new_tab(win: &mut layout::Window, id: PaneId) -> bool {
+    win.tabs.push(Tab::new(String::new(), id));
     win.active = win.tabs.len() - 1;
     true
 }
 
-/// A new tab is named after the folder it starts in.
-fn tab_name(cwd: Option<&Path>) -> String {
-    let name = cwd.map(|p| match p.file_name() {
-        Some(n) => n.to_string_lossy().into_owned(),
-        // A drive root.
-        None => p.display().to_string(),
-    });
-    name.filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "shell".into())
+/// What the sidebar calls a session, and the message under its name.
+/// Claude Code's title names the task, and Claude's /rename changes it;
+/// `claude` says the title has its mark. Other programs keep their name,
+/// as a shell's title is often only its exe's path; their title shows as
+/// the message when there is none.
+fn label(program: &str, title: &str, claude: bool, msg: &str) -> (String, String) {
+    // Without the mark Claude Code puts in front.
+    let task = claude_title(title).map_or(title, |c| c.1);
+    let name = if claude && !task.is_empty() {
+        task
+    } else {
+        program
+    };
+    let msg = match msg {
+        "" if claude => "",
+        "" => task,
+        m => m,
+    };
+    (name.to_owned(), msg.to_owned())
 }
 
 /// Takes a fresh snapshot of `term` into `snap`. Returns false when that
@@ -5037,9 +5042,28 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         assert_eq!(got, home);
         assert_eq!(start_dir(""), home);
-        assert_eq!(tab_name(Some(Path::new(r"C:\dev\shop"))), "shop");
-        assert_eq!(tab_name(Some(Path::new(r"C:\"))), r"C:\");
-        assert_eq!(tab_name(None), "shell");
+    }
+
+    #[test]
+    fn app_claude_sessions_go_by_their_task() {
+        let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
+        let l = |title, claude, msg| label("pwsh", title, claude, msg);
+        let s = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(l(pwsh, false, ""), s("pwsh", pwsh));
+        assert_eq!(
+            l("\u{2733} Fix the login", true, ""),
+            s("Fix the login", "")
+        );
+        assert_eq!(
+            l("\u{25D0} Fix the login", true, "Done."),
+            s("Fix the login", "Done.")
+        );
+        assert_eq!(l("\u{2733} ", true, ""), s("pwsh", ""));
+        // Claude Code has exited, but its title has not changed yet.
+        assert_eq!(
+            l("\u{2733} Fix the login", false, ""),
+            s("pwsh", "Fix the login")
+        );
     }
 
     #[test]

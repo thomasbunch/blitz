@@ -15,6 +15,9 @@ use crate::theme::{Theme, Ui};
 pub struct Session {
     pub id: PaneId,
     pub name: String,
+    /// Set when another session has the same name: this one's number,
+    /// drawn dimmer after it to tell them apart.
+    pub num: Option<u32>,
     pub cwd: String,
     pub branch: Option<String>,
     pub state: Attn,
@@ -265,6 +268,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
     };
     let p = &mut out.prims;
     let text = |p: &mut Vec<Prim>, x, y, t: &str, color, bold| {
+        if t.is_empty() {
+            return;
+        }
         p.push(Prim::Text {
             x,
             y,
@@ -341,14 +347,16 @@ pub fn build(m: &ChromeModel) -> Chrome {
             let x = r.x + s(14.0);
             let right = r.right() - s(14.0);
             if let Some(x2) = sess {
-                let name = fit(&x2.name, right - x, tw);
+                let (name, num) = name_parts(x2, right - x, tw);
                 let (nc, cc) = if focused {
                     (c.name, c.dim)
                 } else {
                     (c.hdr_name, c.hdr_cwd)
                 };
                 text(p, x, ty, &name, nc, focused);
-                let cx = x + text_w(&name, tw) + s(8.0);
+                let nx = x + text_w(&name, tw);
+                text(p, nx, ty, &num, cc, false);
+                let cx = nx + text_w(&num, tw) + s(8.0);
                 let room = right - s(15.0) - cx;
                 text(p, cx, ty, &fit_left(&x2.cwd, room, tw), cc, false);
             }
@@ -374,10 +382,12 @@ pub fn build(m: &ChromeModel) -> Chrome {
         }
         if multi && !expanded {
             if let Some(x) = sess {
-                let label = fit(&x.name, r.w / 2, tw);
+                let (label, num) = name_parts(x, r.w / 2, tw);
                 let color = if focused { c.label_focus } else { c.label };
-                let lx = r.right() - s(16.0) - text_w(&label, tw);
-                text(p, lx, r.bottom() - s(10.0) - th, &label, color, false);
+                let nx = r.right() - s(16.0) - text_w(&num, tw);
+                let (lx, ly) = (nx - text_w(&label, tw), r.bottom() - s(10.0) - th);
+                text(p, lx, ly, &label, color, false);
+                text(p, nx, ly, &num, c.dim, false);
             }
             if state == Attn::NeedsYou {
                 let b = s(2.0);
@@ -445,7 +455,12 @@ pub fn build(m: &ChromeModel) -> Chrome {
             let gy = y + (gh - th) / 2;
             let count = list.len().to_string();
             let cx = gr - text_w(&count, tw);
-            let name = fit(&t.name, cx - s(16.0) - gx, tw);
+            // A tab nobody named is called after where its focused pane is.
+            let named = match t.name.as_str() {
+                "" => folder_name(session(t.focus).map_or("", |x| &x.cwd)),
+                n => n.to_owned(),
+            };
+            let name = fit(&named, cx - s(16.0) - gx, tw);
             let nc = if ti == m.win.active { c.msg } else { c.dim };
             text(p, gx, gy, &name, nc, false);
             text(p, cx, gy, &count, c.dim, false);
@@ -523,14 +538,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     text(p, wx, ty, &word, c.dim, false);
                     wx
                 };
-                text(
-                    p,
-                    left,
-                    ty,
-                    &fit(&x.name, state_x - s(8.0) - left, tw),
-                    c.name,
-                    true,
-                );
+                let (name, num) = name_parts(x, state_x - s(8.0) - left, tw);
+                text(p, left, ty, &name, c.name, true);
+                text(p, left + text_w(&name, tw), ty, &num, c.dim, false);
                 ly += l1 + gap;
                 // Line 2: directory and branch.
                 let ty = ly + (l2 - th) / 2;
@@ -1213,6 +1223,33 @@ fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
     lines.into_iter().map(|l| fit(&l, max, cw)).collect()
 }
 
+/// A session's name cut to fit `max` pixels, and after it its number when
+/// another session has the same name, or else nothing.
+fn name_parts(x: &Session, max: i32, cw: i32) -> (String, String) {
+    let num = x.num.map(|n| format!(" {n}")).unwrap_or_default();
+    (fit(&x.name, max - text_w(&num, cw), cw), num)
+}
+
+/// Numbers the sessions that share a name with another, so the sidebar
+/// can tell them apart; the rest go without.
+pub fn number_twins(sessions: &mut [Session]) {
+    for i in 0..sessions.len() {
+        let twin = (sessions.iter().enumerate()).any(|(j, x)| j != i && x.name == sessions[i].name);
+        sessions[i].num = twin.then_some(sessions[i].id.0);
+    }
+}
+
+/// What a tab nobody named is called: the last folder of `cwd`, a drive
+/// root as it is, or `shell` with none. Either slash separates folders.
+pub fn folder_name(cwd: &str) -> String {
+    let leaf = (cwd.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next()).unwrap_or("");
+    match leaf {
+        "" => "shell".into(),
+        l if l.ends_with(':') => cwd.into(),
+        l => l.into(),
+    }
+}
+
 /// The stroke of a needs-you mark: filled until the user has seen the
 /// question, then a ring until they answer it.
 fn ring(x: Option<&Session>) -> f32 {
@@ -1411,6 +1448,7 @@ mod tests {
         Session {
             id: PaneId(id),
             name: name.into(),
+            num: None,
             cwd: format!(r"C:\dev\{name}"),
             branch: Some("main".into()),
             state,
@@ -1539,6 +1577,68 @@ mod tests {
         assert_eq!(strokes(&sessions), [1.5; 3]);
         let c = build(&model(&win, &sessions, now));
         assert!(texts(&c).contains(&"needs you \u{b7} 1m"));
+    }
+
+    /// Sessions that share a name are told apart by a dim number; the
+    /// rest show their name alone.
+    #[test]
+    fn twins_get_their_numbers() {
+        let now = Instant::now();
+        let mut s = vec![
+            session(1, "Claude Code", Attn::Idle, now),
+            session(2, "pwsh", Attn::Idle, now),
+            session(3, "Claude Code", Attn::Idle, now),
+        ];
+        number_twins(&mut s);
+        let nums: Vec<_> = s.iter().map(|x| x.num).collect();
+        assert_eq!(nums, [Some(1), None, Some(3)]);
+        s[2].name = "Fix the login".into();
+        number_twins(&mut s);
+        assert!(s.iter().all(|x| x.num.is_none()));
+
+        let (win, mut sessions, now) = fleet(true);
+        sessions[1].name = "api".into();
+        number_twins(&mut sessions);
+        let c = build(&model(&win, &sessions, now));
+        let dim = crate::theme::blitz(false).ui.dim;
+        let nums: Vec<_> = (c.prims.iter())
+            .filter_map(|p| match p {
+                Prim::Text { text, color, .. } if text.starts_with(' ') => {
+                    Some((text.as_str(), *color))
+                }
+                _ => None,
+            })
+            .collect();
+        // The focused pane's header and the two sidebar rows.
+        assert!(
+            nums.contains(&(" 1", dim)) && nums.contains(&(" 2", dim)),
+            "{nums:?}"
+        );
+        assert!(texts(&c).iter().filter(|t| **t == "api").count() >= 4);
+    }
+
+    /// A tab nobody named follows the folder of its focused pane.
+    #[test]
+    fn unnamed_tabs_follow_the_focused_folder() {
+        let (mut win, mut sessions, now) = fleet(true);
+        win.tabs[0].name = String::new();
+        sessions[0].cwd = r"C:\dev\shop\api".into();
+        let heads = |win: &Window, sessions: &[Session]| {
+            let c = build(&model(win, sessions, now));
+            texts(&c).iter().map(|t| t.to_string()).collect::<Vec<_>>()
+        };
+        assert!(heads(&win, &sessions).contains(&"api".to_owned()));
+        win.tabs[0].focus = PaneId(2);
+        sessions[1].cwd = r"C:\dev\shop\web\src".into();
+        assert!(heads(&win, &sessions).contains(&"src".to_owned()));
+        // A name the user gave stays.
+        win.tabs[0].name = "shop".into();
+        assert!(heads(&win, &sessions).contains(&"shop".to_owned()));
+        assert_eq!(folder_name(r"C:\dev\shop"), "shop");
+        assert_eq!(folder_name(r"C:\dev\shop\"), "shop");
+        assert_eq!(folder_name("/home/me/shop"), "shop");
+        assert_eq!(folder_name(r"C:\"), r"C:\");
+        assert_eq!(folder_name(""), "shell");
     }
 
     #[test]

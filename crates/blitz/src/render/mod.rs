@@ -808,6 +808,7 @@ mod gpu {
         let session = |id, name: &str, cwd: &str, branch: &str, state, msg: &str| Session {
             id,
             name: name.into(),
+            num: None,
             cwd: cwd.into(),
             branch: Some(branch.into()),
             state,
