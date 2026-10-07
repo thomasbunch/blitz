@@ -5,7 +5,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, Prefix};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::attention::{Command, PaneAttn};
 use crate::layout::PaneId;
@@ -68,8 +68,24 @@ pub enum Note {
     Dirty,
     /// The child exited with this code.
     Exit(u32),
-    /// Parsing panicked; the pane no longer updates.
+    /// Parsing panicked, and the screen started over blank.
+    Reset,
+    /// Parsing panicked once too often; the pane no longer updates.
     Dead,
+}
+
+/// A pane gives up on its output at the [`MAX_PANICS`]th parser panic
+/// within this long.
+const PANIC_WINDOW: Duration = Duration::from_secs(60);
+const MAX_PANICS: usize = 3;
+
+/// Notes a parser panic at `now` in `times`, the recent ones. True when it
+/// is one too many: output that keeps panicking would otherwise blank the
+/// screen over and over.
+fn gives_up(times: &mut Vec<Instant>, now: Instant) -> bool {
+    times.retain(|&t| now.saturating_duration_since(t) < PANIC_WINDOW);
+    times.push(now);
+    times.len() >= MAX_PANICS
 }
 
 /// Locks a mutex even if a thread panicked while holding it: a half
@@ -116,13 +132,12 @@ impl Pane {
         let dirty = Arc::new(AtomicBool::new(false));
         let (t, d) = (term.clone(), dirty.clone());
         let mut dead = false;
+        let mut panics = Vec::new();
         let mut replies = Vec::new();
-        let on_event = move |ev: PtyEvent<'_>, w: &crate::pty::Writer| {
-            if dead {
-                return;
-            }
-            let r = catch_unwind(AssertUnwindSafe(|| match ev {
-                PtyEvent::Data(bytes) => {
+        let on_event = move |ev: PtyEvent<'_>, w: &crate::pty::Writer| match ev {
+            PtyEvent::Data(_) if dead => {}
+            PtyEvent::Data(bytes) => {
+                let r = catch_unwind(AssertUnwindSafe(|| {
                     for chunk in bytes.chunks(FEED_BYTES) {
                         let mut term = lock(&t);
                         term.feed(chunk);
@@ -136,23 +151,36 @@ impl Pane {
                     if !d.swap(true, Ordering::AcqRel) {
                         notify(id, Note::Dirty);
                     }
+                }));
+                if r.is_err() {
+                    dead = gives_up(&mut panics, Instant::now());
+                    replies.clear();
+                    // The panic may have left the screen half updated, and
+                    // the UI thread reads it every frame. A fresh one the
+                    // program can draw on again takes its place; once the
+                    // pane gives up, a blank one, 1x1 until the next resize
+                    // so it never draws past the pane.
+                    let mut term = lock(&t);
+                    if dead {
+                        *term = vt::Terminal::new(vt::Options {
+                            cols: 1,
+                            rows: 1,
+                            ..Default::default()
+                        });
+                    } else {
+                        term.reset();
+                    }
+                    drop(term);
+                    // The panic may have come before the UI heard of the
+                    // output, which would then never be drawn.
+                    d.store(false, Ordering::Release);
+                    notify(id, if dead { Note::Dead } else { Note::Reset });
                 }
-                PtyEvent::Exit(code) => {
-                    lock(&t).on_child_exit();
-                    notify(id, Note::Exit(code));
-                }
-            }));
-            if r.is_err() {
-                dead = true;
-                // The panic may have left the screen half updated, and the UI
-                // thread reads it every frame. A blank one takes its place,
-                // 1x1 until the next resize so it never draws past the pane.
-                *lock(&t) = vt::Terminal::new(vt::Options {
-                    cols: 1,
-                    rows: 1,
-                    ..Default::default()
-                });
-                notify(id, Note::Dead);
+            }
+            // Even a pane that gave up reports the exit, so it can close.
+            PtyEvent::Exit(code) => {
+                let _ = catch_unwind(AssertUnwindSafe(|| lock(&t).on_child_exit()));
+                notify(id, Note::Exit(code));
             }
         };
         let mut env = s.env.to_vec();
@@ -280,8 +308,8 @@ fn read_start(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     #[test]
     fn pane_program_names() {
@@ -407,15 +435,16 @@ mod tests {
         assert!(text.contains("pane-7"), "screen: {text:?}");
     }
 
-    /// After a panic on the reader thread the UI never sees the screen it
-    /// was updating.
-    #[test]
-    fn pane_drops_its_screen_after_a_panic() {
+    /// Runs `cmdline` in a pane whose parsing panics on the first `panics`
+    /// batches of output, and returns what the pane told the UI up to the
+    /// exit, the exit included.
+    fn panicking(cmdline: &str, panics: usize) -> (Pane, Vec<Note>) {
         let (tx, rx) = mpsc::channel();
+        let left = AtomicUsize::new(panics);
         let pane = Pane::spawn(
             PaneId(8),
             &Spawn {
-                cmdline: "cmd.exe /d /c echo pane-output",
+                cmdline,
                 env: &[],
                 cwd: None,
                 cols: 40,
@@ -428,16 +457,64 @@ mod tests {
                 restored: &[],
             },
             move |_, n| {
-                // Stands in for a parser panic, once all output is on screen.
-                assert!(!matches!(n, Note::Exit(_)), "test panic at exit");
+                // Stands in for a parser panic, once the output is parsed.
+                let take = |l: usize| l.checked_sub(1);
+                if n == Note::Dirty
+                    && left
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, take)
+                        .is_ok()
+                {
+                    panic!("test panic");
+                }
                 let _ = tx.send(n);
             },
         )
         .expect("spawn");
-        let dead = std::iter::from_fn(|| rx.recv_timeout(Duration::from_secs(20)).ok())
-            .any(|n| n == Note::Dead);
-        assert!(dead);
+        let mut notes = Vec::new();
+        while let Ok(n) = rx.recv_timeout(Duration::from_secs(20)) {
+            notes.push(n);
+            match n {
+                Note::Dirty => pane.dirty.store(false, Ordering::Release),
+                Note::Exit(_) => break,
+                _ => {}
+            }
+        }
+        (pane, notes)
+    }
+
+    /// After a parser panic the UI never sees the screen it was updating,
+    /// and output after it shows on a fresh one.
+    #[test]
+    fn pane_starts_its_screen_over_after_a_panic() {
+        let cmd = "cmd.exe /d /c echo pane-one& ping -n 2 127.0.0.1 >nul& echo pane-two";
+        let (pane, notes) = panicking(cmd, 1);
+        assert!(notes.contains(&Note::Reset), "{notes:?}");
+        assert!(!notes.contains(&Note::Dead), "{notes:?}");
+        assert_eq!(notes.last(), Some(&Note::Exit(0)));
         let text = lock(&pane.term).screen_text();
-        assert!(!text.contains("pane-output"), "screen: {text:?}");
+        assert!(text.contains("pane-two"), "screen: {text:?}");
+    }
+
+    /// Output that keeps panicking stops being parsed, but the exit still
+    /// comes through, so the pane can close.
+    #[test]
+    fn pane_gives_up_on_the_third_panic_and_still_reports_its_exit() {
+        let pause = "ping -n 2 127.0.0.1 >nul";
+        let cmd = format!("cmd.exe /d /c echo pane-a& {pause}& echo pane-b& {pause}& echo pane-c");
+        let (pane, notes) = panicking(&cmd, usize::MAX);
+        assert_eq!(notes, [Note::Reset, Note::Reset, Note::Dead, Note::Exit(0)]);
+        let text = lock(&pane.term).screen_text();
+        assert!(!text.contains("pane-"), "screen: {text:?}");
+    }
+
+    #[test]
+    fn pane_gives_up_on_three_panics_within_a_minute() {
+        let (t0, mut times) = (Instant::now(), Vec::new());
+        let at = |s| t0 + Duration::from_secs(s);
+        assert!(!gives_up(&mut times, at(0)));
+        assert!(!gives_up(&mut times, at(30)));
+        // The first is more than a minute old by now.
+        assert!(!gives_up(&mut times, at(61)));
+        assert!(gives_up(&mut times, at(62)));
     }
 }

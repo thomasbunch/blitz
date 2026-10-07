@@ -3947,6 +3947,15 @@ impl App {
                     false,
                 );
             }
+            // The selection and link under the pointer end with the line
+            // numbers they used; matches are found again.
+            Note::Reset => {
+                if let Some(f) = self.find.as_mut().filter(|f| f.pane == id) {
+                    f.stale = true;
+                }
+                let text = "the screen was cleared after an internal error";
+                self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+            }
             Note::Dead => {
                 self.attention(id, Ev::Error { sticky: true });
                 self.set_notice(
