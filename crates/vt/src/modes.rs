@@ -33,7 +33,9 @@ pub struct InputModes {
     pub mouse: MouseMode,
     /// Mode 1006.
     pub mouse_sgr: bool,
-    /// Mode 1007: the wheel on the alternate screen sends arrow keys.
+    /// Mode 1007: the wheel on the alternate screen sends arrow keys. A
+    /// terminal starts with it on, as most do: pagers such as less never
+    /// ask for it.
     pub alt_scroll: bool,
     pub alt_screen: bool,
 }
@@ -96,7 +98,7 @@ impl KittyStack {
 }
 
 /// Mode state that does not depend on which screen is showing.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Modes {
     /// Input modes. `kitty` and `alt_screen` are not kept here; the
     /// terminal fills them in from the active screen.
@@ -114,6 +116,22 @@ pub struct Modes {
     pub paste_confirmed: bool,
     /// Mode 2031: report dark/light changes unasked, as `CSI ? 997 ; n n`.
     pub theme_reports: bool,
+}
+
+impl Default for Modes {
+    fn default() -> Modes {
+        Modes {
+            input: InputModes {
+                alt_scroll: true,
+                ..InputModes::default()
+            },
+            kitty: Default::default(),
+            mok: 0,
+            sync: None,
+            paste_confirmed: false,
+            theme_reports: false,
+        }
+    }
 }
 
 impl Modes {
@@ -180,8 +198,8 @@ impl Modes {
 
     /// Clears the input modes a program can leave behind when it dies
     /// without restoring them: both kitty stacks, modifyOtherKeys, mouse
-    /// tracking and wheel arrows, bracketed paste, synchronized output and
-    /// theme reports.
+    /// tracking, bracketed paste, synchronized output and theme reports,
+    /// and turns wheel arrows back on.
     /// Otherwise the next program gets CSI-u keys or reports it never asked
     /// for.
     pub fn reset_input(&mut self) {
@@ -189,7 +207,7 @@ impl Modes {
         self.mok = 0;
         self.input.mouse = MouseMode::Off;
         self.input.mouse_sgr = false;
-        self.input.alt_scroll = false;
+        self.input.alt_scroll = true;
         self.input.bracketed = false;
         self.paste_confirmed = false;
         self.sync = None;
@@ -252,13 +270,10 @@ mod tests {
             ..Modes::default()
         };
         m.kitty[1].push(1);
-        m.set_dec(1007, true);
+        m.set_dec(1007, false);
         m.reset_input();
         assert_eq!((m.mok, m.kitty[1].flags()), (0, 0));
-        assert!(
-            !m.input.alt_scroll,
-            "a shell would get arrows for the wheel"
-        );
+        assert!(m.input.alt_scroll, "the next pager scrolls by the wheel");
     }
 
     #[test]

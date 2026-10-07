@@ -5569,10 +5569,10 @@ enum Wheel {
 }
 
 /// What the wheel does over a pane in modes `m`; `shift` keeps it from a
-/// program that takes the mouse. Arrows go only to a program that asked
-/// for them in the `focused` pane, where the user types, and never to
-/// Claude Code (`claude`), where they walk its prompt history and replace
-/// what was typed.
+/// program that takes the mouse. Arrows go only to a full-screen program
+/// that did not turn them off, in the `focused` pane, where the user
+/// types, and never to Claude Code (`claude`), where they walk its prompt
+/// history and replace what was typed.
 fn wheel_does(m: &InputModes, shift: bool, claude: bool, focused: bool) -> Wheel {
     if m.mouse != MouseMode::Off && !shift {
         Wheel::Report
@@ -7433,7 +7433,7 @@ mod tests {
     }
 
     #[test]
-    fn app_wheel_sends_arrows_only_when_asked_and_never_to_claude() {
+    fn app_wheel_sends_arrows_unless_turned_off_and_never_to_claude() {
         let alt = InputModes {
             alt_screen: true,
             ..InputModes::default()
@@ -7448,8 +7448,12 @@ mod tests {
         };
         let does = |m: &InputModes, shift, claude| wheel_does(m, shift, claude, true);
         assert_eq!(does(&InputModes::default(), false, false), Wheel::Scroll);
-        assert_eq!(does(&alt, false, false), Wheel::Nothing, "not asked");
+        assert_eq!(does(&alt, false, false), Wheel::Nothing, "turned off");
         assert_eq!(does(&asked, false, false), Wheel::Arrows);
+        // Pagers such as less never ask.
+        let pager = fed(10, 2, "\x1b[?1049h").input_modes();
+        assert_eq!(does(&pager, false, false), Wheel::Arrows, "less");
+
         assert_eq!(does(&asked, false, true), Wheel::Nothing, "Claude Code");
         assert_eq!(does(&mouse, false, true), Wheel::Report);
         assert_eq!(
