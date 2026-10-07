@@ -3345,9 +3345,14 @@ impl App {
                 };
                 lock(&v.pane.term).clear_scrollback();
                 // The console host draws the screen again after this.
-                v.pane.pty.clear();
+                let screen = v.pane.pty.clear();
+                let id = v.pane.id;
                 if let Some(f) = self.find.as_mut() {
                     f.stale = true;
+                }
+                if !screen {
+                    let text = "Cleared the scrollback; this console host cannot clear the screen";
+                    self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
                 }
                 self.request_redraw();
             }
