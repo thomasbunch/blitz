@@ -70,6 +70,9 @@ pub struct PaneMeta {
     pub name: Option<String>,
     /// The number after the session's name in the sidebar; 0 for none.
     pub num: u32,
+    /// The `shell` setting the pane runs; empty for the one in the
+    /// settings.
+    pub shell: String,
 }
 
 impl NodeState {
@@ -356,6 +359,9 @@ fn node_json(n: &NodeState, out: &mut String) {
                 escape_json(n, out);
                 out.push('"');
             }
+            out.push_str(",\"shell\":\"");
+            escape_json(&m.shell, out);
+            out.push('"');
             out.push_str("}}");
         }
         NodeState::Split { axis, ratio, a, b } => {
@@ -455,6 +461,10 @@ fn node(j: &Json) -> Option<NodeState> {
             .filter(|n| !n.is_empty());
         // Sessions saved before numbers have none.
         let num = int(p.get("num")).unwrap_or(0);
+        // Sessions saved before shells were kept run the one in the settings.
+        let shell = (p.get("shell").and_then(Json::as_str))
+            .unwrap_or_default()
+            .into();
         return Some(NodeState::Pane(PaneMeta {
             cwd,
             claude,
@@ -462,6 +472,7 @@ fn node(j: &Json) -> Option<NodeState> {
             done,
             name,
             num,
+            shell,
         }));
     }
     let axis = match j.get("split")?.as_str()? {
@@ -537,6 +548,9 @@ mod tests {
     use super::*;
     use crate::layout::Dir;
 
+    /// A shell picked in the command palette, with quotes and backslashes.
+    const GIT_BASH: &str = r#""C:\Program Files\Git\bin\bash.exe" --login -i"#;
+
     const AREA: Rect = Rect {
         x: 0,
         y: 0,
@@ -568,6 +582,7 @@ mod tests {
             done: None,
             name: None,
             num: 0,
+            shell: String::new(),
         })
     }
 
@@ -607,7 +622,11 @@ mod tests {
                     root: split(
                         Axis::Row,
                         0.3333,
-                        pane(r"C:\dev\shop", None),
+                        NodeState::Pane(PaneMeta {
+                            cwd: r"C:\dev\shop".into(),
+                            shell: GIT_BASH.into(),
+                            ..PaneMeta::default()
+                        }),
                         split(
                             Axis::Column,
                             0.25,
@@ -762,9 +781,17 @@ mod tests {
         let good = to_json(&sample());
         let more = good
             .replacen("{\"v\":1,", "{\"v\":1,\"later\":[1,{\"x\":null}],", 1)
-            .replace("\"key\":\"\"}", "\"key\":\"\",\"shell\":\"pwsh\"}");
+            .replace("\"shell\":\"\"}", "\"shell\":\"\",\"later\":\"x\"}");
         assert_ne!(more, good);
         assert_eq!(from_json(&more), Some(sample()));
+    }
+
+    #[test]
+    fn panes_saved_before_shells_were_kept_run_the_set_one() {
+        let old = to_json(&sample()).replace(",\"shell\":\"\"", "");
+        let s = from_json(&old).expect("still a session");
+        let shells: Vec<&str> = (s.layout(1).1.iter()).map(|p| p.1.shell.as_str()).collect();
+        assert_eq!(shells, ["", GIT_BASH, "", "", ""]);
     }
 
     #[test]
@@ -842,11 +869,11 @@ mod tests {
         };
         let s = State::capture(&win, Geometry::default(), |p| PaneMeta {
             cwd: format!("d{}", p.0),
-            claude: None,
             key: format!("{:032x}", p.0),
             done: None,
             name: None,
             num: p.0 + 10,
+            ..PaneMeta::default()
         });
         let s = from_json(&to_json(&s)).expect("reads back");
         // Leaf order is 1, 2, 4, 3: the left split put 4 before 3.
@@ -881,6 +908,7 @@ mod tests {
             done: None,
             name: None,
             num: 0,
+            shell: String::new(),
         });
         assert!(s.sidebar_expanded);
     }

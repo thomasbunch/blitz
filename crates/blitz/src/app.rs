@@ -949,6 +949,10 @@ struct View {
     /// The number after the session's name, which tells look-alike
     /// sessions apart; kept across restarts.
     num: u32,
+    /// The `shell` setting the session runs when one was picked in the
+    /// command palette; empty for the one in the settings. Kept across
+    /// restarts.
+    shell: String,
     /// The progress the program last reported, and when.
     progress: Option<(chrome::Progress, Instant)>,
     /// When the title first showed Claude Code working.
@@ -1147,13 +1151,15 @@ impl Picker {
 }
 
 /// What a row of the command palette does when picked.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Pick {
     Run(Action),
     /// Bring this session to the front.
     Show(PaneId),
     /// Open the settings panel on what was typed.
     Settings,
+    /// A new tab running this `shell` setting.
+    Shell(String),
 }
 
 /// The open command palette.
@@ -1171,6 +1177,8 @@ struct Commands {
     /// Sessions to go to, listed in place of the actions: each with its
     /// row and its state.
     sessions: Option<Vec<(PaneId, String, String)>>,
+    /// A row for each shell installed, as (label, `shell` setting).
+    shells: Vec<(String, String)>,
 }
 
 /// What the command palette's line names.
@@ -1182,11 +1190,26 @@ enum Rename {
 }
 
 impl Commands {
+    /// The palette with a "New tab: <name>" row for each of `shells`, as
+    /// [`crate::shell::choices`] lists them; the automatic one is New tab.
+    fn new(shells: Vec<(String, String)>) -> Commands {
+        let shells = (shells.into_iter())
+            .filter(|(_, shell)| !shell.is_empty())
+            .map(|(name, shell)| (format!("New tab: {name}"), shell))
+            .collect();
+        Commands {
+            shells,
+            ..Commands::default()
+        }
+    }
+
     /// The matching rows, each what it does and its label: the sessions
     /// whose row or state holds every typed word, or else actions in
-    /// [`keymap::ACTIONS`] order, leaving out the palette itself, going to
-    /// a tab by number and the `hidden` actions. When none matches what
-    /// was typed, one row searches the settings for it instead.
+    /// [`keymap::ACTIONS`] order with the shells after New tab, leaving out
+    /// the palette itself, going to a tab by number and the `hidden`
+    /// actions. A shell's command line matches too, so `wsl` finds every
+    /// WSL distribution. When none matches what was typed, one row searches
+    /// the settings for it instead.
     fn matches(&self) -> Vec<(Pick, String)> {
         if self.rename.is_some() {
             return Vec::new();
@@ -1204,12 +1227,22 @@ impl Commands {
                 .map(|s| (Pick::Show(s.0), s.1.clone()))
                 .collect();
         }
-        let mut rows: Vec<(Pick, String)> = (keymap::ACTIONS.iter())
+        let mut rows: Vec<(Pick, String)> = Vec::new();
+        let actions = (keymap::ACTIONS.iter())
             .filter(|a| !matches!(a.0, Action::Palette | Action::GoToTab(_) | Action::LastTab))
-            .filter(|a| !self.hidden.contains(&a.0))
-            .filter(|a| hit(format!("{} {}", a.2, a.1)))
-            .map(|a| (Pick::Run(a.0), a.2.to_string()))
-            .collect();
+            .filter(|a| !self.hidden.contains(&a.0));
+        for &(a, name, label) in actions {
+            if hit(format!("{label} {name}")) {
+                rows.push((Pick::Run(a), label.to_string()));
+            }
+            if a == Action::NewTab {
+                for (label, shell) in &self.shells {
+                    if hit(format!("{label} {shell}")) {
+                        rows.push((Pick::Shell(shell.clone()), label.clone()));
+                    }
+                }
+            }
+        }
         let typed = self.filter.trim();
         if rows.is_empty() && !typed.is_empty() {
             rows.push((Pick::Settings, format!("Search settings for \"{typed}\"")));
@@ -1611,7 +1644,7 @@ impl App {
             win.tabs.push(Tab::new(String::new(), id));
             win.active = win.tabs.len() - 1;
             let cmd = self.args.cmd.clone();
-            self.open(win, id, cmd.as_deref(), cwd)?;
+            self.open(win, id, cmd.as_deref(), "", cwd)?;
         }
 
         // A dev build is left alone; a scripted run and a separate window
@@ -1667,30 +1700,32 @@ impl App {
     }
 
     /// Starts a session for pane `id` and shows `win`, a layout that
-    /// already holds it, running `cmd` or else the shell. Once a session
-    /// exists, a layout that leaves the new pane, or the one it split,
-    /// below the minimum size is refused; panes the window already made
-    /// small do not count.
+    /// already holds it, running `cmd` or else `shell` (see [`App::spawn`]).
+    /// Once a session exists, a layout that leaves the new pane, or the one
+    /// it split, below the minimum size is refused; panes the window already
+    /// made small do not count.
     fn open(
         &mut self,
         win: layout::Window,
         id: PaneId,
         cmd: Option<&str>,
+        shell: &str,
         cwd: Option<PathBuf>,
     ) -> Result<(), String> {
         let grids = self.grids(&win);
         if !self.views.is_empty() && no_room(&win, &grids, id, self.focus_id()) {
             return Err("no room for another pane".into());
         }
-        self.spawn(id, &grids, cmd, cwd, None)?;
+        self.spawn(id, &grids, cmd, shell, cwd, None)?;
         self.install(win);
         Ok(())
     }
 
     /// Starts every pane of a saved session, each in its folder, and shows
     /// its layout. A pane whose folder a process cannot start in (too long
-    /// a path for one, say) starts where blitz runs instead. Starts none if
-    /// one still fails.
+    /// a path for one, say) starts where blitz runs instead, and one whose
+    /// shell has gone runs the shell in the settings. Starts none if one
+    /// still fails.
     fn restore(&mut self, s: &session::State) -> Result<(), String> {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
@@ -1699,8 +1734,15 @@ impl App {
             let old = (self.config.restore_scrollback)
                 .then(|| session::load_output(&meta.key))
                 .flatten();
-            let started = (self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()))
-                .or_else(|_| self.spawn(id, &grids, None, None, old.as_deref()));
+            let (cwd, old) = (start_dir(&meta.cwd), old.as_deref());
+            let started = (self.spawn(id, &grids, None, &meta.shell, cwd.clone(), old))
+                .or_else(|_| self.spawn(id, &grids, None, &meta.shell, None, old))
+                .or_else(|e| {
+                    if meta.shell.is_empty() {
+                        return Err(e);
+                    }
+                    self.spawn(id, &grids, None, "", cwd, old)
+                });
             if let Err(e) = started {
                 self.views.clear();
                 self.next_num = 1;
@@ -1752,12 +1794,12 @@ impl App {
             return;
         };
         let (old, new) = (&self.views[i], PaneId(self.next_id));
-        let (cwd, cmd) = (start_dir(&old.pane.cwd), old.cmd.clone());
+        let (cwd, cmd, shell) = (start_dir(&old.pane.cwd), old.cmd.clone(), old.shell.clone());
         let claude = old.pane.claude.clone().filter(|_| cmd.is_none());
         let mut win = self.win.clone();
         win.replace_pane(id, new);
         let grids = self.grids(&win);
-        if let Err(e) = self.spawn(new, &grids, cmd.as_deref(), cwd, None) {
+        if let Err(e) = self.spawn(new, &grids, cmd.as_deref(), &shell, cwd, None) {
             self.error(id, e);
             return;
         }
@@ -1768,13 +1810,15 @@ impl App {
     }
 
     /// Starts a session for pane `id`, sized as `grids` lays it out (or
-    /// 80x24 when it has no place there), running `cmd` or else the shell,
-    /// below `old`, output saved by [`session::save_output`].
+    /// 80x24 when it has no place there), running `cmd`, or else `shell`, a
+    /// `shell` setting (empty for the one in the settings), below `old`,
+    /// output saved by [`session::save_output`].
     fn spawn(
         &mut self,
         id: PaneId,
         grids: &[(PaneId, (i32, i32))],
         cmd: Option<&str>,
+        shell: &str,
         cwd: Option<PathBuf>,
         old: Option<&str>,
     ) -> Result<(), String> {
@@ -1791,14 +1835,20 @@ impl App {
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         // Not the token, which is a secret between the pane and its child.
         let key = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
-        let shell =
+        // The pane's own `shell` setting, else the one in the settings.
+        let setting = if shell.is_empty() {
+            self.config.shell.as_str()
+        } else {
+            shell
+        };
+        let launch_of =
             |program: &str| crate::shell::launch(program, self.config.shell_integration, &token);
         let mut launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
                 env: Vec::new(),
             },
-            None => shell(&self.config.shell),
+            None => launch_of(setting),
         };
         // Claude Code loads blitz's hooks from there, with nothing pasted
         // into its settings.
@@ -1840,14 +1890,14 @@ impl App {
             // A shell setting that names a missing or mistyped program would
             // fail every pane, and blitz would close as it opened. The shell
             // blitz finds runs instead, and the pane says why.
-            Err(e) if cmd.is_none() && !self.config.shell.is_empty() => {
-                let mut auto = shell("");
+            Err(e) if cmd.is_none() && !setting.is_empty() => {
+                let mut auto = launch_of("");
                 auto.env.extend(plugin);
                 let p =
                     (start(&auto)).map_err(|e| format!("cannot start {}: {e}", auto.cmdline))?;
                 let keys = keymap::keys_for(Action::Settings, &self.config.keys);
                 let using = program_name(&auto.cmdline);
-                fell_back = Some(shell_failed(&self.config.shell, &e, &using, keys));
+                fell_back = Some(shell_failed(setting, &e, &using, keys));
                 launch = auto;
                 p
             }
@@ -1873,6 +1923,7 @@ impl App {
             key,
             cmd: cmd.map(str::to_owned),
             num: self.next_num,
+            shell: shell.into(),
             progress: None,
             claude_working: None,
             hooks_seen: false,
@@ -1899,12 +1950,14 @@ impl App {
         self.focus_moved(before);
     }
 
-    /// Opens a pane in a copy of the layout that `place` changes; tells the
-    /// user in the focused pane when that fails. The pane starts in `dir`,
-    /// or else where the focused one is.
+    /// Opens a pane running `shell` (see [`App::spawn`]) in a copy of the
+    /// layout that `place` changes; tells the user in the focused pane when
+    /// that fails. The pane starts in `dir`, or else where the focused one
+    /// is.
     fn add(
         &mut self,
         dir: Option<PathBuf>,
+        shell: &str,
         place: impl FnOnce(&mut layout::Window, PaneId) -> bool,
     ) {
         let cwd = dir.or_else(|| start_dir(self.current().map_or("", |v| v.pane.cwd.as_str())));
@@ -1913,7 +1966,7 @@ impl App {
         if !place(&mut win, id) {
             return;
         }
-        if let Err(e) = self.open(win, id, None, cwd)
+        if let Err(e) = self.open(win, id, None, shell, cwd)
             && let Some(id) = self.focus_id()
         {
             self.error(id, e);
@@ -2103,7 +2156,7 @@ impl App {
                             Pick::Show(id) => (cm.sessions.iter().flatten())
                                 .find(|s| s.0 == id)
                                 .map(|s| s.2.clone()),
-                            Pick::Settings => None,
+                            Pick::Settings | Pick::Shell(_) => None,
                         };
                         (label, side.unwrap_or_default())
                     })
@@ -2472,7 +2525,7 @@ impl App {
         match k.vk {
             VK_ESCAPE => self.commands = None,
             VK_RETURN => {
-                let picked = cm.matches().get(cm.sel).map(|r| r.0);
+                let picked = cm.matches().get(cm.sel).map(|r| r.0.clone());
                 let typed = cm.filter.trim().to_string();
                 let rename = cm.rename.map(|r| (r, crate::hook::one_line(&cm.filter)));
                 self.commands = None;
@@ -2530,7 +2583,7 @@ impl App {
             return;
         };
         self.request_redraw();
-        if let Some(&(p, _)) = cm.matches().get(i) {
+        if let Some((p, _)) = cm.matches().into_iter().nth(i) {
             self.pick(el, p, cm.filter.trim().to_string());
         }
     }
@@ -2548,6 +2601,7 @@ impl App {
                 }
             }
             Pick::Show(id) => self.show(id),
+            Pick::Shell(shell) => self.add(None, &shell, new_tab),
             Pick::Settings => {
                 self.open_settings();
                 if let Some(p) = &mut self.settings {
@@ -3438,7 +3492,7 @@ impl App {
                 }
                 self.request_redraw();
             }
-            Action::NewTab => self.add(None, new_tab),
+            Action::NewTab => self.add(None, "", new_tab),
             Action::ClosePane => {
                 let Some(v) = self.current() else {
                     return true;
@@ -3514,7 +3568,7 @@ impl App {
                 } else {
                     Dir::Down
                 };
-                self.add(None, split(dir));
+                self.add(None, "", split(dir));
             }
             Action::ReopenClosed => {
                 let Some((cwd, claude)) = self.closed.take() else {
@@ -3525,7 +3579,7 @@ impl App {
                     return true;
                 };
                 let id = PaneId(self.next_id);
-                self.add(start_dir(&cwd), split(Dir::Right));
+                self.add(start_dir(&cwd), "", split(Dir::Right));
                 if self.view(id).is_some() {
                     self.resume(id, claude);
                 } else {
@@ -3568,7 +3622,7 @@ impl App {
                 };
                 self.commands = Some(Commands {
                     hidden,
-                    ..Commands::default()
+                    ..Commands::new(crate::shell::choices())
                 });
                 self.request_redraw();
             }
@@ -4364,7 +4418,7 @@ impl App {
             }
             Some(Dropped::Open(dirs)) => {
                 for dir in dirs {
-                    self.add(Some(dir), new_tab);
+                    self.add(Some(dir), "", new_tab);
                 }
             }
             None => {}
@@ -5302,6 +5356,7 @@ impl App {
                     .map(|v| v.pane.msg.clone()),
                 name: v.and_then(|v| v.pane.named.clone()),
                 num: v.map_or(0, |v| v.num),
+                shell: v.map(|v| v.shell.clone()).unwrap_or_default(),
             }
         };
         let s = session::State::capture(&self.win, self.placed, meta);
@@ -7012,7 +7067,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // foreground.
                 self.to_front();
                 if let crate::handoff::Ask::Open(dir) = ask {
-                    self.add(Some(dir), new_tab);
+                    self.add(Some(dir), "", new_tab);
                 }
             }
             // So does a click on a notification, and the jump key.
@@ -9702,6 +9757,36 @@ mod tests {
         let rows = notice_rows(ask, (12, 2));
         assert_eq!(rows.len(), 2);
         assert!(rows[1].ends_with('\u{2026}'), "{rows:?}");
+    }
+
+    #[test]
+    fn palette_opens_a_tab_on_each_shell() {
+        let wsl = r"C:\Windows\System32\wsl.exe -d Ubuntu";
+        let mut c = Commands::new(vec![
+            ("Automatic (PowerShell 7)".into(), String::new()),
+            (
+                "Command Prompt".into(),
+                r"C:\Windows\System32\cmd.exe".into(),
+            ),
+            ("Ubuntu".into(), wsl.into()),
+        ]);
+        c.filter = "new tab".into();
+        let labels: Vec<String> = c.matches().into_iter().map(|m| m.1).collect();
+        // Right after New tab, before the actions that follow it.
+        assert_eq!(
+            labels,
+            [
+                "New tab",
+                "New tab: Command Prompt",
+                "New tab: Ubuntu",
+                "Move the pane to a new tab"
+            ]
+        );
+        c.filter = "wsl".into();
+        assert_eq!(
+            c.matches(),
+            [(Pick::Shell(wsl.into()), "New tab: Ubuntu".into())]
+        );
     }
 
     #[test]
