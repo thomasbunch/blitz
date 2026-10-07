@@ -52,18 +52,25 @@ The shell is PowerShell 7 if installed, else Windows PowerShell, else cmd.
 The installer adds **Open in blitz** to the right-click menu of folders
 and drives; on Windows 11 it is under **Show more options**.
 Shift+right-click also offers **Open in new blitz window**. Untick the
-option during setup to leave the menu alone.
+option during setup to leave the menu alone. Setup can also start blitz
+when you sign in, with the tabs and sessions you left; that option is off
+unless you tick it.
 
 blitz asks GitHub for the latest release when it starts and every six
-hours. If there is a newer one, the foot of the sidebar says so, or a
-strip under the panes while the sidebar is collapsed or not shown.
-Ctrl+Shift+U downloads the installer, checks it against the release's
-`SHA256SUMS.txt` and restarts blitz on the new version. That ends every
-session, so blitz asks you to press it twice if one is busy. A copy run
-from the zip opens the release page instead. If the installer fails,
-blitz starts again on the old version and a strip under the panes names
-the installer's log. With nothing shown, Ctrl+Shift+U asks GitHub right
-away and says what it found.
+hours, through the proxy Windows is set to use. If there is a newer
+one, the foot of the sidebar says so, or a strip under the panes while
+the sidebar is collapsed or not shown: a click on it opens the release
+notes, and its × hides it until a newer release. Ctrl+Shift+U downloads
+the installer, checks it against the release's `SHA256SUMS.txt` and
+restarts blitz on the new version. That ends every session and closes
+any other blitz window, so blitz asks first. When a session is busy in
+the only blitz window, the first press leaves the update to install when
+you close blitz, and a second press restarts now. A copy run from the
+zip opens the release page instead. If the installer fails, blitz starts
+again on the old version and a strip under the panes names the
+installer's log. With nothing shown, Ctrl+Shift+U asks GitHub right away
+and says what it found. The settings panel, under **Check for updates**,
+says why the last look or update failed.
 
 ## Build
 
@@ -436,6 +443,9 @@ nothing cleared comes back when the pane is resized. Resetting the
 terminal turns off what a program that crashed can leave on, such as
 mouse reports, a hidden cursor or keys sent as escape codes; the text
 stays.
+**Report an issue**, also only in the palette, starts a GitHub issue
+that says which blitz, Windows, renderer and ConPTY you run, but no file
+or folder names.
 
 ## Key bindings
 
@@ -475,12 +485,13 @@ The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
 `swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
 `font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
 `find`, `quick_select`, `previous_prompt`, `next_prompt`,
-`system_menu`, `claude_setup`, `go_to_tab_1` to `go_to_tab_8` and
-`last_tab`. Typing a name in the command palette finds its action.
+`system_menu`, `claude_setup`, `report_issue`, `go_to_tab_1` to
+`go_to_tab_8` and `last_tab`. Typing a name in the command palette finds
+its action.
 
 A binding can also type text into the focused pane: `text:` and the
 text, with `\e` for Esc, `\r` for Enter, `\n`, `\t`, `\s` for a space,
-`\` for a backslash and `\xNN` for any byte. Put the line in single
+`\\` for a backslash and `\xNN` for any byte. Put the line in single
 quotes to keep a `#` in the text.
 
 ```
