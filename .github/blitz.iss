@@ -69,6 +69,8 @@ Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz"; Flags: d
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz.window"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
 Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
 Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz.window"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
+; The name and icon blitz gives its notifications when it first shows one.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\blitz.terminal"; Flags: uninsdeletekey dontcreatekey
 
 [Icons]
 Name: "{autoprograms}\blitz"; Filename: "{app}\blitz.exe"
