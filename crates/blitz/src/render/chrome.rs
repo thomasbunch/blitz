@@ -214,26 +214,40 @@ pub struct Chrome {
 pub struct SideHits {
     /// Each session's row.
     pub rows: Vec<(PaneId, Rect)>,
+    /// Each tab's heading, by index.
+    pub heads: Vec<(usize, Rect)>,
     /// The "+N more" footer and the sessions it stands for.
     pub more: Option<(Rect, Vec<PaneId>)>,
+    /// The collapsed rail.
+    pub rail: Option<Rect>,
 }
 
 /// What the sidebar or rail has under a point.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Side {
     Session(PaneId),
+    /// A tab's heading, by index.
+    Tab(usize),
     /// The "+N more" footer, with the sessions it stands for.
     More(Vec<PaneId>),
+    /// The rail between its rows.
+    Rail,
 }
 
 impl SideHits {
+    /// What is at (`x`, `y`).
     pub fn at(&self, x: i32, y: i32) -> Option<Side> {
         let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
         if let Some(&(id, _)) = self.rows.iter().find(|r| inside(&r.1)) {
             return Some(Side::Session(id));
         }
-        let (_, ids) = self.more.as_ref().filter(|m| inside(&m.0))?;
-        Some(Side::More(ids.clone()))
+        if let Some(&(i, _)) = self.heads.iter().find(|r| inside(&r.1)) {
+            return Some(Side::Tab(i));
+        }
+        if let Some((_, ids)) = self.more.as_ref().filter(|m| inside(&m.0)) {
+            return Some(Side::More(ids.clone()));
+        }
+        self.rail.filter(inside).map(|_| Side::Rail)
     }
 }
 
@@ -575,6 +589,13 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 h: 1,
             };
             p.push(Prim::Rect(rule, c.rule));
+            let head = Rect {
+                x: s(8.0),
+                y,
+                w: (side - s(18.0)).max(0),
+                h: gh,
+            };
+            out.side.heads.push((ti, head));
             y += gh;
 
             for &x in list {
@@ -734,6 +755,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             },
             c.border,
         ));
+        out.side.rail = Some(rail);
         let mut y = s(12.0);
         for (ti, t) in m.win.tabs.iter().enumerate() {
             if ti > 0 {
@@ -1826,6 +1848,31 @@ mod tests {
             t.contains(&"access violation") && t.contains(&"exit -1"),
             "{t:?}"
         );
+    }
+
+    #[test]
+    fn clicks_on_headings_and_the_rail_have_a_target() {
+        let (mut win, sessions, now) = fleet(true);
+        let c = build(&model(&win, &sessions, now));
+        // Each heading is above its tab's first row.
+        let heads = &c.side.heads;
+        assert_eq!(heads.iter().map(|h| h.0).collect::<Vec<_>>(), [0, 1]);
+        let (db, row) = (heads[1].1, c.side.rows[2].1);
+        assert!(db.bottom() <= row.y && db.x == row.x);
+        assert_eq!(c.side.at(db.x + 50, db.y + 2), Some(Side::Tab(1)));
+        // Between the groups there is nothing to click.
+        assert_eq!(c.side.at(db.x, db.y - 1), None);
+        assert_eq!(c.side.rail, None);
+
+        win.sidebar_expanded = false;
+        let c = build(&model(&win, &sessions, now));
+        assert!(c.side.heads.is_empty());
+        let row = c.side.rows[2];
+        assert_eq!(c.side.at(5, row.1.y + 1), Some(Side::Session(row.0)));
+        // Off the rows, the rail itself.
+        assert_eq!(c.side.at(5, row.1.y - 1), Some(Side::Rail));
+        assert_eq!(c.side.at(5, AREA.h - 1), Some(Side::Rail));
+        assert_eq!(c.side.at(15, AREA.h - 1), None);
     }
 
     #[test]

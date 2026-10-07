@@ -3370,12 +3370,21 @@ impl App {
         if pressed && x < self.tab_area().x {
             match self.side.at(x, y) {
                 Some(Side::Session(id)) => self.show(id),
+                Some(Side::Tab(i)) => {
+                    if let Some(id) = self.win.tabs.get(i).map(|t| t.focus) {
+                        self.show(id);
+                    }
+                }
                 Some(Side::More(ids)) => self.show_hidden(&ids),
+                Some(Side::Rail) => {
+                    self.win.toggle_sidebar();
+                    self.request_redraw();
+                }
                 None => {}
             }
             return;
         }
-        // A click on another pane or in the sidebar only moves focus.
+        // A click on another pane only moves focus.
         if pressed {
             let (id, side) = self.hit(self.mouse.pos);
             if side || id.is_some_and(|id| Some(id) != self.focus_id()) {
