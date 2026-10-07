@@ -39,23 +39,66 @@ fn cli_prints_its_version() {
 
 #[test]
 fn cli_prints_usage() {
-    for args in [&["--help"][..], &["-h"]] {
+    for args in [&["--help"][..], &["-h"], &["/?"]] {
         let out = blitz(Path::new(BLITZ), args, &tmp("cli"));
         assert_eq!(out.status.code(), Some(0), "{args:?}");
         assert!(text(&out.stdout).starts_with("usage: blitz"), "{args:?}");
     }
-    for args in [
-        &["bogus"][..],
-        &["setup"],
-        &["setup", "vim"],
-        &["setup", "claude", "--linux"],
-        &["debug"],
-        &["debug", "frob"],
+    // None of these opens a window: each is a mistake, said on the console.
+    for (args, why) in [
+        (
+            &["no-such-folder-here"][..],
+            "blitz: no such folder: no-such-folder-here",
+        ),
+        (
+            &["--new-window", "--frob", "1"],
+            "blitz: unknown option --frob",
+        ),
+        (&["--cwd"], "blitz: --cwd needs a value"),
+        (&["setup"], ""),
+        (&["setup", "vim"], ""),
+        (&["debug"], ""),
+        (&["debug", "frob"], ""),
+        (&["setup", "claude", "--linux"], ""),
     ] {
         let out = blitz(Path::new(BLITZ), args, &tmp("cli"));
         assert_eq!(out.status.code(), Some(2), "{args:?}");
-        assert!(text(&out.stderr).contains("usage: blitz"), "{args:?}");
+        let err = text(&out.stderr);
+        assert!(
+            err.starts_with(why) && err.contains("usage: blitz"),
+            "{err}"
+        );
     }
+}
+
+/// Every option blitz reads from its command line is in its usage.
+#[test]
+fn cli_usage_lists_every_option() {
+    let out = blitz(Path::new(BLITZ), &["--help"], &tmp("cli"));
+    let usage = text(&out.stdout);
+    let sources = [
+        include_str!("../src/app.rs"),
+        include_str!("../src/debug.rs"),
+        include_str!("../src/render/mod.rs"),
+    ];
+    let mut seen = 0;
+    for src in sources {
+        // Each option is matched as `"--name" =>` or compared as
+        // `== "--name"`.
+        for (i, _) in src.match_indices("\"--") {
+            let rest = &src[i + 1..];
+            let Some(end) = rest[2..].find(|c: char| !c.is_ascii_lowercase() && c != '-') else {
+                continue;
+            };
+            let flag = &rest[..end + 2];
+            let read = rest[end + 3..].starts_with(" =>") || src[..i].ends_with("== ");
+            if read {
+                assert!(usage.contains(flag), "{flag} is not in the usage:\n{usage}");
+                seen += 1;
+            }
+        }
+    }
+    assert!(seen > 20, "found only {seen} options");
 }
 
 /// The settings name the `blitz-hook` next to this exe, and the message

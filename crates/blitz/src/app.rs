@@ -189,15 +189,20 @@ impl Args {
                 a.new_window = true;
                 continue;
             }
+            // A folder alone, as in `blitz .`, is `--cwd`. Anything else is
+            // a mistyped command, which must not open a window.
+            if !flag.starts_with("--") {
+                let dir = folder(flag);
+                if !dir.is_dir() {
+                    return Err(format!("no such folder: {flag}"));
+                }
+                a.cwd = Some(dir);
+                continue;
+            }
             let v = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--cmd" => a.cmd = Some(v.clone()),
-                // Explorer passes a drive root as "C:\", and argv parsing
-                // reads the \" as an escaped quote, so it arrives as C:".
-                "--cwd" => match v.strip_suffix('"') {
-                    Some(root) => a.cwd = Some(format!("{root}\\").into()),
-                    None => a.cwd = Some(v.into()),
-                },
+                "--cwd" => a.cwd = Some(folder(v)),
                 "--selftest" => a.selftest = Some(v.into()),
                 "--capture" => a.capture = Some(v.into()),
                 "--exit-after" => {
@@ -230,15 +235,19 @@ impl Args {
     }
 }
 
-/// Runs the GUI until the window closes. Returns the process exit code.
-pub fn run(args: &[String]) -> i32 {
-    let mut args = match Args::parse(args) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("blitz: {e}");
-            return 2;
-        }
-    };
+/// A folder from the command line. Explorer passes a drive root as "C:\",
+/// and argv parsing reads the \" as an escaped quote, so it arrives as C:".
+fn folder(arg: &str) -> PathBuf {
+    match arg.strip_suffix('"') {
+        Some(root) => format!("{root}\\").into(),
+        None => arg.into(),
+    }
+}
+
+/// Runs the GUI until the window closes. Returns the process exit code, or
+/// what is wrong with the arguments.
+pub fn run(args: &[String]) -> Result<i32, String> {
+    let mut args = Args::parse(args)?;
     // Run as administrator, blitz is a window of its own: it takes no
     // launches, gives none away, and leaves the saved session to the
     // normal one, whose Claude Code sessions it would resume elevated.
@@ -250,7 +259,7 @@ pub fn run(args: &[String]) -> i32 {
     if !args.new_window && !args.scripted() {
         let sent = crate::handoff::send(args.cwd.as_deref());
         if args.handed_off(sent) {
-            return 0;
+            return Ok(0);
         }
     }
     // Loading the graphics driver is most of the time to the first
@@ -268,7 +277,7 @@ pub fn run(args: &[String]) -> i32 {
         Ok(l) => l,
         Err(e) => {
             eprintln!("blitz: {e}");
-            return 1;
+            return Ok(1);
         }
     };
     let mut app = App::new(args, keys, event_loop.create_proxy());
@@ -276,9 +285,9 @@ pub fn run(args: &[String]) -> i32 {
     app.admin = admin;
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("blitz: {e}");
-        return 1;
+        return Ok(1);
     }
-    app.code
+    Ok(app.code)
 }
 
 /// Key input taken from raw window messages, waiting for the app.
@@ -8865,6 +8874,15 @@ mod tests {
         let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
         assert!(a.new_window);
         assert_eq!(a.cwd, Some(r"C:\foo".into()));
+        // A folder alone is the same as --cwd, but it has to be one: a
+        // mistyped command opens no window.
+        let here = std::env::temp_dir();
+        assert_eq!(parse(&[here.to_str().expect("UTF-8")]).cwd, Some(here));
+        let a = parse(&["--new-window", "C:\""]);
+        assert!(a.new_window);
+        assert_eq!(a.cwd, Some(r"C:\".into()));
+        let bad = Args::parse(&["stup".into()]).err();
+        assert_eq!(bad.as_deref(), Some("no such folder: stup"));
     }
 
     /// A launch that a running blitz did not take must not open a second
