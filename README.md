@@ -15,7 +15,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   there. Sessions that do not fit are counted at the foot, in the accent
   colour when one of them needs you, and a click there goes to it.
 - Claude Code's title tells blitz when a session works and when it
-  stops, and its hooks, which blitz sets up itself, when it needs input;
+  stops, and its hooks, which blitz sets up itself, when it needs input.
+  The window title starts with how many need you, as in `(2) pwsh`, and
   the taskbar button flashes if blitz is in the background.
 - In PowerShell, a command that runs for 10 seconds or more and ends in
   a pane you are not looking at marks it *done*, or *error* with its exit
@@ -119,7 +120,7 @@ the session's name, and the conversation to resume.
 | Dot in the accent colour, *needs you* | needs you | Claude Code asks for permission or a decision, or has a plan ready; a bell rings in a pane you are not looking at | you answer a question by typing, pasting or clicking in its pane (looking only outlines it), or the next hook says what it does now; a bell's mark clears when you look |
 | Thin bar under the session, *working · 4m* | working | a prompt is sent, or the title shows Claude Code working | the turn ends |
 | Hollow ring, *done* | done | a turn ends while you look elsewhere | you look at it |
-| Red dot, *error* | error | Claude Code stops on an error, or the program exits with a failure code | you look at it; a program that exited stays until its pane closes |
+| Red square, *error* | error | Claude Code stops on an error, or the program exits with a failure code | you look at it; a program that exited stays until its pane closes |
 | None | idle | nothing is running, or Claude Code has ended | |
 
 You look at a session when its pane has focus and blitz is the window in
@@ -254,7 +255,8 @@ accent = #f2b84b
 `palette` sets colours 0 to 15. Colours a file leaves out come from the
 blitz theme of the same lightness. The sidebar and pane headers are mixed
 from the background and foreground; to choose them yourself, add any of
-`accent` (marks sessions that need you), `sidebar-background`, `border`,
+`accent` (marks sessions that need you; its dots are made darker or
+lighter until they stand out), `sidebar-background`, `border`,
 `rule`, `row-focus`, `title`, `dim`, `message`, `track`, `progress`,
 `error`, `header-background`, `header-line`, `header-title`,
 `header-cwd`, `rail-focus`, `rail-work`, `idle`, `label`, `label-focus`
@@ -292,15 +294,19 @@ selection: Shift+drag selects, and Ctrl+Shift+click opens a link.
 
 Ctrl+Shift+F opens a find bar at the top right of the focused pane. It
 searches the pane's scrollback and screen as you type, ignoring case
-unless what you type has a capital letter, and tints every match in
-view. Enter or F3 goes to the next match up, Shift+Enter or Shift+F3 to
-the next one down, and Esc closes the bar, leaving the view where it is.
-A full-screen program is searched on its screen only.
+unless what you type has a capital letter, and shows every match in
+view in the selection colour, the current one outlined. Enter or F3 goes
+to the next match up, Shift+Enter or Shift+F3 to the next one down, and
+Esc closes the bar, leaving the view where it is. A full-screen program
+is searched on its screen only.
 
 With shell integration on, Ctrl+Shift+Up and Ctrl+Shift+Down scroll to
 the previous and next prompt; down from the last one goes back to the
 bottom. With no prompt that way, or in a full-screen program, the keys
 go to the program.
+
+A pane scrolled back says how many lines are below the view; a click on
+that, or typing, goes back to the bottom.
 
 ## Default keys
 
