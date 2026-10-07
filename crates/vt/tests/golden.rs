@@ -694,6 +694,25 @@ fn rows_only_resize_keeps_the_wrap_spacer() {
     assert_eq!(t.screen_text(), "abcd中\n\n");
 }
 
+/// Scrollback is not cut to a one-column pane, so it comes back whole; a
+/// wide character in it shows there as a blank, not as half of one.
+#[test]
+fn one_column_view_of_wide_scrollback() {
+    let mut t = Terminal::new(Options {
+        cols: 4,
+        rows: 1,
+        scrollback_lines: 10,
+        ambiguous_wide: false,
+    });
+    feed(&mut t, "中中\r\n中中\r\n");
+    t.resize(1, 1);
+    t.scroll_viewport(1);
+    let c = cell(&snap(&mut t), 0, 0);
+    assert_eq!((c.width, c.len), (1, 0));
+    t.resize(4, 1);
+    assert_eq!(t.scrollback_text(), "中中\n中中");
+}
+
 #[test]
 fn resize_rewraps_the_main_screen_under_the_alternate_one() {
     let mut t = run(5, 3, "abcdefg\x1b[?1049hALT-SCREEN");

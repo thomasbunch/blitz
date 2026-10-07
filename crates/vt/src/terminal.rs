@@ -363,7 +363,12 @@ impl Terminal {
             let row = g.line(i).unwrap_or(&empty);
             out.wrapped.push(row.flags & rf::WRAPPED != 0);
             for x in 0..cols {
-                let cell = row.cells.get(x as usize).copied().unwrap_or_default();
+                let mut cell = row.cells.get(x as usize).copied().unwrap_or_default();
+                // Scrollback is not rewrapped for a one-column screen, so
+                // a wide character there can end past the edge.
+                if cell.flags & cf::WIDE != 0 && x + 1 == cols {
+                    cell = Cell::blank(cell.style);
+                }
                 out.cells
                     .push(render_cell(cell, row, x, self.styles.get(cell.style), pal));
             }
