@@ -2995,7 +2995,9 @@ impl App {
         );
         let action = keymap::action(k, &self.config.keys);
         // A copy key with no selection in view goes to the program.
-        let hidden = action == Some(Action::Copy) && !copy_key_copies(k, self.selection_shown());
+        let shown = self.selection_shown();
+        let hidden = action == Some(Action::Copy)
+            && !copy_key_copies(k, shown, self.orphan.is_some());
         let action = action.filter(|_| !hidden);
         if k.down && !modifier {
             self.dismiss(action);
@@ -6073,10 +6075,11 @@ fn first_line(text: &str) -> String {
 }
 
 /// Whether copy key `k` copies a selection that `shown` says is in view or
-/// not, when there is one. Plain Ctrl+C is the interrupt too, so it copies
-/// only what the user can see; the other copy keys always copy.
-fn copy_key_copies(k: &KeyInput, shown: Option<bool>) -> bool {
-    shown != Some(false) || !vt::keys::is_interrupt(k)
+/// not, when there is one, or else the text of one output rewrote
+/// (`orphan`), which shows nowhere. Plain Ctrl+C is the interrupt too, so
+/// it copies only what the user can see; the other copy keys always copy.
+fn copy_key_copies(k: &KeyInput, shown: Option<bool>, orphan: bool) -> bool {
+    shown.or(orphan.then_some(false)) != Some(false) || !vt::keys::is_interrupt(k)
 }
 
 /// Whether a copy key that found nothing to copy is kept from the program.
@@ -8838,11 +8841,14 @@ mod tests {
         }
         // Ctrl+C copies only a selection in view; scrolled out of view it
         // interrupts, and the other copy keys still copy it.
-        assert!(copy_key_copies(&ctrl_c, Some(true)));
-        assert!(!copy_key_copies(&ctrl_c, Some(false)));
-        assert!(copy_key_copies(&ctrl_c, None), "nothing selected");
+        assert!(copy_key_copies(&ctrl_c, Some(true), false));
+        assert!(!copy_key_copies(&ctrl_c, Some(false), false));
+        assert!(copy_key_copies(&ctrl_c, None, false), "nothing selected");
+        // Nor what output rewrote, which shows nowhere.
+        assert!(!copy_key_copies(&ctrl_c, None, true));
         for k in [ctrl_shift_c, ctrl_insert] {
-            assert!(copy_key_copies(&k, Some(false)));
+            assert!(copy_key_copies(&k, Some(false), false));
+            assert!(copy_key_copies(&k, None, true));
         }
     }
 
