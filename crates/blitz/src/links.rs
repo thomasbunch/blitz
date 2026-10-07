@@ -55,54 +55,87 @@ const OPENS: &[&str] = &[
 
 /// Every URL and path-like word in `text`, the logical line under the
 /// pointer, with where each is.
+///
+/// This runs on every Ctrl-hover, so it is linear by construction: one
+/// pass that looks at each char once, knowing only the char before it and
+/// the one its character builds on, and a URL or path word is measured
+/// only from past the end of the last one of its kind, found or not, but
+/// for a few paths inside a word. No char is walked by more than a few
+/// measures of each kind, whatever the text.
 pub fn scan(text: &str) -> Vec<(Range<usize>, Link)> {
     let mut out = Vec::new();
     let mut i = 0;
-    // The char before `i`, or the one the marks and joiners after it build
-    // on: no word starts inside a character, so a run of letters that each
-    // carry a mark is walked once, not once per letter.
-    let mut before = None;
+    // The char before `i`, and the one the marks and joiners after it
+    // build on.
+    let (mut prev, mut before) = (None, None);
+    // Where the last URL and path word measured end. Nothing is lost by
+    // starting no other before them: every char a path word holds is a
+    // path char or builds on one, so no path starts inside it but after
+    // a bracket, `=` or quote, and past the URL taken from it, or past its
+    // scheme when none was, a URL word holds only the punctuation and
+    // joiners trimmed off, never a scheme.
+    let (mut url_end, mut path_end) = (0, 0);
+    // Claude Code's tool headers, as in `Update(src/app.rs)`, Markdown
+    // links and `--flag=path` put a path right after a word, so one may
+    // start after a bracket, `=` or quote inside a path word too. Each such
+    // start reads the rest of the word, so only the first few in a word
+    // are tried, and a word of `a(a(a(` is read a few times, not once per
+    // bracket.
+    let mut tries = 0;
     while let Some(c) = text[i..].chars().next() {
-        if before.is_none_or(|b: char| !b.is_alphanumeric())
-            && let Some(n) = url_len(&text[i..])
-        {
-            out.push((i..i + n, Link::Url(text[i..i + n].to_owned())));
-            i += n;
-            before = text[..i].chars().next_back();
-            continue;
-        }
-        // Claude Code's tool headers, as in `Update(src/app.rs)`, Markdown
-        // links and `--flag=path` put a path right after a word.
-        if before.is_none_or(|b| !path_char(b) || matches!(b, '(' | '[' | '=' | '\''))
-            && let Some((path, end, at)) = path_at(&text[i..])
-        {
-            let found = Link::Path(text[i + path.start..i + path.end].to_owned(), at);
-            out.push((i + path.start..i + end, found));
-            i += end;
-            before = text[..i].chars().next_back();
-            continue;
-        }
-        if !text[..i].chars().next_back().is_some_and(|p| joins(p, c)) {
+        let rest = &text[i..];
+        let mut found = None;
+        // No word starts inside a character.
+        if !prev.is_some_and(|p| joins(p, c)) {
+            if i >= url_end && before.is_none_or(|b: char| !b.is_alphanumeric()) {
+                let (seen, n) = url_len(rest);
+                url_end = i + seen;
+                found = n.map(|n| (0, n, Link::Url(rest[..n].to_owned())));
+            }
+            let after = matches!(before, Some('(' | '[' | '=' | '\''));
+            let new = i >= path_end && (after || before.is_none_or(|b| !path_char(b)));
+            if found.is_none() && (new || after && tries < 8) {
+                tries = if new { 0 } else { tries + 1 };
+                let (seen, at) = path_at(rest);
+                path_end = path_end.max(i + seen);
+                found = at.map(|(path, end, at)| {
+                    (path.start, end, Link::Path(rest[path].to_owned(), at))
+                });
+            }
             before = Some(c);
         }
-        i += c.len_utf8();
+        prev = Some(c);
+        i += match found {
+            Some((start, end, link)) => {
+                out.push((i + start..i + end, link));
+                prev = rest[..end].chars().next_back();
+                before = prev;
+                end
+            }
+            None => c.len_utf8(),
+        };
     }
     out
 }
 
-/// The length of the URL that starts `s`, if one does.
-fn url_len(s: &str) -> Option<usize> {
-    let scheme = ["https://", "http://"]
+/// How far `s` was read for a URL at its start, and the URL's length if
+/// there is one.
+fn url_len(s: &str) -> (usize, Option<usize>) {
+    let Some(scheme) = ["https://", "http://"]
         .into_iter()
-        .find(|p| s.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)))?;
+        .find(|p| s.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)))
+    else {
+        return (0, None);
+    };
     // Letters and digits of any script, as in `https://bücher.de`, but not
     // the quotes and punctuation of the text around it.
     let url_char = |c: char| {
         c.is_ascii_graphic() && !matches!(c, '<' | '>' | '"' | '`' | '{' | '}' | '|' | '\\' | '^')
             || !c.is_ascii() && c.is_alphanumeric()
     };
-    let n = trim_end(&s[..word_len(s, url_char)]);
-    (n > scheme.len()).then_some(n)
+    let word = word_len(s, url_char);
+    let n = trim_end(&s[..word]);
+    (word, (n > scheme.len()).then_some(n))
 }
 
 /// The length of the run of `ok` chars that starts `s`. A mark or joiner
@@ -143,11 +176,12 @@ fn path_char(c: char) -> bool {
 /// column after the path.
 type PathWord = (Range<usize>, usize, Option<(u32, u32)>);
 
-/// The path word at the start of `s`: where the path is in it, where the
-/// word ends after any `:line`, `:line:col` or `(line,col)`, and that line
-/// and column. A path starts with a drive or `~`, holds a `/` or `\` and
-/// ends in a name with an extension, or is a bare `name.ext`.
-fn path_at(s: &str) -> Option<PathWord> {
+/// How far `s` was read for a path word at its start, and, if it is one,
+/// where the path is in it, where the word ends after any `:line`,
+/// `:line:col` or `(line,col)`, and that line and column. A path starts
+/// with a drive or `~`, holds a `/` or `\` and ends in a name with an
+/// extension, or is a bare `name.ext`.
+fn path_at(s: &str) -> (usize, Option<PathWord>) {
     // A bracket or quote before a path is not part of it.
     let lead = s.len() - s.trim_start_matches(['(', '[', '\'']).len();
     let p = &s[lead..];
@@ -157,6 +191,7 @@ fn path_at(s: &str) -> Option<PathWord> {
     let home = p.starts_with("~/") || p.starts_with("~\\");
     let from = if drive { 2 } else { 0 };
     let word = from + word_len(&p[from..], path_char);
+    let seen = lead + word;
     // A Markdown link's text ends where its target starts.
     let word = p[..word].find("](").unwrap_or(word);
     let mut path = &p[..trim_end(&p[..word])];
@@ -185,7 +220,7 @@ fn path_at(s: &str) -> Option<PathWord> {
         .next()
         .is_some_and(|s| s.contains('='));
     if !drive && !home && !relative && !bare || flag {
-        return None;
+        return (seen, None);
     }
     if at.is_none() {
         let mut place = Vec::new();
@@ -201,7 +236,7 @@ fn path_at(s: &str) -> Option<PathWord> {
             .first()
             .map(|&line| (line, place.get(1).copied().unwrap_or(1)));
     }
-    Some((lead..lead + path.len(), end, at))
+    (seen, Some((lead..lead + path.len(), end, at)))
 }
 
 /// The line and column in `12,5` or `12`, a line alone at column 1.
@@ -555,20 +590,57 @@ mod tests {
     }
 
     #[test]
-    fn links_scan_a_long_run_of_brackets_quickly() {
-        let t0 = std::time::Instant::now();
+    fn links_scan_any_long_line_quickly() {
+        // One pass takes milliseconds and each quadratic walk found so far
+        // took minutes on these, so a slow, busy runner still has room.
+        let quick = |text: &str, what: &str| {
+            let t0 = std::time::Instant::now();
+            let n = found(text).len();
+            assert!(
+                t0.elapsed().as_secs_f32() < 1.0,
+                "{what}: {:?}",
+                t0.elapsed()
+            );
+            n
+        };
         for word in ["https://x.com/", "a/b.c"] {
             let text = format!("{word}{}", ")]".repeat(50_000));
-            assert_eq!(found(&text).len(), 1, "{word}");
+            assert_eq!(quick(&text, word), 1);
         }
-        // Every letter carries a mark or joiner, so none starts a word.
-        for mark in ['\u{300}', '\u{200D}'] {
-            let text = format!("a{mark}").repeat(100_000);
-            assert_eq!(found(&text), [], "{mark:?}");
+        // Every letter carries a mark or joiner, so none starts a word, and
+        // a run of marks on a space or quote starts none either.
+        let mut marks = vec!["a\u{300}".repeat(100_000), "a\u{200D}".repeat(100_000)];
+        marks.extend([" ", "\"", "*"].map(|b| format!("{b}{}", "\u{941}".repeat(100_000))));
+        for text in marks {
+            assert_eq!(quick(&text, &text.chars().take(2).collect::<String>()), 0);
         }
-        // One pass takes milliseconds and the old quadratic walks took over
-        // half a minute, so a slow, busy runner still has room.
-        assert!(t0.elapsed().as_secs() < 5, "{:?}", t0.elapsed());
+        // Lines of everything that has ever made a walk start over: each
+        // its own mix, so some hold long words and some long runs of marks.
+        let parts: Vec<_> =
+            "a|Z|/|.|:|(|)|[|]|\u{300}|\u{941}|\u{200D}|\u{200C}|\u{D4E}|\u{111C2}|漢| |https://"
+                .split('|')
+                .collect();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for line in 0..24 {
+            let mix: Vec<_> = (parts.iter())
+                .filter(|_| next() % 3 != 0)
+                .copied()
+                .collect();
+            let mut text = String::new();
+            let mut chars = 0;
+            while chars < 100_000 && !mix.is_empty() {
+                let part = mix[next() as usize % mix.len()];
+                text.push_str(part);
+                chars += part.chars().count();
+            }
+            quick(&text, &format!("line {line}"));
+        }
     }
 
     #[test]
