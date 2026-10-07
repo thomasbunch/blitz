@@ -907,6 +907,7 @@ impl Find {
     /// Searches `term` again. The current match stays on the one that
     /// starts where it did, or else the nearest one above it; with none
     /// yet, it is the nearest one above the bottom of the `rows` high view.
+    /// With nothing above, it is the first one below.
     fn search(&mut self, term: &vt::Terminal, rows: u16) {
         let anchor = match self.cur.and_then(|i| self.found.get(i)) {
             Some(m) => m.start,
@@ -4963,6 +4964,17 @@ mod tests {
         assert!(!e.release(0x41), "once");
         // Ctrl was down before the picker opened: its release goes on.
         assert!(!e.release(0x11));
+    }
+
+    #[test]
+    fn app_find_starts_below_the_view_when_nothing_above_matches() {
+        let mut t = fed(10, 2, "a\r\nb\r\nc\r\nmatch\r\nmatch");
+        t.scroll_viewport(9);
+        assert_eq!(t.view_top(), 0);
+        let mut f = Find::new(PaneId(1));
+        f.query = "match".into();
+        f.search(&t, 2);
+        assert_eq!((f.found.len(), f.cur), (2, Some(0)));
     }
 
     #[test]
