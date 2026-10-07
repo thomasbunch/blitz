@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use crate::attention::PaneAttn;
+use crate::attention::{Command, PaneAttn};
 use crate::layout::PaneId;
 use crate::pty::{Pty, PtyEvent, SpawnOpts};
 
@@ -26,10 +26,18 @@ pub struct Pane {
     pub pty: Pty,
     /// Attention state and when it last changed.
     pub attn: PaneAttn,
+    /// The command its shell is running, from blitz's prompt marks.
+    pub cmd: Command,
     /// Shown in the sidebar and the pane header.
     pub name: String,
+    /// The name the user gave the session, which wins over any other.
+    pub named: Option<String>,
     /// Latest title set by the program (OSC 0/2).
     pub title: String,
+    /// What Claude Code's mark in `title` says: true while it works, false
+    /// once it stopped, `None` with no such mark. See
+    /// [`crate::attention::claude_title`].
+    pub claude_title: Option<bool>,
     /// Latest directory reported by the shell, else the spawn directory.
     pub cwd: String,
     /// Git branch of `cwd`, read from `.git/HEAD`.
@@ -43,6 +51,10 @@ pub struct Pane {
     /// notifications. Kept until Claude ends the session, so a window closed
     /// mid-session can resume it.
     pub claude: Option<String>,
+    /// Claude Code's hooks report for the pane, from the first one with
+    /// its token until the session ends. Bells and other notifications
+    /// would only say the same again.
+    pub hooked: bool,
     /// Set once the child has exited.
     pub exit_code: Option<u32>,
     /// Set by the reader thread when there is new output to draw.
@@ -115,11 +127,13 @@ impl Pane {
                         let mut term = lock(&t);
                         term.feed(chunk);
                         term.take_replies(&mut replies);
-                        drop(term);
-                        // Replies go out in the order the queries came in.
+                        // Replies go out in the order the queries came in,
+                        // and before the lock goes, so a focus report the
+                        // UI thread sends next follows any queued here.
                         if !replies.is_empty() {
                             w.reply(std::mem::take(&mut replies));
                         }
+                        drop(term);
                     }
                     if !d.swap(true, Ordering::AcqRel) {
                         notify(id, Note::Dirty);
@@ -162,13 +176,17 @@ impl Pane {
             term,
             pty,
             attn: PaneAttn::new(Instant::now()),
+            cmd: Command::default(),
             name: String::new(),
+            named: None,
             title: String::new(),
+            claude_title: None,
             cwd: s.cwd.map(|p| p.display().to_string()).unwrap_or_default(),
             branch: None,
             msg: String::new(),
             token: s.token.into(),
             claude: None,
+            hooked: false,
             exit_code: None,
             dirty,
         })

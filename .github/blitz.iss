@@ -38,6 +38,8 @@ Name: explorermenu; Description: "Add ""Open in blitz"" to the folder right-clic
 Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
 [Registry]
+; So "blitz" starts it from Win+R, and from "start blitz" in a shell.
+Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\blitz.exe"; ValueType: string; ValueData: "{app}\blitz.exe"; Flags: uninsdeletekey
 ; Right-click menu entries. HKA is HKCU on a per-user install and HKLM on an
 ; all-users one. Windows 11 shows them under "Show more options". The second
 ; verb is Extended: it only shows on Shift+right-click.
@@ -103,4 +105,21 @@ begin
     except
       // Setup stopped before it knew the folder.
     end;
+end;
+
+// Hooks pasted into Claude Code's settings name blitz-hook.exe, which is
+// about to go, and Claude Code would report each of them failing.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Settings: String;
+  Text: AnsiString;
+begin
+  if (CurUninstallStep <> usUninstall) or UninstallSilent then
+    Exit;
+  Settings := GetEnv('CLAUDE_CONFIG_DIR');
+  if Settings = '' then
+    Settings := ExpandConstant('{%USERPROFILE}\.claude');
+  Settings := AddBackslash(Settings) + 'settings.json';
+  if LoadStringFromFile(Settings, Text) and (Pos('blitz-hook', Lowercase(String(Text))) > 0) then
+    MsgBox(Settings + ' still runs blitz-hook.exe. Remove those hooks, or Claude Code will report them failing on every event.', mbInformation, MB_OK);
 end;

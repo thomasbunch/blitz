@@ -143,6 +143,9 @@ pub struct Terminal {
     modes: Modes,
     /// Dark or light system theme, for `CSI ? 996 n`.
     dark: bool,
+    /// The host shows this terminal with keyboard focus, for focus
+    /// reports (mode 1004).
+    focused: bool,
     /// Cell width and height in pixels, for size reports.
     cell_px: (u16, u16),
     /// Foreground, background and cursor colours the host draws with, for
@@ -219,6 +222,7 @@ impl Terminal {
             changed: true,
             modes: Modes::default(),
             dark: true,
+            focused: false,
             cell_px: (0, 0),
             pal: DARK,
             colors: [None; 3],
@@ -473,6 +477,13 @@ impl Terminal {
     /// see [`crate::keys::needs_paste_confirm`].
     pub fn paste_trusted(&self) -> bool {
         self.modes.input.bracketed && self.modes.paste_confirmed
+    }
+
+    /// Whether the host shows this terminal with keyboard focus. The host
+    /// reports changes itself while mode 1004 is on; a program that sets
+    /// the mode is told the state at once.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
     }
 
     /// The secret blitz's shell integration puts in its prompt marks, as
@@ -971,6 +982,7 @@ impl Terminal {
         std::mem::swap(&mut t.prompt_token, &mut self.prompt_token);
         t.line_epoch = self.line_epoch.wrapping_add(1);
         t.dark = self.dark;
+        t.focused = self.focused;
         t.cell_px = self.cell_px;
         t.pal = self.pal;
         // ConPTY turns these on for itself at startup and is not told that
@@ -1076,6 +1088,15 @@ impl Terminal {
             1049 if !on && self.alt => {
                 self.switch_screen(false);
                 self.restore_cursor();
+            }
+            // Otherwise a program started in a pane in the background
+            // would take itself to have focus until the user came and went.
+            // Each time: ConPTY turns the mode on for itself before the
+            // program starts, so the program's own request finds it on.
+            1004 if on => {
+                self.modes.set_dec(m, on);
+                let state = if self.focused { 'I' } else { 'O' };
+                self.reply(format_args!("\x1b[{state}"));
             }
             _ => {
                 self.modes.set_dec(m, on);

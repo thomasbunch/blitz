@@ -48,6 +48,7 @@ fn cli_prints_usage() {
         &["bogus"][..],
         &["setup"],
         &["setup", "vim"],
+        &["setup", "claude", "--linux"],
         &["debug"],
         &["debug", "frob"],
     ] {
@@ -86,6 +87,58 @@ fn cli_setup_claude_prints_the_hooks() {
         "{err}"
     );
     assert!(!err.contains("is missing"), "{err}");
+    assert!(err.contains("nothing to set up"), "{err}");
+    assert!(!err.contains("runs blitz-hook already"), "{err}");
+}
+
+/// Claude Code inside WSL runs the same blitz-hook, by its WSL path.
+#[test]
+fn cli_setup_claude_for_wsl() {
+    let out = blitz(Path::new(BLITZ), &["setup", "claude", "--wsl"], &tmp("cli"));
+    assert_eq!(out.status.code(), Some(0));
+    let v = Json::parse(&text(&out.stdout)).expect("settings JSON");
+    let Some(Json::Arr(groups)) = v.get("hooks").and_then(|h| h.get("Stop")) else {
+        panic!("{v:?}")
+    };
+    let Some(Json::Arr(cmds)) = groups[0].get("hooks") else {
+        panic!("{v:?}")
+    };
+    let cmd = cmds[0].get("command").and_then(Json::as_str).unwrap();
+    let hook = Path::new(BLITZ).with_file_name("blitz-hook.exe");
+    let hook = hook.to_str().expect("UTF-8 path");
+    let want = format!(
+        "/mnt/{}/{}",
+        hook[..1].to_ascii_lowercase(),
+        hook[3..].replace('\\', "/")
+    );
+    assert_eq!(cmd, want);
+    let err = text(&out.stderr);
+    assert!(err.contains("inside WSL"), "{err}");
+    assert!(err.contains("automount"), "{err}");
+}
+
+/// Hooks pasted before blitz loaded its own are pointed out: with both,
+/// every event reports twice.
+#[test]
+fn cli_setup_claude_flags_pasted_hooks() {
+    let config = tmp("cli-claude-pasted");
+    std::fs::create_dir_all(&config).expect("dir");
+    let settings = config.join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"C:\\Tools\\Blitz-Hook.exe","args":["claude"]}]}]}}"#,
+    )
+    .expect("settings");
+    let out = blitz(Path::new(BLITZ), &["setup", "claude"], &config);
+    assert_eq!(out.status.code(), Some(0));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains(&format!("{} runs blitz-hook already", settings.display())),
+        "{err}"
+    );
+    std::fs::write(&settings, r#"{"model":"opus"}"#).expect("settings");
+    let out = blitz(Path::new(BLITZ), &["setup", "claude"], &config);
+    assert!(!text(&out.stderr).contains("already"));
 }
 
 #[test]

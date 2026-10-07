@@ -16,6 +16,11 @@ pub enum Action {
     ScrollPage(i8),
     NewTab,
     ClosePane,
+    /// Close every pane of the active tab.
+    CloseTab,
+    /// Open the pane closed last again, beside the focused one, resuming
+    /// its Claude Code session.
+    ReopenClosed,
     /// Next (1) or previous (-1) tab.
     CycleTab(i8),
     /// Tab 1 to 9, 0-based.
@@ -53,6 +58,14 @@ pub enum Action {
     JumpToPrompt(i8),
     /// Open the find bar on the focused pane, or close it.
     Find,
+    /// Name the focused session on the command palette's line; an empty
+    /// name gives back the one blitz picks.
+    RenameSession,
+    /// The same for the focused session's tab.
+    RenameTab,
+    /// Copy the hooks for Claude Code's settings, for a Claude Code that
+    /// does not load blitz's own.
+    ClaudeSetup,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -65,6 +78,10 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::ScrollPage(-1), "scroll_page_down", "Scroll down a page"),
     (Action::NewTab, "new_tab", "New tab"),
     (Action::ClosePane, "close_pane", "Close pane"),
+    (Action::CloseTab, "close_tab", "Close tab"),
+    (Action::RenameSession, "rename_session", "Rename session"),
+    (Action::RenameTab, "rename_tab", "Rename tab"),
+    (Action::ReopenClosed, "reopen_closed", "Reopen the last closed pane"),
     (Action::CycleTab(1), "next_tab", "Next tab"),
     (Action::CycleTab(-1), "previous_tab", "Previous tab"),
     (Action::SplitRight, "split_right", "Split right"),
@@ -96,6 +113,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::JumpToPrompt(1), "previous_prompt", "Scroll to the previous prompt"),
     (Action::JumpToPrompt(-1), "next_prompt", "Scroll to the next prompt"),
     (Action::Find, "find", "Find in the scrollback"),
+    (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
@@ -349,7 +367,7 @@ pub fn repeats(k: &KeyInput, user: &[Binding], panel: bool) -> bool {
 pub fn drops_repeat(k: &KeyInput, user: &[Binding], taken: bool, panel: bool) -> bool {
     let confirms = matches!(
         action(k, user),
-        Some(Action::Paste | Action::ClosePane | Action::Update)
+        Some(Action::Paste | Action::ClosePane | Action::CloseTab | Action::Update)
     );
     (taken || confirms) && !repeats(k, user, panel)
 }
@@ -988,6 +1006,14 @@ mod msg_to_key_tests {
             binding("ctrl+shift+w=none"),
             Some((CTRL | SHIFT, 0x57, None))
         );
+        assert_eq!(
+            binding("ctrl+shift+q=close_tab"),
+            Some((CTRL | SHIFT, 0x51, Some(Action::CloseTab)))
+        );
+        assert_eq!(
+            binding("ctrl+shift+o=reopen_closed"),
+            Some((CTRL | SHIFT, 0x4f, Some(Action::ReopenClosed)))
+        );
         // Punctuation by character or by name.
         let plus = Some((CTRL, 0xbb, Some(Action::Copy)));
         for s in [
@@ -1109,6 +1135,15 @@ mod msg_to_key_tests {
     }
 
     #[test]
+    fn readme_names_every_action() {
+        let readme = include_str!("../../../README.md");
+        for &(_, name, _) in ACTIONS {
+            let named = readme.contains(&format!("`{name}`"));
+            assert!(named, "README.md does not name {name}");
+        }
+    }
+
+    #[test]
     fn readme_lists_every_default_shortcut() {
         let readme = include_str!("../../../README.md");
         // Followed by something other than more of a key name, so
@@ -1179,7 +1214,7 @@ mod msg_to_key_tests {
             assert!(!repeats_with(vk, &[], true), "{vk:#x}");
         }
         // Outside a panel, a key blitz took that is no shortcut, as Enter
-        // closing an exited pane, does not go on to the next pane.
+        // restarting an exited pane, does not go on to the new one.
         assert!(!repeats_with(0x0d, &[], false));
 
         let drops = |vk: u16, held: &[usize], taken: bool| {
@@ -1194,13 +1229,23 @@ mod msg_to_key_tests {
         for (vk, held) in [(0x56, &[0xa2][..]), (0x57, CS), (0x55, CS), (0x2d, &[0xa1])] {
             assert!(drops(vk, held, false), "{vk:#x}");
         }
+        // Closing a tab asks too, on whichever key it is bound to.
+        let close_tab = [binding("ctrl+shift+q=close_tab").unwrap()];
+        let mut t = String::new();
+        let again = lp(0, false, true, 1) | 1 << 30;
+        let k = msg_to_key(0x51, again, &state(CS, &[]), layout(US), &mut t);
+        assert!(drops_repeat(&k, &close_tab, false, false), "close_tab");
         // Copy with nothing selected passes its press on, so the program
         // gets every ^C of a held Ctrl+C; taken, it copies once.
         for (vk, held) in [(0x43, &[0xa2][..]), (0x2d, &[0xa2])] {
             assert!(!drops(vk, held, false), "{vk:#x}");
             assert!(drops(vk, held, true), "{vk:#x} taken");
         }
-        assert!(drops(0x0d, &[], true), "Enter that closed an exited pane");
+        assert!(
+            drops(0x0d, &[], true),
+            "Enter that restarted an exited pane"
+        );
+        assert!(drops(0x1b, &[], true), "Esc that closed one");
         // Typing, and moving that repeats, go on.
         assert!(!drops(0x41, &[], false));
         assert!(!drops(0x0d, &[], false));

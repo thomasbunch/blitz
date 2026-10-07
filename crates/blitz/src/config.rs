@@ -19,7 +19,8 @@ pub struct Config {
     pub scrollback_lines: usize,
     /// Flash the taskbar button when a session needs attention.
     pub flash: bool,
-    /// Whether BEL in an unfocused pane asks for attention.
+    /// Whether BEL, or a notification without the pane's token, in an
+    /// unfocused pane asks for attention.
     pub bell_attention: bool,
     /// Look for a newer release on GitHub at start and every six hours.
     pub check_updates: bool,
@@ -183,8 +184,9 @@ pub const SETTINGS: &[Setting] = &[
         key: "bell_attention",
         group: "Notifications",
         label: "Bell needs you",
-        help: "A bell in a pane you are not looking at marks its session as \
-               needing you, as a question from Claude Code does.",
+        help: "A bell or a notification in a pane you are not looking at marks \
+               its session as needing you until you look. A pane Claude Code's \
+               hooks report for leaves it to them.",
         kind: Kind::Toggle,
         applies: NOW,
     },

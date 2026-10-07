@@ -3,6 +3,7 @@
 // One process hosts every session, so a failed HRESULT must never panic.
 #![deny(clippy::unwrap_used)]
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetKeyState, GetKeyboardState,
+    GetDoubleClickTime, GetKeyState, GetKeyboardState, GetLastInputInfo, LASTINPUTINFO,
 };
 use windows::Win32::UI::Shell::{
     ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
@@ -43,7 +44,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowId};
 
 use crate::arcade::run::{self, Run};
-use crate::attention::{Attn, Ev};
+use crate::attention::{Attn, Ev, claude_title, exit_text};
 use crate::config::{Config, Kind};
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
@@ -74,11 +75,14 @@ const VK_W: u16 = 0x57;
 const VK_F3: u16 = 0x72;
 const VK_F4: u16 = 0x73;
 
-/// How long a multi-line paste waits for a second Ctrl+V, and closing a
-/// busy session for a second Ctrl+Shift+W.
-const CONFIRM: Duration = Duration::from_secs(3);
-/// How long the notice about the system ConPTY stays up.
+/// How long a notice that is neither a question nor an error stays up.
 const NOTICE: Duration = Duration::from_secs(5);
+/// How long a hint about setting something up stays up.
+const HINT: Duration = Duration::from_secs(10);
+/// How long Claude Code may show it is working with no word from its
+/// hooks before blitz says they are not reporting. A turn's first hook
+/// lands within a second of it starting.
+const HOOKS_QUIET: Duration = Duration::from_secs(45);
 /// Frame times for blitz run, and for scenery and the spark, which move
 /// slowly.
 const GAME_FRAME: Duration = Duration::from_millis(16);
@@ -92,6 +96,9 @@ const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const INTERNAL: &str = "an internal error";
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
+/// After this long with no key or mouse input anywhere, the user counts as
+/// away from the screen, even with blitz in front.
+const AWAY_AFTER: Duration = Duration::from_secs(30);
 /// How long a restored pane waits for its shell's first prompt before it
 /// types the Claude Code resume command anyway.
 const RESUME_AFTER: Duration = Duration::from_secs(3);
@@ -262,9 +269,12 @@ fn hook(keys: &RefCell<Keys>, msg: &MSG) -> bool {
             let _ = unsafe { GetKeyboardState(&mut state) };
             let held = |vk: usize| state[vk] & 0x80 != 0;
             // The input method owns the key; winit turns it into IME events.
-            // Alt+F4 still closes the window.
-            if vk == VK_PROCESSKEY || vk == VK_F4 && held(0x12) && !held(0x11) && !held(0x10) {
+            if vk == VK_PROCESSKEY {
                 return false;
+            }
+            // Alt+F4 still closes the window.
+            if vk == VK_F4 && held(0x12) && !held(0x11) && !held(0x10) {
+                return !alt_f4_passes(down, msg.lParam.0);
             }
             if k.skipped(vk, down) {
                 return true;
@@ -408,6 +418,51 @@ struct Notice {
     /// Removed at this time; `None` keeps it until something replaces it.
     until: Option<Instant>,
     dim: bool,
+    ask: Ask,
+}
+
+/// What a notice waits for. One that asks to confirm stays armed while
+/// it shows, with no deadline to read it by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Ask {
+    Nothing,
+    /// An error: the next key in its pane takes it away, read by then.
+    Key,
+    /// The action that showed it, run again in its pane, confirms. Any
+    /// other key takes it away and goes on to do what it does.
+    Paste(String),
+    ClosePane,
+    CloseTab,
+    Update,
+    /// Closing the window again confirms; any key takes it away.
+    Quit,
+}
+
+impl Ask {
+    /// Whether a key that runs `a`, if any, takes the notice away. `here`
+    /// when the key goes to the notice's pane. Opening the palette does
+    /// not, since an action run from it confirms too. A question about its
+    /// own pane goes at any key aimed at another, so the same action there
+    /// cannot answer it later.
+    fn gone(&self, a: Option<Action>, here: bool) -> bool {
+        let by = match self {
+            Ask::Nothing => return false,
+            Ask::Key => return here,
+            Ask::Paste(_) | Ask::ClosePane | Ask::CloseTab if !here => return true,
+            Ask::Paste(_) => Action::Paste,
+            Ask::ClosePane => Action::ClosePane,
+            Ask::CloseTab => Action::CloseTab,
+            Ask::Update => Action::Update,
+            Ask::Quit => return true,
+        };
+        a != Some(by) && a != Some(Action::Palette)
+    }
+
+    /// Whether the question is about its own pane, so focus leaving that
+    /// pane takes it away.
+    fn of_pane(&self) -> bool {
+        matches!(self, Ask::Paste(_) | Ask::ClosePane | Ask::CloseTab)
+    }
 }
 
 /// The renderer and the window's swap chain, rebuilt together after the
@@ -697,13 +752,32 @@ struct View {
     /// A restored Claude Code session: the line to type at the shell's
     /// first prompt, and when to type it anyway.
     resume: Option<(String, Instant)>,
+    /// The shell has shown blitz's prompt mark, so the next one means
+    /// what ran in it has ended.
+    prompted: bool,
     /// When the program's open synchronized update times out, as of the
     /// last look at its terminal.
     sync_until: Option<Instant>,
     /// Names the session's saved output; kept across restarts.
     key: String,
+    /// The command line it runs in place of the shell.
+    cmd: Option<String>,
     /// The progress the program last reported, and when.
     progress: Option<(chrome::Progress, Instant)>,
+    /// When the title first showed Claude Code working.
+    claude_working: Option<Instant>,
+    /// A hook notification came, so Claude Code's hooks report.
+    hooks_seen: bool,
+}
+
+impl View {
+    /// What closing the session would cut short; see [`crate::attention::busy`].
+    fn busy(&self) -> Option<&'static str> {
+        let p = &self.pane;
+        (p.exit_code.is_none())
+            .then(|| crate::attention::busy(p.attn.state, &p.cmd, p.claude.is_some()))
+            .flatten()
+    }
 }
 
 struct App {
@@ -746,6 +820,9 @@ struct App {
     rows: Vec<(PaneId, Rect)>,
     next_id: u32,
     focused: bool,
+    /// A session changed while the user was away from the screen; the
+    /// focused pane counts as seen once they are back.
+    away: bool,
     /// A selection in the focused pane.
     selection: Option<Selection>,
     /// The link under the pointer while Ctrl is held, drawn underlined:
@@ -757,18 +834,14 @@ struct App {
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
-    /// A multi-line paste waiting for its confirming Ctrl+V in the pane
-    /// that asked.
-    paste: Option<(PaneId, String, Instant)>,
-    /// A busy session waiting for a second Ctrl+Shift+W.
-    close_confirm: Option<(PaneId, Instant)>,
     /// A newer release: its version and the banner text.
     update: Option<(String, String)>,
-    /// Busy sessions, waiting for a second Ctrl+Shift+U.
-    update_confirm: Option<Instant>,
     /// The installer is downloading, or Ctrl+Shift+U is looking for a
     /// release; this pane shows that.
     updating: Option<PaneId>,
+    /// The folder and Claude Code session of the pane closed last, which
+    /// the palette can reopen.
+    closed: Option<(String, Option<String>)>,
     /// The banner strip in the last frame, for clicks.
     banner: Option<Rect>,
     /// Keys whose releases belong to a shortcut or a panel and are not sent.
@@ -799,6 +872,11 @@ struct App {
     taskbar: Option<ITaskbarList3>,
     /// The progress the taskbar button shows.
     taskbar_shows: Option<chrome::Progress>,
+    /// blitz's Claude Code plugin, which every pane loads; `None` when it
+    /// could not be written.
+    plugin: Option<String>,
+    /// A hint about Claude Code's hooks was shown; one per run is enough.
+    hooks_hinted: bool,
     counters: Counters,
     code: i32,
 }
@@ -854,12 +932,25 @@ struct Commands {
     filter: String,
     /// The highlighted action, among the matching ones.
     sel: usize,
+    /// What the typed text names instead, with no actions to pick.
+    rename: Option<Rename>,
+}
+
+/// What the command palette's line names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rename {
+    Session(PaneId),
+    /// The tab that holds this session.
+    Tab(PaneId),
 }
 
 impl Commands {
     /// The matching actions and their labels, in [`keymap::ACTIONS`] order.
     /// The palette leaves itself out.
     fn matches(&self) -> Vec<(Action, &'static str)> {
+        if self.rename.is_some() {
+            return Vec::new();
+        }
         let words: Vec<String> = (self.filter.split_whitespace())
             .map(str::to_lowercase)
             .collect();
@@ -1004,16 +1095,15 @@ impl App {
             rows: Vec::new(),
             next_id: 1,
             focused: false,
+            away: false,
             selection: None,
             hover: None,
             resolved: RefCell::new(None),
             mouse: Mouse::default(),
             preedit: String::new(),
-            paste: None,
-            close_confirm: None,
             update: None,
-            update_confirm: None,
             updating: None,
+            closed: None,
             banner: None,
             eaten: Eaten::default(),
             ime_at: None,
@@ -1029,6 +1119,8 @@ impl App {
             gpu: None,
             taskbar: None,
             taskbar_shows: None,
+            plugin: None,
+            hooks_hinted: false,
             counters: Counters::default(),
             code: 0,
         }
@@ -1077,6 +1169,7 @@ impl App {
             crate::handoff::install(self.hwnd, self.proxy.clone());
         }
         watch_settings(self.proxy.clone());
+        self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
         self.frame_theme();
         self.window = Some(window);
         self.ensure_gfx();
@@ -1102,7 +1195,7 @@ impl App {
                 None => std::env::current_dir().ok(),
             };
             let id = PaneId(self.next_id);
-            win.tabs.push(Tab::new(tab_name(cwd.as_deref()), id));
+            win.tabs.push(Tab::new(String::new(), id));
             win.active = win.tabs.len() - 1;
             let cmd = self.args.cmd.clone();
             self.open(win, id, cmd.as_deref(), cwd)?;
@@ -1215,17 +1308,61 @@ impl App {
             {
                 v.key = meta.key.clone();
             }
-            if let Some(line) = resume_line(self.config.restore_claude, meta.claude.as_deref())
+            // A result the user had not seen before blitz closed.
+            if let Some(msg) = &meta.done
                 && let Some(v) = self.views.last_mut()
             {
-                // Known from the start, so closing blitz again before the
-                // first prompt still resumes it next time.
-                v.pane.claude = meta.claude.clone();
-                v.resume = Some((line, Instant::now() + RESUME_AFTER));
+                v.pane.attn.apply(Ev::Done, false, Instant::now());
+                v.pane.msg.clone_from(msg);
             }
+            if let Some(v) = self.views.last_mut() {
+                v.pane.named.clone_from(&meta.name);
+            }
+            self.resume(id, meta.claude.clone());
         }
         self.install(win);
         Ok(())
+    }
+
+    /// Has the shell of the new pane `id` resume Claude Code session
+    /// `claude` once it is ready.
+    fn resume(&mut self, id: PaneId, claude: Option<String>) {
+        if let Some(line) = resume_line(self.config.restore_claude, claude.as_deref())
+            && let Some(v) = self.view_mut(id)
+        {
+            // Known from the start, so closing blitz again before the
+            // first prompt still resumes it next time.
+            v.pane.claude = claude;
+            v.resume = Some((line, Instant::now() + RESUME_AFTER));
+        }
+    }
+
+    /// Starts the program of pane `id`, which exited, again in its place:
+    /// in its folder, by the name the user gave it, resuming its Claude
+    /// Code session. The new session
+    /// gets a new id, so nothing still on its way from the old one lands
+    /// in it.
+    fn restart(&mut self, id: PaneId) {
+        let Some(i) = self.views.iter().position(|v| v.pane.id == id) else {
+            return;
+        };
+        let (old, new) = (&self.views[i], PaneId(self.next_id));
+        let (cwd, cmd) = (start_dir(&old.pane.cwd), old.cmd.clone());
+        let claude = old.pane.claude.clone().filter(|_| cmd.is_none());
+        let mut win = self.win.clone();
+        win.replace_pane(id, new);
+        let grids = self.grids(&win);
+        if let Err(e) = self.spawn(new, &grids, cmd.as_deref(), cwd, None) {
+            self.error(id, e);
+            return;
+        }
+        // The new session takes the old one's row in the sidebar.
+        let named = self.views.swap_remove(i).pane.named;
+        if let Some(v) = self.view_mut(new) {
+            v.pane.named = named;
+        }
+        self.resume(new, claude);
+        self.install(win);
     }
 
     /// Starts a session for pane `id`, sized as `grids` lays it out (or
@@ -1252,13 +1389,20 @@ impl App {
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         // Not the token, which is a secret between the pane and its child.
         let key = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
-        let launch = match cmd {
+        let mut launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
                 env: Vec::new(),
             },
             None => crate::shell::launch(&self.config.shell, self.config.shell_integration, &token),
         };
+        // Claude Code loads blitz's hooks from there, with nothing pasted
+        // into its settings.
+        if let Some(dir) = &self.plugin {
+            let inherited = std::env::var("CLAUDE_CODE_PLUGIN_DIRS").ok();
+            let dirs = crate::hook::plugin_dirs(inherited.as_deref(), dir);
+            launch.env.push(("CLAUDE_CODE_PLUGIN_DIRS".into(), dirs));
+        }
         let proxy = self.proxy.clone();
         let mut pane = Pane::spawn(
             id,
@@ -1292,12 +1436,16 @@ impl App {
             flashed: None,
             finding_branch: false,
             resume: None,
+            prompted: false,
             sync_until: None,
             key,
+            cmd: cmd.map(str::to_owned),
             progress: None,
+            claude_working: None,
+            hooks_seen: false,
         });
         self.find_branch(id);
-        self.next_id = id.0 + 1;
+        self.next_id = self.next_id.max(id.0 + 1);
         Ok(())
     }
 
@@ -1316,24 +1464,27 @@ impl App {
     fn add(
         &mut self,
         dir: Option<PathBuf>,
-        place: impl FnOnce(&mut layout::Window, PaneId, Option<&Path>) -> bool,
+        place: impl FnOnce(&mut layout::Window, PaneId) -> bool,
     ) {
         let cwd = dir.or_else(|| start_dir(self.current().map_or("", |v| v.pane.cwd.as_str())));
         let id = PaneId(self.next_id);
         let mut win = self.win.clone();
-        if !place(&mut win, id, cwd.as_deref()) {
+        if !place(&mut win, id) {
             return;
         }
         if let Err(e) = self.open(win, id, None, cwd)
             && let Some(id) = self.focus_id()
         {
-            self.set_notice(id, e, Some(Instant::now() + NOTICE), false);
+            self.error(id, e);
         }
     }
 
     /// Closes a session and its pane. The window closes with the last one.
     fn close(&mut self, el: &ActiveEventLoop, id: PaneId) {
         let before = self.focus_id();
+        if let Some(v) = self.view(id) {
+            self.closed = Some((v.pane.cwd.clone(), v.pane.claude.clone()));
+        }
         self.win.close_pane(id);
         // The divider being dragged may be gone, even when focus stays.
         self.mouse.divider = None;
@@ -1362,6 +1513,12 @@ impl App {
         }
         self.selection = None;
         self.find = None;
+        if let Some(left) = before {
+            focus_left(
+                self.views.iter_mut().map(|v| (v.pane.id, &mut v.notice)),
+                left,
+            );
+        }
         self.mouse.drag = None;
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
@@ -1370,9 +1527,7 @@ impl App {
         if self.focused {
             for (id, f) in [(before, false), (now, true)] {
                 if let Some(v) = id.and_then(|id| self.view(id)) {
-                    let mut out = Vec::new();
-                    vt::encode_focus(f, &lock(&v.pane.term).input_modes(), &mut out);
-                    v.pane.send(out);
+                    tell_focus(v, f);
                 }
             }
             if let Some(id) = now {
@@ -1483,6 +1638,10 @@ impl App {
                     })
                     .collect(),
                 sel: cm.sel,
+                rename: cm.rename.map(|r| match r {
+                    Rename::Session(_) => "Rename session",
+                    Rename::Tab(_) => "Rename tab",
+                }),
             }),
             find: self.find.as_ref().map(|f| chrome::FindBar {
                 query: &f.query,
@@ -1624,9 +1783,7 @@ impl App {
                             let focus = self.focus_id();
                             match (&mut self.settings, focus) {
                                 (Some(p), _) => p.error = Some(text),
-                                (None, Some(id)) => {
-                                    self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
-                                }
+                                (None, Some(id)) => self.error(id, text),
                                 (None, None) => {}
                             }
                         }
@@ -1818,8 +1975,11 @@ impl App {
             VK_ESCAPE => self.commands = None,
             VK_RETURN => {
                 let picked = cm.matches().get(cm.sel).map(|a| a.0);
+                let rename = cm.rename.map(|r| (r, crate::hook::one_line(&cm.filter)));
                 self.commands = None;
-                if let Some(a) = picked {
+                if let Some((r, name)) = rename {
+                    self.rename(r, name);
+                } else if let Some(a) = picked {
                     self.act(el, a);
                 }
             }
@@ -1834,6 +1994,24 @@ impl App {
                 cm.sel = 0;
             }
             _ => return,
+        }
+        self.request_redraw();
+    }
+
+    /// Gives a session or a tab the name `name`, or with an empty one lets
+    /// blitz pick it again.
+    fn rename(&mut self, r: Rename, name: String) {
+        match r {
+            Rename::Session(id) => {
+                if let Some(v) = self.view_mut(id) {
+                    v.pane.named = (!name.is_empty()).then_some(name);
+                }
+            }
+            Rename::Tab(id) => {
+                if let Some(t) = self.win.tabs.iter_mut().find(|t| t.root.contains(id)) {
+                    t.name = name;
+                }
+            }
         }
         self.request_redraw();
     }
@@ -1954,29 +2132,30 @@ impl App {
 
     /// Every session as the sidebar shows it.
     fn sessions(&self) -> Vec<chrome::Session> {
-        self.views
-            .iter()
+        let mut list: Vec<chrome::Session> = (self.views.iter())
             .map(|v| {
                 let p = &v.pane;
+                let claude = titled_by_claude(p.claude_title, p.hooked, p.claude.as_deref());
+                let (name, msg) = label(p.named.as_deref(), &p.name, &p.title, claude, &p.msg);
                 chrome::Session {
                     id: p.id,
-                    // Programs set the rest of the row, so the session's
-                    // number is what tells two look-alike sessions apart.
-                    name: format!("{} {}", p.name, p.id.0),
+                    name,
+                    num: None,
                     cwd: p.cwd.clone(),
                     branch: p.branch.clone(),
                     state: p.attn.state,
                     since: p.attn.since,
-                    msg: if p.msg.is_empty() {
-                        p.title.clone()
-                    } else {
-                        p.msg.clone()
-                    },
+                    turn: p.attn.turn,
+                    took: p.attn.took,
+                    seen: p.attn.seen,
+                    msg,
                     progress: v.progress.map(|p| p.0),
                     exit_code: p.exit_code,
                 }
             })
-            .collect()
+            .collect();
+        chrome::number_twins(&mut list);
+        list
     }
 
     /// Builds the renderer and swap chain if there are none. Never panics:
@@ -2053,6 +2232,32 @@ impl App {
         }
     }
 
+    /// Says dimly in pane `id`, for a while, that Claude Code's hooks are
+    /// not reporting, or are `older` than this blitz, unless a hint about
+    /// them was shown already. One a question keeps out comes at the next
+    /// title or hook.
+    fn hooks_hint(&mut self, id: PaneId, older: bool) {
+        if self.hooks_hinted {
+            return;
+        }
+        let palette = keymap::keys_for(Action::Palette, &self.config.keys);
+        let text = hooks_hint_text(older, palette);
+        self.hooks_hinted = self.hint(id, text, Instant::now() + HINT);
+    }
+
+    /// Says `text` dimly in pane `id`, which nobody asked for, until
+    /// `until`, unless a question, an error or a plain notice waits there.
+    /// Whether it did.
+    fn hint(&mut self, id: PaneId, text: impl Into<String>, until: Instant) -> bool {
+        let shown =
+            (self.view_mut(id)).is_some_and(|v| hint_into(&mut v.notice, text.into(), until));
+        self.request_redraw();
+        shown
+    }
+
+    /// Shows `text` in pane `id` in place of any notice there, as what a
+    /// user's action led to does; a hint nobody asked for goes through
+    /// [`App::hint`].
     fn set_notice(
         &mut self,
         id: PaneId,
@@ -2065,9 +2270,55 @@ impl App {
                 text: text.into(),
                 until,
                 dim,
+                ask: Ask::Nothing,
             });
         }
         self.request_redraw();
+    }
+
+    /// Shows `text` in pane `id` until `ask` is answered or a key takes it
+    /// away.
+    fn ask(&mut self, id: PaneId, text: impl Into<String>, ask: Ask) {
+        if let Some(v) = self.view_mut(id) {
+            v.notice = Some(Notice {
+                text: text.into(),
+                until: None,
+                dim: false,
+                ask,
+            });
+        }
+        self.request_redraw();
+    }
+
+    /// Says what went wrong in pane `id`, until the next key there.
+    fn error(&mut self, id: PaneId, text: impl Into<String>) {
+        self.ask(id, text, Ask::Key);
+    }
+
+    /// Whether pane `id` asks `ask`, which a second run of its action
+    /// answers. Takes the question away if so.
+    fn confirmed(&mut self, id: PaneId, ask: &Ask) -> bool {
+        let yes = (self.view_mut(id))
+            .and_then(|v| v.notice.take_if(|n| n.ask == *ask))
+            .is_some();
+        if yes {
+            self.request_redraw();
+        }
+        yes
+    }
+
+    /// A key that runs `a`, if anything, takes away the questions it does
+    /// not answer, and the focused pane's error.
+    fn dismiss(&mut self, a: Option<Action>) {
+        let focus = self.focus_id();
+        let mut gone = false;
+        for v in &mut self.views {
+            let here = Some(v.pane.id) == focus;
+            gone |= v.notice.take_if(|n| n.ask.gone(a, here)).is_some();
+        }
+        if gone {
+            self.request_redraw();
+        }
     }
 
     /// Handles queued key input.
@@ -2077,6 +2328,8 @@ impl App {
             match input {
                 Input::Text(t) => {
                     if !self.filter_text(&t) {
+                        // As any other key, it takes questions away.
+                        self.dismiss(None);
                         self.typed(t.into_bytes());
                     }
                 }
@@ -2175,7 +2428,15 @@ impl App {
             }
             return;
         }
-        if let Some(a) = keymap::action(k, &self.config.keys)
+        let modifier = matches!(
+            k.key,
+            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
+        );
+        let a = keymap::action(k, &self.config.keys);
+        if k.down && !modifier && !lock_key(k.vk) {
+            self.dismiss(a);
+        }
+        if let Some(a) = a
             && self.act(el, a)
         {
             self.eaten.press(k.vk);
@@ -2198,20 +2459,19 @@ impl App {
             return;
         };
         if v.pane.exit_code.is_some() {
-            if k.down && k.vk == VK_RETURN {
+            if k.down && matches!(k.vk, VK_RETURN | VK_ESCAPE) {
                 let id = v.pane.id;
                 // The release must not reach the pane that takes focus.
                 self.eaten.press(k.vk);
-                self.close(el, id);
+                match k.vk {
+                    VK_RETURN => self.restart(id),
+                    _ => self.close(el, id),
+                }
             }
             return;
         }
         let mut out = Vec::new();
         vt::encode_key(k, &self.modes(), &mut out);
-        let modifier = matches!(
-            k.key,
-            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
-        );
         if k.down && !modifier && !out.is_empty() {
             self.typed(out);
         } else {
@@ -2219,7 +2479,8 @@ impl App {
         }
     }
 
-    /// Sends input the user typed: the view follows the cursor again.
+    /// Sends input the user typed: the view follows the cursor again, and
+    /// it answers what the session asked.
     fn typed(&mut self, bytes: Vec<u8>) {
         if self.selection.take().is_some() {
             self.request_redraw();
@@ -2227,6 +2488,22 @@ impl App {
         if let Some(v) = self.current() {
             lock(&v.pane.term).scroll_viewport(isize::MIN);
             v.pane.send(bytes);
+            let id = v.pane.id;
+            self.answered(id);
+        }
+    }
+
+    /// The user typed, pasted or clicked into session `id`. A question it
+    /// showed is answered, so its text goes too.
+    fn answered(&mut self, id: PaneId) {
+        let asked = self
+            .view(id)
+            .is_some_and(|v| v.pane.attn.state == Attn::NeedsYou);
+        if self.attention(id, Ev::Answered)
+            && asked
+            && let Some(v) = self.view_mut(id)
+        {
+            v.pane.msg.clear();
         }
     }
 
@@ -2263,23 +2540,13 @@ impl App {
                     let Some(id) = before else {
                         return false;
                     };
-                    let confirmed = self.paste.take().is_some_and(|(p, t, until)| {
-                        p == id && t == text && Instant::now() < until
-                    });
-                    if !confirmed {
+                    if !self.confirmed(id, &Ask::Paste(text.clone())) {
                         let lines = text.lines().count();
-                        let until = Instant::now() + CONFIRM;
-                        self.paste = Some((id, text, until));
-                        self.set_notice(
-                            id,
-                            format!("Paste {lines} lines? Press Ctrl+V again within 3 s"),
-                            Some(until),
-                            false,
-                        );
+                        let asked = format!("Paste {lines} lines? Press Ctrl+V again");
+                        self.ask(id, asked, Ask::Paste(text));
                         return true;
                     }
-                    if let Some(v) = self.view_mut(id) {
-                        v.notice = None;
+                    if let Some(v) = self.view(id) {
                         lock(&v.pane.term).confirm_paste();
                     }
                 }
@@ -2300,24 +2567,32 @@ impl App {
                 let Some(v) = self.current() else {
                     return true;
                 };
-                let id = v.pane.id;
-                let busy = match (v.pane.attn.state, v.pane.exit_code) {
-                    (Attn::Working, None) => Some("working"),
-                    (Attn::NeedsYou, None) => Some("waiting for you"),
-                    _ => None,
-                };
-                let again = (self.close_confirm.take())
-                    .is_some_and(|(p, until)| p == id && Instant::now() < until);
+                let (id, busy) = (v.pane.id, v.busy());
                 match busy {
-                    Some(what) if !again => {
-                        let until = Instant::now() + CONFIRM;
-                        self.close_confirm = Some((id, until));
-                        let text = format!(
-                            "This session is {what}. Press Ctrl+Shift+W again within 3 s to close it"
-                        );
-                        self.set_notice(id, text, Some(until), false);
+                    Some(what) if !self.confirmed(id, &Ask::ClosePane) => {
+                        let again = again(a, &self.config.keys);
+                        let text = format!("This session is {what}. {again} to close it");
+                        self.ask(id, text, Ask::ClosePane);
                     }
                     _ => self.close(el, id),
+                }
+            }
+            Action::CloseTab => {
+                let (Some(id), Some(t)) = (before, self.win.tabs.get(self.win.active)) else {
+                    return true;
+                };
+                let panes = t.panes();
+                let busy: Vec<_> = (panes.iter())
+                    .filter_map(|&p| self.view(p)?.busy())
+                    .collect();
+                if !busy.is_empty() && !self.confirmed(id, &Ask::CloseTab) {
+                    let what = busy_text(&busy, " in this tab");
+                    let text = format!("{what}. {} to close it", again(a, &self.config.keys));
+                    self.ask(id, text, Ask::CloseTab);
+                    return true;
+                }
+                for p in panes {
+                    self.close(el, p);
                 }
             }
             Action::CycleTab(step) => {
@@ -2340,20 +2615,23 @@ impl App {
                 } else {
                     Dir::Down
                 };
-                self.add(None, |win, id, _| {
-                    // Only the pane minimum matters, and `open` checks that
-                    // against the real window.
-                    let any = Rect {
-                        x: 0,
-                        y: 0,
-                        w: 1 << 16,
-                        h: 1 << 16,
-                    };
-                    let active = win.active;
-                    win.tabs
-                        .get_mut(active)
-                        .is_some_and(|t| t.split(dir, id, any, (0, 0)))
-                });
+                self.add(None, split(dir));
+            }
+            Action::ReopenClosed => {
+                let Some((cwd, claude)) = self.closed.take() else {
+                    if let Some(id) = before {
+                        let until = Some(Instant::now() + NOTICE);
+                        self.set_notice(id, "No closed pane to reopen", until, true);
+                    }
+                    return true;
+                };
+                let id = PaneId(self.next_id);
+                self.add(start_dir(&cwd), split(Dir::Right));
+                if self.view(id).is_some() {
+                    self.resume(id, claude);
+                } else {
+                    self.closed = Some((cwd, claude));
+                }
             }
             Action::ToggleSidebar => {
                 self.win.sidebar_expanded = !self.win.sidebar_expanded;
@@ -2395,7 +2673,7 @@ impl App {
             Action::JumpToAttention => {
                 let waiting = (self.views.iter())
                     .filter(|v| Some(v.pane.id) != before)
-                    .map(|v| (v.pane.id, v.pane.attn.state, v.pane.attn.since));
+                    .map(|v| (v.pane.id, v.pane.attn));
                 if let Some(id) = crate::attention::jump_target(waiting) {
                     self.show(id);
                 }
@@ -2425,28 +2703,21 @@ impl App {
                             "Could not open a browser; get it at {}",
                             crate::update::PAGE
                         );
-                        self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                        self.error(id, text);
                     }
                     return true;
                 }
                 // Updating restarts blitz, which ends every session.
-                let busy = (self.views.iter())
-                    .filter(|v| v.pane.exit_code.is_none())
-                    .filter(|v| matches!(v.pane.attn.state, Attn::Working | Attn::NeedsYou))
-                    .count();
-                let again = (self.update_confirm.take()).is_some_and(|t| Instant::now() < t);
-                if busy > 0 && !again {
-                    let until = Instant::now() + CONFIRM;
-                    self.update_confirm = Some(until);
+                let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
+                if busy > 0 && !self.confirmed(id, &Ask::Update) {
                     let what = if busy == 1 {
                         "A session is"
                     } else {
                         "Sessions are"
                     };
-                    let text = format!(
-                        "{what} busy, and updating restarts blitz. Press Ctrl+Shift+U again within 3 s"
-                    );
-                    self.set_notice(id, text, Some(until), false);
+                    let again = again(a, &self.config.keys);
+                    let text = format!("{what} busy, and updating restarts blitz. {again}");
+                    self.ask(id, text, Ask::Update);
                     return true;
                 }
                 self.updating = Some(id);
@@ -2509,11 +2780,61 @@ impl App {
                 }
                 self.request_redraw();
             }
+            // The file is the user's to edit, so the hooks go on the
+            // clipboard.
+            Action::ClaudeSetup => {
+                let Some(id) = before else {
+                    return false;
+                };
+                let text = match crate::hook::hook_exe() {
+                    Ok(hook) => crate::hook::claude_settings(&hook.to_string_lossy()),
+                    Err(e) => {
+                        self.set_notice(
+                            id,
+                            format!("blitz cannot find itself: {e}"),
+                            Some(Instant::now() + HINT),
+                            false,
+                        );
+                        return true;
+                    }
+                };
+                let copied =
+                    crate::clipboard::set_text(Some(HWND(self.hwnd as *mut c_void)), &text);
+                let text = if copied {
+                    "Copied hooks for Claude Code's settings.json; Claude Code 2.1.280 and later need none"
+                } else {
+                    "Could not copy to the clipboard"
+                };
+                self.set_notice(id, text, Some(Instant::now() + HINT), copied);
+            }
             Action::Find => {
                 let Some(id) = before else {
                     return false;
                 };
                 self.find = Some(Find::new(id));
+                self.request_redraw();
+            }
+            // The palette's line takes the name, starting from the one the
+            // user gave before.
+            Action::RenameSession | Action::RenameTab => {
+                let Some(id) = before else {
+                    return false;
+                };
+                let (rename, name) = if a == Action::RenameSession {
+                    let named = self.view(id).and_then(|v| v.pane.named.clone());
+                    (Rename::Session(id), named.unwrap_or_default())
+                } else {
+                    let tab = self.win.tabs.get(self.win.active);
+                    (
+                        Rename::Tab(id),
+                        tab.map(|t| t.name.clone()).unwrap_or_default(),
+                    )
+                };
+                self.commands = Some(Commands {
+                    filter: name,
+                    sel: 0,
+                    rename: Some(rename),
+                });
                 self.request_redraw();
             }
         }
@@ -2546,7 +2867,7 @@ impl App {
                     if let Some(text) = crate::pty::inbox_notice() {
                         self.counters.inbox = true;
                         eprintln!("blitz: {text}");
-                        self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                        self.hint(id, text, Instant::now() + NOTICE);
                     }
                 }
                 if shown {
@@ -2555,6 +2876,7 @@ impl App {
             }
             Note::Exit(code) => {
                 v.pane.exit_code = Some(code);
+                v.pane.cmd = Default::default();
                 v.progress = None;
                 self.taskbar_progress();
                 self.attention(id, Ev::from_exit(code));
@@ -2564,12 +2886,8 @@ impl App {
                     self.close(el, id);
                     return;
                 }
-                self.set_notice(
-                    id,
-                    format!("exited with code {code} \u{b7} Enter close"),
-                    None,
-                    false,
-                );
+                // `notice_line` says so from now on.
+                self.request_redraw();
             }
             Note::Dead => {
                 self.attention(id, Ev::Error { sticky: true });
@@ -2583,56 +2901,104 @@ impl App {
         }
     }
 
+    /// One thing a session's output did. Where Claude Code's signals
+    /// disagree, its title says whether it is working, its hooks say when
+    /// it needs the user, what to show and which session it is, and
+    /// blitz's own prompt coming back says it has exited.
     fn on_term_event(&mut self, id: PaneId, e: Event) {
         let focus = self.focus_id() == Some(id);
+        let bell = self.config.bell_attention;
         let Some(v) = self.view_mut(id) else {
             return;
         };
         match e {
             Event::Title(t) => {
+                if claude_working_title(&t) {
+                    v.claude_working.get_or_insert(Instant::now());
+                }
+                let silent = hooks_silent(v.claude_working, v.hooks_seen, Instant::now());
+                let (was, now) = (v.pane.claude_title, claude_title(&t).map(|c| c.0));
+                v.pane.claude_title = now;
                 v.pane.title = t;
                 if focus {
                     let t = v.pane.title.clone();
                     self.set_title(&t);
+                }
+                // This needs no hooks, and it sees a turn the user
+                // interrupted end, which runs no hook at all.
+                match (was, now) {
+                    (w, Some(true)) if w != Some(true) => {
+                        self.attention(id, Ev::Busy);
+                    }
+                    (Some(true), Some(false)) => {
+                        self.attention(id, Ev::Quiet);
+                        self.find_branch(id);
+                    }
+                    _ => {}
+                }
+                if silent {
+                    self.hooks_hint(id, false);
                 }
             }
             Event::Cwd(dir) => {
                 v.pane.cwd = dir;
                 self.find_branch(id);
             }
-            // The shell is ready for input: bring back its Claude session.
-            Event::Prompt(PromptMark::A { blitz: true }) => {
-                if let Some((line, _)) = v.resume.take() {
-                    v.pane.send(line);
-                }
-            }
-            Event::Notify { title, body } => {
-                if let Some((ev, session)) = Ev::from_notify(&title, &v.pane.token) {
-                    // `idle` is SessionEnd: the user quit Claude, so there is
-                    // nothing left to resume.
-                    if ev == Ev::Idle {
-                        v.pane.claude = None;
-                    } else if let Some(id) = session {
-                        v.pane.claude = Some(id.to_owned());
-                    }
-                    let changed = self.attention(id, ev);
-                    if relabels(ev, changed)
-                        && let Some(v) = self.view_mut(id)
-                    {
-                        v.pane.msg = body;
+            Event::Prompt(m) => {
+                let ended = v.pane.cmd.mark(m, Instant::now());
+                if m == (PromptMark::A { blitz: true }) {
+                    match prompt_back(&mut v.prompted, &mut v.resume) {
+                        Prompt::Resume(line) => v.pane.send(line),
+                        Prompt::First => {}
+                        Prompt::Exited => {
+                            v.pane.claude = None;
+                            v.pane.claude_title = None;
+                            v.pane.hooked = false;
+                            self.attention(id, Ev::Exited);
+                        }
                     }
                 }
+                // A long command that ended while the user looked away. Its
+                // time, not that of a Claude Code turn before it, shows.
+                if let Some((ev, msg, took)) = ended
+                    && self.attention(id, ev)
+                    && let Some(v) = self.view_mut(id)
+                {
+                    v.pane.msg = msg;
+                    v.pane.attn.took = Some(took);
+                }
             }
+            Event::Notify { title, body } => match Ev::from_notify(&title, &v.pane.token) {
+                Some((ev, session)) => {
+                    v.hooks_seen = true;
+                    v.pane.cmd.hooked = true;
+                    note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
+                    v.pane.hooked = ev != Ev::Idle;
+                    if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
+                        self.hooks_hint(id, true);
+                    }
+                    self.attention(id, ev);
+                    if turn_ends(ev) {
+                        self.find_branch(id);
+                    }
+                }
+                // Another program's, or Claude Code's own without hooks
+                // (OSC 9 or 777): like a bell.
+                None if rings(bell, v.pane.hooked) => {
+                    self.attention(id, Ev::Bell);
+                }
+                None => {}
+            },
             Event::Progress { state, pct } => {
                 let next = chrome::Progress::next(v.progress.map(|p| p.0), state, pct);
                 v.progress = next.map(|p| (p, Instant::now()));
                 self.taskbar_progress();
                 self.request_redraw();
             }
-            // Like a question from Claude Code: it needs the user, unless
-            // they are already looking at the pane.
-            Event::Bell if self.config.bell_attention => {
-                self.attention(id, Ev::NeedsYou);
+            // It needs the user, unless they are already looking at the
+            // pane; looking is all it asks for.
+            Event::Bell if rings(bell, v.pane.hooked) => {
+                self.attention(id, Ev::Bell);
             }
             _ => {}
         }
@@ -2728,9 +3094,12 @@ impl App {
             self.close_game();
             self.game_ended = Some(now);
         }
-        // While it is open, it covers the panes: the focused one is not in view.
-        let attended = self.focused && self.game.is_none() && self.focus_id() == Some(id);
-        let away = !self.focused && self.config.flash;
+        // While it is open, it covers the panes: the focused one is not in
+        // view. Nor is anything while the user is away from the screen.
+        let here = present(self.focused, idle_for());
+        self.away |= !here;
+        let attended = here && self.game.is_none() && self.focus_id() == Some(id);
+        let away = !here && self.config.flash;
         let Some(v) = self.view_mut(id) else {
             return false;
         };
@@ -2910,6 +3279,10 @@ impl App {
                 MouseKind::Release
             };
             self.mouse_report(id, kind, b as u8, mods);
+            // A click can pick an answer in the program's menu.
+            if pressed {
+                self.answered(id);
+            }
             return;
         }
         if b != 0 {
@@ -3107,7 +3480,7 @@ impl App {
         if let Err(e) = crate::links::open(target)
             && let Some(id) = self.focus_id()
         {
-            self.set_notice(id, e, Some(Instant::now() + NOTICE), false);
+            self.error(id, e);
         }
     }
 
@@ -3354,8 +3727,8 @@ impl App {
                     let dim = dimmed.contains(&v.pane.id);
                     let hollow = dim || !self.focused;
                     g.r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
-                    if let Some(n) = &v.notice {
-                        draw_notice(&mut g.r, &pal, at, v.grid, n);
+                    if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code) {
+                        draw_notice(&mut g.r, &pal, at, v.grid, &text, dim);
                     }
                 }
                 g.r.chrome(&chrome);
@@ -3456,6 +3829,9 @@ impl App {
                 cwd: v.map(|v| v.pane.cwd.clone()).unwrap_or_default(),
                 claude: v.and_then(|v| v.pane.claude.clone()),
                 key: v.map(|v| v.key.clone()).unwrap_or_default(),
+                done: (v.filter(|v| v.pane.attn.state == Attn::DoneUnseen))
+                    .map(|v| v.pane.msg.clone()),
+                name: v.and_then(|v| v.pane.named.clone()),
             }
         };
         let mut s = session::State::capture(&self.win, self.placed, meta);
@@ -3522,14 +3898,12 @@ impl App {
             .iter()
             .filter_map(|v| v.notice.as_ref()?.until)
             .min();
-        // The sidebar counts how long each session has been working.
+        // The sidebar counts how long each session has been working, and
+        // how long a question has waited.
         let sidebar = self.views.len() >= 2 && self.win.sidebar_expanded;
         let timer = (self.views.iter())
-            .filter(|v| sidebar && v.pane.attn.state == Attn::Working)
-            .map(|v| {
-                let since = v.pane.attn.since;
-                since + Duration::from_secs(now.saturating_duration_since(since).as_secs() + 1)
-            })
+            .filter(|_| sidebar)
+            .filter_map(|v| chrome::row_tick(&v.pane.attn, now))
             .min();
         let resume = (self.views.iter())
             .filter_map(|v| Some(v.resume.as_ref()?.1))
@@ -3644,19 +4018,187 @@ fn ends_game(attn: crate::attention::PaneAttn, ev: Ev, now: Instant) -> bool {
     seen.apply(ev, false, now) && seen.state == Attn::NeedsYou
 }
 
+/// Whether a pane title shows Claude Code working, as the sidebar reads
+/// it too.
+fn claude_working_title(title: &str) -> bool {
+    claude_title(title).is_some_and(|(working, _)| working)
+}
+
+/// The hint about Claude Code's hooks, `older` than this blitz or not
+/// reporting, and where to set them up: the palette, by its keys if it has
+/// some. `blitz setup claude` run from a shell prints nothing there.
+fn hooks_hint_text(older: bool, palette: Option<String>) -> String {
+    let what = if older {
+        "Claude Code's settings run an older blitz-hook"
+    } else {
+        "Claude Code's hooks are not reporting to blitz"
+    };
+    let palette = palette.map_or_else(|| "the command palette".into(), |k| k + ",");
+    format!("{what} \u{b7} {palette} Claude Code setup")
+}
+
+/// Whether Claude Code's hooks are not reporting: it has shown it is
+/// working, at `working` first, for a while, and no hook has said a word.
+fn hooks_silent(working: Option<Instant>, hooks_seen: bool, now: Instant) -> bool {
+    !hooks_seen && working.is_some_and(|t| now.saturating_duration_since(t) >= HOOKS_QUIET)
+}
+
 /// Whether a press of `vk` is a jump meant for blitz run that arrived
 /// after a session closed it, `since` ago.
 fn late_jump(vk: u16, since: Option<Duration>) -> bool {
     is_jump(vk) && since.is_some_and(|d| d < LATE_JUMP)
 }
 
-/// Whether a notification replaces the session's sidebar message. It is
-/// kept with the state it came with, so a repeat or an ignored event does
-/// not relabel the session. Idle always does: the hook sends it with an
-/// empty body when the session ends, which clears the last reply even
-/// when the session was already idle.
-fn relabels(ev: Ev, changed: bool) -> bool {
-    changed || ev == Ev::Idle
+/// What a hook's notification says besides the state. Its text replaces
+/// the session's message, even when the state stays: the title may have
+/// ended the turn before the hook with the reply came, and `idle`, sent
+/// with none, clears it; `ready` keeps what the last turn said. It names
+/// the Claude Code session, which `idle` (SessionEnd: the user quit
+/// Claude) ends, so there is nothing left to resume.
+fn note_hook(
+    msg: &mut String,
+    claude: &mut Option<String>,
+    ev: Ev,
+    session: Option<&str>,
+    body: String,
+) {
+    if ev == Ev::Idle {
+        *claude = None;
+    } else if let Some(id) = session {
+        *claude = Some(id.to_owned());
+    }
+    if ev != Ev::Ready {
+        *msg = body;
+    }
+}
+
+/// What blitz's own prompt coming back in a pane means.
+#[derive(Debug, PartialEq, Eq)]
+enum Prompt {
+    /// The shell is ready: bring back its Claude Code session.
+    Resume(String),
+    /// The shell's first prompt: nothing ran in it yet, though a resume
+    /// the timer typed ahead of it is about to.
+    First,
+    /// Whatever ran has ended, Claude Code too, even one that crashed or
+    /// was killed and could tell no hook. A resume that failed is not
+    /// tried again at the next start either.
+    Exited,
+}
+
+fn prompt_back(prompted: &mut bool, resume: &mut Option<(String, Instant)>) -> Prompt {
+    let first = !std::mem::replace(prompted, true);
+    match resume.take() {
+        Some((line, _)) => Prompt::Resume(line),
+        None if first => Prompt::First,
+        None => Prompt::Exited,
+    }
+}
+
+/// Tells the program in `v` whether its pane has keyboard focus: now if it
+/// asked for focus reports, or else once it does.
+fn tell_focus(v: &View, focused: bool) {
+    let mut out = Vec::new();
+    // Under one lock, so a program turning reports on meanwhile is told
+    // either way, and its reports reach it in the order they were made.
+    let mut term = lock(&v.pane.term);
+    term.set_focused(focused);
+    vt::encode_focus(focused, &term.input_modes(), &mut out);
+    v.pane.send(out);
+    drop(term);
+}
+
+/// Whether the user, `away` when a pane changed, is back to see the
+/// focused pane: blitz run does not cover it, and they are `here`, which
+/// is asked only then. Clears `away` if so.
+fn back_at_screen(away: &mut bool, game_open: bool, here: impl FnOnce() -> bool) -> bool {
+    let back = *away && !game_open && here();
+    *away &= !back;
+    back
+}
+
+/// Takes a question about pane `left`, which focus just left, off it, so
+/// a press in another pane never answers it. Other notices stay.
+fn focus_left<'a>(notices: impl Iterator<Item = (PaneId, &'a mut Option<Notice>)>, left: PaneId) {
+    for (_, n) in notices.filter(|(id, _)| *id == left) {
+        n.take_if(|n| n.ask.of_pane());
+    }
+}
+
+/// Whether the user is at the window: it is in front, and they touched a
+/// key or the mouse in the last `AWAY_AFTER`, `idle` being how long ago.
+/// Walking away from blitz must not let a question pass as seen.
+fn present(focused: bool, idle: Duration) -> bool {
+    focused && idle < AWAY_AFTER
+}
+
+/// How long ago the last key or mouse input anywhere was; zero when
+/// Windows cannot say.
+fn idle_for() -> Duration {
+    let mut info = LASTINPUTINFO {
+        cbSize: size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    // SAFETY: `info` is a LASTINPUTINFO with its size set, as the call
+    // requires.
+    if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        return Duration::ZERO;
+    }
+    // SAFETY: plain Win32 call with no arguments.
+    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
+    // Both are milliseconds since boot, kept in 32 bits, so they wrap.
+    Duration::from_millis(u64::from(now.wrapping_sub(info.dwTime)))
+}
+
+/// Whether a hook's `ev` ends a stretch of Claude Code's work. It may have
+/// switched branches meanwhile, which the shell, still waiting under it,
+/// never reports.
+fn turn_ends(ev: Ev) -> bool {
+    matches!(ev, Ev::Done | Ev::NeedsYou | Ev::Idle)
+}
+
+/// Whether a bell, or a notification without the pane's token, needs the
+/// user: when `bell_attention` is on, and Claude Code's hooks do not
+/// report for the pane already, which would only say the same twice.
+fn rings(bell_attention: bool, hooked: bool) -> bool {
+    bell_attention && !hooked
+}
+
+/// "A session is working", or "3 sessions are busy", of the sessions
+/// that closing would cut short and what each is doing; `place` follows
+/// "session".
+fn busy_text(busy: &[&str], place: &str) -> String {
+    match busy {
+        [what] => format!("A session{place} is {what}"),
+        _ => format!("{} sessions{place} are busy", busy.len()),
+    }
+}
+
+/// Whether a key message for Alt+F4 goes on to Windows, which closes the
+/// window on a press: all but the auto-repeat of a held one, so holding it
+/// cannot answer the question a busy session asks.
+fn alt_f4_passes(down: bool, lparam: isize) -> bool {
+    !down || !keymap::held_before(lparam)
+}
+
+/// Caps Lock, Num Lock and Scroll Lock, which like a modifier change how
+/// keys type and answer no question.
+fn lock_key(vk: u16) -> bool {
+    matches!(vk, 0x14 | 0x90 | 0x91)
+}
+
+/// How to confirm action `a`: its first key again, or with none, the
+/// palette.
+fn again(a: Action, keys: &[keymap::Binding]) -> String {
+    match keymap::keys_for(a, keys) {
+        Some(k) => format!("Press {k} again"),
+        None => {
+            let label = (keymap::ACTIONS.iter())
+                .find(|x| x.0 == a)
+                .map_or("it", |x| x.2);
+            format!("Run {label} again")
+        }
+    }
 }
 
 /// How to flash the taskbar for a session that just changed to `state`
@@ -3743,14 +4285,45 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
     out
 }
 
+/// Puts a hint nobody asked for in a pane's notice `slot`, dim until
+/// `until`, unless a question or an error waits there, which it would
+/// take the place of. Whether it did. Only another dim hint gives way:
+/// a plain notice may be the one word that a session was lost.
+fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
+    let fits = slot.as_ref().is_none_or(|n| n.ask == Ask::Nothing && n.dim);
+    if fits {
+        *slot = Some(Notice {
+            text,
+            until: Some(until),
+            dim: true,
+            ask: Ask::Nothing,
+        });
+    }
+    fits
+}
+
+/// The bottom row of a pane, and whether it is dim: its notice, else for
+/// a program that exited, how and what Enter and Esc do, which comes
+/// back when a notice over it goes.
+fn notice_line(n: Option<&Notice>, exit: Option<u32>) -> Option<(Cow<'_, str>, bool)> {
+    match (n, exit) {
+        (Some(n), _) => Some((Cow::Borrowed(n.text.as_str()), n.dim)),
+        (None, Some(code)) => {
+            let text = format!("{} \u{b7} Enter restart \u{b7} Esc close", exit_text(code));
+            Some((Cow::Owned(text), false))
+        }
+        (None, None) => None,
+    }
+}
+
 /// Draws a notice over the bottom row of the pane whose grid is at `at`.
-fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &Notice) {
+fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text: &str, dim: bool) {
     let (_, ch) = r.cell();
-    let mut s = text_snapshot(&format!(" {}", n.text), grid.0, 1, pal);
-    let bg = if n.dim { pal.bg } else { pal.selection_bg };
+    let mut s = text_snapshot(&format!(" {text}"), grid.0, 1, pal);
+    let bg = if dim { pal.bg } else { pal.selection_bg };
     for c in &mut s.cells {
         c.bg = bg;
-        if n.dim {
+        if dim {
             c.attrs |= vt::snapshot::attr::DIM;
         }
     }
@@ -3833,22 +4406,65 @@ fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
 
-/// Puts pane `id` in a new tab after the others and shows that tab.
-fn new_tab(win: &mut layout::Window, id: PaneId, cwd: Option<&Path>) -> bool {
-    win.tabs.push(Tab::new(tab_name(cwd), id));
+/// Splits the focused pane of the active tab, putting the new one on the
+/// `dir` side; for [`App::add`].
+fn split(dir: Dir) -> impl FnOnce(&mut layout::Window, PaneId) -> bool {
+    move |win, id| {
+        // Only the pane minimum matters, and `open` checks that against the
+        // real window.
+        let any = Rect {
+            x: 0,
+            y: 0,
+            w: 1 << 16,
+            h: 1 << 16,
+        };
+        let active = win.active;
+        (win.tabs.get_mut(active)).is_some_and(|t| t.split(dir, id, any, (0, 0)))
+    }
+}
+
+/// Puts pane `id` in a new tab after the others and shows that tab. It
+/// goes by the folder of its focused pane until the user names it.
+fn new_tab(win: &mut layout::Window, id: PaneId) -> bool {
+    win.tabs.push(Tab::new(String::new(), id));
     win.active = win.tabs.len() - 1;
     true
 }
 
-/// A new tab is named after the folder it starts in.
-fn tab_name(cwd: Option<&Path>) -> String {
-    let name = cwd.map(|p| match p.file_name() {
-        Some(n) => n.to_string_lossy().into_owned(),
-        // A drive root.
-        None => p.display().to_string(),
-    });
-    name.filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "shell".into())
+/// Whether a pane's title names its session: it has Claude Code's mark,
+/// and Claude Code is known to run there, as its hooks with the pane's
+/// token or blitz's resume say. Any program can print the mark, and
+/// would then go by a name it picked, perhaps one like another session's.
+fn titled_by_claude(mark: Option<bool>, hooked: bool, session: Option<&str>) -> bool {
+    mark.is_some() && (hooked || session.is_some())
+}
+
+/// What the sidebar calls a session, and the message under its name: the
+/// name the user gave it, else for Claude Code the task its title names,
+/// which Claude's /rename changes too (`claude` says the title has its
+/// mark), else its program. A shell's title is often only its exe's path,
+/// so that is never a name. The title shows as the message when there is
+/// none, unless it is the name already.
+fn label(
+    named: Option<&str>,
+    program: &str,
+    title: &str,
+    claude: bool,
+    msg: &str,
+) -> (String, String) {
+    // Without the mark Claude Code puts in front.
+    let task = claude_title(title).map_or(title, |c| c.1);
+    let name = match named {
+        Some(n) => n,
+        None if claude && !task.is_empty() => task,
+        None => program,
+    };
+    let msg = match msg {
+        "" if task == name => "",
+        "" => task,
+        m => m,
+    };
+    (name.to_owned(), msg.to_owned())
 }
 
 /// Takes a fresh snapshot of `term` into `snap`. Returns false when that
@@ -4000,7 +4616,27 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            // Closing ends every session, so a busy one asks first.
+            WindowEvent::CloseRequested => {
+                let busy: Vec<_> = self.views.iter().filter_map(View::busy).collect();
+                match self.focus_id() {
+                    Some(id) if !busy.is_empty() && !self.confirmed(id, &Ask::Quit) => {
+                        let them = if busy.len() == 1 { "it" } else { "them" };
+                        let text = format!(
+                            "{}. Close the window again to end {them}",
+                            busy_text(&busy, "")
+                        );
+                        self.ask(id, text, Ask::Quit);
+                        // Closed from the taskbar: show the question.
+                        if let Some(w) = &self.window
+                            && w.is_minimized() == Some(true)
+                        {
+                            w.set_minimized(false);
+                        }
+                    }
+                    _ => el.exit(),
+                }
+            }
             WindowEvent::RedrawRequested => {
                 // Keys queued behind this paint go out before its vsync wait.
                 self.drain_keys(el);
@@ -4036,9 +4672,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.set_hover(None);
                 // The cursor is hollow while the window is in the background.
                 self.request_redraw();
-                let mut out = Vec::new();
-                vt::encode_focus(f, &self.modes(), &mut out);
-                self.send(out);
+                if let Some(v) = self.current() {
+                    tell_focus(v, f);
+                }
                 if f && let Some(id) = self.focus_id() {
                     self.attention(id, Ev::Attended);
                 }
@@ -4049,6 +4685,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // that could run or escape anything.
                 text.retain(|c| !c.is_control());
                 if !self.filter_text(&text) {
+                    self.dismiss(None);
                     self.typed(text.into_bytes());
                 }
             }
@@ -4091,12 +4728,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Update(v, log) => self.offer_update(v, log),
             UserEvent::Checked(found) => {
-                let text = crate::update::found(&found);
+                let (text, failed) = (crate::update::found(&found), found.is_err());
                 if let Ok(Some(v)) = found {
                     self.offer_update(v, None);
                 }
-                if let Some(id) = self.updating.take() {
-                    self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                match self.updating.take() {
+                    Some(id) if failed => self.error(id, text),
+                    Some(id) => self.set_notice(id, text, Some(Instant::now() + NOTICE), false),
+                    None => {}
                 }
             }
             UserEvent::Settings => match Config::reload() {
@@ -4109,8 +4748,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Installed(Err(e)) => {
                 eprintln!("blitz: update: {e}");
                 if let Some(id) = self.updating.take() {
-                    let text = format!("Update failed: {e}");
-                    self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                    self.error(id, format!("Update failed: {e}"));
                 }
             }
             UserEvent::OpenHere(dir) => {
@@ -4128,6 +4766,14 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.drain_keys(el);
+        // Back at the screen, with a key or the mouse: the focused pane
+        // is in view again.
+        let game = self.game.is_some();
+        if back_at_screen(&mut self.away, game, || present(self.focused, idle_for()))
+            && let Some(id) = self.focus_id()
+        {
+            self.attention(id, Ev::Attended);
+        }
         self.save_session(false);
         let flow = match self.next_deadline() {
             Some(t) => ControlFlow::WaitUntil(t),
@@ -5045,9 +5691,56 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         assert_eq!(got, home);
         assert_eq!(start_dir(""), home);
-        assert_eq!(tab_name(Some(Path::new(r"C:\dev\shop"))), "shop");
-        assert_eq!(tab_name(Some(Path::new(r"C:\"))), r"C:\");
-        assert_eq!(tab_name(None), "shell");
+    }
+
+    #[test]
+    fn app_only_claude_code_names_a_session_by_its_title() {
+        let id = Some("3f2a0c1e-0000-4000-8000-00000000abcd");
+        assert!(titled_by_claude(Some(true), true, None));
+        assert!(titled_by_claude(Some(false), false, id));
+        assert!(!titled_by_claude(Some(false), false, None), "any program");
+        assert!(!titled_by_claude(None, true, id), "no mark");
+    }
+
+    #[test]
+    fn app_claude_sessions_go_by_their_task() {
+        let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
+        let l = |title, claude, msg| label(None, "pwsh", title, claude, msg);
+        let s = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(l(pwsh, false, ""), s("pwsh", pwsh));
+        assert_eq!(
+            l("\u{2733} Fix the login", true, ""),
+            s("Fix the login", "")
+        );
+        assert_eq!(
+            l("\u{25D0} Fix the login", true, "Done."),
+            s("Fix the login", "Done.")
+        );
+        assert_eq!(l("\u{2733} ", true, ""), s("pwsh", ""));
+        // Claude Code has exited, but its title has not changed yet.
+        assert_eq!(
+            l("\u{2733} Fix the login", false, ""),
+            s("pwsh", "Fix the login")
+        );
+        // A name the user gave wins, and the task goes under it.
+        let named = label(Some("auth"), "pwsh", "\u{2733} Fix", true, "");
+        assert_eq!(named, s("auth", "Fix"));
+        let named = label(Some("auth"), "pwsh", "\u{2733} Fix", true, "Done.");
+        assert_eq!(named, s("auth", "Done."));
+    }
+
+    #[test]
+    fn palette_renames_on_its_line() {
+        let mut c = Commands {
+            filter: "Split".into(),
+            rename: Some(Rename::Tab(PaneId(1))),
+            ..Commands::default()
+        };
+        assert!(c.matches().is_empty(), "the line is a name, not a filter");
+        c.rename = None;
+        assert!(!c.matches().is_empty());
+        let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
+        assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
     }
 
     #[test]
@@ -5071,17 +5764,141 @@ mod tests {
     }
 
     #[test]
-    fn app_message_follows_the_state_and_idle_clears_it() {
+    fn app_hooks_set_the_message_and_the_session() {
+        let id = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
+        let (mut msg, mut claude) = (String::new(), None);
+        note_hook(
+            &mut msg,
+            &mut claude,
+            Ev::Working,
+            Some(id),
+            "Fix it".into(),
+        );
+        assert_eq!((msg.as_str(), claude.as_deref()), ("Fix it", Some(id)));
+        // Still working, now waiting on agents: the message says so.
+        note_hook(
+            &mut msg,
+            &mut claude,
+            Ev::Working,
+            None,
+            "waiting on 2 agents".into(),
+        );
+        assert_eq!(msg, "waiting on 2 agents");
+        // The reply replaces it, whatever the state does.
+        note_hook(&mut msg, &mut claude, Ev::Done, None, "Fixed.".into());
+        assert_eq!((msg.as_str(), claude.as_deref()), ("Fixed.", Some(id)));
+        note_hook(&mut msg, &mut claude, Ev::Done, Some(id), "Again.".into());
+        assert_eq!(msg, "Again.");
+        // Ready keeps what the last turn said.
+        note_hook(&mut msg, &mut claude, Ev::Ready, Some(id), String::new());
+        assert_eq!(msg, "Again.");
+        // The session ended: nothing to show or resume.
+        note_hook(&mut msg, &mut claude, Ev::Idle, Some(id), String::new());
+        assert_eq!((msg.as_str(), claude), ("", None));
+    }
+
+    /// A slow shell's first prompt can come after the timer typed the
+    /// resume: Claude Code is starting then, not gone.
+    #[test]
+    fn app_only_a_later_prompt_ends_claude() {
+        let line = || Some(("claude --resume x".to_owned(), Instant::now()));
+        let (mut prompted, mut resume) = (false, line());
+        assert_eq!(
+            prompt_back(&mut prompted, &mut resume),
+            Prompt::Resume("claude --resume x".into())
+        );
+        assert_eq!(prompt_back(&mut prompted, &mut resume), Prompt::Exited);
+        // The timer typed it before the shell was ready.
+        let (mut prompted, mut resume) = (false, None);
+        assert_eq!(prompt_back(&mut prompted, &mut resume), Prompt::First);
+        assert_eq!(prompt_back(&mut prompted, &mut resume), Prompt::Exited);
+        assert_eq!(prompt_back(&mut prompted, &mut resume), Prompt::Exited);
+    }
+
+    #[test]
+    fn app_a_user_away_from_the_screen_is_not_watching() {
+        let s = Duration::from_secs;
+        assert!(present(true, s(0)));
+        assert!(present(true, s(29)));
+        assert!(!present(true, s(30)), "walked away with blitz in front");
+        assert!(!present(false, s(0)), "another window is in front");
+    }
+
+    #[test]
+    fn app_the_branch_is_read_again_when_a_turn_ends() {
+        for ev in [Ev::Done, Ev::NeedsYou, Ev::Idle] {
+            assert!(turn_ends(ev), "{ev:?}");
+        }
+        for ev in [Ev::Working, Ev::Error { sticky: false }] {
+            assert!(!turn_ends(ev), "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn app_bells_and_notifications_leave_hooked_panes_to_the_hooks() {
+        assert!(rings(true, false));
+        assert!(!rings(true, true));
+        assert!(!rings(false, false));
+        // What reaches the app as a notification: OSC 9 and 777, with
+        // no pane token.
+        let mut t = vt::Terminal::new(vt::Options::default());
+        t.feed(b"\x1b]9;Claude is waiting for your input\x07\x1b]777;notify;Build;done\x07");
+        let mut evs = Vec::new();
+        t.take_events(&mut evs);
+        let untokened = (evs.iter())
+            .filter(|e| matches!(e, Event::Notify { title, .. } if Ev::from_notify(title, "0f1e").is_none()))
+            .count();
+        assert_eq!(untokened, 2);
+    }
+
+    /// Both hints lead to the palette entry that sets the hooks up.
+    #[test]
+    fn app_hooks_hints_name_the_setup() {
+        let keys = Some("Ctrl+Shift+P".to_owned());
+        assert_eq!(
+            hooks_hint_text(false, keys.clone()),
+            "Claude Code's hooks are not reporting to blitz \u{b7} Ctrl+Shift+P, Claude Code setup"
+        );
+        assert_eq!(
+            hooks_hint_text(true, keys),
+            "Claude Code's settings run an older blitz-hook \u{b7} Ctrl+Shift+P, Claude Code setup"
+        );
+        assert!(hooks_hint_text(true, None).ends_with("the command palette Claude Code setup"));
+    }
+
+    #[test]
+    fn app_titles_that_show_claude_working() {
+        for t in ["\u{25d0} Fix the tests", "\u{25d1} x"] {
+            assert!(claude_working_title(t), "{t}");
+        }
+        // Not Claude Code's marks, so the sidebar would not see it work.
+        for t in [
+            "\u{2733} Fix the tests",
+            "",
+            "pwsh",
+            "x \u{25d0}",
+            "\u{25d3} x",
+        ] {
+            assert!(!claude_working_title(t), "{t}");
+        }
+    }
+
+    /// Working for a while with no hook heard means the hooks are not
+    /// reporting; a first hook, or no sign of Claude Code, means nothing.
+    #[test]
+    fn app_hooks_silent_after_working_quietly() {
         let t0 = Instant::now();
-        let mut a = crate::attention::PaneAttn::new(t0);
-        let mut feed = |ev, attended| relabels(ev, a.apply(ev, attended, t0));
-        assert!(feed(Ev::Working, true));
-        assert!(!feed(Ev::Working, true), "a repeat");
-        assert!(!feed(Ev::NeedsYou, true), "ignored while looking");
-        // Watched to the end: done is seen at once and lands on idle, and
-        // the end of the session still clears the message.
-        assert!(feed(Ev::Done, true));
-        assert!(feed(Ev::Idle, true));
+        let later = t0 + HOOKS_QUIET;
+        assert!(!hooks_silent(None, false, later));
+        assert!(!hooks_silent(
+            Some(t0),
+            false,
+            later - Duration::from_secs(1)
+        ));
+        assert!(hooks_silent(Some(t0), false, later));
+        assert!(!hooks_silent(Some(t0), true, later));
+        // A clock that steps back is not a long wait.
+        assert!(!hooks_silent(Some(later), false, t0));
     }
 
     #[test]
@@ -5098,13 +5915,17 @@ mod tests {
         a.apply(Ev::NeedsYou, false, t0);
         assert!(!ends_game(a, Ev::NeedsYou, t0), "a repeat");
         // The rule `attention()` relies on by closing the game first: a
-        // needs-you on a pane in view is seen and does not relabel it.
-        // This pins `PaneAttn` only; the order inside `attention()` is
-        // not covered here.
+        // needs-you on a pane in view is seen at once. This pins
+        // `PaneAttn` only; the order inside `attention()` is not covered
+        // here.
         let mut b = crate::attention::PaneAttn::new(t0);
         b.apply(Ev::Working, true, t0);
-        assert!(!relabels(Ev::NeedsYou, b.apply(Ev::NeedsYou, true, t0)));
-        assert_eq!(b.state, Attn::Working);
+        assert!(b.apply(Ev::NeedsYou, true, t0));
+        assert_eq!((b.state, b.seen), (Attn::NeedsYou, true));
+        // A bell there needs nothing at all.
+        let mut c = crate::attention::PaneAttn::new(t0);
+        assert!(ends_game(c, Ev::Bell, t0));
+        assert!(!c.apply(Ev::Bell, true, t0));
     }
 
     #[test]
@@ -5194,6 +6015,186 @@ mod tests {
         }
     }
 
+    /// A question stays until it is answered or another key is pressed,
+    /// which then does what it always does; an error goes at the next key
+    /// in its pane; other notices stay. A question about its own pane goes
+    /// at any key aimed at another pane, its own action too.
+    #[test]
+    fn notices_go_at_the_next_key_that_does_not_answer_them() {
+        let close = Some(Action::ClosePane);
+        for ask in [Ask::ClosePane, Ask::CloseTab, Ask::Paste("a\nb".into())] {
+            assert!(ask.of_pane());
+            for a in [close, Some(Action::CloseTab), Some(Action::Paste)] {
+                assert!(ask.gone(a, false), "{ask:?} at {a:?} elsewhere");
+            }
+            assert!(ask.gone(Some(Action::Palette), false));
+        }
+        assert!(!Ask::Update.of_pane() && !Ask::Quit.of_pane() && !Ask::Key.of_pane());
+        let paste = Ask::Paste("a\nb".into());
+        assert!(!paste.gone(Some(Action::Paste), true));
+        assert!(paste.gone(close, true));
+        assert!(!Ask::ClosePane.gone(close, true), "answered");
+        assert!(
+            !Ask::ClosePane.gone(Some(Action::Palette), true),
+            "answered from the palette"
+        );
+        assert!(!Ask::CloseTab.gone(Some(Action::CloseTab), true));
+        for here in [true, false] {
+            let ask = Ask::ClosePane;
+            assert!(ask.gone(None, here), "typing");
+            assert!(ask.gone(Some(Action::Update), here), "another shortcut");
+            assert!(!Ask::Update.gone(Some(Action::Update), here));
+            assert!(Ask::Update.gone(Some(Action::Copy), here));
+            assert_eq!(Ask::Key.gone(None, here), here, "an error, read");
+            assert_eq!(Ask::Key.gone(close, here), here);
+            assert!(!Ask::Nothing.gone(None, here));
+            assert!(Ask::CloseTab.gone(close, here), "not the whole tab");
+            assert!(
+                Ask::Quit.gone(None, here),
+                "closing the window, then typing"
+            );
+            assert!(Ask::Quit.gone(Some(Action::Palette), here));
+        }
+    }
+
+    /// A passing hint leaves a question, an error or a plain notice where
+    /// it is, and says so, to be tried again; an exited program's line
+    /// comes back once a notice over it goes.
+    #[test]
+    fn notices_over_questions_and_exits() {
+        let notice = |ask, dim| Notice {
+            text: "n".into(),
+            until: None,
+            dim,
+            ask,
+        };
+        let until = Instant::now();
+        for mut slot in [None, Some(notice(Ask::Nothing, true))] {
+            assert!(hint_into(&mut slot, "hint".into(), until));
+            let n = slot.expect("the hint");
+            assert_eq!(
+                (n.text.as_str(), n.until, n.dim),
+                ("hint", Some(until), true)
+            );
+        }
+        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit, Ask::Nothing] {
+            let mut slot = Some(notice(ask.clone(), false));
+            assert!(!hint_into(&mut slot, "hint".into(), until));
+            assert!(slot.is_some_and(|n| n.ask == ask && n.text == "n"));
+        }
+        let exited = notice_line(None, Some(2)).expect("a line");
+        assert_eq!(
+            exited,
+            ("exit 2 \u{b7} Enter restart \u{b7} Esc close".into(), false)
+        );
+        let error = notice(Ask::Key, false);
+        assert_eq!(
+            notice_line(Some(&error), Some(2)),
+            Some(("n".into(), false))
+        );
+        assert_eq!(notice_line(None, None), None);
+    }
+
+    /// Focus leaving a pane takes its close or paste question with it, and
+    /// leaves every other notice, there and in other panes.
+    #[test]
+    fn focus_leaving_a_pane_takes_its_question() {
+        let notice = |ask| {
+            Some(Notice {
+                text: "n".into(),
+                until: None,
+                dim: false,
+                ask,
+            })
+        };
+        for ask in [Ask::ClosePane, Ask::CloseTab, Ask::Paste(String::new())] {
+            let mut notices = [(PaneId(1), notice(ask.clone())), (PaneId(2), notice(ask))];
+            focus_left(notices.iter_mut().map(|(id, n)| (*id, n)), PaneId(1));
+            assert!(notices[0].1.is_none());
+            assert!(notices[1].1.is_some(), "only the pane focus left");
+        }
+        for ask in [Ask::Key, Ask::Update, Ask::Quit, Ask::Nothing] {
+            let mut notices = [(PaneId(1), notice(ask))];
+            focus_left(notices.iter_mut().map(|(id, n)| (*id, n)), PaneId(1));
+            assert!(notices[0].1.is_some());
+        }
+    }
+
+    /// Coming back to the screen after a change while away sees the
+    /// focused pane, once, unless blitz run covers it.
+    #[test]
+    fn back_at_the_screen_sees_the_focused_pane() {
+        let mut away = false;
+        assert!(!back_at_screen(&mut away, false, || unreachable!()));
+        away = true;
+        assert!(!back_at_screen(&mut away, true, || true));
+        assert!(!back_at_screen(&mut away, false, || false));
+        assert!(away, "still away");
+        assert!(back_at_screen(&mut away, false, || true));
+        assert!(!away);
+        assert!(!back_at_screen(&mut away, false, || true), "once");
+    }
+
+    #[test]
+    fn lock_keys_leave_questions() {
+        for vk in [0x14, 0x90, 0x91] {
+            assert!(lock_key(vk), "{vk:#x}");
+        }
+        for vk in [0x41, VK_RETURN, VK_ESCAPE, 0x10] {
+            assert!(!lock_key(vk), "{vk:#x}");
+        }
+    }
+
+    #[test]
+    fn busy_sessions_by_what_they_do_or_how_many() {
+        assert_eq!(busy_text(&["working"], ""), "A session is working");
+        assert_eq!(
+            busy_text(&["running a command"], " in this tab"),
+            "A session in this tab is running a command"
+        );
+        assert_eq!(
+            busy_text(&["working", "waiting for you", "working"], ""),
+            "3 sessions are busy"
+        );
+    }
+
+    /// Holding Alt+F4 closes the window once, so a busy session's question
+    /// waits for a second, deliberate press.
+    #[test]
+    fn a_held_alt_f4_closes_once() {
+        let (first, repeat, up) = (0x003e_0001, 0x403e_0001, 0xc03e_0001_u32 as i32 as isize);
+        assert!(alt_f4_passes(true, first));
+        assert!(!alt_f4_passes(true, repeat));
+        assert!(alt_f4_passes(false, up));
+    }
+
+    /// How a split, and a reopened pane, go in: beside the focused pane.
+    #[test]
+    fn a_split_goes_beside_the_focused_pane() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("t".into(), PaneId(1)));
+        assert!(split(Dir::Right)(&mut win, PaneId(2)));
+        let t = &win.tabs[0];
+        assert_eq!(
+            (t.panes(), t.focus),
+            (vec![PaneId(1), PaneId(2)], PaneId(2))
+        );
+        let mut none = layout::Window::default();
+        assert!(!split(Dir::Down)(&mut none, PaneId(3)), "no tab");
+    }
+
+    #[test]
+    fn a_question_names_the_key_that_answers_it() {
+        assert_eq!(again(Action::ClosePane, &[]), "Press Ctrl+Shift+W again");
+        let moved = ["ctrl+shift+w=none", "alt+w=close_pane"].map(keymap::binding);
+        let moved: Vec<_> = moved.into_iter().flatten().collect();
+        assert_eq!(again(Action::ClosePane, &moved), "Press Alt+W again");
+        assert_eq!(
+            again(Action::Equalize, &[]),
+            "Run Give the panes equal space again"
+        );
+    }
+
     #[test]
     fn palette_matches_every_word_of_the_label_or_name() {
         let mut c = Commands::default();
@@ -5202,6 +6203,8 @@ mod tests {
         assert_eq!(c.matches(), [(Action::SplitRight, "Split right")]);
         c.filter = "font_size_up".into();
         assert_eq!(c.matches(), [(Action::FontSize(1), "Bigger font")]);
+        c.filter = "claude".into();
+        assert_eq!(c.matches(), [(Action::ClaudeSetup, "Claude Code setup")]);
         c.move_by(5);
         assert_eq!(c.sel, 0, "one match");
         c.filter = "zzz".into();

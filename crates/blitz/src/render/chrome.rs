@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::attention::Attn;
+use crate::attention::{Attn, PaneAttn};
 use crate::layout::{PaneId, Rect, Tab, Window};
 use crate::theme::{Theme, Ui};
 
@@ -15,11 +15,20 @@ use crate::theme::{Theme, Ui};
 pub struct Session {
     pub id: PaneId,
     pub name: String,
+    /// Set when another session has the same name: this one's number,
+    /// drawn dimmer after it to tell them apart.
+    pub num: Option<u32>,
     pub cwd: String,
     pub branch: Option<String>,
     pub state: Attn,
     /// When `state` last changed.
     pub since: Instant,
+    /// When the turn under way began, and how long the last one took.
+    pub turn: Option<Instant>,
+    pub took: Option<Duration>,
+    /// The user has looked at `state`; a question they saw is drawn
+    /// outlined until they answer it.
+    pub seen: bool,
     /// Latest one-line message: the hook message, else the title.
     pub msg: String,
     /// What the program last reported of its progress.
@@ -108,6 +117,9 @@ pub struct Commands<'a> {
     pub items: Vec<(&'a str, String)>,
     /// The highlighted item.
     pub sel: usize,
+    /// What the typed line renames, such as `Rename session`, instead of
+    /// narrowing the list.
+    pub rename: Option<&'a str>,
 }
 
 /// Rows the theme picker and the command palette show at once.
@@ -259,6 +271,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
     };
     let p = &mut out.prims;
     let text = |p: &mut Vec<Prim>, x, y, t: &str, color, bold| {
+        if t.is_empty() {
+            return;
+        }
         p.push(Prim::Text {
             x,
             y,
@@ -335,20 +350,22 @@ pub fn build(m: &ChromeModel) -> Chrome {
             let x = r.x + s(14.0);
             let right = r.right() - s(14.0);
             if let Some(x2) = sess {
-                let name = fit(&x2.name, right - x, tw);
+                let (name, num) = name_parts(x2, right - x, tw);
                 let (nc, cc) = if focused {
                     (c.name, c.dim)
                 } else {
                     (c.hdr_name, c.hdr_cwd)
                 };
                 text(p, x, ty, &name, nc, focused);
-                let cx = x + text_w(&name, tw) + s(8.0);
+                let nx = x + text_w(&name, tw);
+                text(p, nx, ty, &num, cc, false);
+                let cx = nx + text_w(&num, tw) + s(8.0);
                 let room = right - s(15.0) - cx;
                 text(p, cx, ty, &fit_left(&x2.cwd, room, tw), cc, false);
             }
             let cy = r.y + (hh - 1) / 2;
             match state {
-                Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, 0.0, c.accent),
+                Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, ring(sess), c.accent),
                 Attn::DoneUnseen => mark(p, right - s(4.0), cy, 7.0, 1.5, c.name),
                 Attn::Error => mark(p, right - s(4.0), cy, 7.0, 0.0, c.error),
                 Attn::Working | Attn::Idle => {}
@@ -368,10 +385,12 @@ pub fn build(m: &ChromeModel) -> Chrome {
         }
         if multi && !expanded {
             if let Some(x) = sess {
-                let label = fit(&x.name, r.w / 2, tw);
+                let (label, num) = name_parts(x, r.w / 2, tw);
                 let color = if focused { c.label_focus } else { c.label };
-                let lx = r.right() - s(16.0) - text_w(&label, tw);
-                text(p, lx, r.bottom() - s(10.0) - th, &label, color, false);
+                let nx = r.right() - s(16.0) - text_w(&num, tw);
+                let (lx, ly) = (nx - text_w(&label, tw), r.bottom() - s(10.0) - th);
+                text(p, lx, ly, &label, color, false);
+                text(p, nx, ly, &num, c.dim, false);
             }
             if state == Attn::NeedsYou {
                 let b = s(2.0);
@@ -439,7 +458,12 @@ pub fn build(m: &ChromeModel) -> Chrome {
             let gy = y + (gh - th) / 2;
             let count = list.len().to_string();
             let cx = gr - text_w(&count, tw);
-            let name = fit(&t.name, cx - s(16.0) - gx, tw);
+            // A tab nobody named is called after where its focused pane is.
+            let named = match t.name.as_str() {
+                "" => folder_name(session(t.focus).map_or("", |x| &x.cwd)),
+                n => n.to_owned(),
+            };
+            let name = fit(&named, cx - s(16.0) - gx, tw);
             let nc = if ti == m.win.active { c.msg } else { c.dim };
             text(p, gx, gy, &name, nc, false);
             text(p, cx, gy, &count, c.dim, false);
@@ -482,7 +506,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let (mx, my) = (row.x + s(12.0), y + s(7.0) + s(5.0) + s(4.0));
                 match x.state {
-                    Attn::NeedsYou => mark(p, mx, my, 8.0, 0.0, c.accent),
+                    Attn::NeedsYou => mark(p, mx, my, 8.0, ring(Some(x)), c.accent),
                     Attn::DoneUnseen => mark(p, mx, my, 8.0, 1.5, c.name),
                     Attn::Error => mark(p, mx, my, 8.0, 0.0, c.error),
                     Attn::Working | Attn::Idle => {}
@@ -505,25 +529,23 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     p.push(Prim::Shape {
                         r: chip,
                         radius: 4.0 * m.scale,
-                        stroke: 0.0,
+                        stroke: ring(Some(x)) * m.scale,
                         color: c.accent,
                     });
                     let cy = chip.y + (chip_h - th) / 2;
-                    text(p, chip.x + s(6.0), cy, &word, c.chip_fg, true);
+                    // Off the fill, the accent is too faint for text on
+                    // the light themes.
+                    let fg = if x.seen { c.name } else { c.chip_fg };
+                    text(p, chip.x + s(6.0), cy, &word, fg, true);
                     chip.x
                 } else {
                     let wx = right - text_w(&word, tw);
                     text(p, wx, ty, &word, c.dim, false);
                     wx
                 };
-                text(
-                    p,
-                    left,
-                    ty,
-                    &fit(&x.name, state_x - s(8.0) - left, tw),
-                    c.name,
-                    true,
-                );
+                let (name, num) = name_parts(x, state_x - s(8.0) - left, tw);
+                text(p, left, ty, &name, c.name, true);
+                text(p, left + text_w(&name, tw), ty, &num, c.dim, false);
                 ly += l1 + gap;
                 // Line 2: directory and branch.
                 let ty = ly + (l2 - th) / 2;
@@ -610,7 +632,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let (cx, cy) = (row.w / 2, y + row.h / 2);
                 match x.state {
-                    Attn::NeedsYou => mark(p, cx, cy, 7.0, 0.0, c.accent),
+                    Attn::NeedsYou => mark(p, cx, cy, 7.0, ring(Some(x)), c.accent),
                     Attn::DoneUnseen => mark(p, cx, cy, 8.0, 1.5, c.name),
                     Attn::Error => mark(p, cx, cy, 7.0, 0.0, c.error),
                     Attn::Idle => mark(p, cx, cy, 3.0, 0.0, c.idle),
@@ -761,9 +783,11 @@ struct List<'a> {
     /// The names that match it, and the highlighted one.
     names: Vec<&'a str>,
     sel: usize,
-    /// Shown when nothing matches.
+    /// Shown when nothing matches; for a name, what leaving it empty does.
     empty: &'a str,
     hint: &'a str,
+    /// Shown in place of an empty filter.
+    prompt: &'a str,
     /// Panel width at 96 DPI.
     width: f32,
 }
@@ -811,7 +835,7 @@ fn list(
     text(p, left, ty(y), l.title.into(), c.name, true);
     let fx = left + text_w(l.title, tw) + 2 * tw;
     let (filter, color) = if l.filter.is_empty() {
-        ("type to filter", c.dim)
+        (l.prompt, c.dim)
     } else {
         (l.filter, c.msg)
     };
@@ -878,6 +902,7 @@ fn picker(
         sel: pk.sel,
         empty: "no theme matches",
         hint: "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel",
+        prompt: "type to filter",
         width: 380.0,
     };
     // Six of the theme's colours on its own background.
@@ -916,14 +941,31 @@ fn commands(
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
 ) -> (Rect, Vec<(usize, Rect)>) {
-    let l = List {
-        title: "Commands",
-        filter: cm.filter,
-        names: cm.items.iter().map(|i| i.0).collect(),
-        sel: cm.sel,
-        empty: "no command matches",
-        hint: "\u{2191}\u{2193} choose  \u{b7}  Enter run  \u{b7}  Esc close",
-        width: 460.0,
+    let l = match cm.rename {
+        Some(title) => List {
+            title,
+            filter: cm.filter,
+            names: Vec::new(),
+            sel: 0,
+            // What an empty name does, while it is empty.
+            empty: match cm.filter {
+                "" => "With no name, blitz picks one again",
+                _ => "",
+            },
+            hint: "Enter rename  \u{b7}  Esc cancel",
+            prompt: "type a name",
+            width: 460.0,
+        },
+        None => List {
+            title: "Commands",
+            filter: cm.filter,
+            names: cm.items.iter().map(|i| i.0).collect(),
+            sel: cm.sel,
+            empty: "no command matches",
+            hint: "\u{2191}\u{2193} choose  \u{b7}  Enter run  \u{b7}  Esc close",
+            prompt: "type to filter",
+            width: 460.0,
+        },
     };
     list(p, &l, c, size, s, (tw, th), |p, i, row, right| {
         let keys = &cm.items[i].1;
@@ -1206,25 +1248,97 @@ fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
     lines.into_iter().map(|l| fit(&l, max, cw)).collect()
 }
 
-/// The state shown on the right of a sidebar row.
+/// A session's name cut to fit `max` pixels, and after it its number when
+/// another session has the same name, or else nothing.
+fn name_parts(x: &Session, max: i32, cw: i32) -> (String, String) {
+    let num = x.num.map(|n| format!(" {n}")).unwrap_or_default();
+    (fit(&x.name, max - text_w(&num, cw), cw), num)
+}
+
+/// Numbers the sessions that share a name with another, so the sidebar
+/// can tell them apart; the rest go without.
+pub fn number_twins(sessions: &mut [Session]) {
+    for i in 0..sessions.len() {
+        let twin = (sessions.iter().enumerate()).any(|(j, x)| j != i && x.name == sessions[i].name);
+        sessions[i].num = twin.then_some(sessions[i].id.0);
+    }
+}
+
+/// What a tab nobody named is called: the last folder of `cwd`, a drive
+/// root as it is, or `shell` with none. Either slash separates folders.
+pub fn folder_name(cwd: &str) -> String {
+    let leaf = (cwd.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next()).unwrap_or("");
+    match leaf {
+        "" => "shell".into(),
+        l if l.ends_with(':') => cwd.into(),
+        l => l.into(),
+    }
+}
+
+/// The stroke of a needs-you mark: filled until the user has seen the
+/// question, then a ring until they answer it.
+fn ring(x: Option<&Session>) -> f32 {
+    if x.is_some_and(|x| x.seen) { 1.5 } else { 0.0 }
+}
+
+/// The state shown on the right of a sidebar row, with how long the turn
+/// has run, how long the last one took, or after a minute how long a
+/// question has waited.
 fn state_word(x: &Session, now: Instant) -> String {
+    let waited = now.saturating_duration_since(x.since);
     match (x.state, x.exit_code) {
+        (Attn::NeedsYou, _) if waited.as_secs() >= 60 => {
+            format!("needs you \u{b7} {}", elapsed(waited))
+        }
         (Attn::NeedsYou, _) => "needs you".into(),
-        (Attn::Working, _) => format!("working \u{b7} {}", elapsed(now - x.since)),
-        (Attn::DoneUnseen, _) => "done".into(),
-        (_, Some(n)) => format!("exited {}", n as i32),
+        (Attn::Working, _) => {
+            let start = x.turn.unwrap_or(x.since);
+            format!(
+                "working \u{b7} {}",
+                elapsed(now.saturating_duration_since(start))
+            )
+        }
+        (Attn::DoneUnseen, _) => match x.took {
+            Some(d) => format!("done \u{b7} {}", elapsed(d)),
+            None => "done".into(),
+        },
+        (_, Some(n)) => crate::attention::exit_text(n),
         (Attn::Error, None) => "error".into(),
         (Attn::Idle, None) => "idle".into(),
     }
 }
 
-/// `45s`, `1m 12s`, `2h 5m`.
-fn elapsed(d: Duration) -> String {
+/// `45s`, `12m`, `2h 5m`: seconds only in the first minute, so a long
+/// turn wakes blitz once a minute, not every second.
+pub fn elapsed(d: Duration) -> String {
     let t = d.as_secs();
     match t {
         0..60 => format!("{t}s"),
-        60..3600 => format!("{}m {}s", t / 60, t % 60),
+        60..3600 => format!("{}m", t / 60),
         _ => format!("{}h {}m", t / 3600, t / 60 % 60),
+    }
+}
+
+/// When the time [`elapsed`] shows for something that began at `start`
+/// next changes, as of `now`; with `seconds` false, as if the first minute
+/// showed no time at all.
+pub fn next_tick(start: Instant, now: Instant, seconds: bool) -> Instant {
+    let t = now.saturating_duration_since(start).as_secs();
+    let next = if t < 60 && seconds {
+        t + 1
+    } else {
+        (t / 60 + 1) * 60
+    };
+    start + Duration::from_secs(next)
+}
+
+/// When the time the sidebar shows for a session in `a` next changes, if
+/// it shows one.
+pub fn row_tick(a: &PaneAttn, now: Instant) -> Option<Instant> {
+    match a.state {
+        Attn::Working => Some(next_tick(a.turn.unwrap_or(a.since), now, true)),
+        Attn::NeedsYou => Some(next_tick(a.since, now, false)),
+        _ => None,
     }
 }
 
@@ -1359,10 +1473,14 @@ mod tests {
         Session {
             id: PaneId(id),
             name: name.into(),
+            num: None,
             cwd: format!(r"C:\dev\{name}"),
             branch: Some("main".into()),
             state,
             since: now - Duration::from_secs(72),
+            turn: None,
+            took: None,
+            seen: false,
             msg: String::new(),
             progress: None,
             exit_code: None,
@@ -1450,8 +1568,8 @@ mod tests {
             "db",
             "api",
             "web",
-            "needs you",
-            "working \u{b7} 1m 12s",
+            "needs you \u{b7} 1m",
+            "working \u{b7} 1m",
         ] {
             assert!(t.contains(&want), "missing {want:?} in {t:?}");
         }
@@ -1461,6 +1579,110 @@ mod tests {
             c.prims
                 .iter()
                 .any(|p| matches!(p, Prim::Branch(r, _) if r.w == 10))
+        );
+    }
+
+    /// A question the user saw but did not answer stays, outlined.
+    #[test]
+    fn a_seen_question_is_outlined() {
+        let (win, mut sessions, now) = fleet(true);
+        let accent = crate::theme::blitz(false).ui.accent;
+        let strokes = |sessions: &[Session]| -> Vec<f32> {
+            let c = build(&model(&win, sessions, now));
+            (c.prims.iter())
+                .filter_map(|p| match p {
+                    Prim::Shape { stroke, color, .. } if *color == accent => Some(*stroke),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The pane header's dot, the row's dot and the chip.
+        assert_eq!(strokes(&sessions), [0.0; 3]);
+        sessions[0].seen = true;
+        assert_eq!(strokes(&sessions), [1.5; 3]);
+        // Its word takes the name's colour, which reads on any sidebar.
+        let name = crate::theme::blitz(false).ui.name;
+        let c = build(&model(&win, &sessions, now));
+        let word = (c.prims.iter()).find_map(|p| match p {
+            Prim::Text { text, color, .. } if text == "needs you \u{b7} 1m" => Some(*color),
+            _ => None,
+        });
+        assert_eq!(word, Some(name));
+    }
+
+    /// Sessions that share a name are told apart by a dim number; the
+    /// rest show their name alone.
+    #[test]
+    fn twins_get_their_numbers() {
+        let now = Instant::now();
+        let mut s = vec![
+            session(1, "Claude Code", Attn::Idle, now),
+            session(2, "pwsh", Attn::Idle, now),
+            session(3, "Claude Code", Attn::Idle, now),
+        ];
+        number_twins(&mut s);
+        let nums: Vec<_> = s.iter().map(|x| x.num).collect();
+        assert_eq!(nums, [Some(1), None, Some(3)]);
+        s[2].name = "Fix the login".into();
+        number_twins(&mut s);
+        assert!(s.iter().all(|x| x.num.is_none()));
+
+        let (win, mut sessions, now) = fleet(true);
+        sessions[1].name = "api".into();
+        number_twins(&mut sessions);
+        let c = build(&model(&win, &sessions, now));
+        let dim = crate::theme::blitz(false).ui.dim;
+        let nums: Vec<_> = (c.prims.iter())
+            .filter_map(|p| match p {
+                Prim::Text { text, color, .. } if text.starts_with(' ') => {
+                    Some((text.as_str(), *color))
+                }
+                _ => None,
+            })
+            .collect();
+        // The focused pane's header and the two sidebar rows.
+        assert!(
+            nums.contains(&(" 1", dim)) && nums.contains(&(" 2", dim)),
+            "{nums:?}"
+        );
+        assert!(texts(&c).iter().filter(|t| **t == "api").count() >= 4);
+    }
+
+    /// A tab nobody named follows the folder of its focused pane.
+    #[test]
+    fn unnamed_tabs_follow_the_focused_folder() {
+        let (mut win, mut sessions, now) = fleet(true);
+        win.tabs[0].name = String::new();
+        sessions[0].cwd = r"C:\dev\shop\api".into();
+        let heads = |win: &Window, sessions: &[Session]| {
+            let c = build(&model(win, sessions, now));
+            texts(&c).iter().map(|t| t.to_string()).collect::<Vec<_>>()
+        };
+        assert!(heads(&win, &sessions).contains(&"api".to_owned()));
+        win.tabs[0].focus = PaneId(2);
+        sessions[1].cwd = r"C:\dev\shop\web\src".into();
+        assert!(heads(&win, &sessions).contains(&"src".to_owned()));
+        // A name the user gave stays.
+        win.tabs[0].name = "shop".into();
+        assert!(heads(&win, &sessions).contains(&"shop".to_owned()));
+        assert_eq!(folder_name(r"C:\dev\shop"), "shop");
+        assert_eq!(folder_name(r"C:\dev\shop\"), "shop");
+        assert_eq!(folder_name("/home/me/shop"), "shop");
+        assert_eq!(folder_name(r"C:\"), r"C:\");
+        assert_eq!(folder_name(""), "shell");
+    }
+
+    #[test]
+    fn sidebar_says_how_a_session_exited() {
+        let (win, mut sessions, now) = fleet(true);
+        sessions[1].state = Attn::Error;
+        sessions[1].exit_code = Some(0xC000_0005);
+        sessions[2].exit_code = Some(u32::MAX);
+        let c = build(&model(&win, &sessions, now));
+        let t = texts(&c);
+        assert!(
+            t.contains(&"access violation") && t.contains(&"exit -1"),
+            "{t:?}"
         );
     }
 
@@ -1727,6 +1949,7 @@ mod tests {
             filter: "",
             items,
             sel: 15,
+            rename: None,
         });
         let c = build(&m);
         let (panel, rows) = c.commands.clone().expect("palette hits");
@@ -1737,6 +1960,33 @@ mod tests {
         let t = texts(&c);
         assert!(t.contains(&"Commands") && t.contains(&"Ctrl+15"));
         assert!(!t.contains(&"Ctrl+3"), "scrolled out");
+    }
+
+    /// Renaming takes the palette's line for the name.
+    #[test]
+    fn command_palette_takes_a_name() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.commands = Some(Commands {
+            filter: "",
+            items: Vec::new(),
+            sel: 0,
+            rename: Some("Rename tab"),
+        });
+        let t: Vec<String> = texts(&build(&m)).iter().map(|t| t.to_string()).collect();
+        assert!(t.contains(&"Rename tab".into()) && t.contains(&"type a name".into()));
+        let unnamed = "With no name, blitz picks one again";
+        assert!(t.contains(&unnamed.into()));
+        m.commands = Some(Commands {
+            filter: "shop api",
+            items: Vec::new(),
+            sel: 0,
+            rename: Some("Rename tab"),
+        });
+        let c = build(&m);
+        assert!(texts(&c).contains(&"shop api"));
+        assert!(!texts(&c).contains(&unnamed), "a name is typed");
+        assert!(c.commands.expect("palette").1.is_empty(), "no rows to pick");
     }
 
     #[test]
@@ -1751,8 +2001,63 @@ mod tests {
         assert_eq!(fit("abcdef", 42, 7), "abcdef");
         assert_eq!(fit("abcdefg", 42, 7), "abcde\u{2026}");
         assert_eq!(fit_left(r"C:\dev\shop", 35, 7), "\u{2026}shop");
-        assert_eq!(elapsed(Duration::from_secs(72)), "1m 12s");
+        assert_eq!(elapsed(Duration::from_secs(72)), "1m");
         assert_eq!(elapsed(Duration::from_secs(7500)), "2h 5m");
+    }
+
+    /// Seconds tick for the first minute, then minutes do.
+    #[test]
+    fn times_tick_each_second_then_each_minute() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let ms = |m| t0 + Duration::from_millis(m);
+        assert_eq!(next_tick(t0, t0, true), at(1));
+        assert_eq!(next_tick(t0, ms(59_500), true), at(60));
+        assert_eq!(next_tick(t0, at(60), true), at(120));
+        assert_eq!(next_tick(t0, ms(119_999), true), at(120));
+        assert_eq!(next_tick(t0, at(3601), true), at(3660));
+        assert_eq!(next_tick(t0, t0, false), at(60));
+        assert_eq!(next_tick(t0, at(61), false), at(120));
+        // Each tick is where the text changes.
+        for s in [0, 59, 60, 61, 119, 3599, 3600] {
+            let d = |t: Instant| elapsed(t - t0);
+            let next = next_tick(t0, at(s), true);
+            assert_ne!(d(next), d(next - Duration::from_millis(1)), "{s}");
+        }
+    }
+
+    /// A turn's time runs across its questions; a question shows how long
+    /// it has waited once that is a minute; a result shows how long its
+    /// turn took.
+    #[test]
+    fn rows_show_turn_and_waiting_times() {
+        let now = Instant::now();
+        let ago = |s| now - Duration::from_secs(s);
+        let mut x = session(1, "a", Attn::Working, now);
+        x.since = ago(5);
+        x.turn = Some(ago(600));
+        assert_eq!(state_word(&x, now), "working \u{b7} 10m");
+        x.state = Attn::NeedsYou;
+        assert_eq!(state_word(&x, now), "needs you");
+        x.since = ago(185);
+        assert_eq!(state_word(&x, now), "needs you \u{b7} 3m");
+        x.state = Attn::DoneUnseen;
+        assert_eq!(state_word(&x, now), "done");
+        x.took = Some(Duration::from_secs(750));
+        assert_eq!(state_word(&x, now), "done \u{b7} 12m");
+
+        // The sidebar wakes when those change: each second of a turn's
+        // first minute, then each minute, and a question's each minute.
+        let mut a = PaneAttn::new(ago(5));
+        a.state = Attn::Working;
+        a.turn = Some(ago(600));
+        assert_eq!(row_tick(&a, now), Some(ago(600) + Duration::from_secs(660)));
+        a.turn = None;
+        assert_eq!(row_tick(&a, now), Some(ago(5) + Duration::from_secs(6)));
+        a.state = Attn::NeedsYou;
+        assert_eq!(row_tick(&a, now), Some(ago(5) + Duration::from_secs(60)));
+        a.state = Attn::DoneUnseen;
+        assert_eq!(row_tick(&a, now), None);
     }
 
     #[test]

@@ -595,6 +595,8 @@ const STRIP: &[&str] = &[
     "TERMINATOR_UUID",
     "XTERM_VERSION",
     "TMUX",
+    "TMUX_PANE",
+    "ZELLIJ",
     "STY",
     "COLORTERM",
     // Set when blitz itself was started from a Claude Code session. Each
@@ -615,6 +617,33 @@ const STRIP: &[&str] = &[
     "CLAUDE_ENV_FILE",
 ];
 
+/// What WSL passes from a pane into Linux: how blitz describes itself, and
+/// the pane's token, which goes both ways so that a Windows hook run from
+/// Linux gets it back.
+const WSLENV: &[&str] = &[
+    "BLITZ_PANE_TOKEN",
+    "TERM_PROGRAM/u",
+    "TERM_PROGRAM_VERSION/u",
+    "COLORTERM/u",
+    "FORCE_HYPERLINK/u",
+    "CLAUDE_CODE_FORCE_STRIKETHROUGH/u",
+];
+
+/// `WSLENV` for a pane: the user's own entries, then blitz's for the
+/// variables they leave out.
+pub fn wslenv(user: Option<&str>) -> String {
+    let name = |e: &str| e.split('/').next().unwrap_or("").to_owned();
+    let mut out: Vec<&str> = (user.unwrap_or("").split(':'))
+        .filter(|e| !e.is_empty())
+        .collect();
+    for ours in WSLENV {
+        if !out.iter().any(|e| name(e) == name(ours)) {
+            out.push(ours);
+        }
+    }
+    out.join(":")
+}
+
 /// The environment for a pane's child: `parent` minus other terminals'
 /// markers, plus blitz's own, plus `extra` (which wins). Names compare
 /// case-insensitively, and the result is sorted the way Windows expects.
@@ -634,12 +663,20 @@ pub fn child_env(
         })
         .collect();
     let id = pane_id.to_string();
+    let user_wslenv = (env.iter())
+        .find(|(k, _)| upper(k) == "WSLENV")
+        .map(|(_, v)| v.to_string_lossy().into_owned());
+    let wslenv = wslenv(user_wslenv.as_deref());
     let ours = [
         ("TERM_PROGRAM", "blitz"),
         ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
         ("COLORTERM", "truecolor"),
         ("FORCE_HYPERLINK", "1"),
+        // Claude Code draws ~~text~~ struck through only in terminals it
+        // knows, and blitz draws strikethrough.
+        ("CLAUDE_CODE_FORCE_STRIKETHROUGH", "1"),
         ("BLITZ_PANE_ID", id.as_str()),
+        ("WSLENV", wslenv.as_str()),
     ];
     let sets = ours
         .into_iter()
@@ -689,6 +726,11 @@ mod tests {
             // that pane's, and the token is a secret.
             ("BLITZ_PANE_TOKEN", "0f1e"),
             ("PROMPT", crate::shell::cmd_prompt("0f1e").as_str()),
+            // In tmux or zellij, Claude Code stops turning the mark in its
+            // title.
+            ("TMUX", "/tmp/tmux-1000/default,1,0"),
+            ("TMUX_PANE", "%3"),
+            ("ZELLIJ", "0"),
         ]
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         let extra = [("Path".to_owned(), r"C:\other".to_owned())];
@@ -706,12 +748,14 @@ mod tests {
             ("=C:", r"C:\work"),
             ("ANTHROPIC_MODEL", "m"),
             ("BLITZ_PANE_ID", "7"),
+            ("CLAUDE_CODE_FORCE_STRIKETHROUGH", "1"),
             ("CLAUDE_CONFIG_DIR", "c"),
             ("COLORTERM", "truecolor"),
             ("FORCE_HYPERLINK", "1"),
             ("Path", r"C:\other"),
             ("TERM_PROGRAM", "blitz"),
             ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
+            ("WSLENV", &WSLENV.join(":")),
         ]
         .map(|(k, v)| (k.to_owned(), v.to_owned()));
         assert_eq!(got, want);
@@ -731,6 +775,30 @@ mod tests {
         let ours = crate::shell::cmd_prompt("5eed");
         let set = [("PROMPT".to_owned(), ours.clone())];
         assert_eq!(prompt(&crate::shell::cmd_prompt("0f1e"), &set), Some(ours));
+    }
+
+    /// The pane's token reaches Claude Code in WSL, and a hook it runs gets
+    /// it back; what the user passes stays as they set it.
+    #[test]
+    fn wslenv_keeps_the_users_own() {
+        let ours = WSLENV.join(":");
+        assert_eq!(wslenv(None), ours);
+        assert_eq!(wslenv(Some("")), ours);
+        assert!(ours.starts_with("BLITZ_PANE_TOKEN:"), "{ours}");
+        assert_eq!(
+            wslenv(Some("USERPROFILE/p:")),
+            format!("USERPROFILE/p:{ours}")
+        );
+        let mine = "COLORTERM:BLITZ_PANE_TOKEN/w";
+        let got = wslenv(Some(mine));
+        assert!(got.starts_with(&format!("{mine}:TERM_PROGRAM/u:")), "{got}");
+        assert_eq!(got.matches("COLORTERM").count(), 1, "{got}");
+        assert_eq!(got.matches("BLITZ_PANE_TOKEN").count(), 1, "{got}");
+        let env = child_env([("WSLENV".into(), "GOPATH/l".into())], 1, &[]);
+        let set = (env.iter())
+            .find(|(k, _)| k == "WSLENV")
+            .map(|(_, v)| v.clone());
+        assert_eq!(set, Some(format!("GOPATH/l:{ours}").into()));
     }
 
     #[test]

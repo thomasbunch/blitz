@@ -301,6 +301,25 @@ fn pty_hook_sequences_reach_the_reader() {
     assert_eq!(r.code, 0);
 }
 
+/// Other agents' hooks run `blitz-hook notify`, which writes to the pane's
+/// console, not to the stdout the agent reads (here thrown away), and the
+/// console host passes it on.
+#[test]
+fn pty_notify_reaches_the_reader() {
+    let hook = env!("CARGO_BIN_EXE_blitz-hook");
+    let cmd =
+        format!("cmd /d /c \"\"{hook}\" notify needs-you \"Approve r\u{e9}sum\u{e9}\" > NUL\"");
+    let env = [("BLITZ_PANE_TOKEN".to_owned(), TOKEN.to_owned())];
+    let (_pty, _, rx) = spawn(&cmd, &env);
+    let seq = format!("\x1b]777;notify;blitz:{TOKEN}:needs-you:v2;Approve r\u{e9}sum\u{e9}\x07");
+    let mut out = Vec::new();
+    assert!(
+        wait_for(&rx, &mut out, seq.as_bytes()),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
 /// Each shell blitz integrates with that is on this machine, without the
 /// user's profile, which could replace the prompt.
 fn shells() -> Vec<String> {
@@ -352,6 +371,60 @@ fn pty_shells_print_prompt_marks() {
                 wait_for(&rx, &mut out, b"\x1b]7;file:///"),
                 "{program}: no folder in {:?}",
                 String::from_utf8_lossy(&out)
+            );
+        }
+    }
+}
+
+/// PowerShell marks where each command starts, and ends it with the code
+/// of the program it ran, even the same as last time, or 1 for a failed
+/// cmdlet, which leaves the last program's code behind in `$LASTEXITCODE`.
+/// It does so too when the user's profile turns strict mode on.
+#[test]
+fn pty_powershell_reports_how_commands_end() {
+    let shells = shells().into_iter().filter(|p| !p.ends_with("cmd.exe"));
+    for (program, strict) in shells.flat_map(|p| [(p.clone(), false), (p, true)]) {
+        let mut l = launch(&program);
+        if strict {
+            let script = format!(
+                "Set-StrictMode -Version Latest\n{}",
+                blitz::shell::POWERSHELL_INTEGRATION
+            );
+            let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let encoded = blitz::shell::base64(&utf16);
+            l.cmdline = format!(
+                "{} -NoProfile -NoLogo -NoExit -EncodedCommand {encoded}",
+                blitz::shell::quote(&program)
+            );
+        }
+        let (pty, _, rx) = spawn(&l.cmdline, &l.env);
+        let mut out = Vec::new();
+        let mark = format!("\x1b]133;A;blitz={TOKEN}");
+        assert!(
+            wait_for(&rx, &mut out, mark.as_bytes()),
+            "{program}: no prompt in {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        for (line, code) in [
+            ("cmd /c exit 3", "3"),
+            ("cmd /c exit 3", "3"),
+            ("Get-Item blitz-nothing-here", "1"),
+            ("cmd /c exit 3", "3"),
+            (
+                "Get-Item blitz-nothing-here -ErrorAction SilentlyContinue",
+                "1",
+            ),
+            ("cmd /c exit 0", "0"),
+        ] {
+            out.clear();
+            pty.writer().send(format!("{line}\r").into_bytes());
+            let end = format!("\x1b]133;D;{code}\x07");
+            let ended = wait_for(&rx, &mut out, end.as_bytes());
+            let shown = String::from_utf8_lossy(&out);
+            assert!(ended, "{program}, strict mode {strict}: {line}: {shown:?}");
+            assert!(
+                shown.contains("\x1b]133;C\x07"),
+                "{program}: {line}: {shown:?}"
             );
         }
     }

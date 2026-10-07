@@ -551,6 +551,24 @@ impl Window {
         }
         true
     }
+
+    /// Puts pane `new` where `p` is, with its focus, zoom and place in the
+    /// focus history. Returns false if no tab has `p`.
+    pub fn replace_pane(&mut self, p: PaneId, new: PaneId) -> bool {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.root.contains(p)) else {
+            return false;
+        };
+        if let Some(leaf) = t.root.leaf_mut(p) {
+            *leaf = Node::Leaf(new);
+        }
+        let ids = (t.mru.iter_mut())
+            .chain([&mut t.focus])
+            .chain(t.zoom.as_mut());
+        for q in ids.filter(|q| **q == p) {
+            *q = new;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -990,5 +1008,27 @@ mod tests {
         assert!(w.close_pane(PaneId(2)));
         assert!(w.tabs.is_empty());
         assert_eq!(w.active, 0);
+    }
+
+    #[test]
+    fn a_replaced_pane_keeps_its_place() {
+        let mut w = Window::default();
+        w.tabs.push(Tab::new("a".into(), PaneId(9)));
+        w.tabs.push(four());
+        let before = w.tabs[1].rects(AREA);
+        w.tabs[1].toggle_zoom();
+        assert!(w.replace_pane(PaneId(4), PaneId(7)));
+        let t = &w.tabs[1];
+        assert_eq!(t.panes(), ids(&[1, 2, 3, 7]));
+        assert_eq!((t.focus, t.zoom), (PaneId(7), Some(PaneId(7))));
+        assert_eq!(t.mru[0], PaneId(7));
+        assert!(!t.mru.contains(&PaneId(4)));
+        w.tabs[1].toggle_zoom();
+        let moved = before
+            .iter()
+            .map(|&(p, r)| (if p == PaneId(4) { PaneId(7) } else { p }, r));
+        assert_eq!(w.tabs[1].rects(AREA), moved.collect::<Vec<_>>());
+        assert!(!w.replace_pane(PaneId(4), PaneId(8)));
+        assert_eq!(w.tabs[0], Tab::new("a".into(), PaneId(9)));
     }
 }

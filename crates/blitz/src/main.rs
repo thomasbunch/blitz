@@ -4,7 +4,7 @@
 #[cfg(windows)]
 const USAGE: &str = "usage: blitz [--cwd DIR] [--new-window]
        blitz --version | --help
-       blitz setup claude
+       blitz setup claude [--wsl]
        blitz debug run --script FILE [--cmd CMD] [--cwd DIR] [--cols N --rows N] [--timeout MS]
        blitz debug render --script FILE --bmp OUT [--warp]";
 
