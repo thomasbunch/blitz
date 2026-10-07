@@ -376,6 +376,40 @@ fn pty_shells_print_prompt_marks() {
     }
 }
 
+/// PowerShell marks where each command starts, and ends it with the code
+/// of the program it ran, or 1 for a failed cmdlet, which leaves the last
+/// program's code behind in `$LASTEXITCODE`.
+#[test]
+fn pty_powershell_reports_how_commands_end() {
+    for program in shells().into_iter().filter(|p| !p.ends_with("cmd.exe")) {
+        let l = launch(&program);
+        let (pty, _, rx) = spawn(&l.cmdline, &l.env);
+        let mut out = Vec::new();
+        let mark = format!("\x1b]133;A;blitz={TOKEN}");
+        assert!(
+            wait_for(&rx, &mut out, mark.as_bytes()),
+            "{program}: no prompt in {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        for (line, code) in [
+            ("cmd /c exit 3", "3"),
+            ("Get-Item blitz-nothing-here", "1"),
+            ("cmd /c exit 0", "0"),
+        ] {
+            out.clear();
+            pty.writer().send(format!("{line}\r").into_bytes());
+            let end = format!("\x1b]133;D;{code}\x07");
+            let ended = wait_for(&rx, &mut out, end.as_bytes());
+            let shown = String::from_utf8_lossy(&out);
+            assert!(ended, "{program}: {line}: {shown:?}");
+            assert!(
+                shown.contains("\x1b]133;C\x07"),
+                "{program}: {line}: {shown:?}"
+            );
+        }
+    }
+}
+
 /// A shell started in a `\\?\` folder still marks its prompt and reports
 /// the folder.
 #[test]
