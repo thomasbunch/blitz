@@ -1311,6 +1311,8 @@ struct Quick {
     /// their cells, their text, and what opening them does. A hash opens
     /// nothing.
     items: Vec<QuickItem>,
+    /// Their cells in order, as each frame highlights them.
+    found: Vec<Found>,
 }
 
 type QuickItem = (Found, String, Option<Target>);
@@ -3285,10 +3287,13 @@ impl App {
                     return true;
                 }
                 self.find = None;
+                let mut found: Vec<Found> = items.iter().map(|i| i.0).collect();
+                found.sort();
                 self.quick = Some(Quick {
                     pane: id,
                     epoch,
                     items,
+                    found,
                 });
                 self.request_redraw();
             }
@@ -4812,10 +4817,9 @@ impl App {
                 v.snap.highlight(&f.found, f.cur);
             }
             if let Some(q) = self.quick.as_ref().filter(|q| q.pane == id) {
-                let mut found: Vec<Found> = q.items.iter().map(|i| i.0).collect();
-                found.sort();
-                v.snap.highlight(&found, None);
+                v.snap.highlight(&q.found, None);
             }
+
             // Only the focused pane has a link under the pointer.
             let hover = (self.hover)
                 .filter(|h| Some(id) == focus && h.0 == term.line_epoch())
