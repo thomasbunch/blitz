@@ -3091,6 +3091,12 @@ impl App {
                 // SAFETY: our own window, and a message that carries no pointers.
                 let _ = unsafe { PostMessageW(Some(hwnd), WM_SYSCOMMAND, menu, space) };
             }
+            Action::SendText(i) => {
+                let Some(text) = self.config.texts.get(usize::from(i)) else {
+                    return false;
+                };
+                self.typed(text.clone());
+            }
         }
         true
     }

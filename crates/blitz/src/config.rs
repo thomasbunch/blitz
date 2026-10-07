@@ -41,6 +41,8 @@ pub struct Config {
     /// Key bindings from `keybind` lines, one per chord, which take the
     /// place of the default for that chord; see [`keymap::binding`].
     pub keys: Vec<keymap::Binding>,
+    /// What `text:` bindings type, by [`keymap::Action::SendText`] index.
+    pub texts: Vec<Vec<u8>>,
 }
 
 impl Default for Config {
@@ -62,6 +64,7 @@ impl Default for Config {
             scenery: "off".into(),
             mascot: false,
             keys: Vec::new(),
+            texts: Vec::new(),
         }
     }
 }
@@ -288,13 +291,23 @@ impl Config {
         let num = bare.and_then(number);
         let text = text.unwrap_or_else(|| value.to_string());
         match key {
-            "keybind" => match keymap::binding(&text) {
-                Some(b) => {
-                    self.keys.retain(|k| (k.0, k.1) != (b.0, b.1));
-                    self.keys.push(b);
-                }
-                None => return false,
-            },
+            "keybind" => {
+                let b = match keymap::text_binding(&text) {
+                    Some((mods, vk, t)) => {
+                        let Ok(i) = u16::try_from(self.texts.len()) else {
+                            return false;
+                        };
+                        self.texts.push(t);
+                        (mods, vk, Some(keymap::Action::SendText(i)))
+                    }
+                    None => match keymap::binding(&text) {
+                        Some(b) => b,
+                        None => return false,
+                    },
+                };
+                self.keys.retain(|k| (k.0, k.1) != (b.0, b.1));
+                self.keys.push(b);
+            }
             "theme" | "font_family" if text.is_empty() => return false,
             "theme" => self.theme = text,
             "font_family" => self.font_family = text,
@@ -645,6 +658,22 @@ mod tests {
             .collect();
         assert_eq!(c.keys, want, "the last line for a chord counts");
         assert_eq!(c.font_size, Config::default().font_size);
+    }
+
+    #[test]
+    fn config_reads_text_bindings() {
+        let c = Config::parse(
+            r#"keybind = ctrl+shift+e=text:claude\r # start it
+keybind = "ctrl+shift+y=text:a=b # not a comment\e"
+keybind = ctrl+shift+e=text:git status\r
+keybind = ctrl+shift+n=text:
+"#,
+        );
+        let send = |i| Some(keymap::Action::SendText(i));
+        assert_eq!(c.keys, [(3, 0x59, send(1)), (3, 0x45, send(2))]);
+        assert_eq!(c.texts[0], b"claude\r", "replaced, but kept");
+        assert_eq!(c.texts[1], b"a=b # not a comment\x1b");
+        assert_eq!(c.texts[2], b"git status\r");
     }
 
     #[test]

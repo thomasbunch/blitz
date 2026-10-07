@@ -71,6 +71,10 @@ pub enum Action {
     ClaudeSetup,
     /// Open the window menu, as Alt+Space does in other windows.
     SystemMenu,
+    /// Type what a `text:` binding holds, from [`Config::texts`] by index.
+    ///
+    /// [`Config::texts`]: crate::config::Config::texts
+    SendText(u16),
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -260,6 +264,59 @@ const KEY_NAMES: &[(&str, u16)] = &[
 /// chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`.
 pub fn binding(s: &str) -> Option<Binding> {
     let (chord, name) = s.rsplit_once('=')?;
+    let action = match name.trim() {
+        "none" => None,
+        name => Some(ACTIONS.iter().find(|a| a.1 == name)?.0),
+    };
+    let (mods, vk) = parse_chord(chord)?;
+    Some((mods, vk, action))
+}
+
+/// A binding that types text, as in `ctrl+shift+e=text:git status\r`: the
+/// chord, and the text with the escapes of [`unesc`]. Read before
+/// [`binding`] would split at an `=` in the text.
+pub fn text_binding(s: &str) -> Option<(u8, u16, Vec<u8>)> {
+    let (chord, text) = s.split_once("=text:")?;
+    let (mods, vk) = parse_chord(chord)?;
+    Some((mods, vk, unesc(text))).filter(|b| !b.2.is_empty())
+}
+
+/// Text with the escapes `\e \r \n \t \s \\ \xNN`, as bytes. Any other
+/// backslash stays.
+pub fn unesc(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let (c, next) = (b[i], b.get(i + 1).copied());
+        i += 1;
+        if c != b'\\' || next.is_none() {
+            out.push(c);
+            continue;
+        }
+        i += 1;
+        match next.unwrap_or_default() {
+            b'e' => out.push(0x1b),
+            b'r' => out.push(b'\r'),
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b's' => out.push(b' '),
+            b'\\' => out.push(b'\\'),
+            b'x' => match s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                Some(v) => {
+                    out.push(v);
+                    i += 2;
+                }
+                None => out.extend_from_slice(b"\\x"),
+            },
+            other => out.extend_from_slice(&[b'\\', other]),
+        }
+    }
+    out
+}
+
+/// A chord's modifiers and virtual key.
+fn parse_chord(chord: &str) -> Option<(u8, u16)> {
     let chord = chord.trim();
     // A + key leaves a second + at the end.
     let (mods, key) = match chord.strip_suffix("++") {
@@ -275,11 +332,7 @@ pub fn binding(s: &str) -> Option<Binding> {
             _ => return None,
         };
     }
-    let action = match name.trim() {
-        "none" => None,
-        name => Some(ACTIONS.iter().find(|a| a.1 == name)?.0),
-    };
-    Some((bits, key_code(key.trim())?, action))
+    Some((bits, key_code(key.trim())?))
 }
 
 /// The virtual key a key name stands for.
@@ -1127,6 +1180,23 @@ mod msg_to_key_tests {
         assert_eq!(chord_label(CTRL | ALT | SHIFT, 0x25), "Ctrl+Alt+Shift+Left");
         assert_eq!(chord_label(CTRL, 0xbc), "Ctrl+,");
         assert_eq!(chord_label(0, 0x7a), "F11");
+    }
+
+    #[test]
+    fn keymap_reads_text_bindings() {
+        assert_eq!(
+            text_binding(r"ctrl+shift+e=text:git status\r"),
+            Some((CTRL | SHIFT, 0x45, b"git status\r".to_vec()))
+        );
+        // An = in the text, or as the key, is kept apart from the chord.
+        assert_eq!(
+            text_binding(r"alt+==text:a=b\e[A\x41\s"),
+            Some((ALT, 0xbb, b"a=b\x1b[AA ".to_vec()))
+        );
+        assert_eq!(text_binding("ctrl+e=text:"), None, "nothing to type");
+        assert_eq!(text_binding("ctrl+bogus+e=text:x"), None);
+        assert_eq!(text_binding("ctrl+e=split_right"), None);
+        assert_eq!(binding(r"ctrl+e=text:x"), None, "not an action");
     }
 
     #[test]
