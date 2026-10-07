@@ -3310,9 +3310,7 @@ impl App {
             .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
         let size = (size.width as i32, size.height as i32);
         let tw = self.text_cell().0 as i32;
-        let note = self.banner_note.as_ref().map(|n| n.0.as_str());
-        let update = self.update.as_ref();
-        panes_area(&self.win, size, self.scale as f32, update, note, tw)
+        chrome::area(&self.win, size, self.scale as f32, self.banner(), tw)
     }
 
     /// The text of the update strip or cue, which also decides whether
@@ -4552,21 +4550,6 @@ fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) 
     update.map(|u| note.unwrap_or(&u.1))
 }
 
-/// The part of a `size` window that the active tab's panes share, with
-/// the banner strip as the frame draws it: from the note on the update in
-/// hand while there is one, which may need the strip where the offer fit
-/// the sidebar's foot.
-fn panes_area(
-    win: &layout::Window,
-    size: (i32, i32),
-    scale: f32,
-    update: Option<&(String, String)>,
-    note: Option<&str>,
-    tw: i32,
-) -> Rect {
-    chrome::area(win, size, scale, banner_text(update, note), tw)
-}
-
 /// How to flash the taskbar for a session that just changed to `state`
 /// while the window is in the background: urgently when it needs the
 /// user or failed, gently when it finished, and at most once per session
@@ -5783,7 +5766,7 @@ mod tests {
         let offer = crate::update::banner(None, "0.2.0", None, true).expect("an offer");
         let update = ("0.2.0".to_string(), offer);
         let note = "Sessions are busy, and updating restarts blitz.                     Press Ctrl+Alt+Shift+F12 again";
-        let area = |note| panes_area(&win, (1440, 900), 1.0, Some(&update), note, 7);
+        let area = |note| chrome::area(&win, (1440, 900), 1.0, banner_text(Some(&update), note), 7);
         assert_eq!(area(None).h, 900, "the offer sits at the sidebar's foot");
         assert!(area(Some(note)).h < 900, "the note needs the strip");
     }
