@@ -24,11 +24,21 @@ pub fn detect_with(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     if ps.is_file() {
         return ps;
     }
-    var("ComSpec").map_or_else(|| root.join("System32").join("cmd.exe"), PathBuf::from)
+    absolute(var("ComSpec")).unwrap_or_else(|| root.join("System32").join("cmd.exe"))
 }
 
-fn system_root(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
-    PathBuf::from(var("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+/// The Windows folder, from `SystemRoot`. A value that is empty or not an
+/// absolute path is ignored: it would name a folder under the current one,
+/// where a planted program would run.
+pub(crate) fn system_root(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    absolute(var("SystemRoot")).unwrap_or_else(|| r"C:\Windows".into())
+}
+
+/// `v` as a path, unless Windows would read it against the current folder.
+/// Elsewhere a Windows path is never absolute, and nothing runs from it.
+fn absolute(v: Option<OsString>) -> Option<PathBuf> {
+    v.map(PathBuf::from)
+        .filter(|p| cfg!(not(windows)) || p.is_absolute())
 }
 
 fn windows_powershell(root: &Path) -> PathBuf {
@@ -63,15 +73,13 @@ fn pwsh(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            let major: u32 = name
-                .split(|c: char| !c.is_ascii_digit())
-                .next()?
-                .parse()
-                .ok()?;
+            let digits = name.split(|c: char| !c.is_ascii_digit()).next()?;
+            let major: u32 = digits.parse().ok()?;
             let exe = e.path().join("pwsh.exe");
-            exe.is_file().then_some((major, exe))
+            // `7` beats `7-preview` whichever the folder lists first.
+            exe.is_file().then_some(((major, digits == name), exe))
         })
-        .max_by_key(|(major, _)| *major)
+        .max_by_key(|(key, _)| *key)
         .map(|(_, exe)| exe)
 }
 
@@ -179,7 +187,10 @@ pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
     $e = [char]27; $b = [char]7; $s = "$e[?1049h$e[?1049l$e[!p$e[?5W"
     if ($global:__blitz.Exec) { $s += "$e]133;D;$code$b"; $global:__blitz.Exec = $false }
     $s += "$e]133;A;blitz=$($global:__blitz.Token)$b"
-    if ($PWD.Provider.Name -eq 'FileSystem') { $s += "$e]7;" + ([Uri]::new($PWD.ProviderPath).AbsoluteUri) + $b }
+    if ($PWD.Provider.Name -eq 'FileSystem') {
+      $p = $PWD.ProviderPath -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
+      try { $s += "$e]7;" + [Uri]::new($p).AbsoluteUri + $b } catch {}
+    }
     if (-not $ok) { Write-Error 'x' -ErrorAction Ignore }
     $s + (& $global:__blitz.Orig) + "$e]133;B$b"
   }
@@ -200,6 +211,13 @@ pub fn cmd_prompt(token: &str) -> String {
     )
 }
 
+/// Whether `prompt` is a [`cmd_prompt`], which blitz started from a blitz
+/// pane inherits. It carries the other pane's token, so it is not the
+/// user's own and is not passed on.
+pub fn is_blitz_prompt(prompt: &std::ffi::OsStr) -> bool {
+    prompt.to_string_lossy().contains("]133;A;blitz=")
+}
+
 /// A command line ready for `CreateProcessW`, plus variables to add to the
 /// child's environment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -209,10 +227,9 @@ pub struct Launch {
 }
 
 /// Builds the command line for `program` (empty means [`detect`]). Shell
-/// integration is added only when `integrate` is set and there are no user
-/// arguments; otherwise the command runs exactly as configured. `token` is
-/// the pane's `BLITZ_PANE_TOKEN`.
-pub fn launch(program: &str, args: &[String], integrate: bool, token: &str) -> Launch {
+/// integration is added only when `integrate` is set; otherwise the command
+/// runs exactly as configured. `token` is the pane's `BLITZ_PANE_TOKEN`.
+pub fn launch(program: &str, integrate: bool, token: &str) -> Launch {
     let program = if program.is_empty() {
         detect()
     } else {
@@ -222,7 +239,7 @@ pub fn launch(program: &str, args: &[String], integrate: bool, token: &str) -> L
         cmdline: quote(&program.to_string_lossy()),
         env: Vec::new(),
     };
-    if integrate && args.is_empty() {
+    if integrate {
         match kind(&program) {
             Kind::PowerShell => {
                 // -EncodedCommand still runs when the execution policy forbids
@@ -234,16 +251,11 @@ pub fn launch(program: &str, args: &[String], integrate: bool, token: &str) -> L
                 out.cmdline += " -NoLogo -NoExit -EncodedCommand ";
                 out.cmdline += &base64(&utf16);
             }
-            Kind::Cmd if std::env::var_os("PROMPT").is_none() => {
+            Kind::Cmd if std::env::var_os("PROMPT").is_none_or(|p| is_blitz_prompt(&p)) => {
                 out.env.push(("PROMPT".into(), cmd_prompt(token)));
             }
             _ => {}
         }
-        return out;
-    }
-    for a in args {
-        out.cmdline.push(' ');
-        out.cmdline += &quote(a);
     }
     out
 }
@@ -309,6 +321,103 @@ mod tests {
         assert_eq!(quote(r"dir with\ trailing\"), r#""dir with\ trailing\\""#);
     }
 
+    /// A Windows folder or command shell named relative to the current
+    /// folder is never used: a program planted there would run.
+    #[test]
+    #[cfg(windows)]
+    fn relative_system_folders_are_ignored() {
+        let with =
+            |root: &'static str| move |k: &str| (k == "SystemRoot").then(|| OsString::from(root));
+        assert_eq!(system_root(with(r"D:\Win")), Path::new(r"D:\Win"));
+        for bad in ["", ".", r"System\..", r"\Windows", "C:Windows"] {
+            assert_eq!(system_root(with(bad)), Path::new(r"C:\Windows"), "{bad:?}");
+        }
+        let none = PathBuf::from(r"Z:\no\such");
+        let spec = |c: &'static str| {
+            let none = none.clone();
+            move |k: &str| match k {
+                "SystemRoot" => Some(none.clone().into()),
+                "ComSpec" => Some(c.into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            detect_with(spec(r"cmd.exe")),
+            none.join(r"System32\cmd.exe")
+        );
+        assert_eq!(detect_with(spec(r"D:\cmd.exe")), Path::new(r"D:\cmd.exe"));
+    }
+
+    /// What the system itself makes of a quoted argument.
+    #[test]
+    #[cfg(windows)]
+    fn quote_round_trips_through_the_system_parser() {
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::UI::Shell::CommandLineToArgvW;
+        for arg in [
+            r"a\\b c",
+            "\\\"",
+            r"x\",
+            "a\tb",
+            "a\\\\\"b c",
+            "",
+            " ",
+            "\\",
+            r"trailing\\",
+            r"C:\Program Files\x\",
+            "\"\"",
+            "a\"b\"c",
+            "\u{e9}t\u{e9} \u{2713}",
+        ] {
+            let line = windows::core::HSTRING::from(format!("p {}", quote(arg)));
+            let mut n = 0;
+            // SAFETY: a valid string and out pointer; the array is freed below.
+            let got = unsafe {
+                let argv = CommandLineToArgvW(&line, &mut n);
+                assert!(!argv.is_null());
+                let got = (n == 2).then(|| (*argv.add(1)).to_string().unwrap());
+                let _ = LocalFree(Some(HLOCAL(argv.cast())));
+                got
+            };
+            assert_eq!(got.as_deref(), Some(arg), "{arg:?} as {line}");
+        }
+    }
+
+    #[test]
+    fn only_blitz_prompts_are_its_own() {
+        use std::ffi::OsStr;
+        assert!(is_blitz_prompt(OsStr::new(&cmd_prompt("5eed"))));
+        assert!(!is_blitz_prompt(OsStr::new("$P$G")));
+        // Another terminal's marks are the user's business.
+        assert!(!is_blitz_prompt(OsStr::new(r"$e]133;A$e\$P$G")));
+    }
+
+    #[test]
+    fn other_shells_run_as_configured() {
+        let bash = r"C:\Program Files\Git\bin\bash.exe";
+        let want = Launch {
+            cmdline: format!("\"{bash}\""),
+            env: Vec::new(),
+        };
+        assert_eq!(launch(bash, true, "t"), want);
+        assert_eq!(launch("wsl.exe", true, "t").cmdline, "wsl.exe");
+    }
+
+    #[test]
+    fn choices_start_with_the_automatic_one() {
+        let c = choices();
+        assert!(
+            c[0].0.starts_with("Automatic (") && c[0].1.is_empty(),
+            "{c:?}"
+        );
+        assert!(
+            c[1..]
+                .iter()
+                .all(|(n, p)| !n.is_empty() && Path::new(p).is_file()),
+            "{c:?}"
+        );
+    }
+
     #[test]
     fn kinds() {
         assert_eq!(kind(Path::new(r"C:\x\PowerShell.exe")), Kind::PowerShell);
@@ -319,20 +428,14 @@ mod tests {
 
     #[test]
     fn launch_integration() {
-        let ps = launch(r"C:\Program Files\PowerShell\7\pwsh.exe", &[], true, "t");
+        let ps = launch(r"C:\Program Files\PowerShell\7\pwsh.exe", true, "t");
         let (head, b64) = ps.cmdline.rsplit_once(' ').unwrap();
         assert_eq!(
             head,
             r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit -EncodedCommand"#
         );
         assert!(b64.len() > 1000 && b64.len() < 8000);
-        // User arguments turn integration off.
-        let args = ["-NoProfile".to_owned(), "a b".to_owned()];
-        assert_eq!(
-            launch("pwsh.exe", &args, true, "t").cmdline,
-            r#"pwsh.exe -NoProfile "a b""#
-        );
-        assert_eq!(launch("pwsh.exe", &[], false, "t").cmdline, "pwsh.exe");
+        assert_eq!(launch("pwsh.exe", false, "t").cmdline, "pwsh.exe");
     }
 
     #[test]
@@ -370,8 +473,12 @@ mod tests {
             pf.join("PowerShell").join("7").join("pwsh.exe")
         );
         // A relative entry is resolved against the current directory, so it
-        // is never used.
-        let rel = PathBuf::from(format!("blitz-shell-{}", std::process::id()));
+        // is never used. Tests run in the crate's folder; this one stays out
+        // of the sources.
+        let rel = Path::new("..")
+            .join("..")
+            .join("target")
+            .join(format!("blitz-shell-{}", std::process::id()));
         touch(rel.join("pwsh.exe"));
         let with_rel = |k: &str| match k {
             "PATH" => Some(std::env::join_paths([&rel, &on_path]).unwrap()),
@@ -391,5 +498,28 @@ mod tests {
         assert_eq!(found[0].1, on_path.join("pwsh.exe").to_string_lossy());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Folders are listed in name order, which puts `7-preview` after `7`.
+    #[test]
+    fn detect_prefers_a_release_to_a_preview_of_it() {
+        let root = std::env::temp_dir().join(format!("blitz-preview-{}", std::process::id()));
+        let pf = root.join("pf");
+        for d in ["7", "7-preview", "6"] {
+            let p = pf.join("PowerShell").join(d);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("pwsh.exe"), b"").unwrap();
+        }
+        let env = |k: &str| (k == "ProgramFiles").then(|| pf.clone().into_os_string());
+        let got = detect_with(env);
+        // A preview of a newer major still wins over an older release.
+        std::fs::remove_dir_all(pf.join("PowerShell").join("7")).unwrap();
+        let only_preview = detect_with(env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, pf.join("PowerShell").join("7").join("pwsh.exe"));
+        assert_eq!(
+            only_preview,
+            pf.join("PowerShell").join("7-preview").join("pwsh.exe")
+        );
     }
 }

@@ -4,6 +4,9 @@
 *.md
 !/.gitignore
 !/.gitattributes
+!/.cargo/
+/.cargo/*
+!/.cargo/config.toml
 !/.github/
 !/Cargo.toml
 !/Cargo.lock

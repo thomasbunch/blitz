@@ -1,0 +1,7 @@
+# cargo-about settings for the release's THIRD-PARTY-NOTICES.txt. Keep
+# `accepted` in step with the cargo-deny allowlist in ci.yml, which fails a
+# pull request that brings in a crate under any other license.
+accepted = ["MIT", "Apache-2.0", "Zlib", "Unicode-3.0"]
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

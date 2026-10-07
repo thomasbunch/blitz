@@ -1,7 +1,8 @@
 name: release
 
 # A v* tag builds the Windows zip and installer and attaches them to a draft
-# release. Running the workflow by hand builds the same files as an artifact.
+# release, once CI has passed on the tagged commit. Running the workflow by
+# hand builds the same files as an artifact.
 # Publishing the draft ships it: blitz offers the latest full release as an
 # update, so the draft is not marked as a prerelease.
 on:
@@ -15,11 +16,19 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Microsoft's redistributable ConPTY, pinned by hash. 1.25 keeps
-  # PowerShell's cursor in place after a resize; 1.24 does not.
+  # PowerShell's cursor in place after a resize; 1.24 does not. CI tests
+  # this one too: keep ci.yml in step, which its lint job checks.
   CONPTY_VERSION: 1.25.260710002-preview
   CONPTY_SHA256: 86edb1054c6f56d7377117ff75489197a5f095fe9835df3ad04c2ba9d826b114
 
 jobs:
+  # All of CI on the tagged commit, whatever ran on main: publishing needs
+  # it to pass.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 30
@@ -48,10 +57,8 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # .cargo/config.toml links the C runtime statically.
       - name: Build
-        # A static CRT lets the exes run without the Visual C++ runtime.
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked -p blitz
 
       - name: Fetch ConPTY
@@ -62,7 +69,7 @@ jobs:
 
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-about
+          tool: cargo-about@0.9.2
 
       - name: Stage files
         env:
@@ -74,22 +81,6 @@ jobs:
           cp conpty/runtimes/win-x64/native/conpty.dll conpty/build/native/runtimes/x64/OpenConsole.exe "$d/"
           cp LICENSE "$d/LICENSE.txt"
 
-          # Keep accepted in step with the license allowlist in ci.yml.
-          cat > "$RUNNER_TEMP/about.toml" <<'EOF'
-          accepted = ["MIT", "Apache-2.0", "Zlib", "Unicode-3.0"]
-          targets = ["x86_64-pc-windows-msvc"]
-          ignore-build-dependencies = true
-          ignore-dev-dependencies = true
-          EOF
-          cat > "$RUNNER_TEMP/about.hbs" <<'EOF'
-          {{#each licenses}}
-          ================================================================================
-          {{name}}, used by:{{#each used_by}} {{crate.name}} {{crate.version}}{{/each}}
-
-          {{{text}}}
-          {{/each}}
-          EOF
-
           n="$d/THIRD-PARTY-NOTICES.txt"
           {
             echo "blitz includes the following third-party software."
@@ -97,19 +88,22 @@ jobs:
             echo "================================================================================"
             echo "conpty.dll and OpenConsole.exe: Microsoft.Windows.Console.ConPTY $CONPTY_VERSION"
             echo
-            curl -fsSL https://raw.githubusercontent.com/microsoft/terminal/main/LICENSE
+            # The commit that added the license, which has not changed since.
+            curl -fsSL https://raw.githubusercontent.com/microsoft/terminal/d4d59fa3395012ca37ba12665da4ec11c7dcf9cb/LICENSE
             echo
             echo "================================================================================"
             echo "Character width tables derived from the Unicode Character Database"
             echo
             curl -fsSL https://www.unicode.org/license.txt
             echo
-            cargo about generate --config "$RUNNER_TEMP/about.toml" "$RUNNER_TEMP/about.hbs"
+            cargo about generate --locked --fail --config .github/about.toml .github/about.hbs
           } > "$n"
 
       - name: Zip
         shell: pwsh
-        run: Compress-Archive -Path "dist/blitz-${{ steps.v.outputs.version }}-windows-x64" -DestinationPath "out/blitz-${{ steps.v.outputs.version }}-windows-x64.zip"
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: Compress-Archive -Path "dist/blitz-$env:VERSION-windows-x64" -DestinationPath "out/blitz-$env:VERSION-windows-x64.zip"
 
       # PowerShell, because Git Bash rewrites ISCC's /D switches as paths.
       # Paths are absolute: ISCC resolves relative ones against the script.
@@ -124,6 +118,93 @@ jobs:
           if (-not (Test-Path $iscc)) { throw "Inno Setup 6 is not on this runner image" }
           & $iscc "/DAppVersion=$env:VERSION" "/DSrcDir=$PWD\dist\blitz-$env:VERSION-windows-x64" "/DOutDir=$PWD\out" .github\blitz.iss
 
+      # The last published installer, for the smoke test to upgrade over,
+      # checked against its release's SHA256SUMS as the updater checks what
+      # it downloads. The token stays in this step, out of the installers'.
+      - name: Last published installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $d = "$env:RUNNER_TEMP\prev"
+          gh release download --repo $env:GITHUB_REPOSITORY --pattern '*-setup.exe' --pattern SHA256SUMS.txt --dir $d
+          if ($LASTEXITCODE) { throw "could not fetch the last published installer" }
+          $exe = Get-ChildItem "$d\*-setup.exe"
+          $line = Select-String -Path "$d\SHA256SUMS.txt" -SimpleMatch $exe.Name | Select-Object -First 1
+          $want = if ($line) { ($line.Line -split '\s+')[0] }
+          $got = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash
+          if (-not $want -or $got -ne $want) { throw "$($exe.Name) does not match its SHA256SUMS.txt" }
+
+      # What users get, run before anything is uploaded: the zip as unpacked,
+      # then the installer over the last published release, the installed
+      # blitz, its Explorer menu and the uninstaller. A broken installer would
+      # also break the updater, which could then not fix itself.
+      - name: Smoke test
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          $t = $env:RUNNER_TEMP
+          $name = "blitz-$env:VERSION-windows-x64"
+          # Waits for GUI-subsystem programs too, since the output is piped.
+          function Run {
+            $exe, $rest = $args
+            & $exe @rest | Out-Host
+            if ($LASTEXITCODE) { throw "$exe $rest exited with $LASTEXITCODE" }
+          }
+          # A session through `blitz debug run`, which must use the ConPTY
+          # next to the exe; the counters it writes to BLITZ_TRACE say which
+          # one ran. The text to wait for is not in the command line.
+          function Session([string]$dir, [string]$tag) {
+            Set-Content "$t\smoke-$tag.txt" "waitfor 20000 AMD64-smoke`nwaitexit 20000"
+            $env:BLITZ_TRACE = "$t\smoke-$tag.json"
+            Run "$dir\blitz.exe" debug run --cmd 'cmd /d /c echo %PROCESSOR_ARCHITECTURE%-smoke' --script "$t\smoke-$tag.txt" --timeout 60000
+            Remove-Item Env:BLITZ_TRACE
+            $counters = Get-Content "$t\smoke-$tag.json" -Raw
+            if ($counters -notmatch '"inbox":false') { throw "$dir\blitz.exe ran on the system's ConPTY: $counters" }
+            $v = (& "$dir\blitz.exe" --version | Out-String).Trim()
+            if ($v -ne "blitz $env:VERSION") { throw "$dir\blitz.exe says $v" }
+          }
+          try {
+            Expand-Archive "out\$name.zip" "$t\zip"
+            $files = Get-ChildItem "$t\zip\$name" -Name
+            $want = 'blitz.exe', 'blitz-hook.exe', 'conpty.dll', 'OpenConsole.exe', 'LICENSE.txt', 'THIRD-PARTY-NOTICES.txt'
+            if (Compare-Object $want $files) { throw "the zip holds $($files -join ', ')" }
+            foreach ($exe in 'blitz.exe', 'blitz-hook.exe') {
+              $text = [IO.File]::ReadAllText("$t\zip\$name\$exe", [Text.Encoding]::ASCII)
+              if ($text -match 'vcruntime140|api-ms-win-crt-') { throw "$exe needs the Visual C++ runtime" }
+            }
+            Session "$t\zip\$name" zip
+
+            $app = "$env:LOCALAPPDATA\Programs\blitz"
+            $quiet = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+            Run (Get-ChildItem "$t\prev\*-setup.exe").FullName @quiet "/LOG=$t\install-prev.log"
+            if (-not (Test-Path "$app\blitz.exe")) { throw "the last release did not install to $app" }
+            Run "$PWD\out\$name-setup.exe" @quiet "/LOG=$t\install.log"
+            Session $app installed
+            $menu = 'Directory', 'Directory\Background', 'Drive' | ForEach-Object {
+              "HKCU:\Software\Classes\$_\shell\blitz", "HKCU:\Software\Classes\$_\shell\blitz.window"
+            }
+            foreach ($key in $menu) {
+              $flag = if ($key.EndsWith('.window')) { '--new-window ' } else { '' }
+              $want = "`"$app\blitz.exe`" $flag--cwd `"%V`""
+              $got = (Get-ItemProperty "$key\command").'(default)'
+              if ($got -ne $want) { throw "$key runs $got" }
+            }
+            $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\blitz.lnk"
+            if (-not (Test-Path $lnk)) { throw "no Start menu shortcut" }
+
+            # The uninstaller hands over to a copy of itself and returns.
+            $entry = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{1DA65EB8-E92D-465A-9531-C4B72BB72597}_is1'
+            Run (Get-ItemProperty $entry).UninstallString.Trim('"') @quiet "/LOG=$t\uninstall.log"
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Test-Path $app) -and (Get-Date) -lt $deadline) { Start-Sleep 1 }
+            $left = @($app, $lnk, $entry) + $menu | Where-Object { Test-Path $_ }
+            if ($left) { throw "the uninstaller left $($left -join ', ')" }
+          } finally {
+            Get-ChildItem "$t\*.log" | ForEach-Object { "::group::$($_.Name)"; Get-Content $_; '::endgroup::' }
+          }
+
       - name: Checksums
         working-directory: out
         run: sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt
@@ -136,7 +217,7 @@ jobs:
 
   publish:
     if: github.ref_type == 'tag'
-    needs: windows
+    needs: [ci, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

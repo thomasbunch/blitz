@@ -51,9 +51,10 @@ pub mod rf {
     pub const WRAPPED: u8 = 1 << 0;
 }
 
-/// Longest grapheme tail kept per cell, in bytes. Anything past it is a
-/// stream of combining marks nobody can render anyway.
-const MAX_GRAPHEME_TAIL: usize = 28;
+/// Longest grapheme tail kept per cell, in bytes, so that with its first
+/// code point a cluster fits a [`RenderCell`](crate::RenderCell). Anything
+/// past it is a stream of combining marks nobody can render anyway.
+const MAX_GRAPHEME_TAIL: usize = crate::snapshot::CLUSTER_BYTES - 4;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Row {
@@ -97,18 +98,19 @@ impl Row {
             .map(|g| g.1.as_str())
     }
 
-    /// Appends `c` to the cluster in cell `col`.
-    pub fn push_grapheme(&mut self, col: u16, c: char) {
+    /// Appends `c` to the cluster in cell `col`; false when it does not fit.
+    pub fn push_grapheme(&mut self, col: u16, c: char) -> bool {
         let Some(cell) = self.cells.get_mut(col as usize) else {
-            return;
+            return false;
         };
         cell.flags |= cf::GRAPHEME;
         let ex = self.extra.get_or_insert_with(Default::default);
         match ex.graphemes.iter_mut().find(|g| g.0 == col) {
-            Some(g) if g.1.len() < MAX_GRAPHEME_TAIL => g.1.push(c),
-            Some(_) => {}
+            Some(g) if g.1.len() + c.len_utf8() <= MAX_GRAPHEME_TAIL => g.1.push(c),
+            Some(_) => return false,
             None => ex.graphemes.push((col, c.to_string())),
         }
+        true
     }
 
     fn drop_graphemes(&mut self, cols: Range<usize>) {
@@ -245,6 +247,8 @@ impl Row {
         self.split_pair(x + n);
         self.drop_graphemes(x..x + n);
         self.shift_graphemes(x + n, -(n as isize));
+        // The spacer marks the last column only; pulled left it is a blank.
+        self.cells[len - 1].flags &= !cf::SPACER_HEAD;
         self.cells[x..].rotate_left(n);
         self.cells[len - n..].fill(blank);
     }
@@ -255,7 +259,8 @@ impl Row {
             self.split_pair(cols);
             self.cells.truncate(cols);
             self.drop_graphemes(cols..usize::MAX);
-        } else {
+        } else if cols > self.cells.len() {
+            // The spacer marks the last column, which this one stops being.
             if let Some(last) = self.cells.last_mut() {
                 last.flags &= !cf::SPACER_HEAD;
             }
@@ -329,6 +334,19 @@ impl Grid {
         self.rows.get(i)
     }
 
+    /// Column and screen row of the last cell with anything in it, or the
+    /// top-left corner of an empty screen.
+    pub fn text_end(&self) -> (u16, u16) {
+        (0..self.lines)
+            .rev()
+            .find_map(|y| {
+                let cells = &self.row(y).cells;
+                let x = cells.iter().rposition(|c| c.cp != 0 || c.flags != 0)?;
+                Some((x as u16, y))
+            })
+            .unwrap_or((0, 0))
+    }
+
     /// Every cell, scrollback included.
     pub fn cells(&self) -> impl Iterator<Item = &Cell> {
         self.rows.iter().flat_map(|r| &r.cells)
@@ -389,19 +407,25 @@ impl Grid {
         self.pool.extend(self.rows.drain(..excess));
     }
 
-    /// Changes the size without rewrapping. When rows shrink, blank space
-    /// below the cursor goes first, then rows from the top move into
-    /// scrollback. Returns the cursor's new row.
+    /// Changes the size without rewrapping. When rows shrink, blank rows
+    /// below the cursor go first, then rows from the top move into
+    /// scrollback; only once the cursor is on top do rows below it go.
+    /// Returns the cursor's new row.
     pub fn resize(&mut self, cols: u16, lines: u16, cursor_y: u16) -> u16 {
         let mut y = cursor_y.min(self.lines - 1);
         if lines < self.lines {
-            let drop = (self.lines - lines).min(self.lines - 1 - y);
-            for _ in 0..drop {
+            let need = self.lines - lines;
+            let blank = (y + 1..self.lines)
+                .rev()
+                .take_while(|&r| self.row(r).cells.iter().all(|c| c.cp == 0 && c.flags == 0))
+                .count() as u16;
+            let up = (need - need.min(blank)).min(y);
+            for _ in 0..need - up {
                 if let Some(r) = self.rows.pop_back() {
                     self.pool.push(r);
                 }
             }
-            y -= self.lines - drop - lines;
+            y -= up;
         } else {
             for _ in self.lines..lines {
                 let row = self.fresh(Cell::default());
@@ -450,6 +474,11 @@ impl Grid {
                 out.push_back(row);
                 continue;
             }
+            // Tails in column order, taken as their cells are, so a line
+            // of many clusters costs no more than one of plain text.
+            let mut tails = row.extra.take().map(|e| e.graphemes).unwrap_or_default();
+            tails.sort_unstable_by_key(|g| g.0);
+            let mut tails = tails.into_iter().peekable();
             for (x, c) in row.cells.iter().enumerate() {
                 if i == cy && x == usize::from(cur.0) {
                     cursor = Some(line.len());
@@ -458,11 +487,19 @@ impl Grid {
                 if c.has(cf::SPACER_HEAD) {
                     continue;
                 }
-                if c.has(cf::GRAPHEME) {
-                    let g = row.grapheme(x as u16).unwrap_or_default();
-                    graphemes.push((line.len(), g.to_string()));
+                while tails.next_if(|g| usize::from(g.0) < x).is_some() {}
+                if let Some((_, g)) = tails.next_if(|g| usize::from(g.0) == x)
+                    && c.has(cf::GRAPHEME)
+                {
+                    graphemes.push((line.len(), g));
                 }
                 line.push(*c);
+            }
+            // A cursor past the end of its row, as one saved before the
+            // row narrowed, keeps to the row's last cell, or the rewrap
+            // would lose its place and every row below the first screen.
+            if i == cy && cursor.is_none() {
+                cursor = Some(line.len().saturating_sub(1));
             }
             self.pool.push(row);
             if wrapped {
@@ -473,6 +510,7 @@ impl Grid {
             line.resize(keep.max(cursor.map_or(0, |c| c + 1)), Cell::default());
             let mut row = self.fresh(Cell::default());
             let mut x = 0;
+            let mut tails = graphemes.drain(..).peekable();
             for (k, &c) in line.iter().enumerate() {
                 if x == new || (c.has(cf::WIDE) && x + 1 == new) {
                     if x < new {
@@ -484,9 +522,9 @@ impl Grid {
                     x = 0;
                 }
                 row.cells[x] = c;
-                if let Some(g) = graphemes.iter_mut().find(|g| g.0 == k) {
+                if let Some((_, g)) = tails.next_if(|g| g.0 == k) {
                     let ex = row.extra.get_or_insert_with(Default::default);
-                    ex.graphemes.push((x as u16, std::mem::take(&mut g.1)));
+                    ex.graphemes.push((x as u16, g));
                 }
                 if cursor == Some(k) {
                     at = (out.len(), x);
@@ -495,7 +533,6 @@ impl Grid {
             }
             out.push_back(row);
             line.clear();
-            graphemes.clear();
             cursor = None;
         }
 
@@ -517,6 +554,11 @@ impl Grid {
         }
         self.rows = out;
         self.trim();
+        // Narrowing built every rewrapped row before the excess went; keep
+        // only as many spare rows as the grid can hold.
+        self.pool.truncate(self.max_scrollback + lines);
+        self.pool.shrink_to_fit();
+        self.rows.shrink_to_fit();
         (x as u16, (at.0 - top) as u16, pending)
     }
 
@@ -622,6 +664,118 @@ mod tests {
         assert_eq!(g.resize(2, 2, 2), 1);
         assert_eq!(text(&g), ["a", "b", ""]);
         assert_eq!(g.scrollback_len(), 1);
+    }
+
+    #[test]
+    fn shrinking_moves_the_top_to_scrollback_before_dropping_text() {
+        // Text below the cursor stays; the rows above it make room.
+        let mut g = grid_with(&["a", "b", "c", "d"]);
+        assert_eq!(g.resize(4, 3, 1), 0);
+        assert_eq!(text(&g), ["a", "b", "c", "d"]);
+        assert_eq!(g.scrollback_len(), 1);
+        // Only when the cursor is already on top does text below it go,
+        // so the cursor stays on screen.
+        let mut g = grid_with(&["a", "b", "c", "d"]);
+        assert_eq!(g.resize(4, 2, 0), 0);
+        assert_eq!(text(&g), ["a", "b"]);
+        // Blank rows at the bottom go first.
+        let mut g = grid_with(&["a", "b", "c", ""]);
+        assert_eq!(g.resize(4, 2, 1), 0);
+        assert_eq!(text(&g), ["a", "b", "c"]);
+        assert_eq!(g.scrollback_len(), 1);
+    }
+
+    /// A long line full of clusters rewraps in time linear in its length,
+    /// each mark staying on its own character.
+    #[test]
+    fn reflow_of_a_long_clustered_line_is_linear() {
+        let mark = |k: usize| {
+            if k.is_multiple_of(3) {
+                "\u{300}"
+            } else {
+                "\u{301}"
+            }
+        };
+        let mut g = Grid::new(100, 4000, 0);
+        for y in 0..4000u16 {
+            let r = g.row_mut(y);
+            r.put_ascii(0, &[b'e'; 100], 0);
+            for x in 0..100u16 {
+                let k = usize::from(y) * 100 + usize::from(x);
+                r.push_grapheme(x, mark(k).chars().next().unwrap());
+            }
+            r.flags |= rf::WRAPPED;
+        }
+        let t0 = std::time::Instant::now();
+        g.reflow(99, (0, 0, false));
+        assert!(t0.elapsed().as_secs() < 5, "{:?}", t0.elapsed());
+        for y in 0..4000u16 {
+            for x in 0..99u16 {
+                let k = usize::from(y) * 99 + usize::from(x);
+                assert_eq!(g.row(y).grapheme(x), Some(mark(k)), "{x},{y}");
+            }
+        }
+    }
+
+    /// Narrowing builds every rewrapped row before the excess is dropped;
+    /// none of that may stay allocated afterwards.
+    #[test]
+    fn narrow_then_wide_reflow_frees_the_temporary_rows() {
+        let mut g = Grid::new(200, 10, 1000);
+        for _ in 0..1010 {
+            g.row_mut(9).put_ascii(0, &[b'x'; 200], 0);
+            g.scroll_up(0, 9, 1, Cell::default(), true);
+        }
+        let before = g.bytes_used();
+        g.reflow(2, (0, 9, false));
+        assert!(
+            g.bytes_used() < 2 * before,
+            "{} vs {before}",
+            g.bytes_used()
+        );
+        g.reflow(200, (0, 9, false));
+        assert!(
+            g.bytes_used() < 2 * before,
+            "{} vs {before}",
+            g.bytes_used()
+        );
+    }
+
+    #[test]
+    fn deleting_cells_turns_a_wrap_spacer_into_a_blank() {
+        let mut r = Row::new(5);
+        r.put_ascii(0, b"abcd", 0);
+        r.put(
+            4,
+            Cell {
+                cp: 0,
+                style: 7,
+                flags: cf::SPACER_HEAD,
+            },
+        );
+        r.delete(0, 1, Cell::default());
+        assert!(r.cells.iter().all(|c| c.flags == 0), "{:?}", r.cells);
+        assert_eq!(r.cells[3], Cell::blank(7));
+    }
+
+    /// A tail never passes 28 bytes, so with the first code point a cluster
+    /// fits the snapshot's 32.
+    #[test]
+    fn grapheme_tails_stop_at_the_byte_cap() {
+        let mut r = Row::new(2);
+        r.put_ascii(0, b"ab", 0);
+        for _ in 0..20 {
+            r.push_grapheme(0, '\u{20D0}');
+            r.push_grapheme(1, '\u{301}');
+        }
+        // Nine three-byte marks; a tenth, or a two-byte one, would pass 28.
+        assert_eq!(r.grapheme(0), Some("\u{20D0}".repeat(9).as_str()));
+        r.push_grapheme(0, '\u{301}');
+        assert_eq!(r.grapheme(0).map(str::len), Some(27));
+        assert_eq!(r.grapheme(1), Some("\u{301}".repeat(14).as_str()));
+        // Past the row's end nothing happens.
+        r.push_grapheme(9, '\u{301}');
+        assert_eq!(r.extra.as_ref().map(|e| e.graphemes.len()), Some(2));
     }
 
     #[test]

@@ -67,7 +67,11 @@ fn attach(cmdline: &str, pre: &[u8], prompt: &str) -> (String, String) {
 fn restored_output_survives_the_shell_starting() {
     let old: String = (1..=50).map(|i| format!("old line {i}\n")).collect();
     let pre = restored(&old, "14:32", 24);
-    for (cmdline, prompt) in [("cmd.exe /d", ">"), ("powershell.exe -NoLogo", "PS ")] {
+    // The user's own prompt and profile could replace the ones waited for.
+    for (cmdline, prompt) in [
+        ("cmd.exe /d /k prompt $P$G", ">"),
+        ("powershell.exe -NoProfile -NoLogo", "PS "),
+    ] {
         let (scrollback, screen) = attach(cmdline, &pre, prompt);
         assert!(
             scrollback.contains(&format!("{old}── restored · 14:32 ──")),

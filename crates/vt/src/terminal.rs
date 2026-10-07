@@ -93,6 +93,9 @@ struct Cluster {
     first: char,
     last: char,
     len: usize,
+    /// A code point did not fit the cell; the rest of the cluster is
+    /// dropped, so the cell keeps its start.
+    full: bool,
 }
 
 struct Screen {
@@ -158,7 +161,9 @@ const DARK: [u32; 3] = [0xD6D7D9, 0x131417, 0xECECEA];
 
 /// Longest window title and notification texts kept, in characters.
 const MAX_TITLE: usize = 256;
-const MAX_NOTIFY_TITLE: usize = 64;
+/// blitz-hook's titles run to 85: `blitz:`, a 32-digit token, the longest
+/// state and a 36-char session id. One cut short is not an attention event.
+const MAX_NOTIFY_TITLE: usize = 128;
 const MAX_NOTIFY_BODY: usize = 256;
 
 /// Replies may use a sixteenth of the output, plus a reserve of this
@@ -241,25 +246,32 @@ impl Terminal {
         // the alternate screen redraw it themselves. The bundled ConPTY
         // leaves this to the terminal and repaints nothing.
         let reflow = cols != self.cols() && cols >= 2;
+        // The screen not shown keeps its place by its saved cursor. 47 and
+        // 1047 save none, and DECSTR drops it, so then the end of its text
+        // stands in, and nothing below that is lost.
+        let o = &self.other;
+        let mut other_at = o.saved.map_or_else(
+            || {
+                let (x, y) = o.grid.text_end();
+                (x, y, false)
+            },
+            |c| (c.x, c.y, c.pending_wrap),
+        );
         if reflow {
-            let (grid, cur) = if self.alt {
-                (&mut self.other.grid, self.other.saved.as_mut())
+            if self.alt {
+                other_at = self.other.grid.reflow(cols, other_at);
             } else {
-                (&mut self.screen.grid, Some(&mut self.cur))
-            };
-            let at = cur
-                .as_ref()
-                .map_or((0, 0, false), |c| (c.x, c.y, c.pending_wrap));
-            let (x, y, pending) = grid.reflow(cols, at);
-            if let Some(c) = cur {
-                (c.x, c.y, c.pending_wrap) = (x, y, pending);
+                let c = &mut self.cur;
+                (c.x, c.y, c.pending_wrap) =
+                    (self.screen.grid).reflow(cols, (c.x, c.y, c.pending_wrap));
             }
         }
         self.cur.y = self.screen.grid.resize(cols, rows, self.cur.y);
-        let other_y = self.other.saved.map_or(0, |c| c.y);
-        let other_y = self.other.grid.resize(cols, rows, other_y);
+        other_at.1 = self.other.grid.resize(cols, rows, other_at.1);
+        // Without a rewrap it is still at its old column.
+        other_at.0 = other_at.0.min(cols - 1);
         if let Some(c) = &mut self.other.saved {
-            c.y = other_y;
+            (c.x, c.y, c.pending_wrap) = other_at;
         }
         if cols != self.cols() {
             self.cur.pending_wrap &= reflow && !self.alt;
@@ -356,7 +368,12 @@ impl Terminal {
             let row = g.line(i).unwrap_or(&empty);
             out.wrapped.push(row.flags & rf::WRAPPED != 0);
             for x in 0..cols {
-                let cell = row.cells.get(x as usize).copied().unwrap_or_default();
+                let mut cell = row.cells.get(x as usize).copied().unwrap_or_default();
+                // Scrollback is not rewrapped for a one-column screen, so
+                // a wide character there can end past the edge.
+                if cell.flags & cf::WIDE != 0 && x + 1 == cols {
+                    cell = Cell::blank(cell.style);
+                }
                 out.cells
                     .push(render_cell(cell, row, x, self.styles.get(cell.style), pal));
             }
@@ -481,6 +498,7 @@ impl Terminal {
                 first: c,
                 last: c,
                 len: 1,
+                full: false,
             });
             self.rep = Some(c);
             self.advance(n as u16);
@@ -498,8 +516,12 @@ impl Terminal {
         {
             cl.last = c;
             cl.len += 1;
-            let Cluster { x, y, first, .. } = *cl;
-            self.join(x, y, first, c);
+            let Cluster {
+                x, y, first, full, ..
+            } = *cl;
+            if !full && !self.join(x, y, first, c) {
+                self.cluster = self.cluster.map(|cl| Cluster { full: true, ..cl });
+            }
             return;
         }
         match self.width(c) {
@@ -509,20 +531,23 @@ impl Terminal {
         }
     }
 
-    /// Adds `c` to the cluster in cell (`x`, `y`). VS16 or a skin tone can
-    /// make a narrow emoji wide; it then takes the next column when the
-    /// cursor is still right after it.
-    fn join(&mut self, x: u16, y: u16, first: char, c: char) {
+    /// Adds `c` to the cluster in cell (`x`, `y`); false when it does not
+    /// fit. VS16 or a skin tone can make a narrow emoji wide; it then takes
+    /// the next column when the cursor is still right after it.
+    fn join(&mut self, x: u16, y: u16, first: char, c: char) -> bool {
         let amb = self.opts.ambiguous_wide;
         let at_cursor = self.cur.y == y && self.cur.x == x + 1 && !self.cur.pending_wrap;
         let row = self.screen.grid.row_mut(y);
-        row.push_grapheme(x, c);
+        if !row.push_grapheme(x, c) {
+            return false;
+        }
         let narrow = row.cells[x as usize].flags & cf::WIDE == 0;
         let tail = row.grapheme(x).unwrap_or_default().chars();
         if narrow && at_cursor && chars_width(std::iter::once(first).chain(tail), amb) == 2 {
             row.widen(x as usize);
             self.advance(1);
         }
+        true
     }
 
     fn width(&self, c: char) -> u8 {
@@ -531,11 +556,18 @@ impl Terminal {
 
     /// Writes one character at the cursor and moves past it.
     fn put(&mut self, c: char, wide: bool) {
+        // One column holds no wide character; dropping it moves nothing.
+        // A mark or REP after it goes with it, not onto the cell before.
+        if wide && self.cols() < 2 {
+            (self.cluster, self.rep) = (None, None);
+            return;
+        }
         if self.cur.pending_wrap {
             self.wrap();
         }
         if wide && self.cur.x + 1 >= self.cols() {
-            if !self.autowrap || self.cols() < 2 {
+            if !self.autowrap {
+                (self.cluster, self.rep) = (None, None);
                 return;
             }
             // Wide characters never straddle rows: leave a spacer and wrap.
@@ -566,6 +598,7 @@ impl Terminal {
             first: c,
             last: c,
             len: 1,
+            full: false,
         });
         self.rep = Some(c);
         self.advance(w);
@@ -597,15 +630,15 @@ impl Terminal {
             // screen go to scrollback. Full-screen programs draw their
             // transcript this way above a fixed status area.
             let keep = self.top == 0 && !self.alt;
-            let before = self.screen.grid.scrollback_len();
             let blank = self.blank();
             self.screen
                 .grid
                 .scroll_up(self.top, self.bottom, 1, blank, keep);
-            if self.viewport > 0 {
-                // Keep a scrolled-back view on the same text.
-                let added = self.screen.grid.scrollback_len().saturating_sub(before);
-                self.viewport = (self.viewport + added).min(self.screen.grid.scrollback_len());
+            if keep && self.viewport > 0 {
+                // Keep a scrolled-back view on the same text. Once the
+                // scrollback is full its length stays put while every row
+                // moves up one, so count the row, not the change in length.
+                self.viewport = (self.viewport + 1).min(self.screen.grid.scrollback_len());
             }
         } else if self.cur.y + 1 < self.rows() {
             self.cur.y += 1;
@@ -1501,6 +1534,8 @@ fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> R
         (attr::UNDERLINE, snapshot::attr::UNDERLINE),
         (attr::INVERSE, snapshot::attr::INVERSE),
         (attr::DIM, snapshot::attr::DIM),
+        (attr::STRIKE, snapshot::attr::STRIKE),
+        (attr::OVERLINE, snapshot::attr::OVERLINE),
     ] {
         if a & from != 0 {
             attrs |= to;

@@ -12,7 +12,7 @@ const MAX_EMPTY: usize = 1 << 14;
 /// number of cells it spans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
-    pub text: [u8; 16],
+    pub text: [u8; vt::snapshot::CLUSTER_BYTES],
     pub len: u8,
     /// Bit 0 bold, bit 1 italic.
     pub style: u8,
@@ -142,7 +142,7 @@ mod tests {
 
     fn key(n: u8) -> GlyphKey {
         GlyphKey {
-            text: [n; 16],
+            text: [n; vt::snapshot::CLUSTER_BYTES],
             len: 1,
             style: 0,
             width: 1,

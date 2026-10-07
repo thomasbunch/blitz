@@ -255,6 +255,54 @@ mod tests {
     }
 
     #[test]
+    fn needs_you_over_an_error_ends_idle_when_seen() {
+        let mut p = pane(Attn::Working);
+        assert!(p.apply(Ev::Error { sticky: false }, AWAY, Instant::now()));
+        assert!(p.apply(Ev::NeedsYou, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::NeedsYou);
+        // Back to the error, which is seen at once.
+        assert!(p.apply(Ev::Attended, HERE, Instant::now()));
+        assert_eq!(p.state, Attn::Idle);
+    }
+
+    /// A hook error, then the process dying: the state stays an error,
+    /// so nothing new fires, but now nothing clears it.
+    #[test]
+    fn a_crash_after_a_hook_error_makes_it_stick() {
+        let mut p = pane(Attn::Working);
+        assert!(p.apply(Ev::Error { sticky: false }, AWAY, Instant::now()));
+        assert!(!p.apply(Ev::Error { sticky: true }, AWAY, Instant::now()));
+        assert!(!p.apply(Ev::Attended, HERE, Instant::now()));
+        assert!(!p.apply(Ev::Working, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::Error);
+    }
+
+    #[test]
+    fn session_end_clears_needs_you() {
+        let mut p = pane(Attn::Working);
+        p.apply(Ev::NeedsYou, AWAY, Instant::now());
+        assert!(p.apply(Ev::Idle, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::Idle);
+        // Nothing to go back to once seen.
+        assert!(!p.apply(Ev::Attended, HERE, Instant::now()));
+        assert_eq!(p.state, Attn::Idle);
+    }
+
+    /// A second question after the first was answered goes back to what
+    /// came in between, not to what was there before the first.
+    #[test]
+    fn each_needs_you_remembers_what_it_interrupted() {
+        let mut p = pane(Attn::DoneUnseen);
+        p.apply(Ev::NeedsYou, AWAY, Instant::now());
+        p.apply(Ev::Working, AWAY, Instant::now());
+        p.apply(Ev::NeedsYou, AWAY, Instant::now());
+        // Asked again while still waiting: the first interruption stands.
+        p.apply(Ev::NeedsYou, AWAY, Instant::now());
+        assert!(p.apply(Ev::Attended, HERE, Instant::now()));
+        assert_eq!(p.state, Attn::Working);
+    }
+
+    #[test]
     fn needs_you_over_done_unseen_ends_idle_when_seen() {
         let mut p = pane(Attn::DoneUnseen);
         assert!(p.apply(Ev::NeedsYou, AWAY, Instant::now()));
@@ -284,46 +332,47 @@ mod tests {
         assert!(DoneUnseen < Error && Error < NeedsYou);
     }
 
-    const TOKEN: &str = "0f1e2d3c";
+    /// As long as a real pane token: 128 bits in hex.
+    const TOKEN: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
 
     #[test]
     fn notify_titles() {
-        let ev = |s: &str| Ev::from_notify(s, TOKEN).map(|(ev, _)| ev);
-        assert_eq!(ev("blitz:0f1e2d3c:needs-you"), Some(Ev::NeedsYou));
-        assert_eq!(ev("blitz:0f1e2d3c:working"), Some(Ev::Working));
-        assert_eq!(ev("blitz:0f1e2d3c:done"), Some(Ev::Done));
-        assert_eq!(
-            ev("blitz:0f1e2d3c:error"),
-            Some(Ev::Error { sticky: false })
-        );
-        assert_eq!(ev("blitz:0f1e2d3c:idle"), Some(Ev::Idle));
-        assert_eq!(ev("blitz:0f1e2d3c:bogus"), None);
-        assert_eq!(ev("Build finished"), None);
+        let ev = |s: &str| Ev::from_notify(&format!("blitz:{TOKEN}:{s}"), TOKEN).map(|(ev, _)| ev);
+        assert_eq!(ev("needs-you"), Some(Ev::NeedsYou));
+        assert_eq!(ev("working"), Some(Ev::Working));
+        assert_eq!(ev("done"), Some(Ev::Done));
+        assert_eq!(ev("error"), Some(Ev::Error { sticky: false }));
+        assert_eq!(ev("idle"), Some(Ev::Idle));
+        assert_eq!(ev("bogus"), None);
         assert_eq!(ev(""), None);
+        assert_eq!(Ev::from_notify("Build finished", TOKEN), None);
+        assert_eq!(Ev::from_notify("", TOKEN), None);
     }
 
     const SESSION: &str = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
 
     #[test]
     fn notify_titles_with_a_session() {
-        fn ev(s: &str) -> Option<(Ev, Option<&str>)> {
-            Ev::from_notify(s, TOKEN)
-        }
-        assert_eq!(ev("blitz:0f1e2d3c:done"), Some((Ev::Done, None)));
+        let ev = |s: &str| {
+            let title = format!("blitz:{TOKEN}:{s}");
+            Ev::from_notify(&title, TOKEN).map(|(ev, id)| (ev, id.map(str::to_owned)))
+        };
+        assert_eq!(ev("done"), Some((Ev::Done, None)));
         assert_eq!(
-            ev(&format!("blitz:0f1e2d3c:done:{SESSION}")),
-            Some((Ev::Done, Some(SESSION)))
+            ev(&format!("done:{SESSION}")),
+            Some((Ev::Done, Some(SESSION.to_owned())))
         );
         assert_eq!(
-            ev(&format!("blitz:0f1e2d3c:idle:{SESSION}")),
-            Some((Ev::Idle, Some(SESSION)))
+            ev(&format!("idle:{SESSION}")),
+            Some((Ev::Idle, Some(SESSION.to_owned())))
         );
         for bad in [
-            "blitz:0f1e2d3c:done:",
-            "blitz:0f1e2d3c:done:abc",
-            &format!("blitz:0f1e2d3c:done:{SESSION}:x"),
-            &format!("blitz:0f1e2d3c:done:{}", SESSION.replacen('0', ";", 1)),
-            &format!("blitz:0f1e2d3c:bogus:{SESSION}"),
+            "done:",
+            "done:abc",
+            &format!("done:{SESSION}:x"),
+            &format!("done:{}", SESSION.replacen('0', ";", 1)),
+            &format!("done:{}", &SESSION[..20]),
+            &format!("bogus:{SESSION}"),
         ] {
             assert_eq!(ev(bad), None, "{bad}");
         }
@@ -333,15 +382,16 @@ mod tests {
     #[test]
     fn notify_titles_need_the_token() {
         for title in [
-            "blitz:needs-you",
-            "blitz:working",
-            "blitz::done",
-            "blitz:0f1e2d3:done",
-            "blitz:0f1e2d3c0:done",
-            "blitz:0F1E2D3C:done",
-            "blitz:0f1e2d3cdone",
+            "blitz:needs-you".to_owned(),
+            "blitz:working".to_owned(),
+            "blitz::done".to_owned(),
+            format!("blitz:{}:done", &TOKEN[1..]),
+            format!("blitz:{}:done", &TOKEN[..TOKEN.len() - 1]),
+            format!("blitz:{TOKEN}0:done"),
+            format!("blitz:{}:done", TOKEN.to_uppercase()),
+            format!("blitz:{TOKEN}done"),
         ] {
-            assert_eq!(Ev::from_notify(title, TOKEN), None, "{title}");
+            assert_eq!(Ev::from_notify(&title, TOKEN), None, "{title}");
         }
         assert_eq!(Ev::from_notify("blitz::done", ""), None);
         assert_eq!(events("\x1b]777;notify;blitz:needs-you;Bash: x\x07"), []);
@@ -368,6 +418,14 @@ mod tests {
         assert_eq!(jump_target(s), None);
     }
 
+    #[test]
+    fn jump_ties_go_to_the_first_listed() {
+        let t0 = Instant::now();
+        let s = [(7, Attn::NeedsYou, t0), (8, Attn::NeedsYou, t0)];
+        assert_eq!(jump_target(s), Some(7));
+        assert_eq!(jump_target(Vec::<(u8, Attn, Instant)>::new()), None);
+    }
+
     /// The events a program's output turns into, the way the app reads
     /// them: notifications through the terminal, then the exit code.
     fn events(out: &str) -> Vec<Ev> {
@@ -387,8 +445,9 @@ mod tests {
             .collect()
     }
 
+    /// The sequence blitz-hook prints for `state`, session id and all.
     fn notify(state: &str) -> String {
-        format!("\x1b]777;notify;blitz:{TOKEN}:{state};msg\x07")
+        format!("\x1b]777;notify;blitz:{TOKEN}:{state}:{SESSION};msg\x07")
     }
 
     /// Each attention rule, driven by hook notifications as a program
@@ -455,6 +514,7 @@ mod tests {
     fn other_notifications_are_not_attention() {
         assert!(events("\x1b]777;notify;Build;done\x07").is_empty());
         assert!(events("\x1b]9;build done\x07").is_empty());
+        assert!(events("\x07\x1b]0;done\x07").is_empty(), "a bell or title");
         assert_eq!(events(&notify("done")), [Ev::Done]);
     }
 
@@ -464,5 +524,8 @@ mod tests {
         assert_eq!(Ev::from_exit(0xC000_013A), Ev::Idle);
         assert_eq!(Ev::from_exit(1), Ev::Error { sticky: true });
         assert_eq!(Ev::from_exit(0xC000_0005), Ev::Error { sticky: true });
+        // STILL_ACTIVE is a real exit code a program can return.
+        assert_eq!(Ev::from_exit(259), Ev::Error { sticky: true });
+        assert_eq!(Ev::from_exit(u32::MAX), Ev::Error { sticky: true });
     }
 }

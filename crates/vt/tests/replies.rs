@@ -88,7 +88,29 @@ fn decrqm_table() {
         ("\x1b[4$p", "\x1b[4;2$y"),
         ("\x1b[4h\x1b[4$p", "\x1b[4;1$y"),
         ("\x1b[20$p", "\x1b[20;2$y"),
+        ("\x1b[20h\x1b[20$p", "\x1b[20;1$y"),
         ("\x1b[3$p", "\x1b[3;0$y"),
+        ("\x1b[?6$p", "\x1b[?6;2$y"),
+        ("\x1b[?6h\x1b[?6$p", "\x1b[?6;1$y"),
+        ("\x1b[?7l\x1b[?7$p", "\x1b[?7;2$y"),
+        ("\x1b[?25$p", "\x1b[?25;1$y"),
+        ("\x1b[?66h\x1b[?66$p", "\x1b[?66;1$y"),
+        ("\x1b=\x1b[?66$p", "\x1b[?66;1$y"),
+        ("\x1b[?1000h\x1b[?1000$p", "\x1b[?1000;1$y"),
+        ("\x1b[?1002h\x1b[?1002$p", "\x1b[?1002;1$y"),
+        ("\x1b[?1004$p", "\x1b[?1004;2$y"),
+        ("\x1b[?1004h\x1b[?1004$p", "\x1b[?1004;1$y"),
+        ("\x1b[?1006h\x1b[?1006$p", "\x1b[?1006;1$y"),
+        ("\x1b[?1048$p", "\x1b[?1048;2$y"),
+        ("\x1b[?1048h\x1b[?1048$p", "\x1b[?1048;2$y"),
+        ("\x1b[?2031$p", "\x1b[?2031;2$y"),
+        ("\x1b[?2031h\x1b[?2031$p", "\x1b[?2031;1$y"),
+        ("\x1b[?9001h\x1b[?9001$p", "\x1b[?9001;1$y"),
+        (
+            "\x1b[?47h\x1b[?47$p\x1b[?1047$p\x1b[?1049$p",
+            "\x1b[?47;1$y\x1b[?1047;1$y\x1b[?1049;1$y",
+        ),
+        ("\x1b[?1049$p", "\x1b[?1049;2$y"),
     ];
     for (q, want) in rows {
         assert_eq!(ask(q), want, "{q:?}");
@@ -117,6 +139,8 @@ fn cursor_position_reports() {
 #[test]
 fn device_status() {
     assert_eq!(ask("\x1b[5n"), "\x1b[0n");
+    // Reports blitz does not make get no answer at all.
+    assert_eq!(ask("\x1b[?5n\x1b[?15n\x1b[?26n\x1b[7n\x1b[n"), "");
 }
 
 #[test]
@@ -153,8 +177,13 @@ fn theme_change_reports() {
     assert_eq!(replies_of(&mut t), "", "nothing changed");
     t.set_theme(true, &light);
     assert_eq!(replies_of(&mut t), "\x1b[?997;1n");
-    t.feed(b"\x1b[?2031l");
     t.set_theme(false, &light);
+    assert_eq!(replies_of(&mut t), "\x1b[?997;2n");
+    // A palette change alone is reported too, so the program asks again.
+    t.set_theme(false, &vt::Palette { fg: 1, ..light });
+    assert_eq!(replies_of(&mut t), "\x1b[?997;2n");
+    t.feed(b"\x1b[?2031l");
+    t.set_theme(true, &light);
     assert_eq!(replies_of(&mut t), "");
 }
 

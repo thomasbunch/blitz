@@ -1,6 +1,8 @@
 //! Terminal emulation core: VT parser, screen model and input encoders.
 //!
-//! This crate has no dependencies outside `std`.
+//! This crate has no dependencies outside `std`, and no unsafe code: it
+//! parses whatever bytes a program writes.
+#![forbid(unsafe_code)]
 
 pub mod grid;
 pub mod keys;

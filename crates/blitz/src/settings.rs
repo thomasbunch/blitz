@@ -283,6 +283,44 @@ mod tests {
     }
 
     #[test]
+    fn values_set_by_hand_still_show_and_step() {
+        let (p, mut c) = (panel(), Config::default());
+        // A font that is not installed sits after the installed ones.
+        c.font_family = "Fira Code".into();
+        let font = setting("font_family");
+        assert_eq!(p.shown(font, &c), "Fira Code");
+        assert_eq!(p.step(font, &c, -1, false).as_deref(), Some("\"Consolas\""));
+        assert_eq!(p.step(font, &c, 1, false), None);
+        assert_eq!(
+            p.step(font, &c, 1, true).as_deref(),
+            Some("\"Cascadia Mono\"")
+        );
+        // A length between two presets sits between them.
+        c.scrollback_lines = 1234;
+        let lines = setting("scrollback_lines");
+        assert_eq!(p.shown(lines, &c), "1,234 lines");
+        assert_eq!(p.step(lines, &c, -1, false).as_deref(), Some("1000"));
+        assert_eq!(p.step(lines, &c, 1, false).as_deref(), Some("5000"));
+        // The theme moves only in the theme picker.
+        let theme = setting("theme");
+        assert_eq!(p.step(theme, &c, 1, false), None);
+        assert_eq!(p.step(theme, &c, 1, true), None);
+    }
+
+    #[test]
+    fn the_highlight_comes_back_into_a_shorter_list() {
+        let mut p = panel();
+        p.sel = SETTINGS.len() - 1;
+        p.filter = "font".into();
+        assert_eq!(p.selected(), None, "past the end of the matches");
+        p.move_by(-1);
+        assert_eq!(p.selected().map(|s| s.key), Some("font_size"));
+        p.filter = "zzz".into();
+        p.move_by(1);
+        assert_eq!((p.sel, p.selected()), (0, None));
+    }
+
+    #[test]
     fn easter_eggs_step_through_scenes_and_offer_the_game() {
         let (p, mut c) = (panel(), Config::default());
         let scenery = setting("scenery");

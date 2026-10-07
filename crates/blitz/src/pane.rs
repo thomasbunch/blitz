@@ -11,6 +11,11 @@ use crate::attention::PaneAttn;
 use crate::layout::PaneId;
 use crate::pty::{Pty, PtyEvent, SpawnOpts};
 
+// A panic in vt must end one pane, not every session in the window, so the
+// reader catches it below. Under panic = "abort" nothing could.
+#[cfg(not(panic = "unwind"))]
+compile_error!("blitz must be built with panic = \"unwind\"");
+
 /// The most output parsed per hold of the terminal lock, so the UI thread
 /// never waits long for a snapshot.
 const FEED_BYTES: usize = 64 * 1024;
@@ -200,6 +205,7 @@ pub fn restored(text: &str, stamp: &str, rows: u16) -> Vec<u8> {
         s.extend(line.chars().filter(|c| !c.is_control()));
         s.push_str("\r\n");
     }
+    let stamp: String = stamp.chars().filter(|c| !c.is_control()).collect();
     s.push_str(&format!("\x1b[2m── restored · {stamp} ──\x1b[m\r\n"));
     s.push_str(&"\n".repeat(rows.into()));
     s.push_str("\x1b[H");
@@ -303,6 +309,12 @@ mod tests {
         term.take_replies(&mut replies);
         assert!(replies.is_empty(), "{replies:?}");
         assert!(term.scrollback_text().starts_with("a[cb]0;t\n"));
+        // The stamp is the first line of the same file.
+        let mut term = vt::Terminal::new(vt::Options::default());
+        term.feed(&restored("a", "14:32\x1b[6n", 24));
+        term.take_replies(&mut replies);
+        assert!(replies.is_empty(), "{replies:?}");
+        assert!(term.scrollback_text().contains("restored · 14:32[6n"));
     }
 
     #[test]
@@ -341,8 +353,11 @@ mod tests {
         std::fs::write(&head, format!("ref: refs/heads/{}", "x".repeat(10_000))).expect("head");
         assert!(git_branch(&sub).is_some_and(|b| b.len() < 4096));
 
+        // Gone with its repository. A folder above the temp folder may be in
+        // a repository of its own, so that is what is found now.
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(git_branch(&root), None);
+        assert_eq!(git_branch(&sub), git_branch(&std::env::temp_dir()));
+        assert_ne!(git_branch(&sub).as_deref(), Some("feature/x"));
     }
 
     /// A pane parses its child's output on the reader thread, answers

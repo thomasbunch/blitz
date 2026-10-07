@@ -17,7 +17,8 @@ fn mods(s: &str) -> Mods {
     m
 }
 
-/// A key-down with the fields every encoding looks at.
+/// A key-down with the fields every encoding looks at. Like the keymap,
+/// it gives keypad keys no US base character.
 fn key<'a>(vk: u16, scan: u16, uc: u16, m: &str, key: Key, text: &'a str) -> KeyInput<'a> {
     KeyInput {
         vk,
@@ -32,7 +33,7 @@ fn key<'a>(vk: u16, scan: u16, uc: u16, m: &str, key: Key, text: &'a str) -> Key
         cs: 0,
         key,
         us_base: match key {
-            Key::Char(c) if c.is_ascii() => Some(c),
+            Key::Char(c) if c.is_ascii() && !(0x60..=0x6f).contains(&vk) => Some(c),
             _ => None,
         },
     }
@@ -107,6 +108,124 @@ fn legacy_keys() {
 }
 
 #[test]
+fn legacy_and_kitty_every_named_key() {
+    for (key, legacy, kkp) in [
+        (Key::Up, "\x1b[A", "\x1b[A"),
+        (Key::Down, "\x1b[B", "\x1b[B"),
+        (Key::Right, "\x1b[C", "\x1b[C"),
+        (Key::Left, "\x1b[D", "\x1b[D"),
+        (Key::Home, "\x1b[H", "\x1b[H"),
+        (Key::End, "\x1b[F", "\x1b[F"),
+        (Key::Insert, "\x1b[2~", "\x1b[2~"),
+        (Key::Delete, "\x1b[3~", "\x1b[3~"),
+        (Key::PageUp, "\x1b[5~", "\x1b[5~"),
+        (Key::PageDown, "\x1b[6~", "\x1b[6~"),
+        (Key::F(1), "\x1bOP", "\x1b[P"),
+        (Key::F(2), "\x1bOQ", "\x1b[Q"),
+        (Key::F(3), "\x1bOR", "\x1b[13~"),
+        (Key::F(4), "\x1bOS", "\x1b[S"),
+        (Key::F(5), "\x1b[15~", "\x1b[15~"),
+        (Key::F(6), "\x1b[17~", "\x1b[17~"),
+        (Key::F(7), "\x1b[18~", "\x1b[18~"),
+        (Key::F(8), "\x1b[19~", "\x1b[19~"),
+        (Key::F(9), "\x1b[20~", "\x1b[20~"),
+        (Key::F(10), "\x1b[21~", "\x1b[21~"),
+        (Key::F(11), "\x1b[23~", "\x1b[23~"),
+        (Key::F(12), "\x1b[24~", "\x1b[24~"),
+        (Key::F(13), "", "\x1b[57376u"),
+        (Key::F(24), "", "\x1b[57387u"),
+        (Key::F(35), "", "\x1b[57398u"),
+        (Key::F(36), "", ""),
+    ] {
+        assert_eq!(enc(&k("", key, ""), &LEGACY), legacy, "legacy {key:?}");
+        assert_eq!(enc(&k("", key, ""), &kitty(1)), kkp, "kitty {key:?}");
+    }
+    for (m, key, want) in [
+        ("csa", Key::Down, "\x1b[1;8B"),
+        ("s", Key::Right, "\x1b[1;2C"),
+        ("c", Key::Insert, "\x1b[2;5~"),
+        ("a", Key::PageDown, "\x1b[6;3~"),
+        ("a", Key::F(2), "\x1b[1;3Q"),
+        ("c", Key::F(4), "\x1b[1;5S"),
+        ("s", Key::F(6), "\x1b[17;2~"),
+        ("cs", Key::F(11), "\x1b[23;6~"),
+    ] {
+        assert_eq!(enc(&k(m, key, ""), &LEGACY), want, "{m} {key:?}");
+        assert_eq!(enc(&k(m, key, ""), &kitty(1)), want, "kitty {m} {key:?}");
+    }
+}
+
+/// Ctrl with a character follows Xlib, which xterm uses: `@` to `~` drop
+/// to C0, and the digits 2 to 8 stand in for the ones that need Shift.
+#[test]
+fn legacy_keys_ctrl_digits_and_punctuation() {
+    for (m, c, text, want) in [
+        ("c", '2', "2", "\0"),
+        ("c", '3', "3", "\x1b"),
+        ("c", '4', "4", "\x1c"),
+        ("c", '5', "5", "\x1d"),
+        ("c", '6', "6", "\x1e"),
+        ("c", '7', "7", "\x1f"),
+        ("c", '8', "8", "\x7f"),
+        ("c", '9', "9", "9"),
+        ("c", '0', "0", "0"),
+        ("c", '\\', "\\", "\x1c"),
+        ("c", ']', "]", "\x1d"),
+        ("c", '`', "`", "\0"),
+        ("cs", '`', "~", "\x1e"),
+        ("cs", '6', "^", "\x1e"),
+        ("cs", '2', "@", "\0"),
+        ("cs", '[', "{", "\x1b"),
+        ("cs", '\\', "|", "\x1c"),
+        ("cs", ']', "}", "\x1d"),
+        ("c", '=', "=", "="),
+        ("c", ';', ";", ";"),
+        ("c", '\'', "'", "'"),
+        ("c", ',', ",", ","),
+        ("c", '.', ".", "."),
+        ("ca", '\\', "\\", "\x1b\x1c"),
+    ] {
+        assert_eq!(enc(&k(m, Key::Char(c), text), &LEGACY), want, "{m}+{c}");
+    }
+}
+
+#[test]
+fn legacy_keys_modifier_combinations() {
+    for (m, key, text, want) in [
+        ("sa", Key::Char('a'), "A", "\x1bA"),
+        ("a", Key::Char('é'), "é", "\x1bé"),
+        ("csa", Key::Char('a'), "A", "\x1b\x01"),
+        ("w", Key::Char('a'), "a", "a"),
+        ("s", Key::Backspace, "", "\x7f"),
+        ("ca", Key::Backspace, "", "\x1b\x08"),
+        ("c", Key::Tab, "", "\t"),
+        ("a", Key::Tab, "", "\x1b\t"),
+        ("sa", Key::Tab, "", "\x1b\x1b[Z"),
+        ("s", Key::Escape, "", "\x1b"),
+        ("w", Key::Up, "", "\x1b[1;9A"),
+        ("cw", Key::Home, "", "\x1b[1;13H"),
+    ] {
+        assert_eq!(enc(&k(m, key, text), &LEGACY), want, "{m} {key:?}");
+    }
+}
+
+/// On a layout whose key has no C0 byte of its own, Ctrl falls back to
+/// the key in the same place on a US layout, as it does for Cyrillic.
+#[test]
+fn legacy_keys_ctrl_on_latin_layouts_uses_the_us_position() {
+    // AZERTY: the US 3 key types `"`, the US 2 key types `é`.
+    let mut quote = k("c", Key::Char('"'), "\"");
+    quote.us_base = Some('3');
+    assert_eq!(enc(&quote, &LEGACY), "\x1b");
+    let mut e = k("c", Key::Char('é'), "é");
+    e.us_base = Some('2');
+    assert_eq!(enc(&e, &LEGACY), "\0");
+    // A key with no US counterpart sends its text.
+    e.us_base = None;
+    assert_eq!(enc(&e, &LEGACY), "é");
+}
+
+#[test]
 fn legacy_keys_ignore_key_up() {
     let mut up = k("", Key::Char('a'), "a");
     up.down = false;
@@ -135,11 +254,22 @@ fn legacy_keys_decckm_and_deckpam() {
         deckpam: true,
         ..LEGACY
     };
-    let five = key(0x65, 0x4c, 0x35, "", Key::Char('5'), "5");
-    assert_eq!(enc(&five, &LEGACY), "5");
-    assert_eq!(enc(&five, &kpam), "\x1bOu");
-    let plus = key(0x6b, 0x4e, 0x2b, "", Key::Char('+'), "+");
-    assert_eq!(enc(&plus, &kpam), "\x1bOk");
+    // Windows sends the operator keys whatever Num Lock says.
+    for (vk, scan, c, f) in [
+        (0x6a, 0x37, '*', 'j'),
+        (0x6b, 0x4e, '+', 'k'),
+        (0x6c, 0x53, ',', 'l'),
+        (0x6d, 0x4a, '-', 'm'),
+        (0x6f, 0x35, '/', 'o'),
+    ] {
+        let s = c.to_string();
+        let mut input = key(vk, scan, c as u16, "", Key::Char(c), &s);
+        input.extended = vk == 0x6f;
+        assert_eq!(enc(&input, &LEGACY), s);
+        assert_eq!(enc(&input, &kpam), format!("\x1bO{f}"), "{c}");
+        input.locks.num = true;
+        assert_eq!(enc(&input, &kpam), s, "{c} with Num Lock on");
+    }
     let mut kp_enter = key(0x0d, 0x1c, 13, "", Key::Enter, "");
     kp_enter.extended = true;
     assert_eq!(enc(&kp_enter, &LEGACY), "\r");
@@ -148,17 +278,44 @@ fn legacy_keys_decckm_and_deckpam() {
     let enter = key(0x0d, 0x1c, 13, "", Key::Enter, "");
     assert_eq!(enc(&enter, &kpam), "\r");
 
-    // With Num Lock on the keypad types what is printed on it.
-    for (mut input, want) in [(five, "5"), (plus, "+"), (kp_enter, "\r")] {
-        input.locks.num = true;
+    // With Num Lock on the digit keys type their digits.
+    let mut five = key(0x65, 0x4c, 0x35, "", Key::Char('5'), "5");
+    five.locks.num = true;
+    let mut dot = key(0x6e, 0x53, 0x2e, "", Key::Char('.'), ".");
+    dot.locks.num = true;
+    kp_enter.locks.num = true;
+    for (input, want) in [(five, "5"), (dot, "."), (kp_enter, "\r")] {
         assert_eq!(enc(&input, &kpam), want, "{input:?}");
     }
+    // With it off they arrive as the navigation keys printed under the
+    // digits, not extended, and keypad 5 as VK_CLEAR: Begin.
+    let home = key(0x24, 0x47, 0, "", Key::Home, "");
+    let del = key(0x2e, 0x53, 0, "", Key::Delete, "");
+    let begin = key(0x0c, 0x4c, 0, "", Key::Other, "");
+    for m in [LEGACY, kpam] {
+        assert_eq!(enc(&home, &m), "\x1b[H");
+        assert_eq!(enc(&del, &m), "\x1b[3~");
+        assert_eq!(enc(&begin, &m), "\x1b[E");
+    }
+    assert_eq!(enc(&begin, &ckm), "\x1bOE");
+    let mut ctrl_begin = begin;
+    ctrl_begin.mods = mods("c");
+    assert_eq!(enc(&ctrl_begin, &LEGACY), "\x1b[1;5E");
 }
 
 #[test]
-fn legacy_keys_ime_owned_key_sends_nothing() {
+fn ime_owned_key_sends_nothing_in_any_mode() {
     let input = key(0xe5, 0x1e, 0, "", Key::Char('a'), "a");
-    assert_eq!(enc(&input, &LEGACY), "");
+    for m in [
+        LEGACY,
+        W32IM,
+        kitty(1),
+        kitty(31),
+        InputModes { kitty: 31, ..W32IM },
+    ] {
+        assert_eq!(enc(&input, &m), "", "{m:?}");
+        assert_eq!(enc(&up(input), &m), "", "release {m:?}");
+    }
 }
 
 fn kitty(flags: u8) -> InputModes {
@@ -288,6 +445,26 @@ fn kitty_keys_associated_text() {
         enc(&up(k("", Key::Char('a'), "a")), &kitty(8 | 16 | 2)),
         "\x1b[97;1:3u"
     );
+    // Only keys that type something carry it: Ctrl, Alt and Super chords
+    // type nothing, AltGr types its character.
+    assert_eq!(enc(&k("c", Key::Char('a'), "a"), &m), "\x1b[97;5u");
+    assert_eq!(enc(&k("a", Key::Char('a'), "a"), &m), "\x1b[97;3u");
+    assert_eq!(enc(&k("w", Key::Char('a'), "a"), &m), "\x1b[97;9u");
+    assert_eq!(enc(&k("cs", Key::Char('a'), "A"), &m), "\x1b[97;6u");
+    let at = key(0x51, 16, 0x40, "cg", Key::Char('q'), "@");
+    assert_eq!(enc(&at, &m), "\x1b[113;1;64u");
+    // Every code point of the text, with the alternates when asked.
+    assert_eq!(
+        enc(&k("", Key::Char('e'), "e\u{301}"), &m),
+        "\x1b[101;1;101:769u"
+    );
+    assert_eq!(
+        enc(&k("s", Key::Char('a'), "A"), &kitty(4 | 8 | 16)),
+        "\x1b[97:65;2;65u"
+    );
+    let mut ru = k("s", Key::Char('с'), "С");
+    ru.us_base = Some('c');
+    assert_eq!(enc(&ru, &kitty(4 | 8 | 16)), "\x1b[1089:1057:99;2;1057u");
 }
 
 #[test]
@@ -309,6 +486,96 @@ fn kitty_keys_event_types() {
 fn kitty_keys_without_disambiguate_stay_legacy() {
     assert_eq!(enc(&k("c", Key::Char('c'), "c"), &kitty(4)), "\x03");
     assert_eq!(enc(&k("", Key::Escape, ""), &kitty(2)), "\x1b");
+    // And with win32-input-mode on they stay console records.
+    let a = key(0x41, 30, 97, "", Key::Char('a'), "a");
+    let both = InputModes {
+        kitty: 2 | 4,
+        ..W32IM
+    };
+    assert_eq!(enc(&a, &both), "\x1b[65;30;97;1;0;1_");
+}
+
+#[test]
+fn kitty_keys_releases_and_repeats() {
+    let all = kitty(1 | 2 | 8);
+    assert_eq!(enc(&up(k("s", Key::Enter, "")), &all), "\x1b[13;2:3u");
+    assert_eq!(enc(&up(k("c", Key::Backspace, "")), &all), "\x1b[127;5:3u");
+    assert_eq!(enc(&up(k("", Key::F(5), "")), &all), "\x1b[15;1:3~");
+    // KeyInput carries no repeat flag, so a repeat goes out as a press.
+    let mut held = k("c", Key::Char('a'), "a");
+    held.repeat = 3;
+    assert_eq!(enc(&held, &kitty(1 | 2)), "\x1b[97;5u");
+}
+
+#[test]
+fn kitty_keys_modifier_and_lock_keys() {
+    let m = kitty(8);
+    let mut ralt = key(0x12, 0x38, 0, "g", Key::Alt, "");
+    ralt.extended = true;
+    for (input, want) in [
+        (key(0x11, 0x1d, 0, "c", Key::Control, ""), "\x1b[57442;5u"),
+        (key(0xa2, 0x1d, 0, "c", Key::Control, ""), "\x1b[57442;5u"),
+        (key(0x12, 0x38, 0, "a", Key::Alt, ""), "\x1b[57443;3u"),
+        (ralt, "\x1b[57449;3u"),
+        (key(0x5b, 0x5b, 0, "w", Key::Super, ""), "\x1b[57444;9u"),
+        (key(0x5c, 0x5c, 0, "w", Key::Super, ""), "\x1b[57450;9u"),
+        (key(0xa1, 0x36, 0, "s", Key::Shift, ""), "\x1b[57447;2u"),
+        (key(0x91, 0x46, 0, "", Key::Other, ""), "\x1b[57359u"),
+        (key(0x90, 0x45, 0, "", Key::Other, ""), "\x1b[57360u"),
+        (key(0x5d, 0x5d, 0, "", Key::Other, ""), ""),
+    ] {
+        assert_eq!(enc(&input, &m), want, "{input:?}");
+        // Without all keys as escape codes they send nothing.
+        assert_eq!(enc(&input, &kitty(1)), "", "{input:?}");
+    }
+}
+
+#[test]
+fn kitty_keys_keypad_codes() {
+    let m = kitty(8);
+    for (vk, code) in [
+        (0x60, 57399),
+        (0x69, 57408),
+        (0x6e, 57409),
+        (0x6f, 57410),
+        (0x6a, 57411),
+        (0x6d, 57412),
+        (0x6b, 57413),
+        (0x6c, 57416),
+    ] {
+        let input = key(vk, 0, 0, "", Key::Char('x'), "x");
+        assert_eq!(enc(&input, &m), format!("\x1b[{code}u"), "{vk:#x}");
+    }
+    // Num Lock off: the keypad's navigation keys are not extended, the
+    // main ones are. Keypad 5 is Begin, which keeps its letter form.
+    for (vk, scan, k, code) in [
+        (0x21, 0x49, Key::PageUp, 57421),
+        (0x22, 0x51, Key::PageDown, 57422),
+        (0x23, 0x4f, Key::End, 57424),
+        (0x24, 0x47, Key::Home, 57423),
+        (0x25, 0x4b, Key::Left, 57417),
+        (0x26, 0x48, Key::Up, 57419),
+        (0x27, 0x4d, Key::Right, 57418),
+        (0x28, 0x50, Key::Down, 57420),
+        (0x2d, 0x52, Key::Insert, 57425),
+        (0x2e, 0x53, Key::Delete, 57426),
+    ] {
+        let mut input = key(vk, scan, 0, "", k, "");
+        assert_eq!(enc(&input, &m), format!("\x1b[{code}u"), "{k:?}");
+        let plain = enc(&input, &kitty(1));
+        input.extended = true;
+        assert_eq!(enc(&input, &kitty(1)), plain, "{k:?} like the main key");
+        assert_ne!(enc(&input, &m), format!("\x1b[{code}u"), "main {k:?}");
+    }
+    let begin = key(0x0c, 0x4c, 0, "", Key::Other, "");
+    assert_eq!(enc(&begin, &m), "\x1b[E");
+    assert_eq!(enc(&begin, &kitty(1)), "\x1b[E");
+    let mut ctrl_begin = begin;
+    ctrl_begin.mods = mods("c");
+    assert_eq!(enc(&ctrl_begin, &kitty(1)), "\x1b[1;5E");
+    // Keypad keys carry no US base key for the alternates.
+    let five = key(0x65, 0x4c, 0x35, "", Key::Char('5'), "5");
+    assert_eq!(enc(&five, &kitty(4 | 8)), "\x1b[57404u");
 }
 
 const W32IM: InputModes = InputModes {
@@ -445,6 +712,13 @@ fn interrupt_keys_stay_console_records() {
         enc(&key(0x43, 46, 3, "ca", Key::Char('c'), ""), &both),
         "\x1b[99;7u"
     );
+    // Shift or Super on top still interrupts, as conhost sees Ctrl+C.
+    let cs_c = key(0x43, 46, 3, "cs", Key::Char('c'), "C");
+    assert_eq!(enc(&cs_c, &both), "\x1b[67;46;3;1;24;1_");
+    let cw_c = key(0x43, 46, 3, "cw", Key::Char('c'), "c");
+    assert_eq!(enc(&cw_c, &both), "\x1b[67;46;3;1;8;1_");
+    // Without win32-input-mode there is no console record to keep.
+    assert_eq!(enc(&ctrl_c, &kitty(1)), "\x1b[99;5u");
 }
 
 #[test]
@@ -474,6 +748,27 @@ fn win32_input_mode_keys_send_every_transition() {
     given.cs = 0x20;
     given.repeat = 3;
     assert_eq!(enc(&given, &W32IM), "\x1b[65;30;97;1;32;3_");
+
+    // Each control-key-state bit: RIGHT_ALT 1, LEFT_ALT 2, RIGHT_CTRL 4,
+    // LEFT_CTRL 8, SHIFT 16, NUMLOCK 32, SCROLLLOCK 64, CAPSLOCK 128,
+    // ENHANCED_KEY 256. A repeat count of 0 is sent as 1.
+    let mut right = key(0x41, 30, 97, "", Key::Char('a'), "a");
+    right.mods = Mods {
+        rctrl: true,
+        rshift: true,
+        ..Mods::default()
+    };
+    right.locks.scroll = true;
+    right.repeat = 0;
+    assert_eq!(enc(&right, &W32IM), "\x1b[65;30;97;1;84;1_");
+    right.mods = Mods {
+        ralt: true,
+        lalt: true,
+        ..Mods::default()
+    };
+    right.locks = Locks::default();
+    right.extended = true;
+    assert_eq!(enc(&right, &W32IM), "\x1b[65;30;97;1;259;1_");
 }
 
 #[test]
@@ -575,13 +870,96 @@ fn mouse_sgr_reports() {
         s("\x1b[<34;2;2M")
     );
 
-    // Nothing without tracking, or without SGR encoding.
+    // Nothing without tracking, or without SGR encoding: the X10 byte form
+    // is not implemented.
     assert_eq!(enc_mouse(mouse(Press, 0, 0, 0, ""), &tracking(Off)), None);
-    let x10 = InputModes {
+    let no_sgr = InputModes {
         mouse_sgr: false,
         ..click
     };
-    assert_eq!(enc_mouse(mouse(Press, 0, 0, 0, ""), &x10), None);
+    assert_eq!(enc_mouse(mouse(Press, 0, 0, 0, ""), &no_sgr), None);
+}
+
+#[test]
+fn mouse_sgr_modifiers_buttons_and_edges() {
+    use vt::MouseKind::*;
+    use vt::MouseMode::*;
+    let s = |v: &str| Some(v.to_string());
+    let (click, drag, any) = (tracking(Click), tracking(Drag), tracking(Any));
+    // Shift 4, Alt 8, Ctrl 16, on every kind of event.
+    assert_eq!(
+        enc_mouse(mouse(Release, 2, 0, 0, "c"), &click),
+        s("\x1b[<18;1;1m")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Move, 1, 0, 0, "s"), &drag),
+        s("\x1b[<37;1;1M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Press, 0, 0, 0, "g"), &click),
+        s("\x1b[<8;1;1M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(WheelUp, 0, 0, 0, "s"), &click),
+        s("\x1b[<68;1;1M")
+    );
+    let mut right = mouse(Press, 0, 0, 0, "");
+    right.mods = Mods {
+        rshift: true,
+        rctrl: true,
+        ..Mods::default()
+    };
+    assert_eq!(enc_mouse(right, &click), s("\x1b[<20;1;1M"));
+    // Super is not reported.
+    assert_eq!(
+        enc_mouse(mouse(Press, 0, 0, 0, "w"), &click),
+        s("\x1b[<0;1;1M")
+    );
+    // Drags with any button; motion without one only in mode 1003.
+    assert_eq!(
+        enc_mouse(mouse(Move, 1, 2, 3, ""), &drag),
+        s("\x1b[<33;3;4M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Move, 2, 2, 3, ""), &drag),
+        s("\x1b[<34;3;4M")
+    );
+    assert_eq!(enc_mouse(mouse(Move, 4, 0, 0, ""), &any), None);
+    assert_eq!(enc_mouse(mouse(Release, 3, 0, 0, ""), &click), None);
+    // SGR has no coordinate limit.
+    assert_eq!(
+        enc_mouse(mouse(Press, 0, u16::MAX, u16::MAX, ""), &click),
+        s("\x1b[<0;65536;65536M")
+    );
+}
+
+/// A move the modes did not ask for is not a report, so it does not stop
+/// the next move to the same cell once they do.
+#[test]
+fn mouse_motion_not_sent_does_not_count() {
+    use vt::MouseKind::*;
+    let mut tracker = vt::keys::MouseTracker::default();
+    let mut out = Vec::new();
+    assert!(!tracker.encode(
+        mouse(Move, 3, 5, 5, ""),
+        &tracking(vt::MouseMode::Drag),
+        &mut out
+    ));
+    assert!(tracker.encode(
+        mouse(Move, 3, 5, 5, ""),
+        &tracking(vt::MouseMode::Any),
+        &mut out
+    ));
+    assert!(!tracker.encode(mouse(Press, 0, 6, 6, ""), &LEGACY, &mut out));
+    assert!(tracker.encode(
+        mouse(Move, 3, 6, 6, ""),
+        &tracking(vt::MouseMode::Any),
+        &mut out
+    ));
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "\x1b[<35;6;6M\x1b[<35;7;7M"
+    );
 }
 
 #[test]
@@ -629,6 +1007,20 @@ fn paste_filters_controls_and_line_breaks() {
     assert_eq!(paste("x\x1b[31my\x03\x7f\u{9b}z\tq", false), "x[31myz\tq");
     assert_eq!(paste("héllo ✳ 日本 🦀", false), "héllo ✳ 日本 🦀");
     assert_eq!(paste("", false), "");
+}
+
+#[test]
+fn paste_drops_controls_before_joining_line_breaks() {
+    // CR LF with a dropped control between them is still one line break.
+    assert_eq!(paste("a\r\x1b\nb", false), "a\rb");
+    assert_eq!(paste("a\r\u{9b}\nb", false), "a\rb");
+    // Breaks in other orders stay apart.
+    assert_eq!(paste("a\n\rb", false), "a\r\rb");
+    assert_eq!(paste("a\r\r\nb", false), "a\r\rb");
+    assert_eq!(paste("\r\n\r\n", false), "\r\r");
+    // NEL is C1 and dropped like the rest.
+    assert_eq!(paste("a\u{85}b", false), "ab");
+    assert_eq!(paste("a\tb", true), "\x1b[200~a\tb\x1b[201~");
 }
 
 #[test]

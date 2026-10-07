@@ -1,5 +1,5 @@
 # Tokyo Night Day
-From https://github.com/folke/tokyonight.nvim (Apache-2.0)
+# From https://github.com/folke/tokyonight.nvim (Apache-2.0)
 background = #e1e2e7
 foreground = #3760bf
 cursor-color = #3760bf

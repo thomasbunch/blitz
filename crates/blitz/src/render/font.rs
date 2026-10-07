@@ -53,6 +53,9 @@ pub struct Font {
     /// Top of the underline, from the top of the cell.
     pub underline_y: i32,
     pub underline_h: u32,
+    /// Top of the strikethrough line, from the top of the cell.
+    pub strike_y: i32,
+    pub strike_h: u32,
     /// Text gamma and grayscale contrast boost from the system's
     /// "Adjust ClearType text" settings, applied by the shader.
     pub gamma: f32,
@@ -114,6 +117,13 @@ pub fn monospace_families() -> Vec<String> {
     list().unwrap_or_default()
 }
 
+/// The row strikethrough starts on, `up` pixels above the baseline, kept
+/// in the cell above the baseline. A broken font at a tiny size can put
+/// the baseline at row 0, which leaves only row 0.
+fn strike_row(baseline: i32, up: f32) -> i32 {
+    (baseline - up.round() as i32).min(baseline - 1).max(0)
+}
+
 fn glyph_index(face: &IDWriteFontFace, c: char) -> u16 {
     let cp = c as u32;
     let mut g = 0u16;
@@ -166,6 +176,16 @@ impl Font {
             let underline_h = (f32::from(m.underlineThickness) * scale).round().max(1.0) as u32;
             let underline_y = (baseline - (f32::from(m.underlinePosition) * scale).round() as i32)
                 .min(cell_h as i32 - underline_h as i32);
+            // The font's position is the top of the line, above the
+            // baseline; through the middle of a lowercase x without one.
+            let strike_h = (f32::from(m.strikethroughThickness) * scale)
+                .round()
+                .max(1.0) as u32;
+            let strike_up = match m.strikethroughPosition {
+                0 => f32::from(m.xHeight) * scale / 2.0 + strike_h as f32 / 2.0,
+                p => f32::from(p) * scale,
+            };
+            let strike_y = strike_row(baseline, strike_up);
             let (gamma, contrast) = factory
                 .CreateRenderingParams()
                 .and_then(|p| p.cast::<IDWriteRenderingParams1>())
@@ -184,6 +204,8 @@ impl Font {
                 baseline,
                 underline_y,
                 underline_h,
+                strike_y,
+                strike_h,
                 gamma,
                 contrast,
                 fallbacks: HashMap::new(),
@@ -489,12 +511,33 @@ mod tests {
     }
 
     #[test]
+    fn strikethrough_stays_above_the_baseline() {
+        assert_eq!(strike_row(12, 4.0), 8);
+        assert_eq!(strike_row(12, 30.0), 0, "above the cell");
+        assert_eq!(strike_row(12, -3.0), 11, "below the baseline");
+        // A baseline at the very top, from a broken font at 4 pt.
+        assert_eq!(strike_row(0, 2.0), 0);
+        assert_eq!(strike_row(-1, 0.0), 0);
+    }
+
+    #[test]
     fn metrics_and_ascii() {
         let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
         assert!((7..=12).contains(&font.cell_w), "cell_w {}", font.cell_w);
         assert!((15..=24).contains(&font.cell_h), "cell_h {}", font.cell_h);
         assert!(font.baseline > 0 && font.baseline < font.cell_h as i32);
         assert!((1.0..=3.0).contains(&font.gamma) && font.contrast >= 0.0);
+        // Underline below the baseline, strikethrough above it and below
+        // the top of the cell, both inside the cell.
+        let bottom = font.cell_h as i32;
+        assert!(font.underline_y >= font.baseline - 1 && font.underline_y < bottom);
+        assert!(font.underline_y + font.underline_h as i32 <= bottom);
+        assert!(
+            font.strike_y > 0 && font.strike_y < font.baseline,
+            "{}",
+            font.strike_y
+        );
+        assert!(font.strike_h >= 1 && font.strike_h <= font.underline_h + 2);
         let a = font.raster("A", 0, 1).expect("raster").expect("ink");
         assert!(ink(&a) > 0);
         // The glyph sits inside its cell, on the baseline.
@@ -523,6 +566,37 @@ mod tests {
             assert!(r.dx >= -1 && r.dx + r.w as i32 <= cells + 1, "{s} spills");
             assert!(2 * r.w as i32 >= cells, "{s} is shrunk to {} px", r.w);
         }
+    }
+
+    #[test]
+    fn clusters_without_a_drawable_first_character() {
+        let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        // Variation selectors alone draw nothing.
+        assert!(font.raster("\u{FE0F}", 0, 1).expect("raster").is_none());
+        assert!(
+            font.raster("\u{FE0E}\u{FE0F}", 0, 1)
+                .expect("raster")
+                .is_none()
+        );
+        assert!(font.raster("", 0, 1).expect("raster").is_none());
+        // A joined emoji sequence draws its first emoji, within its cells.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let r = font.raster(family, 0, 2).expect("raster").expect("ink");
+        assert!(r.dx >= -1 && r.dx + r.w as i32 <= 2 * font.cell_w as i32 + 1);
+        // A character no font has comes out as the font's missing-glyph
+        // box, or nothing, but never an error.
+        assert!(font.raster("\u{10FFFD}", 0, 1).is_ok());
+        assert!(font.raster("\u{E000}", ITALIC | BOLD, 1).is_ok());
+        // Italic is a face of its own.
+        let (a, i) = (font.raster("l", 0, 1), font.raster("l", ITALIC, 1));
+        let (a, i) = (
+            a.expect("raster").expect("ink"),
+            i.expect("raster").expect("ink"),
+        );
+        assert!(
+            a.alpha != i.alpha || a.dx != i.dx || a.w != i.w,
+            "italic differs"
+        );
     }
 
     #[test]

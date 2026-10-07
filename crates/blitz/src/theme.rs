@@ -150,9 +150,20 @@ impl Ui {
             error: pal.ansi[1],
             ..Ui::default()
         };
+        let side = ui.side_bg;
         for &(key, d, l) in MIXES {
             if let Some(f) = ui.field(key) {
-                *f = mix(bg, fg, if light { l } else { d });
+                let mut t = if light { l } else { d };
+                *f = mix(bg, fg, t);
+                // On a theme with little contrast, Solarized Dark for one,
+                // the sidebar's dimmer text would be too faint to read.
+                while matches!(key, "dim" | "label" | "label-focus")
+                    && contrast(*f, side) < 3.0
+                    && t < 1.0
+                {
+                    t = (t + 0.05).min(1.0);
+                    *f = mix(bg, fg, t);
+                }
             }
         }
         ui.set_accent(pal.ansi[3]);
@@ -229,7 +240,8 @@ pub fn parse(name: &str, text: &str) -> Theme {
 
 /// `#rrggbb` or `rrggbb`.
 fn color(s: &str) -> Option<u32> {
-    let hex = s.trim().trim_start_matches('#');
+    let s = s.trim();
+    let hex = s.strip_prefix('#').unwrap_or(s);
     if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         u32::from_str_radix(hex, 16).ok()
     } else {
@@ -260,21 +272,40 @@ fn luminance(rgb: u32) -> f64 {
     0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 }
 
+/// WCAG 2 contrast ratio between two `0xRRGGBB` colours.
+fn contrast(a: u32, b: u32) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
 /// `%APPDATA%\blitz\themes`.
 pub fn dir() -> Option<PathBuf> {
     crate::config::dir().map(|d| d.join("themes"))
 }
 
-/// A user theme's name: its file name without a `.conf` ending.
+/// A user theme's name: its file name without a `.conf` ending, in any
+/// case. Hidden files and editor backups (`Midnight~`) are no themes.
 fn file_name(p: &Path) -> Option<String> {
     let n = p.file_name()?.to_str()?;
-    Some(n.strip_suffix(".conf").unwrap_or(n).to_string())
+    if n.starts_with('.') || n.ends_with('~') {
+        return None;
+    }
+    let conf = n.len().checked_sub(5).filter(|&i| n.is_char_boundary(i));
+    let name = match conf {
+        Some(i) if n[i..].eq_ignore_ascii_case(".conf") => &n[..i],
+        _ => n,
+    };
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Every theme: the built-ins in order, then the themes folder sorted by
 /// name. A file named like a built-in replaces it in place.
 pub fn all() -> Vec<Theme> {
-    let mut files: Vec<(String, PathBuf)> = dir()
+    all_in(dir().as_deref())
+}
+
+fn all_in(dir: Option<&Path>) -> Vec<Theme> {
+    let mut files: Vec<(String, PathBuf)> = dir
         .and_then(|d| std::fs::read_dir(d).ok())
         .into_iter()
         .flatten()
@@ -283,11 +314,13 @@ pub fn all() -> Vec<Theme> {
         .filter(|p| p.is_file())
         .filter_map(|p| Some((file_name(&p)?, p)))
         .collect();
-    files.sort_by_key(|f| f.0.to_lowercase());
+    files.sort_by(|a, b| (a.0.to_lowercase(), &a.1).cmp(&(b.0.to_lowercase(), &b.1)));
+    // `X` and `X.conf` name one theme; the first in that order wins.
+    files.dedup_by(|b, a| a.0.eq_ignore_ascii_case(&b.0));
     // A file being saved may not be readable for a moment; the save that
     // follows reloads it.
     let read = |(name, p): (String, PathBuf)| {
-        let text = std::fs::read_to_string(p).ok()?;
+        let text = crate::config::decode(&std::fs::read(p).ok()?);
         Some(parse(&name, &text))
     };
     let mut out: Vec<Theme> = BUILTIN
@@ -302,27 +335,36 @@ pub fn all() -> Vec<Theme> {
     out
 }
 
+/// The `light:` or `dark:` half of a `theme` setting, by `prefix`. Only a
+/// comma before the other half splits the setting, so a theme's name may
+/// hold one.
+fn half<'a>(setting: &'a str, prefix: &str) -> Option<&'a str> {
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for (i, _) in setting.match_indices(',') {
+        let next = setting[i + 1..].trim_start();
+        if next.starts_with("light:") || next.starts_with("dark:") {
+            parts.push(&setting[start..i]);
+            start = i + 1;
+        }
+    }
+    parts.push(&setting[start..]);
+    (parts.into_iter())
+        .find_map(|p| p.trim().strip_prefix(prefix))
+        .map(str::trim)
+}
+
 /// The theme a `theme` setting names: one name, or `light:NAME,dark:NAME`
 /// to follow the Windows app theme.
 pub fn choose(setting: &str, system_light: bool) -> &str {
     let want = if system_light { "light:" } else { "dark:" };
-    setting
-        .split(',')
-        .find_map(|p| p.trim().strip_prefix(want))
-        .unwrap_or(setting)
-        .trim()
+    half(setting, want).unwrap_or(setting.trim())
 }
 
 /// The `theme` setting after picking `name`. Of a `light:X,dark:Y` pair
 /// only the half in use now changes.
 pub fn pick(setting: &str, name: &str, system_light: bool) -> String {
-    let half = |p: &str| {
-        setting
-            .split(',')
-            .find_map(|x| x.trim().strip_prefix(p))
-            .map(str::trim)
-    };
-    match (half("light:"), half("dark:")) {
+    match (half(setting, "light:"), half(setting, "dark:")) {
         (Some(_), Some(d)) if system_light => format!("light:{name},dark:{d}"),
         (Some(l), Some(_)) => format!("light:{l},dark:{name}"),
         _ => name.into(),
@@ -332,8 +374,10 @@ pub fn pick(setting: &str, name: &str, system_light: bool) -> String {
 /// The theme the `theme` setting picks now. An unknown name gives the
 /// blitz theme that matches the system.
 pub fn current(setting: &str) -> Theme {
-    let light = system_is_light();
-    let mut all = all();
+    current_of(all(), setting, system_is_light())
+}
+
+fn current_of(mut all: Vec<Theme>, setting: &str, light: bool) -> Theme {
     let mut take = |name: &str| {
         let i = all.iter().position(|t| t.name.eq_ignore_ascii_case(name))?;
         Some(all.swap_remove(i))
@@ -406,12 +450,6 @@ pub fn system_is_light() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// WCAG 2 contrast ratio between two `0xRRGGBB` colours.
-    fn contrast(a: u32, b: u32) -> f64 {
-        let (a, b) = (luminance(a), luminance(b));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    }
 
     /// Every chrome key a theme file can set.
     fn keys() -> impl Iterator<Item = &'static str> {
@@ -525,6 +563,192 @@ mod tests {
         assert_eq!(pick("Rose Pine", "X", true), "X");
         assert_eq!(pick("light:A", "X", true), "X");
         assert_eq!(choose(&pick(DEFAULT, "X", false), false), "X");
+    }
+
+    #[test]
+    fn pick_and_choose_agree_for_any_name() {
+        for name in [
+            "Rose Pine",
+            "Foo, Bar",
+            "Dracula's",
+            "a ,b",
+            "dark",
+            "light: x",
+        ] {
+            for light in [false, true] {
+                let setting = pick(DEFAULT, name, light);
+                assert_eq!(choose(&setting, light), name.trim(), "{setting:?}");
+                let other = if light { "blitz dark" } else { "blitz light" };
+                assert_eq!(choose(&setting, !light), other, "{setting:?}");
+            }
+        }
+        assert_eq!(choose("light:Foo, Bar, dark:Baz", true), "Foo, Bar");
+        assert_eq!(choose("dark: Baz ,light: Foo, Bar", true), "Foo, Bar");
+    }
+
+    #[test]
+    fn every_builtin_line_is_a_known_key_with_a_good_colour() {
+        let known = [
+            "background",
+            "foreground",
+            "cursor-color",
+            "selection-background",
+            "palette",
+        ];
+        for &(name, text) in BUILTIN {
+            for line in text
+                .lines()
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            {
+                let (key, value) = line
+                    .split_once(" = ")
+                    .unwrap_or_else(|| panic!("{name}: {line:?}"));
+                let value = match key {
+                    "palette" => {
+                        let (i, c) = value.split_once('=').expect("N=#rrggbb");
+                        assert!(matches!(i.parse(), Ok(0..16)), "{name}: {line}");
+                        c
+                    }
+                    _ => value,
+                };
+                assert!(
+                    value.starts_with('#') && color(value).is_some(),
+                    "{name}: {line}"
+                );
+                let chrome = Ui::default().field(key).is_some();
+                assert!(known.contains(&key) || chrome, "{name}: unknown key {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_theme_file_is_built_in() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/themes");
+        let mut files: Vec<String> = (std::fs::read_dir(dir).unwrap().flatten())
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        files.sort();
+        let mut built: Vec<String> = (BUILTIN.iter())
+            .map(|b| b.0.to_lowercase().replace(' ', "-"))
+            .collect();
+        built.sort();
+        assert_eq!(files, built);
+    }
+
+    #[test]
+    fn every_builtin_theme_has_readable_text_and_chrome() {
+        for t in all_in(None) {
+            let (p, ui) = (&t.pal, &t.ui);
+            // The blitz themes meet AA (above); the others are as their
+            // authors made them, Solarized Light at 4.1, but a broken file
+            // would fall far lower.
+            let text = contrast(p.fg, p.bg);
+            assert!(text >= 4.0, "{}: text contrast {text:.2}", t.name);
+            // The chrome is blitz's own, mixed from those colours.
+            for (what, c) in [
+                ("title", ui.name),
+                ("label", ui.label),
+                ("label-focus", ui.label_focus),
+                ("dim", ui.dim),
+            ] {
+                let on = contrast(c, ui.side_bg);
+                assert!(on >= 3.0, "{}: {what} on the sidebar {on:.2}", t.name);
+            }
+            let chip = contrast(ui.chip_fg, ui.accent);
+            assert!(chip >= 4.5, "{}: text on the accent {chip:.2}", t.name);
+        }
+    }
+
+    #[test]
+    fn colours_are_six_hex_digits_and_the_last_line_counts() {
+        assert_eq!(color("#0a0B0c"), Some(0x0a0b0c));
+        assert_eq!(color(" 0a0b0c "), Some(0x0a0b0c));
+        for bad in [
+            "##0a0b0c",
+            "#abc",
+            "#0a0b0c0d",
+            "#0a0b0g",
+            "red",
+            "",
+            "#",
+            "#0a0b0c # x",
+        ] {
+            assert_eq!(color(bad), None, "{bad:?}");
+        }
+        let t = parse(
+            "x",
+            "background = #000001\nbackground = #000002\n\
+             palette = 3=#000003\npalette = 3=#000004\n\
+             accent = #000005\naccent = #000006\n",
+        );
+        assert_eq!((t.pal.bg, t.pal.ansi[3], t.ui.accent), (2, 4, 6));
+    }
+
+    /// A themes folder for one test, gone when the test ends.
+    struct Folder(PathBuf);
+
+    impl Folder {
+        fn new(name: &str, files: &[(&str, &[u8])]) -> Folder {
+            let dir =
+                std::env::temp_dir().join(format!("blitz-themes-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (file, text) in files {
+                std::fs::write(dir.join(file), text).unwrap();
+            }
+            Folder(dir)
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_user_file_replaces_a_builtin_in_place_and_others_follow() {
+        let f = Folder::new(
+            "replace",
+            &[
+                ("rose pine.conf", b"background = #000001\n"),
+                ("Zed", b"background = #ffffff\n"),
+                ("alpha.CONF", b"background = #000002\n"),
+                ("Alpha", b"background = #000003\n"),
+                ("Midnight~", b"background = #000004\n"),
+                (".hidden", b"background = #000005\n"),
+                ("Latin", b"# Th\xe8me\nbackground = #000006\n"),
+            ],
+        );
+        std::fs::create_dir(f.0.join("folder")).unwrap();
+        let t = all_in(Some(&f.0));
+        let rose = BUILTIN.iter().position(|b| b.0 == "Rose Pine").unwrap();
+        assert_eq!((t[rose].name.as_str(), t[rose].pal.bg), ("rose pine", 1));
+        let extra: Vec<(&str, u32)> = (t[BUILTIN.len()..].iter())
+            .map(|t| (t.name.as_str(), t.pal.bg))
+            .collect();
+        // `Alpha` and `alpha.CONF` are one theme; backups, hidden files
+        // and folders are none; a file that is not UTF-8 still reads.
+        assert_eq!(extra, [("Alpha", 3), ("Latin", 6), ("Zed", 0xffffff)]);
+        assert_eq!(all_in(None).len(), BUILTIN.len());
+        assert_eq!(all_in(Some(&f.0.join("missing"))).len(), BUILTIN.len());
+    }
+
+    #[test]
+    fn an_unknown_theme_falls_back_to_blitz() {
+        let all = || all_in(None);
+        assert_eq!(current_of(all(), "rose pine", false).name, "Rose Pine");
+        assert_eq!(current_of(all(), DEFAULT, true).name, "blitz light");
+        assert_eq!(
+            current_of(all(), "light:Gruvbox Light,dark:x", true).name,
+            "Gruvbox Light"
+        );
+        for light in [false, true] {
+            let want = if light { "blitz light" } else { "blitz dark" };
+            assert_eq!(current_of(all(), "nope", light).name, want);
+            assert_eq!(current_of(all(), "light:x,dark:y", light).name, want);
+            assert_eq!(current_of(Vec::new(), "nope", light).name, want);
+        }
     }
 
     #[test]

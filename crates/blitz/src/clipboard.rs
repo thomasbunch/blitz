@@ -116,26 +116,47 @@ mod tests {
         }
     }
 
-    /// Writes and reads back the real clipboard, then restores it.
+    /// Puts back the user's text when the test ends, passed or not, or
+    /// leaves the clipboard empty if it held none.
+    struct Restore(Option<String>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(b) => {
+                    set_text(None, b);
+                }
+                None => {
+                    if let Some(_open) = Open::new(None) {
+                        // SAFETY: the clipboard is open.
+                        let _ = unsafe { EmptyClipboard() };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Writes and reads back the real clipboard, then restores its text.
     #[test]
     fn clipboard_round_trip() {
-        let before = get_text();
+        let _restore = Restore(get_text());
         let text = "blitz clipboard \u{2713}\r\nline 2";
         if !set_text(None, text) {
-            eprintln!("skipped: clipboard unavailable");
+            eprintln!("SKIPPED: the clipboard is unavailable");
             return;
         }
         assert_eq!(get_text().as_deref(), Some(text));
         // Another program can leave out the NUL. With an odd size not even
         // the last unit is zero, and the text must still end with the block.
+        let mut read = 0;
         for n in (3..400).step_by(2) {
+            // Another program may hold the clipboard for a moment.
             if set_raw(&b"A\0".repeat(n)[..n]) {
+                read += 1;
                 let got = get_text().unwrap_or_default();
-                assert!(got.len() <= n / 2, "{n} bytes read as {got:?}");
+                assert_eq!(got, "A".repeat(n / 2), "{n} bytes");
             }
         }
-        if let Some(b) = before {
-            set_text(None, &b);
-        }
+        assert!(read > 100, "the clipboard was busy {} times", 199 - read);
     }
 }

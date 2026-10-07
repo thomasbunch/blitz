@@ -320,6 +320,11 @@ fn parser_param_and_intermediate_limits() {
     let max: Vec<u16> = (1..=MAX_PARAMS as u16).collect();
     assert_eq!(one(&seq(MAX_PARAMS)), [csi(&max, b"", b'm')]);
     assert_eq!(one(&seq(MAX_PARAMS + 1)), []);
+    // Overflowing at a `;` rather than at the final byte, and the rest of
+    // the stream unharmed.
+    let mut s = seq(MAX_PARAMS + 9);
+    s.extend_from_slice(b"x");
+    assert_eq!(one(&s), [text("x")]);
     assert_eq!(one(b"\x1b[1 !\"#p"), [csi(&[1], b" !\"#", b'p')]);
     assert_eq!(one(b"\x1b[1 !\"#$p"), []);
     assert_eq!(one(b"\x1b !\"#$Fx"), [text("x")]);
@@ -413,6 +418,27 @@ fn parser_dcs_strings() {
         ]
     );
     assert_eq!(one(b"\x1bP1?2qbody\x1b\\x"), [text("x")]);
+    // Too many parameters or intermediates: the whole string is ignored,
+    // up to its ST.
+    let p: Vec<String> = (0..40).map(|i| i.to_string()).collect();
+    let many = format!("\x1bP{}qdata\x1b\\x", p.join(";"));
+    assert_eq!(one(many.as_bytes()), [text("x")]);
+    assert_eq!(one(b"\x1bP !\"#$qdata\x1b\\y"), [text("y")]);
+}
+
+#[test]
+fn parser_escape_then_non_ascii() {
+    // ESC then UTF-8 waits for a final byte, as in vte: the character is
+    // lost and the next printable byte ends the escape.
+    assert_eq!(
+        one("\x1b\u{e9}xy".as_bytes()),
+        [Ev::Esc(vec![], b'x'), text("y")]
+    );
+    // Inside an OSC, 0x9C is data, not ST; BEL still ends it.
+    assert_eq!(
+        one(b"\x1b]0;a\x9cb\x07c"),
+        [Ev::Osc(b"0;a\x9cb".into(), true), text("c")]
+    );
 }
 
 #[test]

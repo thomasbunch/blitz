@@ -92,9 +92,14 @@ fn main() {
             _ => fail(&format!("unknown grapheme break class {v}")),
         };
         // Hangul medial vowels and final consonants only ever extend a
-        // syllable.
+        // syllable. Other scripts' V letters (Kirat Rai vowel signs) are
+        // spacing letters and keep their width.
         if matches!(v, "V" | "T") {
-            width[r.clone()].fill(W_ZERO);
+            for cp in r.clone() {
+                if matches!(cp, 0x1160..=0x11FF | 0xD7B0..=0xD7FF) {
+                    width[cp] = W_ZERO;
+                }
+            }
         }
         gcb[r].fill(class);
     }
@@ -154,7 +159,19 @@ pub const SHIFT: u32 = {shift};
 
 fn read(dir: &Path, name: &str) -> String {
     let path = dir.join(name);
-    fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())))
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+    // `# @missing` gives the value of code points a file does not list. The
+    // tables start out narrow, Other and assigned, so a default other than
+    // N, Other or Cn for the whole range would be silently dropped.
+    for line in text.lines().filter_map(|l| l.strip_prefix("# @missing:")) {
+        let data = line.split('#').next().unwrap_or("");
+        let (range, value) = data.split_once(';').unwrap_or((data, ""));
+        if range.trim() != "0000..10FFFF" || !matches!(value.trim(), "N" | "Other" | "Cn") {
+            fail(&format!("{name}: unhandled default `@missing:{line}`"));
+        }
+    }
+    text
 }
 
 /// Yields `(range, value)` for each `XXXX[..YYYY] ; value # comment` line.

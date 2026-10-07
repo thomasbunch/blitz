@@ -43,13 +43,30 @@ pub mod attr {
     pub const UNDERLINE: u16 = 1 << 2;
     pub const INVERSE: u16 = 1 << 3;
     pub const DIM: u16 = 1 << 4;
+    pub const STRIKE: u16 = 1 << 5;
+    pub const OVERLINE: u16 = 1 << 6;
+
+    // Each is a bit of its own, or the build fails.
+    const _: () = {
+        let bits = [BOLD, ITALIC, UNDERLINE, INVERSE, DIM, STRIKE, OVERLINE];
+        let (mut all, mut i) = (0u16, 0);
+        while i < bits.len() {
+            assert!(bits[i].count_ones() == 1 && all & bits[i] == 0);
+            all |= bits[i];
+            i += 1;
+        }
+    };
 }
+
+/// Longest grapheme cluster a cell holds, in bytes: its first code point
+/// and up to 28 bytes after it. Enough for a family or a subdivision flag.
+pub const CLUSTER_BYTES: usize = 32;
 
 /// One cell with its colours already resolved through the palette.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderCell {
     /// UTF-8 of the grapheme cluster; `len` bytes are valid.
-    pub text: [u8; 16],
+    pub text: [u8; CLUSTER_BYTES],
     pub len: u8,
     /// 0 for the right half of a wide character, else 1 or 2.
     pub width: u8,
@@ -78,4 +95,32 @@ pub struct Snapshot {
     pub alt_screen: bool,
     /// Start and end (column, row), inclusive.
     pub selection: Option<((u16, u16), (u16, u16))>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Options, Terminal};
+
+    #[test]
+    fn line_attributes_reach_the_snapshot() {
+        let pal = Palette {
+            fg: 0xffffff,
+            bg: 0,
+            cursor: 0xff0000,
+            selection_bg: 0x00ff00,
+            ansi: [0x808080; 16],
+        };
+        let mut t = Terminal::new(Options {
+            cols: 6,
+            rows: 1,
+            ..Options::default()
+        });
+        t.feed(b"\x1b[9ma\x1b[53mb\x1b[29mc\x1b[55;4md\x1b[0;9;53;4me\x1b[0mf");
+        let mut s = Snapshot::default();
+        t.snapshot(&mut s, &pal);
+        let attrs: Vec<u16> = s.cells.iter().map(|c| c.attrs).collect();
+        let (st, ov, ul) = (attr::STRIKE, attr::OVERLINE, attr::UNDERLINE);
+        assert_eq!(attrs, [st, st | ov, ov, ul, st | ov | ul, 0]);
+    }
 }

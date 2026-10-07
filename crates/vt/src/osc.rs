@@ -68,13 +68,13 @@ pub fn prompt_mark(body: &str, token: &str) -> Option<PromptMark> {
 pub fn file_url_path(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
     let (host, path) = rest.split_at(rest.find('/')?);
+    if cfg!(windows) && !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
     let path = percent_decode(path);
     let b = path.as_bytes();
     if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
         return Some(path[1..].replace('/', "\\"));
-    }
-    if cfg!(windows) && !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
-        return None;
     }
     Some(path)
 }
@@ -148,7 +148,8 @@ fn is_format(c: char) -> bool {
 pub fn parse_color(spec: &str) -> Option<u32> {
     // Scales a channel of `n` hex digits to 8 bits.
     let chan = |h: &str| -> Option<u32> {
-        if h.is_empty() || h.len() > 4 {
+        // `from_str_radix` alone would take a sign.
+        if h.is_empty() || h.len() > 4 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let v = u32::from_str_radix(h, 16).ok()?;
@@ -290,6 +291,9 @@ mod tests {
         assert_eq!(p("file:///bad%zz%4").as_deref(), Some("/bad%zz%4"));
         if cfg!(windows) {
             assert_eq!(p("file://srv/share/x%20y"), None);
+            // A drive on another machine is not this machine's drive.
+            assert_eq!(p("file://srv/C:/x"), None);
+            assert_eq!(p("file://LOCALHOST/C:/x").as_deref(), Some("C:\\x"));
         }
         assert_eq!(p("http://x/y"), None);
         assert_eq!(p("file://host-only"), None);
@@ -331,6 +335,20 @@ mod tests {
         assert_eq!(parse_color("#12345"), None);
         assert_eq!(parse_color("#ééé"), None);
         assert_eq!(parse_color("red"), None);
+        // Hex digits only: no signs, as in XParseColor.
+        for bad in [
+            "#+f+f+f",
+            "rgb:+ff/0/0",
+            "rgb:-1/0/0",
+            "#-1-1-1",
+            "rgb:/0/0",
+            "#",
+            "rgb:12345/0/0",
+        ] {
+            assert_eq!(parse_color(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_color("#ABCDEF"), Some(0xABCDEF));
+        assert_eq!(parse_color("#1234"), None);
         let mut out = Vec::new();
         color_reply(11, 0x131417, true, &mut out);
         color_reply(10, 0xD6D7D9, false, &mut out);

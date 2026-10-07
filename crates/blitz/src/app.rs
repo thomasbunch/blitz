@@ -77,6 +77,9 @@ const SCENERY_FRAME: Duration = Duration::from_millis(66);
 /// one runs every few hours.
 const UPDATE_FIRST: Duration = Duration::from_secs(10);
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// Why an update or a look for one stopped when its thread panicked; only
+/// that thread did.
+const INTERNAL: &str = "an internal error";
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
 /// How long a restored pane waits for its shell's first prompt before it
@@ -86,6 +89,12 @@ const RESUME_AFTER: Duration = Duration::from_secs(3);
 const SAVED_LINES: usize = 1000;
 /// Lines scrolled per wheel notch when the program takes no mouse input.
 const WHEEL_LINES: isize = 3;
+/// How long a changed layout waits before it is saved, so holding a resize
+/// key writes the file at most once this often rather than every step. A
+/// divider drag writes it once, after the drag.
+const SAVE_DELAY: Duration = Duration::from_millis(500);
+/// How long to wait before building the renderer again after it failed.
+const GFX_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -213,13 +222,15 @@ struct Keys {
     chars: bool,
     /// High half of a surrogate pair from WM_CHAR.
     high: Option<u16>,
-    /// The release of this key was already handled as text.
-    skip_up: Option<u16>,
+    /// Keys whose release was already handled as text. Several can be
+    /// down at once, as digits typed fast for an Alt code.
+    skip_up: Eaten,
 }
 
 enum Input {
-    /// A key transition; its text is the second field.
-    Key(KeyInput<'static>, String),
+    /// A key transition; its text is the second field, and the third says
+    /// it is an auto-repeat of a held key.
+    Key(KeyInput<'static>, String, bool),
     /// Text to send as is.
     Text(String),
 }
@@ -242,26 +253,16 @@ fn hook(keys: &RefCell<Keys>, msg: &MSG) -> bool {
             if vk == VK_PROCESSKEY || vk == VK_F4 && held(0x12) && !held(0x11) && !held(0x10) {
                 return false;
             }
-            if !down && k.skip_up == Some(vk) {
-                k.skip_up = None;
+            if k.skipped(vk, down) {
                 return true;
             }
             let mut text = String::new();
             let input =
                 keymap::msg_to_key(vk, msg.lParam.0, &state, keymap::system_layout, &mut text);
-            let modifier = matches!(
-                input.key,
-                vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
-            );
-            if down && !modifier {
-                k.chars = vk == VK_PACKET || k.dead && matches!(input.key, vt::Key::Char(_));
-                k.dead = false;
-            }
-            if vk == VK_PACKET || k.chars && down && !modifier {
-                k.skip_up = Some(vk);
-            } else {
-                k.queue.push(Input::Key(owned(&input), text));
-            }
+            // Alt with keypad digits types a character by its code, which
+            // Windows sends as WM_CHAR once Alt is released.
+            let alt_code = (0x60..=0x69).contains(&vk) && held(0x12) && !held(0x11);
+            k.key(&input, alt_code, keymap::held_before(msg.lParam.0));
             // Still translate: it keeps the dead-key state right and posts
             // the WM_CHAR that carries composed text.
             // SAFETY: a valid message from the queue.
@@ -275,25 +276,82 @@ fn hook(keys: &RefCell<Keys>, msg: &MSG) -> bool {
             true
         }
         WM_CHAR | WM_SYSCHAR => {
-            if k.chars {
-                let unit = msg.wParam.0 as u16;
-                let units = match (k.high.take(), unit) {
-                    (_, 0xd800..=0xdbff) => {
-                        k.high = Some(unit);
-                        vec![]
-                    }
-                    (Some(h), 0xdc00..=0xdfff) => vec![h, unit],
-                    _ => vec![unit],
-                };
-                let text = String::from_utf16_lossy(&units);
-                if !text.is_empty() && !text.chars().any(char::is_control) {
-                    k.queue.push(Input::Text(text));
-                }
-            }
-            // Text for other keys was already sent from the key message.
+            k.unit(msg.wParam.0 as u16);
             true
         }
         _ => false,
+    }
+}
+
+impl Keys {
+    /// Whether this is the release of a key whose text came as WM_CHAR,
+    /// which was handled along with it.
+    fn skipped(&mut self, vk: u16, down: bool) -> bool {
+        !down && self.skip_up.release(vk)
+    }
+
+    /// A key transition from a key message. Its text comes as WM_CHAR
+    /// instead for a Unicode packet, the key after a dead key, and
+    /// keypad digits typed with Alt (`alt_code`), so it is not queued.
+    fn key(&mut self, input: &KeyInput, alt_code: bool, held: bool) {
+        let (vk, down) = (input.vk, input.down);
+        let modifier = matches!(
+            input.key,
+            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
+        );
+        if down && !modifier {
+            let after_dead = self.dead && matches!(input.key, vt::Key::Char(_));
+            self.chars = vk == VK_PACKET || alt_code || after_dead;
+            self.dead = false;
+        }
+        if vk == VK_PACKET || self.chars && down && !modifier {
+            self.skip_up.press(vk);
+        } else {
+            self.queue
+                .push(Input::Key(owned(input), input.text.to_string(), held));
+        }
+    }
+
+    /// A UTF-16 unit from WM_CHAR: queued as text when a key said its
+    /// text comes this way. Text for other keys was already sent from the
+    /// key message.
+    fn unit(&mut self, unit: u16) {
+        if !self.chars {
+            return;
+        }
+        let units = match (self.high.take(), unit) {
+            (_, 0xd800..=0xdbff) => {
+                self.high = Some(unit);
+                vec![]
+            }
+            (Some(h), 0xdc00..=0xdfff) => vec![h, unit],
+            _ => vec![unit],
+        };
+        let text = String::from_utf16_lossy(&units);
+        if !text.is_empty() && !text.chars().any(char::is_control) {
+            self.queue.push(Input::Text(text));
+        }
+    }
+}
+
+/// Keys whose press blitz kept for a shortcut, the theme picker or the
+/// settings panel, so their release is kept too. Several can be down at
+/// once, Shift and a letter typed into the picker say.
+#[derive(Default)]
+struct Eaten(Vec<u16>);
+
+impl Eaten {
+    fn press(&mut self, vk: u16) {
+        if !self.0.contains(&vk) {
+            self.0.push(vk);
+        }
+    }
+
+    /// Whether the release of `vk` is kept; it is forgotten either way.
+    fn release(&mut self, vk: u16) -> bool {
+        let kept = self.0.contains(&vk);
+        self.0.retain(|&v| v != vk);
+        kept
     }
 }
 
@@ -349,8 +407,9 @@ struct Gfx {
 #[derive(Default)]
 struct Mouse {
     pos: PhysicalPosition<f64>,
-    /// Buttons sent to the program as pressed, as a bit set.
-    reported: u8,
+    /// For the left, middle and right button, the pane whose program was
+    /// sent its press.
+    reported: [Option<PaneId>; 3],
     tracker: vt::keys::MouseTracker,
     /// Wheel movement not yet turned into whole steps.
     wheel: f64,
@@ -383,6 +442,8 @@ struct View {
     /// When the program's open synchronized update times out, as of the
     /// last look at its terminal.
     sync_until: Option<Instant>,
+    /// Names the session's saved output; kept across restarts.
+    key: String,
 }
 
 struct App {
@@ -434,8 +495,8 @@ struct App {
     updating: Option<PaneId>,
     /// The banner strip in the last frame, for clicks.
     banner: Option<Rect>,
-    /// The release of this key belongs to a shortcut and is not sent.
-    eaten: Option<u16>,
+    /// Keys whose releases belong to a shortcut or a panel and are not sent.
+    eaten: Eaten,
     /// Where the IME was last told the cursor is, in client pixels.
     ime_at: Option<(i32, i32)>,
     /// Checked once the first output shows which ConPTY is running.
@@ -446,6 +507,10 @@ struct App {
     persist: bool,
     /// The session as last saved.
     saved: Option<session::State>,
+    /// When a changed layout is saved, unless it changes back first.
+    save_after: Option<Instant>,
+    /// No renderer could be built; the next try is not before this.
+    gfx_retry: Option<Instant>,
     /// Where the window last was while neither minimized nor maximized.
     placed: Geometry,
     /// The terminal a running self-test reads: the focused pane's.
@@ -472,6 +537,31 @@ impl Picker {
         (self.themes.iter())
             .filter(|t| t.name.to_lowercase().contains(&f))
             .collect()
+    }
+
+    /// Arrows and Page Up and Down move the highlight, which stays on the
+    /// list; typing narrows the list and Backspace widens it, each going
+    /// back to the first match. Returns false for keys it has no use for.
+    fn key(&mut self, k: &KeyInput) -> bool {
+        let m = &k.mods;
+        // Ctrl and Alt together are AltGr when the layout gives a character.
+        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+        let chord = ctrl != alt || (ctrl && k.uc == 0);
+        let (sel, last) = (self.sel as isize, self.matches().len().saturating_sub(1));
+        let step = |by: isize| (sel + by).clamp(0, last as isize) as usize;
+        match k.vk {
+            VK_UP => self.sel = step(-1),
+            VK_DOWN => self.sel = step(1),
+            VK_PRIOR => self.sel = step(-(chrome::PICKER_ROWS as isize)),
+            VK_NEXT => self.sel = step(chrome::PICKER_ROWS as isize),
+            VK_BACK if self.filter.pop().is_some() => self.sel = 0,
+            _ if !chord && !k.text.is_empty() => {
+                self.filter.push_str(k.text);
+                self.sel = 0;
+            }
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -521,10 +611,7 @@ fn watch_settings(proxy: EventLoopProxy<UserEvent>) {
 impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
         let config = Config::load();
-        let mut theme = crate::theme::current(&config.theme);
-        if let Some(a) = config.accent {
-            theme.ui.set_accent(a);
-        }
+        let theme = crate::theme::current(&config.theme);
         let a = &args;
         let persist = !a.new_window
             && a.cmd.is_none()
@@ -561,12 +648,14 @@ impl App {
             update_confirm: None,
             updating: None,
             banner: None,
-            eaten: None,
+            eaten: Eaten::default(),
             ime_at: None,
             checked_conpty: false,
             capture_then_exit: false,
             persist,
             saved: None,
+            save_after: None,
+            gfx_retry: None,
             placed: Geometry::default(),
             watched: None,
             started: Instant::now(),
@@ -624,10 +713,17 @@ impl App {
         self.ensure_gfx();
 
         let mut win = layout::Window::default();
+        let mut lost = None;
         if let Some(s) = &saved {
             match self.restore(s) {
                 Ok(()) => win = self.win.clone(),
-                Err(e) => eprintln!("blitz: restoring the last session: {e}"),
+                Err(e) => {
+                    eprintln!("blitz: restoring the last session: {e}");
+                    // Keep it for the next start rather than saving this
+                    // run's fresh tab over it.
+                    self.persist = false;
+                    lost = Some(e);
+                }
             }
         }
         // A folder from Explorer gets a tab of its own after the restored ones.
@@ -641,6 +737,14 @@ impl App {
             win.active = win.tabs.len() - 1;
             let cmd = self.args.cmd.clone();
             self.open(win, id, cmd.as_deref(), cwd)?;
+            // Said where it is seen: the release build has no console. It
+            // stays, as nothing this window does is saved.
+            if let Some(e) = lost {
+                let text = format!(
+                    "The last session did not come back ({e}); it is kept for the next start, and this window is not saved"
+                );
+                self.set_notice(id, text, None, false);
+            }
         }
 
         if let Some(script) = self.args.selftest.clone() {
@@ -654,12 +758,18 @@ impl App {
             });
         }
         let scripted = self.args.selftest.is_some() || self.args.exit_after.is_some();
-        if self.config.check_updates && !scripted && !cfg!(debug_assertions) {
+        if !scripted && !cfg!(debug_assertions) {
             let proxy = self.proxy.clone();
+            let look = self.config.check_updates;
             std::thread::spawn(move || {
                 std::thread::sleep(UPDATE_FIRST);
+                // Ctrl+Shift+U updates with checks off too, so a failed
+                // update is shown, and old ones cleared, either way.
                 if let Some((v, log)) = crate::update::failed() {
                     let _ = proxy.send_event(UserEvent::Update(v, Some(log)));
+                }
+                if !look {
+                    return;
                 }
                 loop {
                     // Quiet when it fails, as offline is normal; Ctrl+Shift+U
@@ -678,7 +788,9 @@ impl App {
 
     /// Starts a session for pane `id` and shows `win`, a layout that
     /// already holds it, running `cmd` or else the shell. Once a session
-    /// exists, a layout with a pane below the minimum size is refused.
+    /// exists, a layout that leaves the new pane, or the one it split,
+    /// below the minimum size is refused; panes the window already made
+    /// small do not count.
     fn open(
         &mut self,
         win: layout::Window,
@@ -687,8 +799,10 @@ impl App {
         cwd: Option<PathBuf>,
     ) -> Result<(), String> {
         let grids = self.grids(&win);
-        let small =
-            |&(_, (c, r)): &(PaneId, (i32, i32))| c < layout::MIN_COLS || r < layout::MIN_ROWS;
+        let split = self.focus_id();
+        let small = |&(p, (c, r)): &(PaneId, (i32, i32))| {
+            (p == id || Some(p) == split) && (c < layout::MIN_COLS || r < layout::MIN_ROWS)
+        };
         if !self.views.is_empty() && grids.iter().any(small) {
             return Err("no room for another pane".into());
         }
@@ -698,19 +812,39 @@ impl App {
     }
 
     /// Starts every pane of a saved session, each in its folder, and shows
-    /// its layout. Starts none if one fails.
+    /// its layout. A pane whose folder a process cannot start in (too long
+    /// a path for one, say) starts where blitz runs instead. Starts none if
+    /// one still fails.
     fn restore(&mut self, s: &session::State) -> Result<(), String> {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
-        let keys = leaf_keys(&win);
         for (id, meta) in panes {
+            // A session saved before panes had keys filed output by tab
+            // and leaf; the pane's fresh key files it anew at the next exit.
             let old = (self.config.restore_scrollback)
-                .then(|| keys.iter().find(|k| k.0 == id))
-                .flatten()
-                .and_then(|&(_, tab, leaf)| session::load_output(tab, leaf));
-            if let Err(e) = self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()) {
+                .then(|| {
+                    if session::is_key(&meta.key) {
+                        session::load_output(&meta.key)
+                    } else {
+                        (leaf_index(&win, id))
+                            .and_then(|(tab, leaf)| session::load_legacy_output(tab, leaf))
+                    }
+                })
+                .flatten();
+            // When the retry fails too, the first failure says why.
+            let started = (self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()))
+                .or_else(|first| {
+                    (self.spawn(id, &grids, None, None, old.as_deref()))
+                        .map_err(|then| joined(first, then))
+                });
+            if let Err(e) = started {
                 self.views.clear();
                 return Err(e);
+            }
+            if let Some(v) = self.views.last_mut()
+                && session::is_key(&meta.key)
+            {
+                v.key = meta.key.clone();
             }
             if let Some(line) = resume_line(self.config.restore_claude, meta.claude.as_deref())
                 && let Some(v) = self.views.last_mut()
@@ -747,17 +881,14 @@ impl App {
             crate::pane::restored(text, stamp, grid.1)
         });
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
+        // Not the token, which is a secret between the pane and its child.
+        let key = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         let launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
                 env: Vec::new(),
             },
-            None => crate::shell::launch(
-                &self.config.shell,
-                &self.config.shell_args,
-                self.config.shell_integration,
-                &token,
-            ),
+            None => crate::shell::launch(&self.config.shell, self.config.shell_integration, &token),
         };
         let proxy = self.proxy.clone();
         let mut pane = Pane::spawn(
@@ -793,6 +924,7 @@ impl App {
             finding_branch: false,
             resume: None,
             sync_until: None,
+            key,
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
@@ -803,6 +935,8 @@ impl App {
     fn install(&mut self, win: layout::Window) {
         let before = self.focus_id();
         self.win = win;
+        // A divider being dragged is known by its place in the old layout.
+        self.mouse.divider = None;
         self.focus_moved(before);
     }
 
@@ -831,7 +965,7 @@ impl App {
     fn close(&mut self, el: &ActiveEventLoop, id: PaneId) {
         let before = self.focus_id();
         self.win.close_pane(id);
-        // The divider being dragged may be gone.
+        // The divider being dragged may be gone, even when focus stays.
         self.mouse.divider = None;
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
@@ -857,6 +991,8 @@ impl App {
         }
         self.selection = None;
         self.mouse.anchor = None;
+        // A drag belongs to the tab it started in.
+        self.mouse.divider = None;
         self.ime_at = None;
         if self.focused {
             for (id, f) in [(before, false), (now, true)] {
@@ -1037,10 +1173,7 @@ impl App {
 
     /// Shows `t` everywhere: panes, chrome, window frame, and what colour
     /// queries report.
-    fn apply_theme(&mut self, mut t: Theme) {
-        if let Some(a) = self.config.accent {
-            t.ui.set_accent(a);
-        }
+    fn apply_theme(&mut self, t: Theme) {
         if t == self.theme {
             return;
         }
@@ -1086,20 +1219,10 @@ impl App {
         let Some(pk) = &mut self.picker else {
             return;
         };
-        let n = pk.matches().len();
-        let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
-        let step = |by: isize| {
-            let last = n.saturating_sub(1) as isize;
-            (pk.sel as isize + by).clamp(0, last) as usize
-        };
         match k.vk {
             VK_ESCAPE => {
                 self.picker = None;
                 self.set_theme_from_config();
-                return;
             }
             VK_RETURN => {
                 let picked = pk.matches().get(pk.sel).map(|t| (*t).clone());
@@ -1125,21 +1248,10 @@ impl App {
                     }
                     None => self.set_theme_from_config(),
                 }
-                return;
             }
-            VK_UP => pk.sel = step(-1),
-            VK_DOWN => pk.sel = step(1),
-            VK_PRIOR => pk.sel = step(-(chrome::PICKER_ROWS as isize)),
-            VK_NEXT => pk.sel = step(chrome::PICKER_ROWS as isize),
-            VK_BACK if pk.filter.pop().is_some() => pk.sel = 0,
-            VK_BACK => return,
-            _ if !chord && !k.text.is_empty() => {
-                pk.filter.push_str(k.text);
-                pk.sel = 0;
-            }
-            _ => return,
+            _ if pk.key(k) => self.preview(),
+            _ => {}
         }
-        self.preview();
     }
 
     /// Shows the theme highlighted in the picker.
@@ -1357,9 +1469,10 @@ impl App {
     }
 
     /// Builds the renderer and swap chain if there are none. Never panics:
-    /// without them the window just stays blank until the next try.
+    /// without them the window stays as it is until the next try, which
+    /// comes `GFX_RETRY` after a failed one.
     fn ensure_gfx(&mut self) {
-        if self.gfx.is_some() {
+        if self.gfx.is_some() || self.gfx_retry.is_some_and(|t| Instant::now() < t) {
             return;
         }
         let Some(window) = &self.window else {
@@ -1379,8 +1492,14 @@ impl App {
             Ok(Gfx { r, chain })
         });
         match built {
-            Ok(g) => self.gfx = Some(g),
-            Err(e) => eprintln!("blitz: renderer: {e}"),
+            Ok(g) => {
+                self.gfx = Some(g);
+                self.gfx_retry = None;
+            }
+            Err(e) => {
+                eprintln!("blitz: renderer: {e}");
+                self.gfx_retry = Some(Instant::now() + GFX_RETRY);
+            }
         }
     }
 
@@ -1414,26 +1533,12 @@ impl App {
     /// Shows the banner for release `v`, or for the update to it that
     /// failed and wrote `log`.
     fn offer_update(&mut self, v: String, log: Option<PathBuf>) {
-        // A later look finding the same release keeps a failure in view.
-        if log.is_none() && self.update.as_ref().is_some_and(|u| u.0 == v) {
-            return;
+        let installed = crate::update::installed();
+        let shown = self.update.as_ref();
+        if let Some(text) = crate::update::banner(shown, &v, log.as_deref(), installed) {
+            self.update = Some((v, text));
+            self.request_redraw();
         }
-        let text = match log {
-            Some(log) => format!(
-                "Updating to blitz {v} failed, see {} \u{b7} Ctrl+Shift+U to try again",
-                log.display()
-            ),
-            None => {
-                let how = if crate::update::installed() {
-                    "update and restart"
-                } else {
-                    "open the download page"
-                };
-                format!("blitz {v} is available \u{b7} Ctrl+Shift+U to {how}")
-            }
-        };
-        self.update = Some((v, text));
-        self.request_redraw();
     }
 
     fn set_notice(
@@ -1463,79 +1568,88 @@ impl App {
                         self.typed(t.into_bytes());
                     }
                 }
-                Input::Key(k, text) => {
+                Input::Key(k, text, held) => {
                     let k = KeyInput { text: &text, ..k };
-                    self.key(el, &k);
+                    self.key(el, &k, held);
                 }
             }
         }
     }
 
-    fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput) {
-        if !k.down && self.eaten == Some(k.vk) {
-            self.eaten = None;
+    /// A key transition; `held` when it is the auto-repeat of a held key.
+    fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput, held: bool) {
+        if !k.down && self.eaten.release(k.vk) {
             return;
         }
-        if let Some((g, _)) = &mut self.game {
+        // A repeat of a key blitz took goes where its press went, and only
+        // some keys do anything again; see `keymap::drops_repeat`. blitz
+        // run takes keys as a panel does, so a held jump keeps jumping.
+        let panel = self.picker.is_some() || self.settings.is_some() || self.game.is_some();
+        if held && k.down && keymap::drops_repeat(k, self.eaten.0.contains(&k.vk), panel) {
+            return;
+        }
+        // Every key pressed while blitz run is open is the game's, and so is
+        // its release; one pressed before it opened is released to the
+        // program, as with the picker.
+        if let Some((g, _)) = self.game.as_mut().filter(|_| k.down) {
             // Every key is the game's, but a shortcut closes it and runs.
             if keymap::action(k).is_some() {
                 self.close_game();
             } else {
-                if k.down {
-                    self.eaten = Some(k.vk);
-                    match k.vk {
-                        VK_ESCAPE => self.close_game(),
-                        vk if is_jump(vk) => g.jump(),
-                        _ => {}
-                    }
-                    self.request_redraw();
+                self.eaten.press(k.vk);
+                match k.vk {
+                    VK_ESCAPE => self.close_game(),
+                    vk if is_jump(vk) => g.jump(),
+                    _ => {}
                 }
+                self.request_redraw();
                 return;
             }
         }
-        if self.picker.is_some() {
-            // Every key is the picker's; so is the release of the last.
-            if k.down {
-                self.eaten = Some(k.vk);
-                if keymap::action(k) == Some(Action::ThemePicker) {
-                    self.picker = None;
-                    self.set_theme_from_config();
-                } else {
-                    self.picker_key(k);
-                }
+        // Every key pressed while the picker is open is the picker's, and
+        // so is its release. A key pressed before it opened, such as the
+        // Ctrl of the shortcut that opened it, is released to the program,
+        // which saw the press.
+        if self.picker.is_some() && k.down {
+            self.eaten.press(k.vk);
+            if keymap::action(k) == Some(Action::ThemePicker) {
+                self.picker = None;
+                self.set_theme_from_config();
+            } else {
+                self.picker_key(k);
             }
             return;
         }
-        if self.settings.is_some() {
-            // Every key is the panel's too, but the theme picker opens over it.
-            if k.down {
-                self.eaten = Some(k.vk);
-                match keymap::action(k) {
-                    Some(Action::Settings) => {
-                        self.settings = None;
-                        self.request_redraw();
-                    }
-                    Some(Action::ThemePicker) => self.open_picker(),
-                    _ => self.settings_key(k),
+        // The same for the panel, but the theme picker opens over it.
+        if self.settings.is_some() && k.down {
+            self.eaten.press(k.vk);
+            match keymap::action(k) {
+                Some(Action::Settings) => {
+                    self.settings = None;
+                    self.request_redraw();
                 }
+                Some(Action::ThemePicker) => self.open_picker(),
+                _ => self.settings_key(k),
             }
             return;
         }
         if let Some(a) = keymap::action(k)
             && self.act(el, a)
         {
-            self.eaten = Some(k.vk);
+            self.eaten.press(k.vk);
             return;
         }
-        // A key whose press was eaten is still held: its autorepeat must not
-        // reach the pane either, as when a needs-you closes blitz run mid-jump.
-        if k.down && self.eaten == Some(k.vk) {
+        // The program saw neither the press nor the release of a key blitz
+        // took, so it gets none of its repeats either, even once they stop
+        // doing anything: a swap that reached the edge, or a jump held when
+        // a needs-you closed blitz run.
+        if held && k.down && self.eaten.0.contains(&k.vk) {
             return;
         }
         // Nor do jumps already on their way when it closed.
         let since = self.game_ended.map(|t| t.elapsed());
         if k.down && late_jump(k.vk, since) {
-            self.eaten = Some(k.vk);
+            self.eaten.press(k.vk);
             return;
         }
         let Some(v) = self.current() else {
@@ -1545,7 +1659,7 @@ impl App {
             if k.down && k.vk == VK_RETURN {
                 let id = v.pane.id;
                 // The release must not reach the pane that takes focus.
-                self.eaten = Some(k.vk);
+                self.eaten.press(k.vk);
                 self.close(el, id);
             }
             return;
@@ -1707,22 +1821,26 @@ impl App {
                 }
                 self.focus_moved(before);
             }
-            // The focused session is skipped: the user is already looking
-            // at it, and a session that exited stays red until closed.
+            // With no split on that axis or no pane that way, the key goes
+            // to the program, as it does in a tab of one pane.
             Action::Resize(dir) | Action::Swap(dir) => {
                 let (area, min, (cw, ch)) = (self.tab_area(), self.min_pane(), self.cell());
                 let active = self.win.active;
-                let Some(t) = (self.win.tabs.get_mut(active)).filter(|t| t.panes().len() >= 2)
-                else {
+                let Some(t) = self.win.tabs.get_mut(active) else {
                     return false;
                 };
-                match (a, dir) {
+                let moved = match (a, dir) {
                     (Action::Swap(_), _) => t.swap(dir, area),
                     (_, Dir::Left | Dir::Right) => t.resize(dir, cw as i32, area, min),
                     _ => t.resize(dir, ch as i32, area, min),
                 };
+                if !moved {
+                    return false;
+                }
                 self.request_redraw();
             }
+            // The focused session is skipped: the user is already looking
+            // at it, and a session that exited stays red until closed.
             Action::JumpToAttention => {
                 let waiting = (self.views.iter())
                     .filter(|v| Some(v.pane.id) != before)
@@ -1743,7 +1861,10 @@ impl App {
                     self.set_notice(id, "Looking for a newer blitz\u{2026}", None, true);
                     let proxy = self.proxy.clone();
                     std::thread::spawn(move || {
-                        let _ = proxy.send_event(UserEvent::Checked(crate::update::check()));
+                        // Always answered, or Ctrl+Shift+U stays busy.
+                        let found = std::panic::catch_unwind(crate::update::check)
+                            .unwrap_or_else(|_| Err(INTERNAL.into()));
+                        let _ = proxy.send_event(UserEvent::Checked(found));
                     });
                     return true;
                 };
@@ -1781,7 +1902,9 @@ impl App {
                 self.set_notice(id, format!("Downloading blitz {v}\u{2026}"), None, true);
                 let proxy = self.proxy.clone();
                 std::thread::spawn(move || {
-                    let _ = proxy.send_event(UserEvent::Installed(crate::update::install(&v)));
+                    let done = std::panic::catch_unwind(move || crate::update::install(&v))
+                        .unwrap_or_else(|_| Err(INTERNAL.into()));
+                    let _ = proxy.send_event(UserEvent::Installed(done));
                 });
             }
         }
@@ -1962,7 +2085,12 @@ impl App {
     }
 
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> (u16, u16) {
-        let Some(v) = self.current() else {
+        self.focus_id().map_or((0, 0), |id| self.cell_in(id, pos))
+    }
+
+    /// The cell of pane `id` under `pos`, clamped to its grid.
+    fn cell_in(&self, id: PaneId, pos: PhysicalPosition<f64>) -> (u16, u16) {
+        let Some(v) = self.view(id) else {
             return (0, 0);
         };
         let r = v.rect.unwrap_or_default();
@@ -1974,28 +2102,15 @@ impl App {
         (col as u16, row as u16)
     }
 
-    /// The part of the window the active tab's panes share: all of it
-    /// but the sidebar or rail, which the chrome shows once there are two
-    /// sessions, and the banner strip.
+    /// The part of the window the active tab's panes share, as the chrome
+    /// lays it out.
     fn tab_area(&self) -> Rect {
         let size = self
             .window
             .as_ref()
             .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
-        let side = match (self.views.len() >= 2, self.win.sidebar_expanded) {
-            (false, _) => 0.0,
-            (true, true) => chrome::SIDEBAR_W,
-            (true, false) => chrome::RAIL_W,
-        };
-        let side = (side * self.scale as f32).round() as i32;
-        let banner = self.update.as_ref().map_or(0.0, |_| chrome::BANNER_H);
-        let banner = (banner * self.scale as f32).round() as i32;
-        Rect {
-            x: side,
-            y: 0,
-            w: (size.width as i32 - side).max(0),
-            h: (size.height as i32 - banner).max(0),
-        }
+        let size = (size.width as i32, size.height as i32);
+        chrome::area(&self.win, size, self.scale as f32, self.update.is_some())
     }
 
     /// The session under a point in the window: a pane of the active tab,
@@ -2022,13 +2137,11 @@ impl App {
     }
 
     /// The smallest pane, frame included, that still holds `MIN_COLS` by
-    /// `MIN_ROWS` cells as the active tab is drawn now.
+    /// `MIN_ROWS` cells in a tab of several panes, which is what dragging
+    /// and resizing work on.
     fn min_pane(&self) -> (i32, i32) {
         let (cw, ch) = self.cell();
-        let chrome = chrome::build(&self.model(&self.win, &[], None));
-        let outer = (self.win.tabs.get(self.win.active)).map(|t| t.rects(self.tab_area()));
-        let frame = (outer.iter().flatten().zip(&chrome.panes).next())
-            .map_or((0, 0), |(o, i)| (o.1.w - i.1.w, o.1.h - i.1.h));
+        let frame = chrome::pane_frame(self.scale as f32, self.win.sidebar_expanded, true);
         (
             layout::MIN_COLS * cw as i32 + frame.0,
             layout::MIN_ROWS * ch as i32 + frame.1,
@@ -2052,8 +2165,14 @@ impl App {
         (m.mouse != MouseMode::Off && !(mods.lshift || mods.rshift)).then_some(m)
     }
 
-    fn mouse_report(&mut self, kind: MouseKind, button: u8, m: &InputModes, mods: Mods) {
-        let (col, row) = self.cell_at(self.mouse.pos);
+    /// Sends a mouse event at the pointer to pane `id`'s program, in its
+    /// own mouse mode.
+    fn mouse_report(&mut self, id: PaneId, kind: MouseKind, button: u8, mods: Mods) {
+        let (col, row) = self.cell_in(id, self.mouse.pos);
+        let Some(v) = self.views.iter().find(|v| v.pane.id == id) else {
+            return;
+        };
+        let m = lock(&v.pane.term).input_modes();
         let ev = MouseEv {
             kind,
             button,
@@ -2062,8 +2181,8 @@ impl App {
             mods,
         };
         let mut out = Vec::new();
-        if self.mouse.tracker.encode(ev, m, &mut out) {
-            self.send(out);
+        if self.mouse.tracker.encode(ev, &m, &mut out) {
+            v.pane.send(out);
         }
     }
 
@@ -2115,21 +2234,16 @@ impl App {
                 return;
             }
         }
-        // A release goes wherever its press went.
-        let reported = self.mouse.reported & 1 << b != 0;
-        let to_program = self.mouse_to_program(&mods);
-        if let Some(m) = to_program.filter(|_| pressed || reported) {
+        let program = self.mouse_to_program(&mods).and(self.focus_id());
+        if let Some(id) = route_button(&mut self.mouse.reported, b, pressed, program) {
             let kind = if pressed {
-                self.mouse.reported |= 1 << b;
                 MouseKind::Press
             } else {
-                self.mouse.reported &= !(1 << b);
                 MouseKind::Release
             };
-            self.mouse_report(kind, b, &m, mods);
+            self.mouse_report(id, kind, b as u8, mods);
             return;
         }
-        self.mouse.reported &= !(1 << b);
         if b != 0 {
             return;
         }
@@ -2179,9 +2293,14 @@ impl App {
             return;
         }
         let mods = mods_now();
-        if let Some(m) = self.mouse_to_program(&mods) {
-            let held = (0..3).find(|b| self.mouse.reported & 1 << b != 0);
-            self.mouse_report(MouseKind::Move, held.unwrap_or(3), &m, mods);
+        // A drag goes where its press went, like the release will.
+        let held = (0..3).find_map(|b| Some((b, self.mouse.reported[b]?)));
+        if let Some((b, id)) = held {
+            self.mouse_report(id, MouseKind::Move, b as u8, mods);
+        } else if self.mouse_to_program(&mods).is_some()
+            && let Some(id) = self.focus_id()
+        {
+            self.mouse_report(id, MouseKind::Move, 3, mods);
         }
     }
 
@@ -2224,14 +2343,14 @@ impl App {
             return;
         }
         let mods = mods_now();
-        if let Some(m) = self.mouse_to_program(&mods) {
+        if let Some(id) = self.mouse_to_program(&mods).and(self.focus_id()) {
             let kind = if steps > 0.0 {
                 MouseKind::WheelUp
             } else {
                 MouseKind::WheelDown
             };
             for _ in 0..steps.abs() as u32 {
-                self.mouse_report(kind, 0, &m, mods);
+                self.mouse_report(id, kind, 0, mods);
             }
         } else if !self.modes().alt_screen {
             self.scroll(steps as isize * WHEEL_LINES);
@@ -2309,7 +2428,7 @@ impl App {
                 self.selection = None;
             }
             if Some(id) == focus {
-                v.snap.selection = self.selection;
+                v.snap.selection = self.selection.map(|s| whole_chars(&v.snap, s));
             } else if split {
                 dimmed.push(id);
             }
@@ -2342,7 +2461,9 @@ impl App {
                     g.r.chrome(s);
                 }
                 for v in &self.views {
-                    let Some(at) = v.rect else {
+                    // A pane with no room for a cell shows nothing, rather
+                    // than its 1x1 grid drawn over its neighbour.
+                    let Some(at) = v.rect.filter(|r| r.w >= cw as i32 && r.h >= ch as i32) else {
                         continue;
                     };
                     let dim = dimmed.contains(&v.pane.id);
@@ -2387,11 +2508,14 @@ impl App {
             }
             Err(e) => {
                 eprintln!("blitz: render: {e}");
-                let lost = is_device_lost(&e);
-                // The atlas is only a cache: build everything again.
+                // The atlas is only a cache: build everything again, at once
+                // for a lost device. Other errors wait, so one that persists
+                // cannot spin; either way the frame is drawn again.
                 self.gfx = None;
-                if lost {
+                if is_device_lost(&e) {
                     self.request_redraw();
+                } else {
+                    self.gfx_retry = Some(Instant::now() + GFX_RETRY);
                 }
             }
         }
@@ -2423,19 +2547,18 @@ impl App {
             PaneMeta {
                 cwd: v.map(|v| v.pane.cwd.clone()).unwrap_or_default(),
                 claude: v.and_then(|v| v.pane.claude.clone()),
+                key: v.map(|v| v.key.clone()).unwrap_or_default(),
             }
         };
         let mut s = session::State::capture(&self.win, self.placed, meta);
-        // Output changes all the time, so it is saved only at exit.
-        if force {
-            self.save_output();
-        }
         let same = self.saved.as_ref().is_some_and(|old| {
             (old.sidebar_expanded, old.active, &old.tabs) == (s.sidebar_expanded, s.active, &s.tabs)
         });
-        if same && !force {
+        let dragging = self.mouse.divider.is_some();
+        if !force && !save_now(!same, dragging, Instant::now(), &mut self.save_after) {
             return;
         }
+        self.save_after = None;
         if let Some(w) = &self.window {
             let maximized = w.is_maximized();
             if !maximized
@@ -2456,8 +2579,12 @@ impl App {
                 ..self.placed
             };
         }
-        if let Err(e) = session::save(&s) {
-            eprintln!("blitz: saving the session: {e}");
+        // Output, which changes all the time, is saved only at exit, and
+        // only once the layout holding the keys it is filed by was written.
+        match session::save(&s) {
+            Ok(()) if force => self.save_output(),
+            Ok(()) => {}
+            Err(e) => eprintln!("blitz: saving the session: {e}"),
         }
         // Kept even when the write failed, so it is not retried every turn.
         self.saved = Some(s);
@@ -2467,14 +2594,10 @@ impl App {
     /// deletes what an earlier run saved when it is off.
     fn save_output(&self) {
         let stamp = local_stamp();
-        let keys = if self.config.restore_scrollback {
-            leaf_keys(&self.win)
-        } else {
-            Vec::new()
-        };
-        let panes: Vec<_> = (keys.into_iter())
-            .filter_map(|(id, tab, leaf)| {
-                let term = lock(&self.view(id)?.pane.term);
+        let views = (self.views.iter()).filter(|_| self.config.restore_scrollback);
+        let panes: Vec<_> = views
+            .filter_map(|v| {
+                let term = lock(&v.pane.term);
                 let mut text = term.scrollback_text();
                 // A full-screen program's screen is not output.
                 if !term.input_modes().alt_screen {
@@ -2482,7 +2605,7 @@ impl App {
                     text += &term.screen_text();
                 }
                 let text = last_lines(&text, SAVED_LINES);
-                (!text.is_empty()).then(|| (tab, leaf, format!("{stamp}\n{text}")))
+                (!text.is_empty()).then(|| (v.key.clone(), format!("{stamp}\n{text}")))
             })
             .collect();
         if let Err(e) = session::save_output(&panes) {
@@ -2516,6 +2639,11 @@ impl App {
         let resume = (self.views.iter())
             .filter_map(|v| Some(v.resume.as_ref()?.1))
             .min();
+        // A changed layout waiting to be saved, and a renderer to retry.
+        // A minimized window draws nothing, so it has nothing to retry.
+        let shown = (self.window.as_ref())
+            .is_some_and(|w| w.inner_size().width > 0 && w.inner_size().height > 0);
+        let gfx = self.gfx_retry.filter(|_| self.gfx.is_none() && shown);
         // Only a window in use animates.
         let still =
             !self.motion || (self.config.scenery == "off" && !(self.config.mascot && sidebar));
@@ -2524,10 +2652,56 @@ impl App {
             (true, false, false) => Some(now + SCENERY_FRAME),
             _ => None,
         };
-        [sync, notice, timer, resume, anim]
+        [sync, notice, timer, resume, self.save_after, gfx, anim]
             .into_iter()
             .flatten()
             .min()
+    }
+}
+
+/// Whether a layout that `changed` since the last save is written now. A
+/// divider drag or a held resize key changes it many times a second, so a
+/// change is written `SAVE_DELAY` after it was first seen, or that long
+/// after the drag ends; `due` holds when. A drag holds no deadline, which
+/// would wake the event loop over and over once passed.
+fn save_now(changed: bool, dragging: bool, now: Instant, due: &mut Option<Instant>) -> bool {
+    if !changed {
+        *due = None;
+        return false;
+    }
+    match *due {
+        _ if dragging => {
+            *due = None;
+            false
+        }
+        None => {
+            *due = Some(now + SAVE_DELAY);
+            false
+        }
+        Some(t) if now >= t => {
+            *due = None;
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+/// Which pane's program gets a press or release of mouse button `b`, or
+/// `None` when it is the window's, for selecting. A press goes to
+/// `program`, the focused pane when its program takes the mouse and Shift
+/// is up. A release goes wherever its press went, whatever Shift or focus
+/// did in between, so no program is left with a button held down.
+fn route_button(
+    reported: &mut [Option<PaneId>; 3],
+    b: usize,
+    pressed: bool,
+    program: Option<PaneId>,
+) -> Option<PaneId> {
+    if pressed {
+        reported[b] = program;
+        program
+    } else {
+        reported[b].take()
     }
 }
 
@@ -2637,20 +2811,29 @@ fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
     }
 }
 
+/// The tab and leaf index of pane `id` in `win`, by which output saved
+/// before panes had keys is filed.
+fn leaf_index(win: &layout::Window, id: PaneId) -> Option<(usize, usize)> {
+    (win.tabs.iter().enumerate())
+        .find_map(|(t, tab)| Some((t, tab.panes().iter().position(|&p| p == id)?)))
+}
+
+/// Why a pane failed to start in its folder and then again without one;
+/// once when both say the same.
+fn joined(first: String, then: String) -> String {
+    if first == then {
+        first
+    } else {
+        format!("{first}; then {then}")
+    }
+}
+
 /// What to type into a restored pane's shell to bring back the Claude Code
 /// session it was running, if anything. The id comes from a file on disk,
 /// so only a well-formed one is ever typed.
 fn resume_line(enabled: bool, claude: Option<&str>) -> Option<String> {
     let id = claude.filter(|id| enabled && crate::hook::is_session_id(id))?;
     Some(format!("claude --resume {id}\r"))
-}
-
-/// Every pane of `win` with its tab and leaf index, which its saved output
-/// is filed under.
-fn leaf_keys(win: &layout::Window) -> Vec<(PaneId, usize, usize)> {
-    (win.tabs.iter().enumerate())
-        .flat_map(|(t, tab)| (tab.panes().into_iter().enumerate()).map(move |(l, id)| (id, t, l)))
-        .collect()
 }
 
 /// The last `n` lines of `text`, without blank lines at either end.
@@ -2718,12 +2901,7 @@ fn refresh(
 /// reading order: trailing blanks trimmed, rows joined by CRLF unless one
 /// wraps into the next.
 pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String {
-    let (a, b) = sel;
-    let (a, b) = if (a.1, a.0) <= (b.1, b.0) {
-        (a, b)
-    } else {
-        (b, a)
-    };
+    let (a, b) = whole_chars(snap, sel);
     let cols = usize::from(snap.cols);
     let last = b.1.min(snap.rows.saturating_sub(1));
     let mut out = String::new();
@@ -2765,6 +2943,28 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
         }
     }
     out
+}
+
+/// `sel` in reading order, grown to take in the whole of a wide character
+/// it ends on half of, so what is highlighted is what is copied.
+fn whole_chars(snap: &Snapshot, (a, b): ((u16, u16), (u16, u16))) -> ((u16, u16), (u16, u16)) {
+    let (mut a, mut b) = if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let width = |(c, r): (u16, u16)| {
+        let i = usize::from(r) * usize::from(snap.cols) + usize::from(c);
+        snap.cells.get(i).map(|c| c.width)
+    };
+    // The right half of a wide character starts at its left half.
+    if a.0 > 0 && width(a) == Some(0) && width((a.0 - 1, a.1)) == Some(2) {
+        a.0 -= 1;
+    }
+    if width(b) == Some(2) && b.0 + 1 < snap.cols {
+        b.0 += 1;
+    }
+    (a, b)
 }
 
 /// Adds a cell's text as the screen shows it, so a copy carries nothing
@@ -2861,9 +3061,20 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(f) => {
                 self.focused = f;
                 // A key still held goes up in the other window, so its
-                // release never comes back to clear `eaten`.
+                // release never comes back to clear `eaten`; so does a
+                // button, ending a drag or a selection. A program that saw
+                // the button go down sees it come up here, as it went where
+                // its press did.
                 if !f {
-                    self.eaten = None;
+                    self.eaten = Eaten::default();
+                    self.mouse.divider = None;
+                    self.mouse.anchor = None;
+                    let mods = mods_now();
+                    for b in 0..3 {
+                        if let Some(id) = route_button(&mut self.mouse.reported, b, false, None) {
+                            self.mouse_report(id, MouseKind::Release, b as u8, mods);
+                        }
+                    }
                 }
                 let mut out = Vec::new();
                 vt::encode_focus(f, &self.modes(), &mut out);
@@ -2920,15 +3131,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Update(v, log) => self.offer_update(v, log),
             UserEvent::Checked(found) => {
-                let text = match found {
-                    Ok(Some(v)) => {
-                        let text = format!("blitz {v} is available");
-                        self.offer_update(v, None);
-                        text
-                    }
-                    Ok(None) => format!("blitz {} is up to date", env!("CARGO_PKG_VERSION")),
-                    Err(e) => format!("Could not look for an update: {e}"),
-                };
+                let text = crate::update::found(&found);
+                if let Ok(Some(v)) = found {
+                    self.offer_update(v, None);
+                }
                 if let Some(id) = self.updating.take() {
                     self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
                 }
@@ -3411,11 +3617,257 @@ mod tests {
     }
 
     #[test]
+    fn app_selection_takes_whole_wide_characters() {
+        let pal = crate::theme::dark();
+        let s = text_snapshot("a\u{4e2d}b", 4, 1, &pal);
+        assert_eq!(selection_text(&s, ((0, 0), (1, 0))), "a\u{4e2d}");
+        // Starting on the right half takes the whole character, which is
+        // also what is highlighted.
+        assert_eq!(selection_text(&s, ((2, 0), (3, 0))), "\u{4e2d}b");
+        assert_eq!(whole_chars(&s, ((2, 0), (3, 0))), ((1, 0), (3, 0)));
+        assert_eq!(selection_text(&s, ((2, 0), (2, 0))), "\u{4e2d}");
+        assert_eq!(whole_chars(&s, ((2, 0), (2, 0))), ((1, 0), (2, 0)));
+        // Ending on the left half highlights the right half too.
+        assert_eq!(whole_chars(&s, ((1, 0), (0, 0))), ((0, 0), (2, 0)));
+        assert_eq!(whole_chars(&s, ((3, 0), (3, 0))), ((3, 0), (3, 0)));
+        // A wide character in the last column cannot reach past it.
+        let edge = text_snapshot("ab\u{4e2d}", 4, 1, &pal);
+        assert_eq!(whole_chars(&edge, ((2, 0), (2, 0))), ((2, 0), (3, 0)));
+    }
+
+    #[test]
+    fn app_selection_text_of_short_or_empty_snapshots() {
+        let pal = crate::theme::dark();
+        // A pane whose terminal is smaller than its grid, as after a
+        // session stopped updating.
+        let mut short = text_snapshot("ab\ncd", 2, 2, &pal);
+        short.cells.truncate(1);
+        assert_eq!(selection_text(&short, ((0, 0), (1, 1))), "a\r\n");
+        assert_eq!(selection_text(&Snapshot::default(), ((0, 0), (3, 3))), "");
+        // Past the last row and column.
+        let s = text_snapshot("ab\ncd", 2, 2, &pal);
+        assert_eq!(selection_text(&s, ((0, 0), (9, 9))), "ab\r\ncd");
+        // Text that is not UTF-8 copies as a space.
+        let mut bad = text_snapshot("ab", 2, 1, &pal);
+        bad.cells[0].text[0] = 0xff;
+        assert_eq!(selection_text(&bad, ((0, 0), (1, 0))), " b");
+    }
+
+    #[test]
+    fn app_mouse_release_goes_where_its_press_went() {
+        let (a, b) = (Some(PaneId(1)), Some(PaneId(2)));
+        let mut reported = [None; 3];
+        // Pressed in a program's pane, then Shift held at release: the
+        // program still gets the release.
+        assert_eq!(route_button(&mut reported, 0, true, a), a);
+        assert_eq!(route_button(&mut reported, 0, false, None), a);
+        assert_eq!(reported, [None; 3]);
+        // Focus moved between press and release.
+        assert_eq!(route_button(&mut reported, 2, true, a), a);
+        assert_eq!(route_button(&mut reported, 2, false, b), a);
+        // A press with Shift, or with no mouse mode, is the window's, and
+        // so is its release, even if the mode turned on meanwhile.
+        assert_eq!(route_button(&mut reported, 0, true, None), None);
+        assert_eq!(route_button(&mut reported, 0, false, b), None);
+        // Each button keeps its own pane.
+        route_button(&mut reported, 0, true, a);
+        route_button(&mut reported, 1, true, b);
+        assert_eq!(route_button(&mut reported, 1, false, None), b);
+        assert_eq!(route_button(&mut reported, 0, false, None), a);
+        // A second release has nowhere to go.
+        assert_eq!(route_button(&mut reported, 0, false, a), None);
+    }
+
+    #[test]
+    fn app_layout_saves_wait_out_drags_and_bursts() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut due = None;
+        assert!(!save_now(false, false, at(0), &mut due), "nothing changed");
+        assert_eq!(due, None);
+        // A change waits, however often it is seen again.
+        assert!(!save_now(true, false, at(0), &mut due));
+        assert!(!save_now(true, false, at(100), &mut due));
+        assert!(!save_now(true, false, at(499), &mut due));
+        assert!(save_now(true, false, at(500), &mut due));
+        assert_eq!(due, None);
+        // A change undone before it is saved is forgotten.
+        assert!(!save_now(true, false, at(600), &mut due));
+        assert!(!save_now(false, false, at(700), &mut due));
+        assert!(!save_now(true, false, at(1200), &mut due));
+        assert_eq!(due, Some(at(1700)));
+        // Nothing is written during a drag, however long; the end of the
+        // drag writes what was due.
+        let mut due = None;
+        for ms in [0, 100, 600, 5000] {
+            assert!(!save_now(true, true, at(ms), &mut due));
+        }
+        assert!(!save_now(true, false, at(5001), &mut due));
+        assert!(save_now(true, false, at(5501), &mut due));
+        // A save already due when a drag starts waits for it too, leaving
+        // no deadline in the past for the event loop to spin on.
+        let mut due = Some(at(0));
+        assert!(!save_now(true, true, at(600), &mut due));
+        assert_eq!(due, None);
+        assert!(!save_now(true, false, at(700), &mut due));
+        assert!(save_now(true, false, at(1200), &mut due));
+    }
+
+    fn input(vk: u16, down: bool, key: vt::Key, text: &'static str) -> KeyInput<'static> {
+        KeyInput {
+            vk,
+            scan: 0,
+            extended: false,
+            down,
+            repeat: 1,
+            mods: Mods::default(),
+            locks: vt::Locks::default(),
+            text,
+            uc: 0,
+            cs: 0,
+            key,
+            us_base: None,
+        }
+    }
+
+    /// The queued input: `+vk` and `-vk` for keys, text as itself.
+    fn queued(k: &mut Keys) -> Vec<String> {
+        (k.queue.drain(..))
+            .map(|i| match i {
+                Input::Key(k, _, _) => format!("{}{:x}", if k.down { '+' } else { '-' }, k.vk),
+                Input::Text(t) => t,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn app_alt_and_keypad_digits_type_by_code() {
+        let mut k = Keys::default();
+        let alt = |down| input(0x12, down, vt::Key::Alt, "");
+        let pad = |vk: u16, down| input(vk, down, vt::Key::Char('1'), "1");
+        k.key(&alt(true), false, false);
+        // Alt+0233: the digits are not keys for the program, and their
+        // releases were handled with them.
+        for vk in [0x60, 0x62, 0x63, 0x63] {
+            k.key(&pad(vk, true), true, false);
+            assert!(k.skipped(vk, false));
+        }
+        k.key(&alt(false), false, false);
+        k.unit(0xe9);
+        // The next key brings its own text, so a stray WM_CHAR is dropped.
+        k.key(&input(0x41, true, vt::Key::Char('a'), "a"), false, false);
+        k.unit(u16::from(b'a'));
+        assert!(!k.skipped(0x41, false));
+        k.key(&input(0x41, false, vt::Key::Char('a'), "a"), false, false);
+        assert_eq!(queued(&mut k), ["+12", "-12", "\u{e9}", "+41", "-41"]);
+        // Without Alt, keypad digits are keys.
+        k.key(&pad(0x61, true), false, false);
+        assert_eq!(queued(&mut k), ["+61"]);
+        // Typed fast, the next digit goes down before the last comes up;
+        // neither release reaches the program.
+        k.key(&alt(true), false, false);
+        k.key(&pad(0x60, true), true, false);
+        k.key(&pad(0x62, true), true, false);
+        assert!(k.skipped(0x60, false), "the first digit");
+        assert!(k.skipped(0x62, false));
+        k.key(&alt(false), false, false);
+        assert_eq!(queued(&mut k), ["+12", "-12"]);
+    }
+
+    #[test]
+    fn app_text_from_wm_char_joins_surrogates_and_drops_controls() {
+        let mut k = Keys::default();
+        k.key(&input(VK_PACKET, true, vt::Key::Other, ""), false, false);
+        k.unit(0xd83d);
+        assert!(queued(&mut k).is_empty(), "half a pair waits");
+        k.unit(0xde00);
+        k.unit(0x03);
+        k.unit(0x1b);
+        // A high surrogate with no low one is dropped.
+        k.unit(0xd83d);
+        k.unit(u16::from(b'x'));
+        assert_eq!(queued(&mut k), ["\u{1F600}", "x"]);
+        assert!(k.skipped(VK_PACKET, false));
+        assert!(!k.skipped(VK_PACKET, false), "only once");
+    }
+
+    #[test]
+    fn app_picker_keys_move_and_filter() {
+        let names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"];
+        let mut p = Picker {
+            themes: (names.iter()).map(|n| crate::theme::parse(n, "")).collect(),
+            filter: String::new(),
+            sel: 0,
+        };
+        let key = |vk, text| input(vk, true, vt::Key::Other, text);
+        assert!(p.key(&key(VK_UP, "")) && p.sel == 0, "stays on the list");
+        assert!(p.key(&key(VK_DOWN, "")) && p.sel == 1);
+        assert!(
+            p.key(&key(VK_NEXT, "")) && p.sel == 4,
+            "a page stops at the end"
+        );
+        assert!(p.key(&key(VK_DOWN, "")) && p.sel == 4);
+        assert!(p.key(&key(VK_PRIOR, "")) && p.sel == 0);
+        // Typing narrows the list, case-insensitively, from its top.
+        p.sel = 3;
+        assert!(p.key(&key(0x54, "T")));
+        assert_eq!((p.filter.as_str(), p.sel, p.matches().len()), ("T", 0, 2));
+        assert!(p.key(&key(0x41, "A")));
+        let shown: Vec<&str> = p.matches().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(shown, ["Beta", "Delta"]);
+        assert!(p.key(&key(VK_DOWN, "")) && p.sel == 1);
+        assert!(p.key(&key(VK_BACK, "")));
+        assert_eq!((p.filter.as_str(), p.sel), ("T", 0));
+        assert!(p.key(&key(VK_BACK, "")));
+        assert!(!p.key(&key(VK_BACK, "")), "nothing left to delete");
+        // Nothing matches: the highlight has nowhere to go.
+        p.filter = "zzz".into();
+        assert!(p.key(&key(VK_DOWN, "")) && p.sel == 0);
+        // Ctrl or Alt with a letter is a chord, not text; with both, the
+        // layout's AltGr character is text.
+        p.filter.clear();
+        let mut ctrl = key(0x41, "a");
+        ctrl.mods.lctrl = true;
+        assert!(!p.key(&ctrl));
+        let mut alt = key(0x41, "a");
+        alt.mods.lalt = true;
+        assert!(!p.key(&alt));
+        let mut altgr = key(0x51, "@");
+        (altgr.mods.lctrl, altgr.mods.ralt, altgr.uc) = (true, true, u16::from(b'@'));
+        assert!(p.key(&altgr) && p.filter == "@");
+        let mut ctrl_alt = key(0x51, "q");
+        (ctrl_alt.mods.lctrl, ctrl_alt.mods.lalt) = (true, true);
+        assert!(!p.key(&ctrl_alt), "Ctrl+Alt with no character");
+        assert!(!p.key(&key(0x70, "")), "F1");
+    }
+
+    #[test]
+    fn app_keys_kept_for_a_shortcut_keep_their_release() {
+        let mut e = Eaten::default();
+        // Shift and A typed into the theme picker, released in any order.
+        e.press(0x10);
+        e.press(0x41);
+        e.press(0x41);
+        assert!(e.release(0x10));
+        assert!(e.release(0x41));
+        assert!(!e.release(0x41), "once");
+        // Ctrl was down before the picker opened: its release goes on.
+        assert!(!e.release(0x11));
+    }
+
+    #[test]
     fn app_new_panes_start_in_the_focused_directory() {
         let here = std::env::temp_dir();
-        assert_eq!(start_dir(here.display().to_string()), Some(here));
+        assert_eq!(start_dir(here.display().to_string()), Some(here.clone()));
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
-        assert_eq!(start_dir(r"Z:\gone"), home);
+        let gone = here.join(format!("blitz-gone-{}", std::process::id()));
+        assert_eq!(start_dir(&gone), home);
+        // A file is not a folder to start in.
+        let file = here.join(format!("blitz-file-{}", std::process::id()));
+        std::fs::write(&file, "").expect("write");
+        let got = start_dir(&file);
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(got, home);
         assert_eq!(start_dir(""), home);
         assert_eq!(tab_name(Some(Path::new(r"C:\dev\shop"))), "shop");
         assert_eq!(tab_name(Some(Path::new(r"C:\"))), r"C:\");
@@ -3522,6 +3974,33 @@ mod tests {
     }
 
     #[test]
+    fn output_from_before_keys_is_found_by_tab_and_tree_order() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut a = Tab::new("a".into(), PaneId(1));
+        assert!(a.split(layout::Dir::Right, PaneId(2), area, (1, 1)));
+        let win = layout::Window {
+            tabs: vec![a, Tab::new("b".into(), PaneId(3))],
+            ..Default::default()
+        };
+        assert_eq!(
+            [1, 2, 3, 4].map(|i| leaf_index(&win, PaneId(i))),
+            [Some((0, 0)), Some((0, 1)), Some((1, 0)), None]
+        );
+    }
+
+    #[test]
+    fn a_pane_that_fails_twice_says_why_first() {
+        let (a, b) = ("folder too long".to_string(), "no shell".to_string());
+        assert_eq!(joined(a.clone(), a.clone()), a);
+        assert_eq!(joined(a, b), "folder too long; then no shell");
+    }
+
+    #[test]
     fn resume_line_types_only_a_session_id() {
         const ID: &str = "3f2a9c1e-0b7d-4e5f-9a8b-1c2d3e4f5a6b";
         assert_eq!(
@@ -3545,25 +4024,5 @@ mod tests {
         assert_eq!(last_lines("a\n\nb", 10), "a\n\nb");
         assert_eq!(last_lines("  a\n", 10), "  a");
         assert_eq!(last_lines("\n\n", 10), "");
-    }
-
-    #[test]
-    fn leaf_keys_follow_tabs_and_tree_order() {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            w: 800,
-            h: 600,
-        };
-        let mut a = Tab::new("a".into(), PaneId(1));
-        assert!(a.split(layout::Dir::Right, PaneId(2), area, (1, 1)));
-        let win = layout::Window {
-            tabs: vec![a, Tab::new("b".into(), PaneId(3))],
-            ..Default::default()
-        };
-        assert_eq!(
-            leaf_keys(&win),
-            [(PaneId(1), 0, 0), (PaneId(2), 0, 1), (PaneId(3), 1, 0)]
-        );
     }
 }

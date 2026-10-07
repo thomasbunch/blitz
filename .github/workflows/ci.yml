@@ -4,18 +4,39 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly: a long chaos run with a new seed, and the usual jobs on whatever
+  # the runner images became since the last change.
+  schedule:
+    - cron: "17 6 * * 1"
   workflow_dispatch:
+    inputs:
+      deep:
+        description: Also run the long chaos run
+        type: boolean
+        default: false
+  # release.yml runs this too, so a tag cannot publish untested code.
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Called from release.yml, github.workflow and github.event_name are the
+  # caller's, so a release's CI and a CI run of its own never share a group,
+  # even both started by hand on one branch. The event keeps weekly runs
+  # from queueing behind, or cancelling, push and PR runs. release.yml must
+  # not take this same group, or the two would wait on each other.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   # Runs on main always finish, so the cache is saved.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The ConPTY that releases ship, for the release-mode tests. Must match
+  # release.yml; the lint job checks.
+  CONPTY_VERSION: 1.25.260710002-preview
+  CONPTY_SHA256: 86edb1054c6f56d7377117ff75489197a5f095fe9835df3ad04c2ba9d826b114
 
 jobs:
   lint:
@@ -25,16 +46,54 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # A PR's commits, for the attribution check.
+          fetch-depth: 0
       - name: Only allowlisted files are tracked
         run: |
           bad="$(git ls-files -ci --exclude-standard)"
           [ -z "$bad" ] || { echo "::error::tracked files excluded by .gitignore:"; echo "$bad"; exit 1; }
+      # The allowlist re-includes whole folders, so a note dropped into
+      # crates/ or .github/ gets past the check above.
+      - name: Only expected kinds of files are tracked
+        run: |
+          ok='\.gitignore|\.gitattributes|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|LICENSE|README\.md'
+          ok="$ok|\.cargo/config\.toml|\.github/workflows/[a-z0-9-]+\.yml|\.github/(blitz\.iss|about\.toml|about\.hbs|dependabot\.yml)"
+          ok="$ok|crates/[a-z0-9-]+/(Cargo\.toml|build\.rs)|crates/[a-z0-9-]+/(src|tests|examples)/.+\.rs"
+          ok="$ok|crates/[a-z0-9-]+/tests/.+\.vt|crates/blitz/src/render/[a-z0-9_]+\.hlsl"
+          ok="$ok|crates/blitz/icon/blitz\.(ico|svg)|crates/blitz/themes/[a-z0-9-]+"
+          bad="$(git ls-files | grep -vxE "$ok" || true)"
+          [ -z "$bad" ] || { echo "::error::files of a kind this repo does not track:"; echo "$bad"; exit 1; }
+      - name: CI tests the ConPTY that releases ship
+        run: |
+          for k in CONPTY_VERSION CONPTY_SHA256; do
+            a="$(grep -E "^  $k: " .github/workflows/ci.yml)"
+            b="$(grep -E "^  $k: " .github/workflows/release.yml)"
+            [ -n "$a" ] && [ "$a" = "$b" ] || { echo "::error::$k differs between ci.yml and release.yml"; exit 1; }
+          done
+      - name: No AI attribution in the commits or the description
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BODY: ${{ github.event.pull_request.body }}
+        # Only AI attribution, by its address: a person's Co-authored-by, as
+        # GitHub adds for a committed review suggestion, is fine, whatever
+        # the person is called. The log is read first so that a range it
+        # cannot read fails the step instead of passing it.
+        run: |
+          log="$(git log --format=%B "$BASE..$HEAD")" || exit 1
+          if printf '%s\n%s\n' "$log" "$BODY" |
+            grep -iE '^Co-Authored-By:[^<]*<noreply@anthropic\.com>|^Claude-Session:|Generated with \[Claude Code\]'; then
+            echo "::error::AI attribution is not allowed in this repo"
+            exit 1
+          fi
       - run: rustup toolchain install
       - run: cargo fmt --all --check
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-deny@0.20.2
-      # Releases only accept these licenses (cargo-about in release.yml).
+      # Releases only accept these licenses (cargo-about with
+      # .github/about.toml, whose list this one must match).
       # Checking here fails the pull request that brings in a crate under
       # another license, or from anywhere but crates.io, instead of the
       # next release. Unlike cargo-about this also checks build
@@ -73,8 +132,86 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        timeout-minutes: 15
+      # On Windows this runs on the system's console host.
       - run: cargo test --workspace --locked
-      # The hook tests also run against the optimized blitz-hook.exe that
-      # ships in releases.
+        timeout-minutes: 15
+      # Otherwise the installer script is only compiled once a tag is pushed.
+      - if: runner.os == 'Windows'
+        name: Installer script compiles
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "Inno Setup 6 is not on this runner image" }
+          $src = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\iss-src").FullName
+          New-Item -ItemType File -Force "$src\blitz.exe" | Out-Null
+          & $iscc /Q /DAppVersion=0.0.0 "/DSrcDir=$src" "/DOutDir=$env:RUNNER_TEMP\iss-out" .github\blitz.iss
+          if ($LASTEXITCODE) { throw "ISCC exited with $LASTEXITCODE" }
+      - if: runner.os == 'Windows'
+        name: Bundled ConPTY
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $pkg = "$env:RUNNER_TEMP\conpty.zip"
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.Windows.Console.ConPTY/$env:CONPTY_VERSION" -OutFile $pkg
+          if ((Get-FileHash $pkg -Algorithm SHA256).Hash -ne $env:CONPTY_SHA256) {
+            throw "ConPTY $env:CONPTY_VERSION does not match its pinned hash"
+          }
+          Expand-Archive $pkg "$env:RUNNER_TEMP\conpty-pkg"
+          $dir = (New-Item -ItemType Directory "$env:RUNNER_TEMP\conpty").FullName
+          Copy-Item "$env:RUNNER_TEMP\conpty-pkg\runtimes\win-x64\native\conpty.dll", "$env:RUNNER_TEMP\conpty-pkg\build\native\runtimes\x64\OpenConsole.exe" $dir
+          "BLITZ_CONPTY_DIR=$dir" >> $env:GITHUB_ENV
+      # What ships: the optimized blitz-hook.exe, a static C runtime and the
+      # bundled ConPTY.
       - if: runner.os == 'Windows'
         run: cargo test --release -p blitz --locked
+        timeout-minutes: 15
+
+  # The width tables must be exactly what the generator makes of the
+  # Unicode release they claim.
+  unicode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Unicode 17.0.0 data
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir ucd && cd ucd
+          base=https://www.unicode.org/Public/17.0.0/ucd
+          for f in EastAsianWidth.txt extracted/DerivedGeneralCategory.txt auxiliary/GraphemeBreakProperty.txt emoji/emoji-data.txt; do
+            curl -fsSL --retry 5 --retry-all-errors -o "${f##*/}" "$base/$f"
+          done
+          sha256sum -c - <<'EOF'
+          ea7ce50f3444a050333448dffef1cadd9325af55cbb764b4a2280faf52170a33  EastAsianWidth.txt
+          d62e5bab70ca74f099343f71224fa051cb1fdd61a1ab45c0488c44cfc0b6102e  DerivedGeneralCategory.txt
+          d6b51d1d2ae5c33b451b7ed994b48f1f4dc62b2272a5831e7fd418514a6bae89  GraphemeBreakProperty.txt
+          2cb2bb9455cda83e8481541ecf5b6dfda66a3bb89efa3fa7c5297eccf607b72b  emoji-data.txt
+          EOF
+      - run: cargo run -p vt --example gen_unicode --locked -- "$RUNNER_TEMP/ucd"
+      - run: git diff --exit-code crates/vt/src/width_tables.rs
+
+  # The chaos tests with a new seed and many more rounds, optimized but
+  # with overflow checks. A failure prints the seed to rerun it with.
+  chaos:
+    if: github.event_name == 'schedule' || inputs.deep
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - env:
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CHAOS_ROUNDS: "1000000"
+        run: |
+          CHAOS_SEED="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+          export CHAOS_SEED
+          echo "CHAOS_SEED=$CHAOS_SEED CHAOS_ROUNDS=$CHAOS_ROUNDS"
+          cargo test -p vt --release --locked --test chaos -- --nocapture
+        timeout-minutes: 25

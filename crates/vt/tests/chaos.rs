@@ -1,6 +1,9 @@
 //! Seeded random streams: the terminal must never panic, must keep the
-//! cursor on the screen, and must end in the same state however the
-//! stream is split into chunks.
+//! cursor on the screen and wide characters whole, and must end in the
+//! same state however the stream is split into chunks.
+//!
+//! `CHAOS_SEED` and `CHAOS_ROUNDS` replace the fixed seed and round count,
+//! for long runs on fresh seeds. A failure names the seed to rerun with.
 
 use vt::{Event, Options, Palette, Snapshot, Terminal};
 
@@ -52,9 +55,25 @@ const PIECES: &[&str] = &[
     "65535",
     "99999",
     "m",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
     "H",
+    "I",
     "J",
     "K",
+    "Z",
+    "a",
+    "d",
+    "e",
+    "f",
+    "g",
+    "s",
+    "`",
     "r",
     "h",
     "l",
@@ -63,6 +82,7 @@ const PIECES: &[&str] = &[
     "p",
     "u",
     "q",
+    " q",
     "t",
     "@",
     "P",
@@ -75,10 +95,26 @@ const PIECES: &[&str] = &[
     "\x1b[?1049h",
     "\x1b[?1049l",
     "\x1b[?47h",
+    "\x1b[?47l",
+    "\x1b[?1047h",
     "\x1b[?1047l",
     "\x1b[?1048h",
+    "\x1b[?1048l",
     "\x1b[?6h",
+    "\x1b[?6l",
     "\x1b[?7l",
+    "\x1b[?7h",
+    "\x1b[?25l",
+    "\x1b[20h",
+    "\x1b[20l",
+    "\x1b[4l",
+    "\x1b[3 q",
+    "\x1bH",
+    "\x1bE",
+    "\x1b[3g",
+    "\x1b[2;99r",
+    "\x1b[8m",
+    "\x1b[38;5;232m",
     "\x1b[?2026h",
     "\x1b[?2026l",
     "\x1b[>5u",
@@ -130,6 +166,10 @@ const PIECES: &[&str] = &[
     "e\u{301}",
     "👍🏽",
     "👨‍👩‍👧",
+    "👨‍👩‍👧‍👦",
+    "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
+    "e\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}",
+    "\u{20D0}\u{20D0}\u{20D0}\u{20D0}\u{20D0}\u{20D0}\u{20D0}\u{20D0}\u{20D0}\u{20D0}",
     "🇺🇸",
     "❤\u{fe0f}",
     "\u{200d}",
@@ -176,15 +216,58 @@ fn new_term(rng: &mut Rng) -> Terminal {
     })
 }
 
-fn check(t: &mut Terminal) {
-    let (x, y, _) = t.cursor();
-    let mut s = Snapshot::default();
-    t.snapshot(&mut s, &PAL);
-    let (cols, rows) = (s.cols, s.rows);
-    if cols > 0 {
-        assert!(x < cols && y < rows, "cursor {x},{y} outside {cols}x{rows}");
-        assert_eq!(s.cells.len(), cols as usize * rows as usize);
+/// The fixed default, or the number in the environment variable `name`.
+fn env(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(v) => {
+            (v.trim().parse()).unwrap_or_else(|_| panic!("{name}={v:?} is not a decimal number"))
+        }
+        Err(_) => default,
     }
+}
+
+/// Ends any synchronized update, so there is a snapshot to take, and
+/// checks what must hold whatever came before: the cursor on the screen,
+/// each wide character next to its right half and each right half next
+/// to its wide character, and whole UTF-8 in every cell.
+fn check(t: &mut Terminal, ctx: &str) -> Snapshot {
+    t.feed(b"\x1b[?2026l");
+    let mut s = Snapshot::default();
+    assert!(t.snapshot(&mut s, &PAL), "{ctx}: no snapshot");
+    let (cols, rows) = (usize::from(s.cols), usize::from(s.rows));
+    let (x, y, _) = t.cursor();
+    assert!(
+        x < s.cols && y < s.rows,
+        "{ctx}: cursor {x},{y} outside {cols}x{rows}"
+    );
+    if let Some((x, y, _)) = s.cursor {
+        assert!(x < s.cols && y < s.rows, "{ctx}: drawn cursor {x},{y}");
+    }
+    assert_eq!(
+        (s.cells.len(), s.wrapped.len()),
+        (cols * rows, rows),
+        "{ctx}"
+    );
+    for (r, row) in s.cells.chunks(cols).enumerate() {
+        for (i, c) in row.iter().enumerate() {
+            let text = c.text.get(..usize::from(c.len)).map(std::str::from_utf8);
+            assert!(matches!(text, Some(Ok(_))), "{ctx}: cell {i},{r}: {c:?}");
+            match c.width {
+                0 => assert!(
+                    i > 0 && row[i - 1].width == 2 && c.len == 0,
+                    "{ctx}: right half alone at {i},{r}"
+                ),
+                1 => {}
+                2 => assert_eq!(
+                    row.get(i + 1).map(|n| n.width),
+                    Some(0),
+                    "{ctx}: left half alone at {i},{r}"
+                ),
+                w => panic!("{ctx}: width {w} at {i},{r}"),
+            }
+        }
+    }
+    s
 }
 
 type State = (
@@ -230,9 +313,11 @@ fn latest_only(mut events: Vec<Event>) -> Vec<Event> {
 
 #[test]
 fn chunking_never_changes_the_result() {
-    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    for round in 0..300 {
+    let base = env("CHAOS_SEED", 0x9E37_79B9_7F4A_7C15);
+    let mut rng = Rng(base.max(1));
+    for round in 0..env("CHAOS_ROUNDS", 300) {
         let seed = rng.next();
+        let ctx = format!("CHAOS_SEED={base} round {round} (stream {seed:#x})");
         let mut r = Rng(seed);
         let bytes = stream(&mut r, 400);
         let mut whole = new_term(&mut Rng(seed));
@@ -253,17 +338,19 @@ fn chunking_never_changes_the_result() {
         events.append(&mut b.4);
         b.3 = replies;
         b.4 = latest_only(events);
-        assert_eq!(a, b, "round {round}, seed {seed:#x}");
-        check(&mut whole);
+        assert_eq!(a, b, "{ctx}");
+        // Colours, attributes, widths and the cursor shape too.
+        assert_eq!(check(&mut whole, &ctx), check(&mut split, &ctx), "{ctx}");
     }
 }
 
 #[test]
 fn host_calls_between_chunks_never_panic() {
-    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
-    for _ in 0..200 {
+    let base = env("CHAOS_SEED", 0xD1B5_4A32_D192_ED03);
+    let mut rng = Rng(base.max(1));
+    for round in 0..env("CHAOS_ROUNDS", 200) {
         let mut t = new_term(&mut rng);
-        for _ in 0..20 {
+        for step in 0..20 {
             let bytes = stream(&mut rng, 40);
             t.feed(&bytes);
             match rng.below(6) {
@@ -273,7 +360,10 @@ fn host_calls_between_chunks_never_panic() {
                 3 => t.set_cell_px(rng.below(30) as u16, rng.below(60) as u16),
                 _ => {}
             }
-            check(&mut t);
+            check(
+                &mut t,
+                &format!("CHAOS_SEED={base} round {round} step {step}"),
+            );
             state(&mut t);
         }
     }

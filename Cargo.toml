@@ -14,10 +14,13 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 dbg_macro = "warn"
 todo = "warn"
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
+# A pane catches a panic in vt and closes itself; blitz will not build with
+# "abort".
 panic = "unwind"
 debug = "line-tables-only"
 

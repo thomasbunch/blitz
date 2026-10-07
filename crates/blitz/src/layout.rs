@@ -755,6 +755,131 @@ mod tests {
     }
 
     #[test]
+    fn drag_reaches_splits_nested_on_the_left() {
+        // (1 | 2) over 3: the root's first half is a split, so divider 0
+        // is inside it and the root is divider 1.
+        let mut t = Tab::new("t".into(), PaneId(1));
+        assert!(t.split(Dir::Down, PaneId(3), AREA, MIN));
+        t.focus(PaneId(1));
+        assert!(t.split(Dir::Right, PaneId(2), AREA, MIN));
+        assert_eq!(t.panes(), ids(&[1, 2, 3]));
+        assert_eq!(
+            t.dividers(AREA),
+            vec![r(500, 0, 1, 300), r(0, 300, 1001, 1)]
+        );
+        assert_eq!(t.divider_at(AREA, 500, 100, 3), Some((0, Axis::Row)));
+        assert_eq!(t.divider_at(AREA, 100, 300, 3), Some((1, Axis::Column)));
+        assert!(t.drag(0, 200, 0, AREA, MIN));
+        assert_eq!(t.rects(AREA)[0].1, r(0, 0, 200, 300));
+        assert_eq!(t.rects(AREA)[2].1, r(0, 301, 1001, 300), "3 is untouched");
+        assert!(t.drag(1, 0, 400, AREA, MIN));
+        assert_eq!(t.rects(AREA)[2].1, r(0, 401, 1001, 200));
+        assert_eq!(t.rects(AREA)[0].1, r(0, 0, 200, 400), "1 follows the root");
+        // Deeper: ((1 | 4) | 2) over 3 puts the new split first.
+        t.focus(PaneId(1));
+        assert!(t.split(Dir::Right, PaneId(4), AREA, MIN));
+        assert_eq!(t.dividers(AREA).len(), 3);
+        assert_eq!(t.divider_at(AREA, 100, 100, 3), Some((0, Axis::Row)));
+        assert!(t.drag(0, 90, 0, AREA, MIN));
+        assert_eq!(t.rects(AREA)[0].1.w, 90);
+        // 4 keeps its minimum inside the 200 px the root's left half has.
+        assert!(t.drag(0, 150, 0, AREA, MIN));
+        assert_eq!(t.rects(AREA)[0].1.w, 200 - 1 - 80);
+    }
+
+    #[test]
+    fn divider_hits_follow_the_list_order_where_they_meet() {
+        let t = four();
+        // Where the root divider meets the one under pane 2, both are in
+        // reach: the first listed wins.
+        assert_eq!(t.divider_at(AREA, 501, 299, 3), Some((0, Axis::Row)));
+        assert_eq!(t.divider_at(AREA, 504, 300, 3), Some((1, Axis::Column)));
+        // Exactly at the slop's edge, and past it.
+        assert_eq!(t.divider_at(AREA, 497, 100, 3), Some((0, Axis::Row)));
+        assert_eq!(t.divider_at(AREA, 496, 100, 3), None);
+        assert_eq!(t.divider_at(AREA, 500, 100, 0), Some((0, Axis::Row)));
+        assert_eq!(t.divider_at(AREA, 501, 100, 0), None, "no slop");
+    }
+
+    #[test]
+    fn drag_edges() {
+        let mut t = four();
+        // Past the left edge stops at the minimum.
+        assert!(t.drag(0, -500, 0, AREA, MIN));
+        assert_eq!(t.rects(AREA)[0].1.w, 80);
+        // An area too small for the minimum leaves the ratio alone but
+        // still finds the divider.
+        let before = t.clone();
+        assert!(t.drag(0, 10, 0, r(0, 0, 100, 100), MIN));
+        assert_eq!(t, before);
+        // Zero-size areas do not divide by zero.
+        assert!(t.drag(0, 10, 0, r(0, 0, 0, 0), MIN));
+        assert_eq!(t, before);
+        assert!(!t.drag(usize::MAX, 0, 0, AREA, MIN));
+        // A lone pane has no divider.
+        let mut lone = Tab::new("t".into(), PaneId(1));
+        assert!(!lone.drag(0, 10, 10, AREA, MIN));
+        assert_eq!(lone.divider_at(AREA, 0, 0, 1000), None);
+    }
+
+    #[test]
+    fn split_at_exactly_the_minimum() {
+        // 80 + 1 + 80 fits; 80 + 1 + 79 does not.
+        let mut t = Tab::new("t".into(), PaneId(1));
+        assert!(t.split(Dir::Right, PaneId(2), r(0, 0, 161, 100), MIN));
+        let mut t = Tab::new("t".into(), PaneId(1));
+        assert!(!t.split(Dir::Right, PaneId(2), r(0, 0, 160, 100), MIN));
+        assert!(
+            t.split(Dir::Down, PaneId(2), r(0, 0, 160, 97), MIN),
+            "48 + 1 + 48"
+        );
+        let mut t = Tab::new("t".into(), PaneId(1));
+        assert!(!t.split(Dir::Down, PaneId(2), r(0, 0, 160, 96), MIN));
+        // A focus that is not in the tab cannot be split.
+        t.focus = PaneId(9);
+        assert!(!t.split(Dir::Right, PaneId(2), AREA, MIN));
+    }
+
+    #[test]
+    fn close_after_a_restore_focuses_the_first_pane_of_the_sibling() {
+        // A restored tab knows only its focused pane as recently used.
+        let mut t = four();
+        t.mru = vec![PaneId(1)];
+        t.focus = PaneId(1);
+        assert!(t.close(PaneId(1)));
+        assert_eq!(t.focus, PaneId(2));
+        assert_eq!(t.mru, ids(&[2]));
+        // Closing a pane that does not have focus keeps focus.
+        assert!(t.close(PaneId(4)));
+        assert_eq!(t.focus, PaneId(2));
+    }
+
+    #[test]
+    fn closing_tabs_around_the_active_one() {
+        let tabs = |n: u32| {
+            let mut w = Window::default();
+            for i in 1..=n {
+                w.tabs.push(Tab::new(format!("t{i}"), PaneId(i)));
+            }
+            w
+        };
+        // The active tab in the middle closes: the one to its right takes
+        // its place.
+        let mut w = tabs(3);
+        w.active = 1;
+        assert!(w.close_pane(PaneId(2)));
+        assert_eq!(w.tabs[w.active].name, "t3");
+        // A tab after the active one closes: the active one stays.
+        let mut w = tabs(3);
+        assert!(w.close_pane(PaneId(3)));
+        assert_eq!((w.active, w.tabs[w.active].name.as_str()), (0, "t1"));
+        // The only tab.
+        let mut w = tabs(1);
+        assert!(w.close_pane(PaneId(1)));
+        assert!(w.tabs.is_empty());
+    }
+
+    #[test]
     fn zoom_fills_the_tab_until_focus_moves() {
         let mut t = four();
         t.focus(PaneId(3));

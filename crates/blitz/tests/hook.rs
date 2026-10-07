@@ -5,16 +5,32 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use blitz::attention::Ev;
+use blitz::hook::Json;
+
 const HOOK: &str = env!("CARGO_BIN_EXE_blitz-hook");
 
-/// The pane token the tests run the hook with.
-const TOKEN: &str = "5eed";
+/// The pane token the tests run the hook with, as long as a real one: 128
+/// bits in hex.
+const TOKEN: &str = "5eed0123456789abcdef0123456789ab";
 
-/// Runs `blitz-hook claude` and returns (stdout, exit code).
-fn hook(payload: &str, token: Option<&str>) -> (String, i32) {
+/// A Claude Code session id, which every hook payload carries.
+const SESSION: &str = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
+
+/// Runs `blitz-hook claude` and returns (stdout, exit code). Like Claude
+/// Code, it writes the whole payload, which must not fail.
+fn hook(payload: impl AsRef<[u8]>, token: Option<&str>) -> (String, i32) {
+    let (out, code, wrote) = run_hook(payload.as_ref(), token);
+    if let Err(e) = wrote {
+        panic!("writing the payload: {e}");
+    }
+    (out, code)
+}
+
+/// Runs `blitz-hook claude`: (stdout, exit code, how writing stdin went).
+fn run_hook(payload: &[u8], token: Option<&str>) -> (String, i32, std::io::Result<()>) {
     let mut cmd = Command::new(HOOK);
     cmd.arg("claude")
-        .env("BLITZ_PANE_ID", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -23,8 +39,7 @@ fn hook(payload: &str, token: Option<&str>) -> (String, i32) {
         None => cmd.env_remove("BLITZ_PANE_TOKEN"),
     };
     let mut child = cmd.spawn().expect("spawn blitz-hook");
-    // An inert hook may exit without reading; a broken pipe is fine then.
-    let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
+    let wrote = child.stdin.take().unwrap().write_all(payload);
     let out = child.wait_with_output().expect("wait for blitz-hook");
     assert!(
         out.stderr.is_empty(),
@@ -32,7 +47,7 @@ fn hook(payload: &str, token: Option<&str>) -> (String, i32) {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout is UTF-8");
-    (stdout, out.status.code().unwrap_or(-1))
+    (stdout, out.status.code().unwrap_or(-1), wrote)
 }
 
 fn notify(state: &str, msg: &str) -> String {
@@ -108,6 +123,66 @@ fn hook_prints_each_event() {
     }
 }
 
+/// The attention event and session a pane gets from the hook's output,
+/// read the way the app reads it: the `terminalSequence` Claude Code
+/// writes, through the terminal, then the title's state.
+fn in_pane(stdout: &str) -> Vec<(Ev, Option<String>)> {
+    let seq = Json::parse(stdout)
+        .expect("one JSON line")
+        .get("terminalSequence")
+        .and_then(Json::as_str)
+        .expect("a terminalSequence")
+        .to_owned();
+    let mut t = vt::Terminal::new(vt::Options::default());
+    t.feed(seq.as_bytes());
+    let mut evs = Vec::new();
+    t.take_events(&mut evs);
+    evs.into_iter()
+        .filter_map(|e| match e {
+            vt::Event::Notify { title, .. } => {
+                Ev::from_notify(&title, TOKEN).map(|(ev, id)| (ev, id.map(str::to_owned)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every state, with the session id every real payload carries, reaches
+/// the pane whole.
+#[test]
+fn hook_states_reach_the_pane_with_their_session() {
+    let cases = [
+        ("UserPromptSubmit", "", Ev::Working),
+        (
+            "PermissionRequest",
+            r#","tool_name":"Bash","tool_input":{"command":"git push"}"#,
+            Ev::NeedsYou,
+        ),
+        (
+            "Notification",
+            r#","notification_type":"permission_prompt","message":"m""#,
+            Ev::NeedsYou,
+        ),
+        ("Stop", r#","last_assistant_message":"ok""#, Ev::Done),
+        (
+            "StopFailure",
+            r#","error":"overloaded""#,
+            Ev::Error { sticky: false },
+        ),
+        ("SessionEnd", "", Ev::Idle),
+    ];
+    for (event, rest, want) in cases {
+        let payload = format!(r#"{{"hook_event_name":"{event}","session_id":"{SESSION}"{rest}}}"#);
+        let (out, code) = hook(&payload, Some(TOKEN));
+        assert_eq!(code, 0, "{event}");
+        assert_eq!(
+            in_pane(&out),
+            [(want, Some(SESSION.to_owned()))],
+            "{event}: {out}"
+        );
+    }
+}
+
 #[test]
 fn hook_keeps_control_characters_out() {
     let payload = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"a\u001b]0;x\u0007b\u009c\r\nc"}"#;
@@ -125,6 +200,36 @@ fn hook_is_inert_outside_a_pane() {
     // A token that could end the sequence early is not used.
     assert_eq!(hook(payload, Some("a;b")), (String::new(), 0));
     assert_eq!(hook(payload, Some("a\x07b")), (String::new(), 0));
+    // Claude Code in another terminal still writes its whole payload,
+    // more than a pipe holds; the hook reads it rather than breaking the
+    // pipe under the writer.
+    let big = format!(
+        r#"{{"hook_event_name":"Stop","last_assistant_message":"{}"}}"#,
+        "x".repeat(1 << 20)
+    );
+    assert_eq!(hook(&big, None), (String::new(), 0));
+}
+
+#[test]
+fn hook_reads_payloads_that_are_not_utf8() {
+    let payload = b"{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"a\xffb\"}";
+    assert_eq!(
+        hook(payload, Some(TOKEN)),
+        (notify("done", "a\u{FFFD}b"), 0)
+    );
+}
+
+/// A payload past the 64 MiB cap is cut, does not parse and reports
+/// nothing; the hook still exits at once with 0.
+#[test]
+fn hook_drops_a_payload_over_the_cap() {
+    // Past the cap by more than a pipe buffer holds.
+    let reply = "x".repeat(65 << 20);
+    let payload = format!(r#"{{"hook_event_name":"Stop","last_assistant_message":"{reply}"}}"#);
+    let (out, code, wrote) = run_hook(payload.as_bytes(), Some(TOKEN));
+    assert_eq!((out, code), (String::new(), 0));
+    // All of it is read, so Claude Code's write does not fail.
+    wrote.expect("the whole payload is taken");
 }
 
 #[test]
