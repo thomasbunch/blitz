@@ -149,6 +149,17 @@ fn lines_start_over_as_the_screen_scrolls_under_scrollback() {
         assert_eq!(t.find("d"), [found((d, 0), (d, 0))], "{seq:?}");
         assert_ne!(t.line_epoch(), epoch, "{seq:?}");
     }
+    // With no scrollback, as always on the alternate screen, rows moving
+    // down can't keep their numbers either: `less` scrolling back up.
+    for screen in [&b"\x1b[?1049h"[..], b""] {
+        let mut t = term(20, 3, 100);
+        t.feed(screen);
+        t.feed(b"a\r\nb\r\nc");
+        let epoch = t.line_epoch();
+        t.feed(b"\x1b[H\x1bM");
+        assert_eq!(t.find("b"), [found((2, 0), (2, 0))], "{screen:?}");
+        assert_ne!(t.line_epoch(), epoch, "{screen:?}");
+    }
     // A region short of the whole screen leaves the epoch alone.
     let mut t = term(20, 3, 100);
     t.feed(b"a\r\nb\r\nc\r\nd\r\ne");
