@@ -346,7 +346,10 @@ pub fn unesc(s: &str) -> Vec<u8> {
             b't' => out.push(b'\t'),
             b's' => out.push(b' '),
             b'\\' => out.push(b'\\'),
-            b'x' => match s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            b'x' => match (s.get(i..i + 2))
+                .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
                 Some(v) => {
                     out.push(v);
                     i += 2;
@@ -1249,7 +1252,10 @@ mod msg_to_key_tests {
             text_binding(r"alt+==text:a=b\e[A\x41\s"),
             Some((ALT, 0xbb, b"a=b\x1b[AA ".to_vec()))
         );
+        // Only two hex digits make a byte.
+        assert_eq!(unesc(r"\x+f\x4"), br"\x+f\x4");
         assert_eq!(text_binding("ctrl+e=text:"), None, "nothing to type");
+
         assert_eq!(text_binding("ctrl+bogus+e=text:x"), None);
         assert_eq!(text_binding("ctrl+e=split_right"), None);
         assert_eq!(binding(r"ctrl+e=text:x"), None, "not an action");
