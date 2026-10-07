@@ -246,6 +246,8 @@ impl Row {
         self.split_pair(x + n);
         self.drop_graphemes(x..x + n);
         self.shift_graphemes(x + n, -(n as isize));
+        // The spacer marks the last column only; pulled left it is a blank.
+        self.cells[len - 1].flags &= !cf::SPACER_HEAD;
         self.cells[x..].rotate_left(n);
         self.cells[len - n..].fill(blank);
     }
@@ -729,6 +731,23 @@ mod tests {
             "{} vs {before}",
             g.bytes_used()
         );
+    }
+
+    #[test]
+    fn deleting_cells_turns_a_wrap_spacer_into_a_blank() {
+        let mut r = Row::new(5);
+        r.put_ascii(0, b"abcd", 0);
+        r.put(
+            4,
+            Cell {
+                cp: 0,
+                style: 7,
+                flags: cf::SPACER_HEAD,
+            },
+        );
+        r.delete(0, 1, Cell::default());
+        assert!(r.cells.iter().all(|c| c.flags == 0), "{:?}", r.cells);
+        assert_eq!(r.cells[3], Cell::blank(7));
     }
 
     /// A tail never passes 28 bytes, so with the first code point a cluster

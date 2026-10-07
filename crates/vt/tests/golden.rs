@@ -419,6 +419,26 @@ fn clusters_that_change_width() {
 }
 
 #[test]
+fn edits_never_leave_half_a_wide_character() {
+    // A narrow character over the left half, and a wide one offset by a
+    // column over another.
+    let mut t = run(6, 1, "中文\x1b[1Gx");
+    assert_eq!(t.screen_text(), "x 文");
+    feed(&mut t, "\x1b[2G字");
+    assert_eq!(t.screen_text(), "x字");
+    let s = snap(&mut t);
+    assert_eq!([0, 1, 2, 3].map(|x| cell(&s, x, 0).width), [1, 2, 0, 1]);
+    // DCH, ICH and ECH starting on the right half.
+    assert_eq!(run(6, 1, "a中bc\x1b[3G\x1b[P").screen_text(), "a bc");
+    assert_eq!(run(6, 1, "a中bc\x1b[3G\x1b[@").screen_text(), "a   bc");
+    assert_eq!(run(6, 1, "a中bc\x1b[3G\x1b[X").screen_text(), "a  bc");
+    // Deleting before a wide character that wrapped early leaves a blank
+    // where the spacer was, not a hole in the row.
+    let t = run(5, 2, "abcd中\x1b[1;1H\x1b[P\x1b[1;5Hx");
+    assert_eq!(t.screen_text(), "bcd x\n中");
+}
+
+#[test]
 fn resize_rewraps_clusters_whole() {
     let mut t = run(4, 3, "ae\u{301}bce\u{301}d");
     assert_eq!(t.screen_text(), "ae\u{301}bc\ne\u{301}d\n");
