@@ -29,7 +29,8 @@ pub enum Action {
     Swap(Dir),
     JumpToAttention,
     ToggleSidebar,
-    /// Install the newer release. Without one the key goes to the program.
+    /// Install the newer release, or without one look for it now. Without
+    /// a focused pane the key goes to the program.
     Update,
     /// Open the theme picker, or close it unchanged.
     ThemePicker,
@@ -105,6 +106,32 @@ pub fn action(k: &KeyInput) -> Option<Action> {
         .map(|&(_, _, a)| a)
 }
 
+/// Whether a key message is an auto-repeat: lParam bit 30 says the key was
+/// already down.
+pub fn held_before(lparam: isize) -> bool {
+    lparam as u32 & 1 << 30 != 0
+}
+
+/// Whether the auto-repeat of a held key does again what its press did,
+/// when blitz took the press (`panel` when the theme picker or settings
+/// panel did). Moving, scrolling and typing do. Anything that confirms,
+/// toggles, opens or closes does not: a held key would answer its own
+/// "press again", flicker, close pane after pane, or reach the program
+/// once its press closed what took it.
+pub fn repeats(k: &KeyInput, panel: bool) -> bool {
+    match action(k) {
+        Some(a) => matches!(
+            a,
+            Action::ScrollPage(_)
+                | Action::CycleTab(_)
+                | Action::Focus(_)
+                | Action::Resize(_)
+                | Action::Swap(_)
+        ),
+        None => panel && !matches!(k.key, Key::Enter | Key::Escape | Key::Delete),
+    }
+}
+
 /// Unshifted characters of a US layout by set-1 scan code, NUL where the
 /// key types nothing.
 const US_BY_SCAN: &[u8] =
@@ -116,13 +143,14 @@ const US_BY_SCAN: &[u8] =
 /// `keystate` is `GetKeyboardState` read while handling the message, so it
 /// already includes this key's own transition. `layout(vk, scan, state)`
 /// returns what the keyboard layout types for the key under `state`, as
-/// `ToUnicodeEx` does without touching the dead key state, and nothing for
-/// a dead key. The text of the result is stored in `text`.
+/// `ToUnicodeEx` does without touching the dead key state, and `None` for a
+/// dead key. A dead key sends nothing: what it composes comes as WM_CHAR
+/// with the next key. The text of the result is stored in `text`.
 pub fn msg_to_key<'a>(
     vk: u16,
     lparam: isize,
     keystate: &[u8; 256],
-    layout: impl Fn(u16, u16, &[u8; 256]) -> String,
+    layout: impl Fn(u16, u16, &[u8; 256]) -> Option<String>,
     text: &'a mut String,
 ) -> KeyInput<'a> {
     // Only the low 32 bits carry anything; a 64-bit LPARAM may be sign
@@ -146,18 +174,22 @@ pub fn msg_to_key<'a>(
     let alt = mods.lalt || mods.ralt;
 
     let typed = layout(vk, scan, keystate);
+    // An AltGr dead key types nothing either, even though the same key
+    // without Ctrl and Alt does.
+    let dead = typed.is_none();
+    let typed = typed.unwrap_or_default();
     let uc = typed.encode_utf16().next().unwrap_or(0);
     // Windows reports AltGr as Ctrl+Alt. When Ctrl+Alt types something
     // printable that is the key's text; otherwise the text is what the key
     // types with Ctrl and Alt let go.
-    *text = if !(ctrl || alt) || ctrl && alt && printable(&typed) {
+    *text = if dead || !(ctrl || alt) || ctrl && alt && printable(&typed) {
         typed
     } else {
         let mut plain = *keystate;
         for vk in [0x11, 0x12, 0xa2, 0xa3, 0xa4, 0xa5] {
             plain[vk] &= !0x80;
         }
-        layout(vk, scan, &plain)
+        layout(vk, scan, &plain).unwrap_or_default()
     };
     if !printable(text) {
         text.clear();
@@ -183,8 +215,9 @@ pub fn msg_to_key<'a>(
         0x11 | 0xa2 | 0xa3 => Key::Control,
         0x12 | 0xa4 | 0xa5 => Key::Alt,
         0x5b | 0x5c => Key::Super,
+        _ if dead => Key::Other,
         _ => {
-            let base = layout(vk, scan, &[0; 256]);
+            let base = layout(vk, scan, &[0; 256]).unwrap_or_default();
             let mut chars = base.chars();
             match (chars.next(), chars.next()) {
                 (Some(c), None) if !c.is_control() => Key::Char(c),
@@ -225,7 +258,7 @@ fn printable(s: &str) -> bool {
 
 /// The calling thread's keyboard layout, as the `layout` of [`msg_to_key`].
 #[cfg(windows)]
-pub fn system_layout(vk: u16, scan: u16, keystate: &[u8; 256]) -> String {
+pub fn system_layout(vk: u16, scan: u16, keystate: &[u8; 256]) -> Option<String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::ToUnicode;
     let mut buf = [0u16; 8];
     // Flag 4 leaves the dead key state alone, so the WM_CHAR that
@@ -233,8 +266,8 @@ pub fn system_layout(vk: u16, scan: u16, keystate: &[u8; 256]) -> String {
     // returns a negative count.
     // SAFETY: `keystate` and `buf` are valid for the whole call.
     let n = unsafe { ToUnicode(vk.into(), scan.into(), Some(keystate), &mut buf, 4) };
-    let n = usize::try_from(n).unwrap_or(0).min(buf.len());
-    String::from_utf16_lossy(&buf[..n])
+    let n = usize::try_from(n).ok()?.min(buf.len());
+    Some(String::from_utf16_lossy(&buf[..n]))
 }
 
 #[cfg(test)]
@@ -273,26 +306,30 @@ mod msg_to_key_tests {
         v as i32 as isize
     }
 
+    /// Marks a dead key in a test layout.
+    const DEAD: &str = "<dead>";
+
     /// A test layout from `(vk, plain, shifted, altgr)` rows. Ctrl alone
     /// turns letters and Enter into control codes, as Windows layouts do.
     fn layout(
         rows: &'static [(u16, &'static str, &'static str, &'static str)],
-    ) -> impl Fn(u16, u16, &[u8; 256]) -> String {
+    ) -> impl Fn(u16, u16, &[u8; 256]) -> Option<String> {
         move |vk, _, s| {
             let held = |vk: usize| s[vk] & HELD != 0;
             let Some(&(_, plain, shifted, altgr)) = rows.iter().find(|r| r.0 == vk) else {
-                return String::new();
+                return Some(String::new());
             };
             let caps = s[0x14] & 1 != 0 && plain.chars().all(char::is_alphabetic);
-            match (held(0x11), held(0x12)) {
-                (true, true) => altgr.into(),
+            let typed = match (held(0x11), held(0x12)) {
+                (true, true) => altgr,
                 (true, false) if (0x41..=0x5a).contains(&vk) => {
-                    char::from(vk as u8 - 0x40).to_string()
+                    return Some(char::from(vk as u8 - 0x40).to_string());
                 }
-                (true, false) if vk == 0x0d => "\n".into(),
-                _ if held(0x10) != caps => shifted.into(),
-                _ => plain.into(),
-            }
+                (true, false) if vk == 0x0d => "\n",
+                _ if held(0x10) != caps => shifted,
+                _ => plain,
+            };
+            (typed != DEAD).then(|| typed.into())
         }
     }
 
@@ -315,6 +352,14 @@ mod msg_to_key_tests {
 
     /// Polish (214): AltGr+Q is a backslash.
     const PL: &[(u16, &str, &str, &str)] = &[(0x51, "q", "Q", "\\")];
+
+    /// Czech: the 1 key types `+`, and AltGr+1 is a dead `~`. Shift+´ is a
+    /// dead caron without AltGr.
+    const CZ: &[(u16, &str, &str, &str)] = &[
+        (0x31, "+", "1", DEAD),
+        (0xbb, DEAD, DEAD, ""),
+        (0x45, "e", "E", "\u{20ac}"),
+    ];
 
     fn modes(kitty: u8, w32im: bool) -> vt::InputModes {
         vt::InputModes {
@@ -525,6 +570,87 @@ mod msg_to_key_tests {
     }
 
     #[test]
+    fn keymap_dead_keys_send_nothing() {
+        let altgr = state(&[0xa2, 0xa5], &[]);
+        let shift = state(&[0xa0], &[]);
+        let one = lp(0x02, false, true, 1);
+        for kitty in [0, 1, 5, 31] {
+            let m = modes(kitty, false);
+            assert_eq!(
+                enc(0x31, one, &altgr, CZ, &m),
+                "",
+                "AltGr dead key, kitty {kitty}"
+            );
+            let up = lp(0x02, false, false, 1);
+            assert_eq!(
+                enc(0x31, up, &altgr, CZ, &m),
+                "",
+                "its release, kitty {kitty}"
+            );
+            let caron = lp(0x0d, false, true, 1);
+            assert_eq!(
+                enc(0xbb, caron, &shift, CZ, &m),
+                "",
+                "dead key, kitty {kitty}"
+            );
+        }
+        let mut t = String::new();
+        let k = msg_to_key(0x31, one, &altgr, layout(CZ), &mut t);
+        assert_eq!((k.key, k.text, k.uc), (Key::Other, "", 0));
+        // The console record still goes out, without a character.
+        assert_eq!(
+            enc(0x31, one, &altgr, CZ, &modes(0, true)),
+            "\x1b[49;2;0;1;9;1_"
+        );
+        // The same key types as usual without AltGr, and so does a key
+        // whose AltGr level is not dead.
+        assert_eq!(enc(0x31, one, &[0; 256], CZ, &modes(0, false)), "+");
+        let e = lp(0x12, false, true, 1);
+        assert_eq!(enc(0x45, e, &altgr, CZ, &modes(0, false)), "\u{20ac}");
+    }
+
+    #[test]
+    fn keymap_named_keys() {
+        let mut t = String::new();
+        let none = [0; 256];
+        for (vk, scan, extended, want) in [
+            (0x08, 0x0e, false, Key::Backspace),
+            (0x09, 0x0f, false, Key::Tab),
+            (0x1b, 0x01, false, Key::Escape),
+            (0x21, 0x49, true, Key::PageUp),
+            (0x22, 0x51, true, Key::PageDown),
+            (0x23, 0x4f, true, Key::End),
+            (0x25, 0x4b, true, Key::Left),
+            (0x27, 0x4d, true, Key::Right),
+            (0x28, 0x50, true, Key::Down),
+            (0x2d, 0x52, true, Key::Insert),
+            (0x2e, 0x53, true, Key::Delete),
+            (0x70, 0x3b, false, Key::F(1)),
+            (0x87, 0x76, false, Key::F(24)),
+            (0x10, 0x2a, false, Key::Shift),
+            (0xa1, 0x36, false, Key::Shift),
+            (0xa2, 0x1d, false, Key::Control),
+            (0x12, 0x38, false, Key::Alt),
+            (0xa5, 0x38, true, Key::Alt),
+            (0x5b, 0x5b, true, Key::Super),
+            (0x5c, 0x5c, true, Key::Super),
+        ] {
+            let k = msg_to_key(vk, lp(scan, extended, true, 1), &none, layout(US), &mut t);
+            assert_eq!((k.key, k.text, k.extended), (want, "", extended), "{vk:#x}");
+        }
+        // Ctrl+Enter types a line feed on Windows layouts; the text stays
+        // what the key types without Ctrl, and uc is the control code.
+        let k = msg_to_key(
+            0x0d,
+            lp(0x1c, false, true, 1),
+            &state(&[0xa2], &[]),
+            layout(US),
+            &mut t,
+        );
+        assert_eq!((k.key, k.text, k.uc), (Key::Enter, "", 10));
+    }
+
+    #[test]
     fn keymap_numpad() {
         let mut t = String::new();
         // Num Lock on: the keypad types digits, and a comma on German.
@@ -619,6 +745,137 @@ mod msg_to_key_tests {
         let up = lp(0, false, false, 1);
         let k = msg_to_key(0x43, up, &state(&[LCTRL], &[]), layout(US), &mut t);
         assert_eq!(action(&k), None);
+    }
+
+    /// The left-hand keys for a set of shortcut modifiers.
+    fn held_for(m: u8) -> Vec<usize> {
+        [(CTRL, 0xa2), (SHIFT, 0xa0), (ALT, 0xa4)]
+            .into_iter()
+            .filter(|&(bit, _)| m & bit != 0)
+            .map(|(_, vk)| vk)
+            .collect()
+    }
+
+    #[test]
+    fn keymap_every_default_shortcut_fires() {
+        for &(m, vk, a) in DEFAULT_KEYS {
+            assert_eq!(press(vk, &held_for(m)), Some(a), "{m} {vk:#x}");
+            // The right-hand modifier keys count the same.
+            let right: Vec<usize> = held_for(m).into_iter().map(|k| k + 1).collect();
+            assert_eq!(press(vk, &right), Some(a), "right-hand {m} {vk:#x}");
+            // One modifier more is another chord, and Win is never one.
+            for (bit, extra) in [(CTRL, 0xa2), (SHIFT, 0xa0), (ALT, 0xa4), (0, 0x5b)] {
+                let mut more = held_for(m);
+                if !more.contains(&extra) {
+                    more.push(extra);
+                    let other = (DEFAULT_KEYS.iter())
+                        .find(|b| bit != 0 && b.0 == m | bit && b.1 == vk)
+                        .map(|b| b.2);
+                    assert_eq!(press(vk, &more), other, "{m} {vk:#x} + {extra:#x}");
+                }
+            }
+        }
+        for i in 0..9 {
+            assert_eq!(press(0x31 + i, &[0xa2]), Some(Action::GoToTab(i as u8)));
+        }
+        assert_eq!(press(0x30, &[0xa2]), None, "Ctrl+0");
+        assert_eq!(press(0x31, &[0xa2, 0xa0]), None, "Ctrl+Shift+1");
+        assert_eq!(press(0x31, &[0xa2, 0xa4]), None, "AltGr+1");
+        assert_eq!(press(0x61, &[0xa2]), None, "Ctrl+keypad 1 is not tab 1");
+    }
+
+    #[test]
+    fn keymap_default_shortcuts_are_unique_and_unshadowed() {
+        for (i, a) in DEFAULT_KEYS.iter().enumerate() {
+            for b in &DEFAULT_KEYS[i + 1..] {
+                assert!((a.0, a.1) != (b.0, b.1), "{a:?} and {b:?}");
+            }
+            let tab = a.0 == CTRL && (0x31..=0x39).contains(&a.1);
+            assert!(!tab, "{a:?} is a Go to tab key");
+        }
+    }
+
+    #[test]
+    fn readme_lists_every_default_shortcut() {
+        let readme = include_str!("../../../README.md");
+        for &(m, vk, _) in DEFAULT_KEYS {
+            let key = match vk {
+                0x09 => "Tab".to_string(),
+                0x21 => "PgUp".into(),
+                0x22 => "PgDn".into(),
+                0x2d => "Insert".into(),
+                0x25..=0x28 => "Arrows".into(),
+                0xbc => ",".into(),
+                _ => char::from(vk as u8).to_string(),
+            };
+            let mut chord = String::new();
+            for (bit, name) in [(CTRL, "Ctrl+"), (ALT, "Alt+"), (SHIFT, "Shift+")] {
+                if m & bit != 0 {
+                    chord.push_str(name);
+                }
+            }
+            chord.push_str(&key);
+            // Followed by something other than more of a key name, so
+            // Ctrl+Shift+T does not count as Ctrl+Shift+Tab.
+            let listed = readme.match_indices(&chord).any(|(i, _)| {
+                (readme[i + chord.len()..].chars().next())
+                    .is_none_or(|c| !c.is_ascii_alphanumeric())
+            });
+            assert!(listed, "README.md does not list {chord}");
+        }
+    }
+
+    #[test]
+    fn keymap_auto_repeat() {
+        assert!(!held_before(lp(0x16, false, true, 1)), "a first press");
+        assert!(held_before(lp(0x16, false, true, 1) | 1 << 30), "a repeat");
+        let repeats_with = |vk: u16, held: &[usize], panel: bool| {
+            let mut t = String::new();
+            let again = lp(0, false, true, 1) | 1 << 30;
+            let k = msg_to_key(vk, again, &state(held, &[]), layout(US), &mut t);
+            repeats(&k, panel)
+        };
+        const CS: &[usize] = &[0xa2, 0xa0];
+        // Holding a key must not answer its own "press again", flicker a
+        // toggle, or open and close things over and over.
+        for (vk, held) in [
+            (0x55, CS),      // Update
+            (0x57, CS),      // ClosePane
+            (0x56, &[0xa2]), // Paste
+            (0x43, &[0xa2]), // Copy
+            (0x4b, CS),      // ThemePicker
+            (0xbc, &[0xa2]), // Settings
+            (0x42, CS),      // ToggleSidebar
+            (0x54, CS),      // NewTab
+            (0x52, CS),      // SplitRight
+            (0x4a, CS),      // JumpToAttention
+            (0x33, &[0xa2]), // GoToTab
+        ] {
+            for panel in [false, true] {
+                assert!(!repeats_with(vk, held, panel), "{vk:#x} panel {panel}");
+            }
+        }
+        // Moving and scrolling go on while the key is held.
+        for (vk, held) in [
+            (0x21, &[0xa0][..]),         // ScrollPage
+            (0x09, &[0xa2]),             // CycleTab
+            (0x25, &[0xa2, 0xa4]),       // Focus
+            (0x26, &[0xa4, 0xa0]),       // Resize
+            (0x27, &[0xa2, 0xa4, 0xa0]), // Swap
+        ] {
+            assert!(repeats_with(vk, held, false), "{vk:#x}");
+        }
+        // In a panel the arrows, Backspace and typing repeat; Enter, Esc
+        // and Delete do not.
+        for vk in [0x26, 0x28, 0x25, 0x27, 0x21, 0x08, 0x41] {
+            assert!(repeats_with(vk, &[], true), "{vk:#x}");
+        }
+        for vk in [0x0d, 0x1b, 0x2e] {
+            assert!(!repeats_with(vk, &[], true), "{vk:#x}");
+        }
+        // Outside a panel, a key blitz took that is no shortcut, as Enter
+        // closing an exited pane, does not go on to the next pane.
+        assert!(!repeats_with(0x0d, &[], false));
     }
 
     /// Enter and Space type the same on every layout.

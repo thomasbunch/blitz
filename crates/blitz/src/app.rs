@@ -211,8 +211,9 @@ struct Keys {
 }
 
 enum Input {
-    /// A key transition; its text is the second field.
-    Key(KeyInput<'static>, String),
+    /// A key transition; its text is the second field, and the third says
+    /// it is an auto-repeat of a held key.
+    Key(KeyInput<'static>, String, bool),
     /// Text to send as is.
     Text(String),
 }
@@ -253,7 +254,8 @@ fn hook(keys: &RefCell<Keys>, msg: &MSG) -> bool {
             if vk == VK_PACKET || k.chars && down && !modifier {
                 k.skip_up = Some(vk);
             } else {
-                k.queue.push(Input::Key(owned(&input), text));
+                let held = keymap::held_before(msg.lParam.0);
+                k.queue.push(Input::Key(owned(&input), text, held));
             }
             // Still translate: it keeps the dead-key state right and posts
             // the WM_CHAR that carries composed text.
@@ -1406,17 +1408,24 @@ impl App {
                         self.typed(t.into_bytes());
                     }
                 }
-                Input::Key(k, text) => {
+                Input::Key(k, text, held) => {
                     let k = KeyInput { text: &text, ..k };
-                    self.key(el, &k);
+                    self.key(el, &k, held);
                 }
             }
         }
     }
 
-    fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput) {
+    /// A key transition; `held` when it is the auto-repeat of a held key.
+    fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput, held: bool) {
         if !k.down && self.eaten == Some(k.vk) {
             self.eaten = None;
+            return;
+        }
+        // A repeat of a key blitz took goes where its press went, and only
+        // some keys do anything again; see `keymap::repeats`.
+        let panel = self.picker.is_some() || self.settings.is_some();
+        if held && k.down && self.eaten == Some(k.vk) && !keymap::repeats(k, panel) {
             return;
         }
         if self.picker.is_some() {
