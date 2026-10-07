@@ -555,7 +555,11 @@ pub fn load_best() -> u32 {
 pub fn save_best(best: u32) {
     if let Some(d) = crate::session::dir() {
         let _ = std::fs::create_dir_all(&d);
-        let _ = std::fs::write(d.join("run-best"), best.to_string());
+        // A crash mid-write must not leave a cut-off score.
+        let tmp = d.join("run-best.tmp");
+        if std::fs::write(&tmp, best.to_string()).is_ok() {
+            let _ = std::fs::rename(tmp, d.join("run-best"));
+        }
     }
 }
 
