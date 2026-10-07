@@ -278,6 +278,13 @@ fn node_json(n: &NodeState, out: &mut String) {
                 Axis::Column => "column",
             };
             // `{}` on an f32 prints the shortest text that reads back the same.
+            // NaN or infinity would print as text JSON has no word for, and the
+            // whole session would fail to read back.
+            let ratio = if ratio.is_finite() {
+                ratio.clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
             let _ = write!(out, "{{\"split\":\"{axis}\",\"ratio\":{ratio},\"a\":");
             node_json(a, out);
             out.push_str(",\"b\":");
@@ -391,10 +398,15 @@ pub fn on_screen(g: Geometry, monitors: &[Rect], primary: Rect) -> Geometry {
         g.w.min(i32::MAX as u32) as i32,
         g.h.min(i32::MAX as u32) as i32,
     );
+    // In i64: the position comes from a file, and near i32::MIN the overlap
+    // of a window far off one side would not fit an i32.
     let seen = monitors.iter().any(|m| {
-        let across = (g.x.saturating_add(w)).min(m.right()) - g.x.max(m.x);
-        let down = (g.y.saturating_add(h)).min(m.bottom()) - g.y.max(m.y);
-        across >= VISIBLE.min(w) && down >= VISIBLE.min(h)
+        let span = |at: i32, len: i32, m_at: i32, m_len: i32| {
+            let (at, m_at) = (i64::from(at), i64::from(m_at));
+            (at + i64::from(len)).min(m_at + i64::from(m_len)) - at.max(m_at)
+        };
+        span(g.x, w, m.x, m.w) >= i64::from(VISIBLE.min(w))
+            && span(g.y, h, m.y, m.h) >= i64::from(VISIBLE.min(h))
     });
     if seen {
         return g;
@@ -517,11 +529,17 @@ mod tests {
             good.replace("\"maximized\":true", "\"maximized\":1"),
             good.replace("\"cwd\":\"\"", "\"cwd\":null"),
             good.replace("\"claude\":null", "\"claude\":7"),
-            good.replace("\"tabs\":[", "\"tabs\":{")
-                .replace("]}\n", "}}"),
+            good.replace("\"zoom\":null,", ""),
+            format!("{}\"tabs\":7}}", &good[..good.find("\"tabs\"").unwrap()]),
+            format!("{}\"tabs\":{{}}}}", &good[..good.find("\"tabs\"").unwrap()]),
         ];
         for (i, c) in cases.iter().enumerate() {
             assert_eq!(from_json(c), None, "case {i}: {c}");
+        }
+        // The cases for `tabs` are JSON, so what turns them down is the check
+        // on `tabs`, not the parser.
+        for c in &cases[cases.len() - 2..] {
+            assert!(Json::parse(c).is_some(), "{c}");
         }
         // With no tabs there is no active one.
         let empty = State {
@@ -530,6 +548,36 @@ mod tests {
             ..sample()
         };
         assert_eq!(from_json(&to_json(&empty)), None);
+    }
+
+    #[test]
+    fn fields_it_does_not_know_are_ignored() {
+        let good = to_json(&sample());
+        let more = good
+            .replacen("{\"v\":1,", "{\"v\":1,\"later\":[1,{\"x\":null}],", 1)
+            .replace("\"claude\":null}", "\"claude\":null,\"shell\":\"pwsh\"}");
+        assert_ne!(more, good);
+        assert_eq!(from_json(&more), Some(sample()));
+    }
+
+    #[test]
+    fn a_ratio_that_is_not_a_number_still_saves() {
+        for (ratio, back) in [
+            (f32::NAN, 0.5),
+            (f32::INFINITY, 0.5),
+            (-0.25, 0.0),
+            (1.5, 1.0),
+        ] {
+            let mut s = sample();
+            s.tabs[1].root = split(Axis::Row, ratio, pane("a", None), pane("b", None));
+            s.tabs[1].focus = 0;
+            s.tabs[1].zoom = None;
+            let read = from_json(&to_json(&s)).expect("reads back");
+            let NodeState::Split { ratio, .. } = read.tabs[1].root else {
+                panic!("{:?}", read.tabs[1].root);
+            };
+            assert_eq!(ratio, back);
+        }
     }
 
     /// `cargo run` must never restore, resume or delete the sessions of the
@@ -654,5 +702,46 @@ mod tests {
         // Minimized windows sit at -32000.
         let min = on_screen(g(-32000, -32000, 160, 28), &both, primary);
         assert_eq!((min.x, min.y), (880, 526));
+    }
+
+    /// The place comes from a file, so it can be anything an i32 holds.
+    #[test]
+    fn far_off_windows_come_back_without_overflowing() {
+        let primary = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let right = Rect {
+            x: 1920,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let g = |x, y, w, h| Geometry {
+            x,
+            y,
+            w,
+            h,
+            maximized: false,
+        };
+        for (x, y, w, h) in [
+            (-2_147_483_000, 0, 800, 600),
+            (0, -2_147_483_000, 800, 600),
+            (i32::MIN, i32::MIN, 800, 600),
+            (i32::MAX, i32::MAX, 800, 600),
+            (i32::MAX - 10, 0, u32::MAX, u32::MAX),
+            (i32::MIN, 0, u32::MAX, 600),
+        ] {
+            let r = on_screen(g(x, y, w, h), &[primary, right], primary);
+            assert!(
+                r.x >= 0 && r.y >= 0 && r.x + r.w as i32 <= 1920 && r.y + r.h as i32 <= 1080,
+                "{x},{y} {w}x{h} -> {r:?}"
+            );
+        }
+        // Covering both monitors from far off the left still shows on them.
+        let wide = g(-1_000_000, 0, 2_000_000, 600);
+        assert_eq!(on_screen(wide, &[primary, right], primary), wide);
     }
 }
