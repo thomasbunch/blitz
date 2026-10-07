@@ -223,6 +223,19 @@ mod tests {
     }
 
     #[test]
+    fn width_kirat_rai_vowel_signs_are_spacing_letters() {
+        // Grapheme break class V like Hangul medial vowels, but letters
+        // that take a column of their own.
+        for c in ['\u{16D63}', '\u{16D67}', '\u{16D6A}'] {
+            assert_eq!(char_width(c), 1, "U+{:X}", c as u32);
+        }
+        assert_eq!(char_width('\u{1161}'), 0, "hangul medial vowel");
+        assert_eq!(char_width('\u{11A8}'), 0, "hangul final consonant");
+        assert_eq!(char_width('\u{D7B0}'), 0, "hangul jamo extended-b vowel");
+        assert_eq!(char_width('\u{D7FB}'), 0, "hangul jamo extended-b final");
+    }
+
+    #[test]
     fn width_joins_clusters() {
         assert_eq!(clusters("abc"), ["a", "b", "c"]);
         assert_eq!(clusters("e\u{0301}x"), ["e\u{0301}", "x"]);
