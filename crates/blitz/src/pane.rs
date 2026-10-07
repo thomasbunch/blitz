@@ -172,7 +172,7 @@ impl Pane {
                             ..Default::default()
                         });
                     } else {
-                        start_over(&mut term);
+                        start_over(&mut term, vt::Terminal::feed);
                     }
                     drop(term);
                     if !replies.is_empty() {
@@ -274,8 +274,8 @@ fn feed_pieces(bytes: &[u8], mut feed: impl FnMut(&[u8]), mut recover: impl FnMu
 /// Starts `term` over after a panic left it half updated. The cursor's
 /// line stays, as its text, at the top: where the bundled console host
 /// puts it once [`Pane::repaint`] clears it, and the line a shell's prompt
-/// is on.
-fn start_over(term: &mut vt::Terminal) {
+/// is on. `feed` is [`vt::Terminal::feed`].
+fn start_over(term: &mut vt::Terminal, feed: impl FnOnce(&mut vt::Terminal, &[u8])) {
     // What the panic left may panic again.
     let line = catch_unwind(AssertUnwindSafe(|| {
         let (col, row, _) = term.cursor();
@@ -284,8 +284,11 @@ fn start_over(term: &mut vt::Terminal) {
         format!("{}\r\x1b[{}G", line.trim_end(), col + 1)
     }));
     term.reset();
-    if let Ok(line) = line {
-        term.feed(line.as_bytes());
+    // So may the line: it is often the one being printed at the panic.
+    if let Ok(line) = line
+        && catch_unwind(AssertUnwindSafe(|| feed(term, line.as_bytes()))).is_err()
+    {
+        term.reset();
     }
 }
 
@@ -599,7 +602,7 @@ mod tests {
         };
         assert!(shows("pane-two>"));
         // As the reader and the UI do after a panic.
-        start_over(&mut lock(&pane.term));
+        start_over(&mut lock(&pane.term), vt::Terminal::feed);
         pane.repaint(40, 5);
         pane.send("echo pane-three\r");
         let again = shows("pane-two>echo pane-three");
@@ -649,9 +652,27 @@ mod tests {
             ..Default::default()
         });
         term.feed(b"\x1b[31mone\r\ntwo\r\nC:\\>dir");
-        start_over(&mut term);
+        start_over(&mut term, vt::Terminal::feed);
         assert_eq!(term.screen_text().trim_end(), "C:\\>dir");
         assert_eq!(term.cursor(), (7, 0, true));
+    }
+
+    /// The line fed again may panic as it did the first time. The screen
+    /// then starts over blank, and the reader lives on.
+    #[test]
+    fn pane_starts_over_blank_when_the_line_panics_again() {
+        let mut term = vt::Terminal::new(vt::Options {
+            cols: 20,
+            rows: 4,
+            ..Default::default()
+        });
+        term.feed(b"one\r\nC:\\>dir");
+        start_over(&mut term, |t, line| {
+            t.feed(line);
+            panic!("test panic");
+        });
+        assert_eq!(term.screen_text(), "\n\n\n");
+        assert_eq!(term.cursor(), (0, 0, true));
     }
 
     #[test]
