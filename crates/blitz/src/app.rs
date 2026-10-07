@@ -3212,7 +3212,7 @@ impl App {
             &self.win,
             size,
             self.scale as f32,
-            self.update.is_some(),
+            self.update.as_ref().map(|u| u.1.as_str()),
             tw,
         )
     }

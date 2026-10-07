@@ -275,9 +275,10 @@ pub fn sidebar_w(width: i32, scale: f32, tw: i32) -> i32 {
 
 /// The part of a `size` window that the active tab's panes share: all of
 /// it but the sidebar or rail, shown once there are two sessions, and the
-/// banner strip, which the expanded sidebar holds at its foot instead.
-/// `tw` is the width of a sidebar character.
-pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: bool, tw: i32) -> Rect {
+/// strip for the update cue `banner`, which the expanded sidebar holds at
+/// its foot instead when it fits there. `tw` is the width of a sidebar
+/// character.
+pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: Option<&str>, tw: i32) -> Rect {
     let s = |v: f32| (v * scale).round() as i32;
     let fleet = win.has_sidebar();
     let side = match (fleet, win.sidebar_expanded) {
@@ -285,8 +286,12 @@ pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: bool, tw: i32) -
         (true, true) => sidebar_w(size.0, scale, tw),
         (true, false) => s(RAIL_W),
     };
-    let strip = banner && !(fleet && win.sidebar_expanded);
-    let bh = if strip { s(BANNER_H) } else { 0 };
+    let foot = |msg| fleet && win.sidebar_expanded && foot_lines(msg, side, scale, tw).is_some();
+    let bh = if banner.is_some_and(|msg| !foot(msg)) {
+        s(BANNER_H)
+    } else {
+        0
+    };
     Rect {
         x: side,
         y: 0,
@@ -323,7 +328,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
     };
     let fleet = m.win.has_sidebar();
     let expanded = m.win.sidebar_expanded;
-    let area = area(m.win, m.size, m.scale, m.banner.is_some(), tw);
+    let area = area(m.win, m.size, m.scale, m.banner, tw);
     let (side, bh) = (area.x, h - area.bottom());
     let session = |id: PaneId| m.sessions.iter().find(|x| x.id == id);
     // A tab's sessions in reading order, as its panes sit.
@@ -509,7 +514,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
         // The update cue sits at the foot, where it takes no row from
         // every pane.
         let lh = th + s(3.0);
-        let cue = m.banner.map(|msg| wrap(msg, side - s(32.0), tw, 3));
+        let cue = (m.banner.filter(|_| bh == 0)).and_then(|msg| foot_lines(msg, side, m.scale, tw));
         let bottom = h - cue.as_ref().map_or(0, |l| l.len() as i32 * lh + s(10.0));
         if let Some(lines) = cue {
             let foot = Rect {
@@ -837,7 +842,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let (cw, ch) = (m.term_cell.0 as i32, m.term_cell.1.max(1) as i32);
     let pane = |id: PaneId| out.panes.iter().find(|x| x.0 == id).map(|x| x.1);
     let mut extra = Vec::new();
-    if let Some(msg) = m.banner.filter(|_| !(fleet && expanded)) {
+    if let Some(msg) = m.banner.filter(|_| bh > 0) {
         let strip = Rect {
             y: area.bottom(),
             h: bh,
@@ -1404,6 +1409,15 @@ fn settings(
         false,
     );
     hits
+}
+
+/// The update cue `msg` on the lines it takes at the foot of a sidebar
+/// `side` px wide, or None when it does not fit there whole, such as a
+/// failure that names the installer's long log path.
+fn foot_lines(msg: &str, side: i32, scale: f32, tw: i32) -> Option<Vec<String>> {
+    let lines = wrap(msg, side - (32.0 * scale).round() as i32, tw, 3);
+    let words = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    (words(&lines.join(" ")) == words(msg)).then_some(lines)
 }
 
 /// `t` broken at spaces into at most `n` lines of `max` pixels; the last
@@ -2240,6 +2254,27 @@ mod tests {
     }
 
     #[test]
+    fn a_cue_too_long_for_the_sidebar_foot_keeps_its_strip() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let msg = concat!(
+            "Updating to blitz 0.0.2 failed \u{b7} Ctrl+Shift+U to try again \u{b7} log: ",
+            r"C:\Users\someone\AppData\Local\Temp\blitz-update-0.0.2\setup.log"
+        );
+        m.banner = Some(msg);
+        let c = build(&m);
+        // The whole of it, log path and all, under the panes.
+        let strip = c.banner.expect("cue");
+        assert_eq!(
+            (strip.x, strip.right(), strip.bottom()),
+            (240, AREA.w, AREA.h)
+        );
+        assert!(texts(&c).contains(&msg), "{:?}", texts(&c));
+        assert!(c.panes.iter().all(|(_, r)| r.bottom() <= strip.y));
+        assert_eq!(area(&win, m.size, 1.0, Some(msg), 7).bottom(), strip.y);
+    }
+
+    #[test]
     fn preedit_goes_in_the_focused_pane() {
         let (win, sessions, now) = fleet(true);
         let mut m = model(&win, &sessions, now);
@@ -2524,7 +2559,7 @@ mod tests {
             // The banner goes at the sidebar's foot.
             let foot = c.banner.expect("banner");
             assert_eq!((foot.right(), foot.bottom()), (side - 1, AREA.h));
-            let a = area(&win, m.size, scale, true, 7);
+            let a = area(&win, m.size, scale, Some("u"), 7);
             assert_eq!(
                 (a.x, a.right(), a.bottom()),
                 (side, AREA.w, AREA.h),
@@ -2556,7 +2591,7 @@ mod tests {
             let mut m = model(&win, &sessions, now);
             m.size = size;
             let c = build(&m);
-            let tiles = win.tabs[0].rects(area(&win, size, 1.0, false, 7));
+            let tiles = win.tabs[0].rects(area(&win, size, 1.0, None, 7));
             for ((_, p), (_, t)) in c.panes.iter().zip(&tiles) {
                 assert!(p.w >= 0 && p.h >= 0, "{size:?} {p:?}");
                 assert!(
