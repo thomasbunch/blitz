@@ -410,7 +410,10 @@ mod gpu {
             for r in 0..rows {
                 for c in 0..cols {
                     let mut cl = cell(c, r);
-                    if dim {
+                    // Faint text is dimmer already than a pane without
+                    // focus makes text; both at once is unreadable.
+                    let faint = cl.attrs & attr::DIM != 0;
+                    if dim && !faint {
                         cl.fg = super::toward(cl.fg, cl.bg);
                         cl.ul = super::toward(cl.ul, cl.bg);
                     }
@@ -425,7 +428,7 @@ mod gpu {
                         on_cursor
                     } else if selected(c, r) || marked(c, r) != 0 {
                         pal.fg
-                    } else if cl.attrs & attr::DIM != 0 {
+                    } else if faint {
                         super::mix(cl.fg, cl.bg)
                     } else {
                         cl.fg
@@ -1422,6 +1425,14 @@ mod tests {
         let (cw, ch) = r.cell();
         let i = ((ch / 2 * w + cw + cw / 2) * 4) as usize;
         assert_eq!(&px[i..i + 3], &[0x20, 0x40, 0x7f], "BGR of #7f4020");
+        // A pane without focus does not dim it again; other text, yes.
+        let t = r.gpu.offscreen(w, ch).expect("target");
+        r.begin();
+        r.unfocused(&snap, &p, 0, 0, true);
+        r.draw(&t.rtv, w, ch, p.bg).expect("draw");
+        let px = r.gpu.read(&t).expect("read");
+        assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), 0x7f4020);
+        assert_eq!(pixel(&px, w, cw / 2, ch / 2), toward(p.fg, p.bg));
     }
 
     #[cfg(windows)]
