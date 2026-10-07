@@ -1328,7 +1328,8 @@ impl App {
     }
 
     /// Starts the program of pane `id`, which exited, again in its place:
-    /// in its folder, resuming its Claude Code session. The new session
+    /// in its folder, by the name the user gave it, resuming its Claude
+    /// Code session. The new session
     /// gets a new id, so nothing still on its way from the old one lands
     /// in it.
     fn restart(&mut self, id: PaneId) {
@@ -1346,7 +1347,10 @@ impl App {
             return;
         }
         // The new session takes the old one's row in the sidebar.
-        self.views.swap_remove(i);
+        let named = self.views.swap_remove(i).pane.named;
+        if let Some(v) = self.view_mut(new) {
+            v.pane.named = named;
+        }
         self.resume(new, claude);
         self.install(win);
     }
