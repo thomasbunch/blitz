@@ -3205,6 +3205,12 @@ impl App {
             Event::Bell if rings(bell, v.pane.hooked) => {
                 self.attention(id, Ev::Bell);
             }
+            // OSC 52. The pane says so, as any program can write there.
+            Event::Clipboard(text) => {
+                let owner = Some(HWND(self.hwnd as *mut c_void));
+                let copied = crate::clipboard::set_text(owner, &text);
+                self.notice_copy(id, program_copy_notice(&text, copied), copied);
+            }
             _ => {}
         }
     }
@@ -4987,6 +4993,16 @@ fn without_indent(text: &str) -> String {
         .map(|l| l.get(common..).unwrap_or_default().trim_end())
         .collect();
     lines.join("\r\n")
+}
+
+/// What a pane says when its program copied `text` with OSC 52.
+fn program_copy_notice(text: &str, copied: bool) -> String {
+    if !copied {
+        return copy_notice(text, false, false);
+    }
+    let n = text.chars().count();
+    let s = if n == 1 { "" } else { "s" };
+    format!("Program copied {n} character{s}")
 }
 
 /// What a copy of `text` says: how many lines went to the clipboard, and
@@ -7081,6 +7097,19 @@ mod tests {
         // Blank lines stay, and lines are never joined.
         assert_eq!(without_indent("    a\r\n\r\n      b"), "a\r\n\r\n  b");
         assert_eq!(without_indent("x \u{23BF} y"), "x \u{23BF} y");
+    }
+
+    #[test]
+    fn app_a_program_copy_says_so() {
+        assert_eq!(program_copy_notice("é", true), "Program copied 1 character");
+        assert_eq!(
+            program_copy_notice("ls -la", true),
+            "Program copied 6 characters"
+        );
+        assert_eq!(
+            program_copy_notice("ls", false),
+            "Clipboard busy; nothing was copied"
+        );
     }
 
     #[test]
