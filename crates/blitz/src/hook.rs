@@ -1181,17 +1181,21 @@ mod tests {
         );
 
         // Unchanged, it is not written again: a read-only file would fail.
-        let readonly = |on: bool| {
-            for f in [&hooks, &dir.join(".claude-plugin/plugin.json")] {
-                let mut p = std::fs::metadata(f).unwrap().permissions();
-                p.set_readonly(on);
-                std::fs::set_permissions(f, p).unwrap();
-            }
-        };
-        readonly(true);
-        let again = write_plugin(&dir, exe);
-        readonly(false);
-        again.expect("nothing to write");
+        // Elsewhere a rename replaces a read-only file all the same.
+        #[cfg(windows)]
+        {
+            let readonly = |on: bool| {
+                for f in [&hooks, &dir.join(".claude-plugin/plugin.json")] {
+                    let mut p = std::fs::metadata(f).unwrap().permissions();
+                    p.set_readonly(on);
+                    std::fs::set_permissions(f, p).unwrap();
+                }
+            };
+            readonly(true);
+            let again = write_plugin(&dir, exe);
+            readonly(false);
+            again.expect("nothing to write");
+        }
 
         // blitz moved: the hooks follow, and no temporary file stays.
         let moved = r"D:\tools\blitz\blitz-hook.exe";
