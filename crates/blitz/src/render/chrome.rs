@@ -532,6 +532,27 @@ pub fn build(m: &ChromeModel) -> Chrome {
             h: (r.h - fh).clamp(0, r.bottom() - y),
         };
         out.panes.push((id, content));
+        // A pane scrolled back says how far below its output goes on, in
+        // the corner of its grid; in the rail mode the pane's label sits
+        // above the grid, clear of it.
+        if let Some(n) = sess.map(|x| x.below).filter(|&n| n > 0) {
+            let label = format!("\u{2193} {n} line{}", if n == 1 { "" } else { "s" });
+            let (pad, one) = (s(8.0), s(1.0).max(1));
+            let (w, h) = (text_w(&label, tw) + 2 * pad, th + s(8.0));
+            let (right, bottom) = (content.right(), content.bottom());
+            let chip = Rect {
+                x: right - w,
+                y: bottom - h,
+                w,
+                h,
+            };
+            if chip.x >= content.x && chip.y >= content.y {
+                p.push(Prim::Rect(chip, c.border));
+                p.push(Prim::Rect(inset(chip, one), c.side_bg));
+                text(p, chip.x + pad, chip.y + (h - th) / 2, &label, c.msg, false);
+                out.below.push((id, chip));
+            }
+        }
     }
 
     if fleet && expanded {
@@ -908,35 +929,6 @@ pub fn build(m: &ChromeModel) -> Chrome {
             bold: false,
             term: false,
         });
-    }
-    // A pane scrolled back says how far below its output goes on.
-    for &(id, r) in &out.panes {
-        let Some(n) = session(id).map(|x| x.below).filter(|&n| n > 0) else {
-            continue;
-        };
-        let label = format!("\u{2193} {n} line{}", if n == 1 { "" } else { "s" });
-        let (pad, one) = (s(8.0), s(1.0).max(1));
-        let (w, h) = (text_w(&label, tw) + 2 * pad, th + s(8.0));
-        if w > r.w || h > r.h {
-            continue;
-        }
-        let chip = Rect {
-            x: r.right() - w,
-            y: r.bottom() - h,
-            w,
-            h,
-        };
-        extra.push(Prim::Rect(chip, c.border));
-        extra.push(Prim::Rect(inset(chip, one), c.side_bg));
-        extra.push(Prim::Text {
-            x: chip.x + pad,
-            y: chip.y + (h - th) / 2,
-            text: label,
-            color: c.msg,
-            bold: false,
-            term: false,
-        });
-        out.below.push((id, chip));
     }
     if let (Some((col, row, t)), Some(r)) = (m.preedit, pane(tab.focus)) {
         let (x, y) = (r.x + i32::from(col) * cw, r.y + i32::from(row) * ch);
@@ -2599,6 +2591,33 @@ mod tests {
         let mut ids: Vec<PaneId> = c.below.iter().map(|b| b.0).collect();
         ids.sort();
         assert_eq!(ids, [PaneId(1), PaneId(2)]);
+        // In the rail mode the pane's label has that corner; the chip sits
+        // beside it, not over it.
+        let (win, _, _) = fleet(false);
+        let c = build(&model(&win, &sessions, now));
+        let (tw, th) = (7, 15);
+        for name in ["api", "web"] {
+            let (x, y) = (c.prims.iter())
+                .find_map(|p| match p {
+                    Prim::Text { x, y, text, .. } if text == name => Some((*x, *y)),
+                    _ => None,
+                })
+                .expect("label");
+            let label = Rect {
+                x,
+                y,
+                w: 3 * tw,
+                h: th,
+            };
+            let apart = |b: &Rect| {
+                b.right() <= label.x
+                    || label.right() <= b.x
+                    || b.bottom() <= label.y
+                    || label.bottom() <= b.y
+            };
+            assert!(c.below.iter().all(|(_, b)| apart(b)), "{name}");
+        }
+        assert_eq!(c.below.len(), 2);
     }
 
     #[test]
