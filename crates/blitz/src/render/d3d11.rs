@@ -37,8 +37,10 @@ use windows::core::{Error, Interface, Result, s};
 static VS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shader.vs.dxbc"));
 static PS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shader.ps.dxbc"));
 
-/// Width and height of the glyph atlas texture.
-pub const ATLAS_SIZE: u32 = 2048;
+/// Width and height of the glyph atlas texture: room for a 4K screen of
+/// distinct wide glyphs, so a full one never clears it every frame.
+/// Feature level 10_0 allows 8192.
+pub const ATLAS_SIZE: u32 = 4096;
 
 /// The four alpha-correction constants the shader needs for a text
 /// `gamma`, as DirectWrite computes them for grayscale text.
@@ -574,6 +576,28 @@ mod tests {
     #[test]
     fn quad_is_20_bytes() {
         assert_eq!(size_of::<Quad>(), 20);
+    }
+
+    #[test]
+    fn the_atlas_holds_a_4k_screen_of_distinct_wide_glyphs() {
+        use crate::render::atlas::{Atlas, GlyphKey};
+
+        // 3840x2160 at 200 %: 11 pt is 29 px, cells 17x34, so 225x63
+        // cells, or 7087 wide glyphs of about 30x30 px each. Terminal
+        // text keeps out of the last eighth, as the renderer does.
+        let n = ATLAS_SIZE as u16;
+        let mut atlas = Atlas::new(n, n);
+        for i in 0..225 * 63 / 2u32 {
+            let mut key = GlyphKey {
+                text: [0; vt::snapshot::CLUSTER_BYTES],
+                len: 4,
+                style: 0,
+                width: 2,
+            };
+            key.text[..4].copy_from_slice(&i.to_le_bytes());
+            let slot = atlas.insert_above(n - n / 8, key, 30, 30, 0, 0);
+            assert!(slot.is_some(), "full after {i} glyphs");
+        }
     }
 
     #[test]
