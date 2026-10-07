@@ -51,15 +51,26 @@ fn run_hook(payload: &[u8], token: Option<&str>) -> (String, i32, std::io::Resul
 }
 
 fn notify(state: &str, msg: &str) -> String {
-    format!("{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:{state};{msg}\\u0007\"}}\n")
+    format!(
+        "{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:{state}:v2;{msg}\\u0007\"}}\n"
+    )
 }
 
 #[test]
 fn hook_prints_each_event() {
     let cases = [
         (
+            r#"{"hook_event_name":"SessionStart","source":"startup"}"#,
+            notify("ready", ""),
+        ),
+        (
             r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#,
-            notify("working", ""),
+            notify("working", "hi"),
+        ),
+        // A prompt of several lines shows as one.
+        (
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"fix the\n\nlogin  bug\u001b[2J"}"#,
+            notify("working", "fix the login bug[2J"),
         ),
         (
             r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"cargo test"}}"#,
@@ -90,12 +101,20 @@ fn hook_prints_each_event() {
             notify("done", "Fixed the \\\"flaky\\\" test."),
         ),
         (
-            r#"{"hook_event_name":"Stop","background_tasks":[{"id":"bash_1"}]}"#,
-            notify("working", ""),
+            r#"{"hook_event_name":"Stop","background_tasks":[{"type":"subagent","agent_id":"a1"},{"type":"shell","command":"npm test"}]}"#,
+            notify("working", "waiting on 1 agent"),
+        ),
+        (
+            r#"{"hook_event_name":"Stop","background_tasks":[{"type":"shell","command":"npm run dev"}],"last_assistant_message":"Started it."}"#,
+            notify("done", "Started it. \u{b7} 1 background"),
         ),
         (
             r#"{"hook_event_name":"StopFailure","error":"overloaded"}"#,
             notify("error", "overloaded"),
+        ),
+        (
+            r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#,
+            notify("done", "usage limit"),
         ),
         (
             r#"{"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}"#,
@@ -152,6 +171,7 @@ fn in_pane(stdout: &str) -> Vec<(Ev, Option<String>)> {
 #[test]
 fn hook_states_reach_the_pane_with_their_session() {
     let cases = [
+        ("SessionStart", r#","source":"resume""#, Ev::Ready),
         ("UserPromptSubmit", "", Ev::Working),
         (
             "PermissionRequest",
@@ -242,6 +262,27 @@ fn hook_ignores_other_subcommands() {
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stdout.is_empty());
+}
+
+/// `notify` never fails the agent that runs it, even when misused; it
+/// says why on stderr. (tests/pty.rs sees what it writes in a pane.)
+#[test]
+fn hook_notify_never_fails() {
+    let run = |args: &[&str], token: Option<&str>| {
+        let mut cmd = Command::new(HOOK);
+        cmd.arg("notify").args(args).stdin(Stdio::null());
+        match token {
+            Some(t) => cmd.env("BLITZ_PANE_TOKEN", t),
+            None => cmd.env_remove("BLITZ_PANE_TOKEN"),
+        };
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        String::from_utf8(out.stderr).unwrap()
+    };
+    assert!(run(&["finished"], Some(TOKEN)).contains("usage: blitz-hook notify"));
+    assert!(run(&[], Some(TOKEN)).contains("usage: blitz-hook notify"));
+    assert_eq!(run(&["done", "ok"], None), "");
 }
 
 #[test]

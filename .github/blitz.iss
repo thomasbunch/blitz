@@ -33,11 +33,17 @@ OutputBaseFilename=blitz-{#AppVersion}-windows-x64-setup
 [Tasks]
 Name: desktopicon; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: explorermenu; Description: "Add ""Open in blitz"" to the folder right-click menu"
+; Starting at sign-in reopens the last session, so it is for the user who
+; installs. Setup for all users may run as an administrator who typed their
+; password for another user, whose own sign-in it would not start.
+Name: startup; Description: "Start blitz when I sign in"; Flags: unchecked; Check: not IsAdminInstallMode
 
 [Files]
 Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
 [Registry]
+; So "blitz" starts it from Win+R, and from "start blitz" in a shell.
+Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\blitz.exe"; ValueType: string; ValueData: "{app}\blitz.exe"; Flags: uninsdeletekey
 ; Right-click menu entries. HKA is HKCU on a per-user install and HKLM on an
 ; all-users one. Windows 11 shows them under "Show more options". The second
 ; verb is Extended: it only shows on Shift+right-click.
@@ -66,6 +72,11 @@ Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz"; Flags: d
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz.window"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
 Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
 Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz.window"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
+; The name and icon blitz gives its notifications when it first shows one.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\blitz.terminal"; Flags: uninsdeletekey dontcreatekey
+; Starting at sign-in: unticked on a reinstall, it goes.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "blitz"; ValueData: """{app}\blitz.exe"""; Flags: uninsdeletevalue; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "blitz"; Flags: deletevalue dontcreatekey; Check: not WizardIsTaskSelected('startup')
 
 [Icons]
 Name: "{autoprograms}\blitz"; Filename: "{app}\blitz.exe"
@@ -103,4 +114,21 @@ begin
     except
       // Setup stopped before it knew the folder.
     end;
+end;
+
+// Hooks pasted into Claude Code's settings name blitz-hook.exe, which is
+// about to go, and Claude Code would report each of them failing.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Settings: String;
+  Text: AnsiString;
+begin
+  if (CurUninstallStep <> usUninstall) or UninstallSilent then
+    Exit;
+  Settings := GetEnv('CLAUDE_CONFIG_DIR');
+  if Settings = '' then
+    Settings := ExpandConstant('{%USERPROFILE}\.claude');
+  Settings := AddBackslash(Settings) + 'settings.json';
+  if LoadStringFromFile(Settings, Text) and (Pos('blitz-hook', Lowercase(String(Text))) > 0) then
+    MsgBox(Settings + ' still runs blitz-hook.exe. Remove those hooks, or Claude Code will report them failing on every event.', mbInformation, MB_OK);
 end;

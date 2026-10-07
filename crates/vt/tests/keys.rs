@@ -59,6 +59,7 @@ const LEGACY: InputModes = InputModes {
     focus: false,
     mouse: vt::MouseMode::Off,
     mouse_sgr: false,
+    alt_scroll: false,
     alt_screen: false,
 };
 
@@ -712,13 +713,53 @@ fn interrupt_keys_stay_console_records() {
         enc(&key(0x43, 46, 3, "ca", Key::Char('c'), ""), &both),
         "\x1b[99;7u"
     );
-    // Shift or Super on top still interrupts, as conhost sees Ctrl+C.
-    let cs_c = key(0x43, 46, 3, "cs", Key::Char('c'), "C");
-    assert_eq!(enc(&cs_c, &both), "\x1b[67;46;3;1;24;1_");
+    // Super on top still interrupts, as conhost sees Ctrl+C. Ctrl+Shift+C
+    // is copy, so with nothing to copy a program that pushed kitty flags
+    // gets it as its own key.
     let cw_c = key(0x43, 46, 3, "cw", Key::Char('c'), "c");
     assert_eq!(enc(&cw_c, &both), "\x1b[67;46;3;1;8;1_");
+    let cs_c = key(0x43, 46, 3, "cs", Key::Char('c'), "C");
+    assert_eq!(enc(&cs_c, &both), "\x1b[99;6u");
+    // Ctrl+Shift+Break is no copy key, so it still interrupts.
+    let mut cs_break = key(0x03, 70, 3, "cs", Key::Other, "");
+    cs_break.extended = true;
+    assert_eq!(enc(&cs_break, &both), "\x1b[3;70;3;1;280;1_");
     // Without win32-input-mode there is no console record to keep.
     assert_eq!(enc(&ctrl_c, &kitty(1)), "\x1b[99;5u");
+}
+
+/// Which keys arrive as Ctrl+C, so a copy chord with nothing to copy can
+/// be kept from interrupting the program.
+#[test]
+fn ctrl_shift_c_interrupts_only_without_kitty_keys() {
+    use vt::keys::{interrupts, is_interrupt};
+    let ctrl_c = key(0x43, 46, 3, "c", Key::Char('c'), "c");
+    let cs_c = key(0x43, 46, 3, "cs", Key::Char('c'), "C");
+    assert!(is_interrupt(&ctrl_c) && !is_interrupt(&cs_c));
+    for m in [
+        LEGACY,
+        W32IM,
+        kitty(1),
+        kitty(8),
+        InputModes { kitty: 5, ..W32IM },
+    ] {
+        assert!(interrupts(&ctrl_c, &m), "{m:?}");
+    }
+    // Without kitty keys Ctrl+Shift+C is sent as Ctrl+C.
+    assert_eq!(enc(&cs_c, &LEGACY), "\x03");
+    for m in [LEGACY, W32IM, kitty(2)] {
+        assert!(interrupts(&cs_c, &m), "{m:?}");
+    }
+    for m in [kitty(1), kitty(8), InputModes { kitty: 1, ..W32IM }] {
+        assert!(!interrupts(&cs_c, &m), "{m:?}");
+    }
+    // Other chords never interrupt.
+    let ctrl_insert = key(0x2d, 82, 0, "c", Key::Insert, "");
+    let ctrl_alt_c = key(0x43, 46, 3, "ca", Key::Char('c'), "c");
+    let c = key(0x43, 46, 99, "", Key::Char('c'), "c");
+    for k in [ctrl_insert, ctrl_alt_c, c] {
+        assert!(!interrupts(&k, &LEGACY), "{k:?}");
+    }
 }
 
 #[test]
@@ -1040,11 +1081,26 @@ fn paste_cannot_break_out_of_the_bracket() {
 #[test]
 fn paste_confirm_only_for_untrusted_line_breaks() {
     use vt::keys::needs_paste_confirm;
-    assert!(!needs_paste_confirm("ls -la", false));
-    assert!(needs_paste_confirm("echo 1\necho 2", false));
-    assert!(needs_paste_confirm("echo 1\r", false));
-    assert!(!needs_paste_confirm("echo 1\necho 2", true));
-    assert!(!needs_paste_confirm("", false));
+    for bracketed in [false, true] {
+        assert!(!needs_paste_confirm("ls -la", bracketed, false));
+        assert!(needs_paste_confirm("echo 1\necho 2", bracketed, false));
+        assert!(needs_paste_confirm("echo 1\r", bracketed, false));
+        assert!(!needs_paste_confirm("", bracketed, false));
+    }
+    assert!(!needs_paste_confirm("echo 1\necho 2", true, true));
+}
+
+/// A long line without bracketed paste is typed in key by key, so it is
+/// confirmed first, as Windows Terminal's large paste warning does.
+#[test]
+fn paste_confirm_for_large_unbracketed_text() {
+    use vt::keys::{LARGE_PASTE, needs_paste_confirm};
+    let line = "x".repeat(LARGE_PASTE);
+    assert!(!needs_paste_confirm(&line, false, false), "at the limit");
+    let big = "x".repeat(LARGE_PASTE + 1);
+    assert!(needs_paste_confirm(&big, false, false));
+    assert!(!needs_paste_confirm(&big, true, false), "bracketed");
+    assert!(!needs_paste_confirm(&big, true, true));
 }
 
 /// Any output can turn bracketed paste on, also for a program that does
@@ -1058,12 +1114,52 @@ fn bracketed_paste_is_trusted_once_confirmed() {
     assert!(!t.paste_trusted(), "set by output after a command started");
     t.confirm_paste();
     assert!(t.paste_trusted());
-    t.feed(b"\x1b[?2004h");
-    assert!(!t.paste_trusted(), "set again");
+    // Claude Code sets it again on every redraw; only turning it on anew
+    // asks again.
+    t.feed(b"\x1b[?2004h\x1b[?2004h");
+    assert!(t.paste_trusted(), "set again while on");
     for reset in ["\x1b]133;A;blitz=1\x07", "\x1bc", "\x1b[?2004l"] {
         t.confirm_paste();
         t.feed(reset.as_bytes());
         t.feed(b"\x1b[?2004h");
         assert!(!t.paste_trusted(), "{reset:?}");
     }
+}
+
+/// A program that says it reads pastes as text before it turns bracketed
+/// paste on is trusted when it does, and only that once.
+#[test]
+fn a_vouched_paste_holds_for_the_next_turn_on_only() {
+    let mut t = vt::Terminal::new(vt::Options::default());
+    t.vouch_paste(true);
+    assert!(!t.paste_trusted(), "off");
+    t.feed(b"\x1b[?2004h");
+    assert!(t.paste_trusted());
+    t.feed(b"\x1b[?2004l\x1b[?2004h");
+    assert!(!t.paste_trusted(), "the next one asks");
+    // A shell's prompt, a reset or a no in between forget it.
+    for reset in ["\x1b]133;A;blitz=1\x07", "\x1bc"] {
+        t.feed(b"\x1b[?2004l");
+        t.vouch_paste(true);
+        t.feed(reset.as_bytes());
+        t.feed(b"\x1b[?2004h");
+        assert!(!t.paste_trusted(), "{reset:?}");
+    }
+    t.feed(b"\x1b[?2004l");
+    t.vouch_paste(true);
+    t.vouch_paste(false);
+    t.feed(b"\x1b[?2004h");
+    assert!(!t.paste_trusted(), "no");
+    // While on, a yes confirms at once, as the user would.
+    t.vouch_paste(true);
+    assert!(t.paste_trusted());
+    // A no after the turn-on took the yes forgets it too, so a prompt
+    // that is not blitz's does not keep it.
+    t.feed(b"[?2004l");
+    t.vouch_paste(true);
+    t.feed(b"[?2004h");
+    t.vouch_paste(false);
+    assert!(!t.paste_trusted(), "no after the turn-on");
+    t.feed(b"]133;A");
+    assert!(!t.paste_trusted(), "another prompt");
 }

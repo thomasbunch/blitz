@@ -1,15 +1,24 @@
 //! The settings panel: which settings match what was typed, what each one
 //! shows, and the value the arrow keys move it to.
 
-use crate::config::{Config, Kind, SETTINGS, Setting, quote};
+use crate::config::{Config, FALLBACK_FONTS, Kind, SETTINGS, Setting, TOASTS, quote};
 use crate::render::chrome::SettingRow;
 
 /// Font sizes offered, in points.
 const FONT_SIZES: &[f32] = &[
     8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0,
 ];
+/// Line heights offered, as multiples of the font's own.
+const LINE_HEIGHTS: &[f32] = &[0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8, 2.0];
 /// Scrollback lengths offered.
 const SCROLLBACK: &[usize] = &[1000, 5000, 10_000, 20_000, 50_000, 100_000];
+/// Editors offered for Ctrl+click on a path, by the URI that opens a file
+/// at a line. Others can be set in `config.toml`.
+const EDITORS: &[(&str, &str)] = &[
+    ("Off", ""),
+    ("VS Code", "vscode://file/{path}:{line}:{col}"),
+    ("Cursor", "cursor://file/{path}:{line}:{col}"),
+];
 
 /// The open settings panel.
 #[derive(Debug, Default)]
@@ -23,17 +32,34 @@ pub struct Panel {
     pub top: usize,
     /// Fixed-width fonts installed, sorted.
     pub fonts: Vec<String>,
+    /// Every font family installed; a font set that is not among them is
+    /// not found. Empty when not known.
+    pub families: Vec<String>,
     /// Shells to choose from, as (name, path); an empty path is automatic.
     pub shells: Vec<(String, String)>,
+    /// The names of the themes there are; a theme set that is not among
+    /// them is not found. Empty when not known.
+    pub themes: Vec<String>,
     /// Why the last change was not saved.
     pub error: Option<String>,
 }
 
 impl Panel {
-    pub fn new(fonts: Vec<String>, shells: Vec<(String, String)>) -> Panel {
+    /// The panel on the font `families` installed, each with whether it is
+    /// fixed-width, and the `shells` and `themes` there are.
+    pub fn new(
+        families: Vec<(String, bool)>,
+        shells: Vec<(String, String)>,
+        themes: Vec<String>,
+    ) -> Panel {
         Panel {
-            fonts,
+            fonts: (families.iter())
+                .filter(|f| f.1)
+                .map(|f| f.0.clone())
+                .collect(),
+            families: families.into_iter().map(|f| f.0).collect(),
             shells,
+            themes,
             ..Panel::default()
         }
     }
@@ -71,14 +97,23 @@ impl Panel {
             "font_size" => (FONT_SIZES.iter())
                 .map(|n| (format!("{n} pt"), n.to_string()))
                 .collect(),
+            "line_height" => (LINE_HEIGHTS.iter())
+                .map(|n| (format!("{n:.1}"), n.to_string()))
+                .collect(),
             "scrollback_lines" => (SCROLLBACK.iter())
                 .map(|&n| (format!("{} lines", thousands(n)), n.to_string()))
                 .collect(),
             "scenery" => (crate::arcade::scenery::SCENES.iter())
                 .map(|v| (title(v), quote(v)))
                 .collect(),
+            "toasts" => (TOASTS.iter())
+                .map(|v| (title(&v.replace('-', " ")), quote(v)))
+                .collect(),
             "shell" => (self.shells.iter())
                 .map(|(name, path)| (name.clone(), quote(path)))
+                .collect(),
+            "editor_uri" => (EDITORS.iter())
+                .map(|(name, uri)| (name.to_string(), quote(uri)))
                 .collect(),
             _ => Vec::new(),
         };
@@ -87,12 +122,13 @@ impl Panel {
             let shown = match s.key {
                 "font_size" => format!("{} pt", c.font_size),
                 "scrollback_lines" => format!("{} lines", thousands(c.scrollback_lines)),
-                "shell" => c
-                    .shell
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .unwrap_or_default()
-                    .into(),
+                "shell" => crate::shell::label(&c.shell),
+                "font_family" => {
+                    let used = (FALLBACK_FONTS.iter())
+                        .find(|f| self.families.iter().any(|g| g.eq_ignore_ascii_case(f)))
+                        .unwrap_or(&FALLBACK_FONTS[0]);
+                    found_or(&c.font_family, &self.families, used)
+                }
                 _ => c.get(s.key).trim_matches(['"', '\'']).into(),
             };
             out.push((shown, now));
@@ -109,8 +145,13 @@ impl Panel {
     pub fn shown(&self, s: &Setting, c: &Config) -> String {
         match s.kind {
             Kind::Toggle => if c.get(s.key) == "true" { "on" } else { "off" }.into(),
+            Kind::Theme if crate::theme::contrast_for(&c.theme).is_some() => {
+                crate::theme::HIGH_CONTRAST.into()
+            }
             Kind::Theme => {
-                crate::theme::choose(&c.theme, crate::theme::system_is_light()).to_string()
+                let light = crate::theme::system_is_light();
+                let used = crate::theme::choose(crate::theme::DEFAULT, light);
+                found_or(crate::theme::choose(&c.theme, light), &self.themes, used)
             }
             Kind::Game => "play".into(),
             Kind::Choice => {
@@ -151,10 +192,14 @@ impl Panel {
     }
 
     /// The rows the chrome draws: each matching setting with its value.
-    pub fn rows(&self, c: &Config) -> Vec<SettingRow> {
+    /// Checking for updates also says why the last look or update failed.
+    pub fn rows(&self, c: &Config, update_error: Option<&str>) -> Vec<SettingRow> {
         let d = Config::default();
         (self.matches().into_iter())
             .map(|s| SettingRow {
+                note: update_error
+                    .filter(|_| s.key == "check_updates")
+                    .map(Into::into),
                 group: s.group,
                 label: s.label,
                 help: s.help,
@@ -167,6 +212,16 @@ impl Panel {
                 changed: c.get(s.key) != d.get(s.key),
             })
             .collect()
+    }
+}
+
+/// `name`, saying `used` takes its place when it is not among `known`.
+/// Just `name` when `known` is empty, as nothing is known then.
+fn found_or(name: &str, known: &[String], used: &str) -> String {
+    if known.is_empty() || known.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+        name.into()
+    } else {
+        format!("{name} (not found, using {used})")
     }
 }
 
@@ -197,7 +252,11 @@ mod tests {
 
     fn panel() -> Panel {
         Panel::new(
-            vec!["Cascadia Mono".into(), "Consolas".into()],
+            vec![
+                ("Arial".into(), false),
+                ("Cascadia Mono".into(), true),
+                ("Consolas".into(), true),
+            ],
             vec![
                 ("Automatic (PowerShell 7)".into(), String::new()),
                 (
@@ -205,6 +264,9 @@ mod tests {
                     r"C:\Windows\System32\cmd.exe".into(),
                 ),
             ],
+            ["blitz dark", "blitz light", "Rose Pine"]
+                .map(Into::into)
+                .to_vec(),
         )
     }
 
@@ -218,7 +280,7 @@ mod tests {
         assert_eq!(p.matches().len(), SETTINGS.len());
         p.filter = "FONT".into();
         let keys: Vec<_> = p.matches().iter().map(|s| s.key).collect();
-        assert_eq!(keys, ["font_family", "font_size"]);
+        assert_eq!(keys, ["font_family", "font_size", "line_height"]);
         // Help text counts: the scrollback warning mentions secrets.
         p.filter = "secrets".into();
         assert_eq!(p.selected().map(|s| s.key), Some("restore_scrollback"));
@@ -264,6 +326,21 @@ mod tests {
     }
 
     #[test]
+    fn line_heights_step_through_their_presets() {
+        let (p, mut c) = (panel(), Config::default());
+        let lh = setting("line_height");
+        assert_eq!(p.shown(lh, &c), "1.0");
+        assert_eq!(p.step(lh, &c, 1, false).as_deref(), Some("1.1"));
+        assert_eq!(p.step(lh, &c, -1, false).as_deref(), Some("0.9"));
+        c.line_height = 2.0;
+        assert_eq!(p.step(lh, &c, 1, false), None);
+        // A height set by hand shows as written.
+        c.line_height = 1.25;
+        assert_eq!(p.shown(lh, &c), "1.25");
+        assert_eq!(p.step(lh, &c, 1, false).as_deref(), Some("1.3"));
+    }
+
+    #[test]
     fn shells_and_fonts_show_names() {
         let (p, mut c) = (panel(), Config::default());
         let shell = setting("shell");
@@ -272,9 +349,13 @@ mod tests {
         assert!(c.set("shell", &next));
         assert_eq!(c.shell, r"C:\Windows\System32\cmd.exe");
         assert_eq!(p.shown(shell, &c), "Command Prompt");
-        // A shell set by hand shows its file name.
+        // A shell set by hand shows its file name and arguments.
         c.shell = r"D:\tools\nu.exe".into();
         assert_eq!(p.shown(shell, &c), "nu.exe");
+        c.shell = r#""C:\Program Files\Git\bin\bash.exe" --login -i"#.into();
+        assert_eq!(p.shown(shell, &c), "bash.exe --login -i");
+        c.shell = r"C:\Windows\System32\wsl.exe -d Ubuntu".into();
+        assert_eq!(p.shown(shell, &c), "wsl.exe -d Ubuntu");
         // Font names match whatever their case in config.toml.
         c.font_family = "consolas".into();
         assert_eq!(p.shown(setting("font_family"), &c), "Consolas");
@@ -288,7 +369,10 @@ mod tests {
         // A font that is not installed sits after the installed ones.
         c.font_family = "Fira Code".into();
         let font = setting("font_family");
-        assert_eq!(p.shown(font, &c), "Fira Code");
+        assert_eq!(
+            p.shown(font, &c),
+            "Fira Code (not found, using Cascadia Mono)"
+        );
         assert_eq!(p.step(font, &c, -1, false).as_deref(), Some("\"Consolas\""));
         assert_eq!(p.step(font, &c, 1, false), None);
         assert_eq!(
@@ -308,13 +392,39 @@ mod tests {
     }
 
     #[test]
+    fn a_theme_or_font_that_is_not_there_says_what_takes_its_place() {
+        let (mut p, mut c) = (panel(), Config::default());
+        let (theme, font) = (setting("theme"), setting("font_family"));
+        let light = crate::theme::system_is_light();
+        let blitz = crate::theme::choose(crate::theme::DEFAULT, light);
+        assert_eq!(p.shown(theme, &c), blitz);
+        c.theme = "rose pine".into();
+        assert_eq!(p.shown(theme, &c), "rose pine");
+        c.theme = "Nord".into();
+        let missing = format!("Nord (not found, using {blitz})");
+        assert_eq!(p.shown(theme, &c), missing);
+        assert_eq!(p.rows(&c, None)[0].value, missing);
+        // Installed, though not fixed-width: blitz uses it.
+        c.font_family = "arial".into();
+        assert_eq!(p.shown(font, &c), "arial");
+        // Without Cascadia Mono, Consolas takes the place of a missing one.
+        p.families.retain(|f| f != "Cascadia Mono");
+        c.font_family = "Fira Code".into();
+        assert_eq!(p.shown(font, &c), "Fira Code (not found, using Consolas)");
+        // When nothing is known, nothing is said.
+        let p = Panel::default();
+        assert_eq!(p.shown(theme, &c), "Nord");
+        assert_eq!(p.shown(font, &c), "Fira Code");
+    }
+
+    #[test]
     fn the_highlight_comes_back_into_a_shorter_list() {
         let mut p = panel();
         p.sel = SETTINGS.len() - 1;
         p.filter = "font".into();
         assert_eq!(p.selected(), None, "past the end of the matches");
         p.move_by(-1);
-        assert_eq!(p.selected().map(|s| s.key), Some("font_size"));
+        assert_eq!(p.selected().map(|s| s.key), Some("line_height"));
         p.filter = "zzz".into();
         p.move_by(1);
         assert_eq!((p.sel, p.selected()), (0, None));
@@ -335,14 +445,44 @@ mod tests {
     }
 
     #[test]
+    fn editors_step_from_off_and_show_one_set_by_hand() {
+        let (p, mut c) = (panel(), Config::default());
+        let editor = setting("editor_uri");
+        assert_eq!(p.shown(editor, &c), "Off");
+        let next = p.step(editor, &c, 1, false).expect("an editor");
+        assert!(c.set("editor_uri", &next));
+        assert_eq!(c.editor_uri, "vscode://file/{path}:{line}:{col}");
+        assert_eq!(p.shown(editor, &c), "VS Code");
+        c.editor_uri = "zed://file/{path}:{line}".into();
+        assert_eq!(p.shown(editor, &c), "zed://file/{path}:{line}");
+        assert_eq!(
+            p.step(editor, &c, -1, false).as_deref(),
+            Some("\"cursor://file/{path}:{line}:{col}\"")
+        );
+    }
+
+    #[test]
+    fn notifications_step_from_none_to_all() {
+        let (p, mut c) = (panel(), Config::default());
+        let toasts = setting("toasts");
+        assert_eq!(p.shown(toasts, &c), "Needs you");
+        assert_eq!(p.step(toasts, &c, -1, false).as_deref(), Some("\"off\""));
+        let next = p.step(toasts, &c, 1, false).expect("all");
+        assert!(c.set("toasts", &next));
+        assert_eq!(p.shown(toasts, &c), "All");
+        assert_eq!(p.step(toasts, &c, 1, false), None);
+    }
+
+    #[test]
     fn rows_mark_changed_settings_and_where_they_can_move() {
         let p = panel();
         let c = Config {
             restore_scrollback: true,
             ..Config::default()
         };
-        let rows = p.rows(&c);
+        let rows = p.rows(&c, None);
         assert_eq!(rows.len(), SETTINGS.len());
+        assert!(rows.iter().all(|r| r.note.is_none()));
         let row = |label| rows.iter().find(|r| r.label == label).expect(label);
         let out = row("Restore output");
         assert!(out.changed && out.on == Some(true) && out.default == "off");
@@ -351,5 +491,16 @@ mod tests {
         assert!(size.less && size.more);
         let font = row("Font");
         assert!(!font.less && font.more, "Cascadia Mono comes first");
+    }
+
+    #[test]
+    fn checking_for_updates_says_why_the_last_look_failed() {
+        let p = panel();
+        let why = "Could not look for an update: curl: (7) Failed to connect";
+        let rows = p.rows(&Config::default(), Some(why));
+        let noted: Vec<_> = (rows.iter())
+            .filter_map(|r| Some((r.label, r.note.as_deref()?)))
+            .collect();
+        assert_eq!(noted, [("Check for updates", why)]);
     }
 }
