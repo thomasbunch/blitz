@@ -2740,7 +2740,6 @@ impl App {
             // Borderless on the window's monitor. winit puts the window back
             // where it was; the session keeps that place, not the monitor's.
             Action::Fullscreen => {
-                self.note_place();
                 if let Some(w) = &self.window {
                     let full = w.fullscreen().is_none();
                     w.set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
@@ -3778,26 +3777,25 @@ impl App {
         }
     }
 
-    /// Notes where the window is, unless it is minimized, maximized or full
-    /// screen, none of which is a place to go back to.
+    /// Notes where the window is, each time it moves or changes size; see
+    /// [`placement`].
     fn note_place(&mut self) {
         let Some(w) = &self.window else {
             return;
         };
-        if !w.is_maximized()
-            && w.is_minimized() != Some(true)
-            && w.fullscreen().is_none()
-            && let Ok(p) = w.outer_position()
-        {
-            let size = w.inner_size();
-            self.placed = Geometry {
-                x: p.x,
-                y: p.y,
-                w: size.width,
-                h: size.height,
-                maximized: false,
-            };
-        }
+        let Ok(p) = w.outer_position() else {
+            return;
+        };
+        let size = w.inner_size();
+        let now = Geometry {
+            x: p.x,
+            y: p.y,
+            w: size.width,
+            h: size.height,
+            maximized: w.is_maximized(),
+        };
+        let (min, full) = (w.is_minimized() == Some(true), w.fullscreen().is_some());
+        self.placed = placement(self.placed, now, min, full);
     }
 
     /// Saves the session when its tabs, splits or folders changed since
@@ -3818,7 +3816,7 @@ impl App {
                 name: v.and_then(|v| v.pane.named.clone()),
             }
         };
-        let mut s = session::State::capture(&self.win, self.placed, meta);
+        let s = session::State::capture(&self.win, self.placed, meta);
         let same = self.saved.as_ref().is_some_and(|old| {
             (old.sidebar_expanded, old.active, &old.tabs) == (s.sidebar_expanded, s.active, &s.tabs)
         });
@@ -3827,13 +3825,6 @@ impl App {
             return;
         }
         self.save_after = None;
-        self.note_place();
-        if let Some(w) = &self.window {
-            s.window = Geometry {
-                maximized: w.is_maximized(),
-                ..self.placed
-            };
-        }
         // Output, which changes all the time, is saved only at exit, and
         // only once the layout holding the keys it is filed by was written.
         match session::save(&s) {
@@ -4265,6 +4256,23 @@ fn min_window(cell: (u32, u32), scale: f32, expanded: bool) -> PhysicalSize<u32>
     PhysicalSize::new((w + rail) as u32, h as u32)
 }
 
+/// Where the window goes back to next time, after it moved or changed size
+/// from `was` to `now`. Minimized or full screen is no place to go back to.
+/// Maximized keeps the place it was maximized from, on the monitor it was
+/// maximized on.
+fn placement(was: Geometry, now: Geometry, minimized: bool, fullscreen: bool) -> Geometry {
+    if minimized || fullscreen {
+        was
+    } else if now.maximized {
+        Geometry {
+            maximized: true,
+            ..was
+        }
+    } else {
+        now
+    }
+}
+
 /// `g`, moved onto the primary monitor when no monitor shows enough of it.
 fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
     let rect = |m: winit::monitor::MonitorHandle| Rect {
@@ -4642,7 +4650,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.drain_keys(el);
                 self.redraw();
             }
-            WindowEvent::Resized(_) => self.request_redraw(),
+            WindowEvent::Resized(_) => {
+                self.note_place();
+                self.request_redraw();
+            }
+            WindowEvent::Moved(_) => self.note_place(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;
                 // The cursor's cell stays, but its pixels move.
@@ -5675,6 +5687,33 @@ mod tests {
         assert!(!c.matches().is_empty());
         let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
         assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
+    }
+
+    /// A window moved to another monitor and maximized there opens
+    /// maximized on that monitor next time, not on the one it started on.
+    #[test]
+    fn app_the_window_comes_back_where_it_was() {
+        let at = |x, y, w, h, maximized| Geometry {
+            x,
+            y,
+            w,
+            h,
+            maximized,
+        };
+        let first = at(100, 100, 800, 600, false);
+        let moved = placement(first, at(2100, 100, 800, 600, false), false, false);
+        assert_eq!(moved, at(2100, 100, 800, 600, false));
+        let maxed = placement(moved, at(1912, -8, 2576, 1416, true), false, false);
+        assert_eq!(maxed, at(2100, 100, 800, 600, true));
+        // Minimized and full screen are no places to come back to.
+        let hidden = at(-32000, -32000, 160, 28, false);
+        assert_eq!(placement(maxed, hidden, true, false), maxed);
+        assert_eq!(
+            placement(maxed, at(1920, 0, 2560, 1440, false), false, true),
+            maxed
+        );
+        let back = placement(maxed, at(2100, 100, 800, 600, false), false, false);
+        assert_eq!(back, moved, "restored");
     }
 
     /// The smallest window still has room for the rail and one pane of
