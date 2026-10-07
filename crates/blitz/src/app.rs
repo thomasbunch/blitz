@@ -1722,7 +1722,7 @@ impl App {
             });
         }
         // Told once, in the window, as a release build has no console.
-        if !scripted
+        if !self.scripted()
             && let Some(id) = self.focus_id()
             && let Some(file) = session::take_crash()
         {
