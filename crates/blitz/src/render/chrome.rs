@@ -1535,7 +1535,7 @@ fn foot_lines(msg: &str, side: i32, scale: f32, tw: i32) -> Option<Vec<String>> 
 
 /// `t` broken at spaces into at most `n` lines of `max` pixels; the last
 /// ends in an ellipsis when the text goes on.
-fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
+pub fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for word in t.split_whitespace() {
         match lines.last_mut() {

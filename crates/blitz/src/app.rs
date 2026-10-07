@@ -4635,10 +4635,20 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
     out
 }
 
-/// Draws a notice over the bottom row of the pane whose grid is at `at`.
+/// The rows a notice takes in a pane of `grid` cells: broken at spaces
+/// onto as many as it needs, so its end, which often names the key to
+/// press, is not cut off in a narrow pane.
+fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
+    let lines = chrome::wrap(text, i32::from(cols) - 1, 1, usize::from(rows.max(1)));
+    lines.into_iter().map(|l| format!(" {l}")).collect()
+}
+
+/// Draws a notice over the bottom rows of the pane whose grid is at `at`.
 fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &Notice) {
     let (_, ch) = r.cell();
-    let mut s = text_snapshot(&format!(" {}", n.text), grid.0, 1, pal);
+    let lines = notice_rows(&n.text, grid);
+    let rows = (lines.len() as u16).clamp(1, grid.1.max(1));
+    let mut s = text_snapshot(&lines.join("\n"), grid.0, rows, pal);
     let bg = if n.dim { pal.bg } else { pal.selection_bg };
     for c in &mut s.cells {
         c.bg = bg;
@@ -4647,7 +4657,7 @@ fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &
         }
     }
     let banner = Palette { bg, ..*pal };
-    let y = at.y + i32::from(grid.1.saturating_sub(1)) * ch as i32;
+    let y = at.y + i32::from(grid.1.saturating_sub(rows)) * ch as i32;
     r.snapshot(&s, &banner, at.x, y);
 }
 
@@ -7291,6 +7301,22 @@ mod tests {
             paste_question("a\nb", None),
             "Paste 2 lines starting \"a\"? Paste again"
         );
+    }
+
+    #[test]
+    fn app_a_notice_too_long_for_its_pane_goes_on_to_more_rows() {
+        let ask = "Paste 2 lines starting \"echo a\"? Press Ctrl+V again";
+        assert_eq!(notice_rows(ask, (80, 24)), [format!(" {ask}")]);
+        assert_eq!(
+            notice_rows(ask, (34, 24)),
+            [" Paste 2 lines starting \"echo a\"?", " Press Ctrl+V again"]
+        );
+        let rows = notice_rows(ask, (12, 24));
+        assert_eq!(rows.last().map(String::as_str), Some(" again"), "{rows:?}");
+        // No more rows than the pane has, the last cut with an ellipsis.
+        let rows = notice_rows(ask, (12, 2));
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].ends_with('\u{2026}'), "{rows:?}");
     }
 
     #[test]
