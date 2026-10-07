@@ -2616,6 +2616,7 @@ impl App {
                     }
                     (Some(true), Some(false)) => {
                         self.attention(id, Ev::Quiet);
+                        self.find_branch(id);
                     }
                     _ => {}
                 }
@@ -2643,6 +2644,9 @@ impl App {
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
                     v.pane.hooked = ev != Ev::Idle;
                     self.attention(id, ev);
+                    if turn_ends(ev) {
+                        self.find_branch(id);
+                    }
                 }
                 // Another program's, or Claude Code's own without hooks
                 // (OSC 9 or 777): like a bell.
@@ -3726,6 +3730,13 @@ fn idle_for() -> Duration {
     let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
     // Both are milliseconds since boot, kept in 32 bits, so they wrap.
     Duration::from_millis(u64::from(now.wrapping_sub(info.dwTime)))
+}
+
+/// Whether a hook's `ev` ends a stretch of Claude Code's work. It may have
+/// switched branches meanwhile, which the shell, still waiting under it,
+/// never reports.
+fn turn_ends(ev: Ev) -> bool {
+    matches!(ev, Ev::Done | Ev::NeedsYou | Ev::Idle)
 }
 
 /// Whether a bell, or a notification without the pane's token, needs the
@@ -5080,6 +5091,16 @@ mod tests {
         assert!(present(true, s(29)));
         assert!(!present(true, s(30)), "walked away with blitz in front");
         assert!(!present(false, s(0)), "another window is in front");
+    }
+
+    #[test]
+    fn app_the_branch_is_read_again_when_a_turn_ends() {
+        for ev in [Ev::Done, Ev::NeedsYou, Ev::Idle] {
+            assert!(turn_ends(ev), "{ev:?}");
+        }
+        for ev in [Ev::Working, Ev::Error { sticky: false }] {
+            assert!(!turn_ends(ev), "{ev:?}");
+        }
     }
 
     #[test]
