@@ -3909,12 +3909,7 @@ impl App {
         };
         self.badge_shows = top;
         let ui = &self.theme.ui;
-        let (fg, ring, label) = match top {
-            Some(Attn::NeedsYou) => (ui.accent, false, "A session needs you"),
-            Some(Attn::Error) => (ui.error, false, "A session failed"),
-            Some(_) => (ui.name, true, "A session finished"),
-            None => (0, false, ""),
-        };
+        let (fg, ring, label) = badge_look(top, ui);
         let icon = top.and_then(|_| {
             let size = small_icon_size().width;
             crate::notify::badge_icon(size, fg, ui.term_bg, ring)
@@ -5675,6 +5670,18 @@ fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) 
 /// that most wants the user, if any does.
 fn badge_state(states: impl Iterator<Item = Attn>) -> Option<Attn> {
     states.max().filter(|&s| s >= Attn::DoneUnseen)
+}
+
+/// How the badge for `top` looks, in the colours the sidebar marks that
+/// state with: its colour, whether it is a ring, and what it says to a
+/// screen reader.
+fn badge_look(top: Option<Attn>, ui: &crate::theme::Ui) -> (u32, bool, &'static str) {
+    match top {
+        Some(Attn::NeedsYou) => (ui.mark, false, "A session needs you"),
+        Some(Attn::Error) => (ui.error, false, "A session failed"),
+        Some(_) => (ui.name, true, "A session finished"),
+        None => (0, false, ""),
+    }
 }
 
 /// How blitz tells the user, who is in another program, about a session.
@@ -8470,6 +8477,20 @@ mod tests {
         );
         // Another session has its own limit.
         assert_eq!(alert(Attn::NeedsYou, &mut None, 21), urgent);
+    }
+
+    #[test]
+    fn app_badge_has_the_sidebar_colours() {
+        // On a light theme the accent itself is too faint on the badge's
+        // background; the mark the sidebar draws is not.
+        let ui = crate::theme::blitz(true).ui;
+        assert_ne!(ui.mark, ui.accent);
+        assert_eq!(badge_look(Some(Attn::NeedsYou), &ui).0, ui.mark);
+        assert_eq!(badge_look(Some(Attn::Error), &ui).0, ui.error);
+        assert_eq!(
+            badge_look(Some(Attn::DoneUnseen), &ui),
+            (ui.name, true, "A session finished")
+        );
     }
 
     #[test]
