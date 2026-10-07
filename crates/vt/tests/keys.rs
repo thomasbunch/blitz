@@ -712,13 +712,49 @@ fn interrupt_keys_stay_console_records() {
         enc(&key(0x43, 46, 3, "ca", Key::Char('c'), ""), &both),
         "\x1b[99;7u"
     );
-    // Shift or Super on top still interrupts, as conhost sees Ctrl+C.
-    let cs_c = key(0x43, 46, 3, "cs", Key::Char('c'), "C");
-    assert_eq!(enc(&cs_c, &both), "\x1b[67;46;3;1;24;1_");
+    // Super on top still interrupts, as conhost sees Ctrl+C. Ctrl+Shift+C
+    // is copy, so with nothing to copy a program that pushed kitty flags
+    // gets it as its own key.
     let cw_c = key(0x43, 46, 3, "cw", Key::Char('c'), "c");
     assert_eq!(enc(&cw_c, &both), "\x1b[67;46;3;1;8;1_");
+    let cs_c = key(0x43, 46, 3, "cs", Key::Char('c'), "C");
+    assert_eq!(enc(&cs_c, &both), "\x1b[99;6u");
     // Without win32-input-mode there is no console record to keep.
     assert_eq!(enc(&ctrl_c, &kitty(1)), "\x1b[99;5u");
+}
+
+/// Which keys arrive as Ctrl+C, so a copy chord with nothing to copy can
+/// be kept from interrupting the program.
+#[test]
+fn ctrl_shift_c_interrupts_only_without_kitty_keys() {
+    use vt::keys::{interrupts, is_interrupt};
+    let ctrl_c = key(0x43, 46, 3, "c", Key::Char('c'), "c");
+    let cs_c = key(0x43, 46, 3, "cs", Key::Char('c'), "C");
+    assert!(is_interrupt(&ctrl_c) && !is_interrupt(&cs_c));
+    for m in [
+        LEGACY,
+        W32IM,
+        kitty(1),
+        kitty(8),
+        InputModes { kitty: 5, ..W32IM },
+    ] {
+        assert!(interrupts(&ctrl_c, &m), "{m:?}");
+    }
+    // Without kitty keys Ctrl+Shift+C is sent as Ctrl+C.
+    assert_eq!(enc(&cs_c, &LEGACY), "\x03");
+    for m in [LEGACY, W32IM, kitty(2)] {
+        assert!(interrupts(&cs_c, &m), "{m:?}");
+    }
+    for m in [kitty(1), kitty(8), InputModes { kitty: 1, ..W32IM }] {
+        assert!(!interrupts(&cs_c, &m), "{m:?}");
+    }
+    // Other chords never interrupt.
+    let ctrl_insert = key(0x2d, 82, 0, "c", Key::Insert, "");
+    let ctrl_alt_c = key(0x43, 46, 3, "ca", Key::Char('c'), "c");
+    let c = key(0x43, 46, 99, "", Key::Char('c'), "c");
+    for k in [ctrl_insert, ctrl_alt_c, c] {
+        assert!(!interrupts(&k, &LEGACY), "{k:?}");
+    }
 }
 
 #[test]

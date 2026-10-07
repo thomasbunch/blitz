@@ -124,8 +124,7 @@ pub fn encode_key(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     // Ctrl+C and Ctrl+Break stay console key records under ConPTY even
     // when kitty flags are pushed: only then does conhost interrupt a
     // program that reads keys, and any program can print a push.
-    let interrupt = matches!(k.vk, VK_C | VK_CANCEL) && mod_bits(k) & 6 == 4;
-    if m.w32im && interrupt {
+    if m.w32im && is_interrupt(k) {
         win32(k, out);
     } else if m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0 {
         // Without disambiguate or all-keys, kitty flags leave presses legacy.
@@ -135,6 +134,21 @@ pub fn encode_key(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     } else {
         legacy(k, m, out);
     }
+}
+
+/// Whether `k` is the interrupt chord: C or Break with Ctrl, and neither
+/// Shift nor Alt. Ctrl+Shift+C is copy in most terminals.
+pub fn is_interrupt(k: &KeyInput) -> bool {
+    matches!(k.vk, VK_C | VK_CANCEL) && mod_bits(k) & 7 == 4
+}
+
+/// Whether `k` reaches the program as Ctrl+C, which interrupts it: the
+/// interrupt chord always, and C with Ctrl and Shift too unless kitty
+/// flags send that as a key of its own.
+pub fn interrupts(k: &KeyInput, m: &InputModes) -> bool {
+    let bits = mod_bits(k);
+    let kitty = m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0;
+    is_interrupt(k) || k.vk == VK_C && bits & 6 == 4 && !kitty
 }
 
 /// win32-input-mode: one console key record per transition, releases and
