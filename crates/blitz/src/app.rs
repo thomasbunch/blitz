@@ -861,6 +861,8 @@ struct App {
     /// What a click in the sidebar acted on in the last frame.
     side: chrome::SideHits,
     next_id: u32,
+    /// The number the next new session shows after its name.
+    next_num: u32,
     focused: bool,
     /// A selection in the focused pane.
     selection: Option<Selection>,
@@ -1128,6 +1130,7 @@ impl App {
             views: Vec::new(),
             side: chrome::SideHits::default(),
             next_id: 1,
+            next_num: 1,
             focused: false,
             selection: None,
             hover: None,
@@ -1319,6 +1322,7 @@ impl App {
                 .or_else(|_| self.spawn(id, &grids, None, None, old.as_deref()));
             if let Err(e) = started {
                 self.views.clear();
+                self.next_num = 1;
                 return Err(e);
             }
             if let Some(v) = self.views.last_mut() {
@@ -1340,7 +1344,7 @@ impl App {
             self.resume(id, meta.claude.clone());
         }
         // New sessions take their numbers after the restored ones.
-        self.next_id = self.next_id.max(next);
+        self.next_num = next;
         self.install(win);
         Ok(())
     }
@@ -1482,7 +1486,7 @@ impl App {
             sync_until: None,
             key,
             cmd: cmd.map(str::to_owned),
-            num: id.0,
+            num: self.next_num,
             progress: None,
             claude_working: None,
             hooks_seen: false,
@@ -1494,6 +1498,7 @@ impl App {
         }
         self.find_branch(id);
         self.next_id = self.next_id.max(id.0 + 1);
+        self.next_num = self.next_num.saturating_add(1);
         Ok(())
     }
 
