@@ -325,6 +325,12 @@ pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
         (m.lalt || m.ralt, ALT),
     ];
     let mods = held.iter().filter(|h| h.0).fold(0, |a, h| a | h.1);
+    // Windows reports AltGr as Ctrl+Alt: a key it types a character with
+    // is typing, not a Ctrl+Alt chord.
+    let typed = char::from_u32(k.uc.into()).is_some_and(|c| !c.is_control());
+    if mods & (CTRL | ALT) == CTRL | ALT && typed {
+        return None;
+    }
     if let Some(b) = bindings(user).find(|b| (b.0, b.1) == (mods, k.vk)) {
         return b.2;
     }
@@ -1063,6 +1069,34 @@ mod msg_to_key_tests {
         assert_eq!(keys(Action::SplitRight), None);
         assert_eq!(keys(Action::ClosePane), None);
         assert_eq!(keys_for(Action::Copy, &[]).as_deref(), Some("Ctrl+C"));
+    }
+
+    #[test]
+    fn keymap_altgr_types_rather_than_running_a_ctrl_alt_binding() {
+        let user: Vec<Binding> = ["ctrl+alt+q=new_tab", "ctrl+alt+left=split_right"]
+            .into_iter()
+            .filter_map(binding)
+            .collect();
+        let press = |vk, rows, held: &[usize]| {
+            let mut t = String::new();
+            let lp = lp(0x10, false, true, 1);
+            let k = msg_to_key(vk, lp, &state(held, &[]), layout(rows), &mut t);
+            action(&k, &user)
+        };
+        let altgr = [0xa2, 0xa5];
+        assert_eq!(press(0x51, DE, &altgr), None, "AltGr+Q types @");
+        assert_eq!(press(0x51, PL, &altgr), None, "AltGr+Q types \\");
+        // Without a character for AltGr it is the chord.
+        assert_eq!(press(0x51, US, &altgr), Some(Action::NewTab));
+        assert_eq!(press(0x25, DE, &altgr), Some(Action::SplitRight), "arrows");
+        // The default Ctrl+Alt+Arrows still move focus on AltGr layouts.
+        let k = |vk| {
+            let mut t = String::new();
+            let lp = lp(0x4b, true, true, 1);
+            let k = msg_to_key(vk, lp, &state(&altgr, &[]), layout(DE), &mut t);
+            action(&k, &[])
+        };
+        assert_eq!(k(0x25), Some(Action::Focus(Dir::Left)));
     }
 
     /// The left-hand keys for a set of shortcut modifiers.
