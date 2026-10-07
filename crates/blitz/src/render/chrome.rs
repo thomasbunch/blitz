@@ -533,7 +533,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
                         color: c.accent,
                     });
                     let cy = chip.y + (chip_h - th) / 2;
-                    let fg = if x.seen { c.accent } else { c.chip_fg };
+                    // Off the fill, the accent is too faint for text on
+                    // the light themes.
+                    let fg = if x.seen { c.name } else { c.chip_fg };
                     text(p, chip.x + s(6.0), cy, &word, fg, true);
                     chip.x
                 } else {
@@ -1594,8 +1596,14 @@ mod tests {
         assert_eq!(strokes(&sessions), [0.0; 3]);
         sessions[0].seen = true;
         assert_eq!(strokes(&sessions), [1.5; 3]);
+        // Its word takes the name's colour, which reads on any sidebar.
+        let name = crate::theme::blitz(false).ui.name;
         let c = build(&model(&win, &sessions, now));
-        assert!(texts(&c).contains(&"needs you \u{b7} 1m"));
+        let word = (c.prims.iter()).find_map(|p| match p {
+            Prim::Text { text, color, .. } if text == "needs you \u{b7} 1m" => Some(*color),
+            _ => None,
+        });
+        assert_eq!(word, Some(name));
     }
 
     /// Sessions that share a name are told apart by a dim number; the
