@@ -464,18 +464,18 @@ pub fn choose(setting: &str, system_light: bool) -> &str {
 
 /// The `theme` setting after picking `name`. Of a `light:X,dark:Y` pair
 /// only the half in use now changes. While high contrast sets the colours
-/// (`contrast`), the pick is the whole setting: a blitz theme in its half
-/// of the default pair would make it the default again, and high contrast
-/// would win over the pick.
+/// (`contrast`), a pick that would leave the default pair as it is becomes
+/// the whole setting, or high contrast would win over it.
 pub fn pick(setting: &str, name: &str, system_light: bool, contrast: bool) -> String {
-    if contrast {
-        return name.into();
-    }
-    match (half(setting, "light:"), half(setting, "dark:")) {
+    let paired = match (half(setting, "light:"), half(setting, "dark:")) {
         (Some(_), Some(d)) if system_light => format!("light:{name},dark:{d}"),
         (Some(l), Some(_)) => format!("light:{l},dark:{name}"),
         _ => name.into(),
+    };
+    if contrast && is_default(&paired) {
+        return name.into();
     }
+    paired
 }
 
 /// The theme the `theme` setting picks now. An unknown name gives the
@@ -767,6 +767,8 @@ mod tests {
             assert_eq!(pick(DEFAULT, name, light, true), name);
             assert!(!is_default(&pick(DEFAULT, name, light, true)));
         }
+        // Any other theme keeps the pair.
+        assert_eq!(pick(DEFAULT, "X", false, true), "light:blitz light,dark:X");
     }
 
     #[test]
