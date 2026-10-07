@@ -3019,8 +3019,8 @@ impl App {
         let action = keymap::action(k, &self.config.keys);
         // A copy key with no selection in view goes to the program.
         let shown = self.selection_shown();
-        let hidden = action == Some(Action::Copy)
-            && !copy_key_copies(k, shown, self.orphan.is_some());
+        let hidden =
+            action == Some(Action::Copy) && !copy_key_copies(k, shown, self.orphan.is_some());
         let action = action.filter(|_| !hidden);
         if k.down && !modifier {
             self.dismiss(action);
@@ -3113,7 +3113,7 @@ impl App {
         let Some(v) = self.view(id).filter(|_| !text.is_empty()) else {
             return;
         };
-        let label = format!("{} {}", v.pane.name, id.0);
+        let label = format!("{} {}", v.pane.name, v.num);
         if let Some(refused) = paste_refused(&label, v.pane.exit_code) {
             self.set_notice(id, refused, None, false);
             return;
@@ -6189,12 +6189,12 @@ fn alt_v(m: &InputModes) -> Vec<u8> {
 }
 
 /// Why nothing is pasted into the pane `label` names, when its program
-/// exited with `code`. The notice it replaces said how to close the pane,
-/// so this one does too.
+/// exited with `code`. The notice it replaces said how to restart or
+/// close the pane, so this one does too.
 fn paste_refused(label: &str, code: Option<u32>) -> Option<String> {
-    let code = code?;
     Some(format!(
-        "{label} exited with code {code}, so nothing was pasted \u{b7} Enter close"
+        "{label} exited ({}), so nothing was pasted \u{b7} Enter restart \u{b7} Esc close",
+        exit_text(code?)
     ))
 }
 
@@ -6232,7 +6232,11 @@ fn paste_question(text: &str, key: Option<&str>) -> String {
         start.pop();
         start.push('\u{2026}');
     }
-    let lines = text.replace("\r\n", "\n").replace('\r', "\n").lines().count();
+    let lines = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .count();
     let s = if lines == 1 { "" } else { "s" };
     let again = match key {
         Some(k) => format!("Press {k} again"),
@@ -8988,8 +8992,11 @@ mod tests {
         assert_eq!(paste_refused("pwsh 3", None), None);
         assert_eq!(
             paste_refused("pwsh 3", Some(1)).as_deref(),
-            Some("pwsh 3 exited with code 1, so nothing was pasted \u{b7} Enter close")
+            Some(
+                "pwsh 3 exited (exit 1), so nothing was pasted \u{b7} Enter restart \u{b7} Esc close"
+            )
         );
+        assert!(paste_refused("cmd 1", Some(0xC000_013A)).is_some_and(|t| t.contains("(Ctrl+C)")));
     }
 
     #[test]
