@@ -4020,30 +4020,34 @@ impl App {
         if self.scripted() {
             return;
         }
-        if a.toast {
-            self.toast(id);
-        }
-        if a.beep {
+        let shown = a.toast && self.toast(id);
+        if a.beeps(shown) {
             // SAFETY: a plain call.
             let _ = unsafe { MessageBeep(MB_OK) };
         }
     }
 
-    /// Shows a Windows notification about session `id`.
-    fn toast(&mut self, id: PaneId) {
+    /// Shows a Windows notification about session `id`; false when none
+    /// was shown.
+    fn toast(&mut self, id: PaneId) -> bool {
         let Some(s) = self.sessions().into_iter().find(|s| s.id == id) else {
-            return;
+            return false;
         };
         let lines = toast_text(&s);
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
         let xml = crate::notify::toast_xml(&lines, !self.config.sound);
         match crate::notify::toast(id, &xml, &self.proxy) {
-            Ok(t) => {
+            Ok(Some(t)) => {
                 if let Some(v) = self.view_mut(id) {
                     v.toast = Some(t);
                 }
+                true
             }
-            Err(e) => eprintln!("blitz: notification: {e}"),
+            Ok(None) => false,
+            Err(e) => {
+                eprintln!("blitz: notification: {e}");
+                false
+            }
         }
     }
 
@@ -5677,8 +5681,16 @@ struct Alert {
     flashes: u32,
     /// Show a Windows notification.
     toast: bool,
-    /// Beep, as no notification makes the sound.
-    beep: bool,
+    /// Make a sound: the notification's, or a beep without one.
+    sound: bool,
+}
+
+impl Alert {
+    /// Whether to beep, once the notification was `shown` or not: one that
+    /// was makes its own sound.
+    fn beeps(&self, shown: bool) -> bool {
+        self.sound && !shown
+    }
 }
 
 /// How to tell the user about a session that just changed to `state`
@@ -5697,7 +5709,7 @@ fn alert(state: Attn, c: &Config, last: &mut Option<Instant>, now: Instant) -> O
     let a = Alert {
         flashes: if c.flash { flashes } else { 0 },
         toast,
-        beep: c.sound && !toast,
+        sound: c.sound,
     };
     if a == Alert::default() || last.is_some_and(|t| now.saturating_duration_since(t) < ALERT_GAP) {
         return None;
@@ -8433,7 +8445,7 @@ mod tests {
         let urgent = Some(Alert {
             flashes: 3,
             toast: true,
-            beep: false,
+            sound: false,
         });
         assert_eq!(alert(Attn::NeedsYou, &mut last, 0), urgent);
         assert_eq!(alert(Attn::Error, &mut last, 9), None);
@@ -8443,7 +8455,7 @@ mod tests {
             Some(Alert {
                 flashes: 1,
                 toast: false,
-                beep: false,
+                sound: false,
             })
         );
         // Another session has its own limit.
@@ -8517,13 +8529,17 @@ mod tests {
             };
             alert(state, &c, &mut None, now)
         };
-        assert!(!alert("off", false, Attn::NeedsYou).is_some_and(|a| a.beep));
-        assert!(alert("off", true, Attn::NeedsYou).is_some_and(|a| a.beep));
+        // As if each notification asked for was shown.
+        let beeps = |a: Option<Alert>| a.is_some_and(|a| a.beeps(a.toast));
+        assert!(!beeps(alert("off", false, Attn::NeedsYou)));
+        assert!(beeps(alert("off", true, Attn::NeedsYou)));
         // The notification makes it.
-        let a = alert("all", true, Attn::DoneUnseen);
-        assert!(a.is_some_and(|a| a.toast && !a.beep));
-        let a = alert("needs-you", true, Attn::DoneUnseen);
-        assert!(a.is_some_and(|a| !a.toast && a.beep));
+        assert!(!beeps(alert("all", true, Attn::DoneUnseen)));
+        assert!(beeps(alert("needs-you", true, Attn::DoneUnseen)));
+        // Unless Windows did not show it, say as the user turned blitz's
+        // notifications off there.
+        let a = alert("all", true, Attn::NeedsYou).expect("an alert");
+        assert!(a.toast && a.beeps(false));
         // A sound is enough of an alert by itself.
         let c = Config {
             flash: false,
@@ -8532,7 +8548,7 @@ mod tests {
             ..Config::default()
         };
         let a = super::alert(Attn::Error, &c, &mut None, now);
-        assert!(a.is_some_and(|a| a.beep && a.flashes == 0));
+        assert!(a.is_some_and(|a| a.beeps(false) && a.flashes == 0));
     }
 
     #[test]

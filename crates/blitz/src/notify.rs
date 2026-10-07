@@ -7,7 +7,9 @@ use std::sync::Once;
 
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::TypedEventHandler;
-use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+use windows::UI::Notifications::{
+    NotificationSetting, ToastNotification, ToastNotificationManager,
+};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -240,12 +242,13 @@ fn group() -> HSTRING {
 
 /// Shows notification `xml` about pane `id`, in place of the one before
 /// about it. Clicking it sends [`UserEvent::ShowPane`]. Keep what it
-/// returns while it is up, so the click still has somewhere to go.
+/// returns while it is up, so the click still has somewhere to go. None
+/// when the user turned blitz's notifications off in Windows.
 pub fn toast(
     id: PaneId,
     xml: &str,
     proxy: &EventLoopProxy<UserEvent>,
-) -> windows::core::Result<ToastNotification> {
+) -> windows::core::Result<Option<ToastNotification>> {
     REGISTERED.call_once(register);
     let doc = XmlDocument::new()?;
     doc.LoadXml(&HSTRING::from(xml))?;
@@ -257,8 +260,17 @@ pub fn toast(
         let _ = proxy.send_event(UserEvent::ShowPane(id));
         Ok(())
     }))?;
-    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))?.Show(&t)?;
-    Ok(t)
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))?;
+    // Show still succeeds then, and nothing comes up. Where Windows cannot
+    // say, the notification is shown.
+    if notifier
+        .Setting()
+        .is_ok_and(|s| s != NotificationSetting::Enabled)
+    {
+        return Ok(None);
+    }
+    notifier.Show(&t)?;
+    Ok(Some(t))
 }
 
 /// Takes the notification about pane `id` off the screen and out of the
