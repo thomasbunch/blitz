@@ -191,7 +191,7 @@ pub const SETTINGS: &[Setting] = &[
         key: "check_updates",
         group: "Updates",
         label: "Check for updates",
-        help: "Ask GitHub for a newer release at start and once a day.",
+        help: "Ask GitHub for a newer release at start and every six hours.",
         kind: Kind::Toggle,
         applies: RESTART,
     },

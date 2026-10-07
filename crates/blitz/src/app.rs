@@ -67,9 +67,9 @@ const CONFIRM: Duration = Duration::from_secs(3);
 /// How long the notice about the system ConPTY stays up.
 const NOTICE: Duration = Duration::from_secs(5);
 /// The first look for a newer release waits until startup is done, then
-/// one runs a day.
+/// one runs every few hours.
 const UPDATE_FIRST: Duration = Duration::from_secs(10);
-const UPDATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
 /// How long a restored pane waits for its shell's first prompt before it
@@ -88,8 +88,11 @@ pub enum UserEvent {
     /// Exit with this code: the self-test finished, or `--exit-after`
     /// ran out.
     Finish(i32),
-    /// A newer release, by version.
-    Update(String),
+    /// A newer release, by version, with the installer's log when an
+    /// update to it failed.
+    Update(String, Option<PathBuf>),
+    /// What a look for a newer release that Ctrl+Shift+U asked for found.
+    Checked(Result<Option<String>, String>),
     /// The installer started, so blitz exits; or why it did not.
     Installed(Result<(), String>),
     /// Another launch handed this folder over to open in a new tab.
@@ -408,7 +411,8 @@ struct App {
     update: Option<(String, String)>,
     /// Busy sessions, waiting for a second Ctrl+Shift+U.
     update_confirm: Option<Instant>,
-    /// The installer is downloading; this pane shows that.
+    /// The installer is downloading, or Ctrl+Shift+U is looking for a
+    /// release; this pane shows that.
     updating: Option<PaneId>,
     /// The banner strip in the last frame, for clicks.
     banner: Option<Rect>,
@@ -633,9 +637,14 @@ impl App {
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(UPDATE_FIRST);
+                if let Some((v, log)) = crate::update::failed() {
+                    let _ = proxy.send_event(UserEvent::Update(v, Some(log)));
+                }
                 loop {
-                    if let Some(v) = crate::update::check()
-                        && proxy.send_event(UserEvent::Update(v)).is_err()
+                    // Quiet when it fails, as offline is normal; Ctrl+Shift+U
+                    // says why.
+                    if let Ok(Some(v)) = crate::update::check()
+                        && proxy.send_event(UserEvent::Update(v, None)).is_err()
                     {
                         return;
                     }
@@ -1338,6 +1347,31 @@ impl App {
         }
     }
 
+    /// Shows the banner for release `v`, or for the update to it that
+    /// failed and wrote `log`.
+    fn offer_update(&mut self, v: String, log: Option<PathBuf>) {
+        // A later look finding the same release keeps a failure in view.
+        if log.is_none() && self.update.as_ref().is_some_and(|u| u.0 == v) {
+            return;
+        }
+        let text = match log {
+            Some(log) => format!(
+                "Updating to blitz {v} failed, see {} \u{b7} Ctrl+Shift+U to try again",
+                log.display()
+            ),
+            None => {
+                let how = if crate::update::installed() {
+                    "update and restart"
+                } else {
+                    "open the download page"
+                };
+                format!("blitz {v} is available \u{b7} Ctrl+Shift+U to {how}")
+            }
+        };
+        self.update = Some((v, text));
+        self.request_redraw();
+    }
+
     fn set_notice(
         &mut self,
         id: PaneId,
@@ -1592,14 +1626,29 @@ impl App {
                 }
             }
             Action::Update => {
-                let (Some((v, _)), Some(id)) = (self.update.clone(), before) else {
+                let Some(id) = before else {
                     return false;
                 };
                 if self.updating.is_some() {
                     return true;
                 }
+                let Some((v, _)) = self.update.clone() else {
+                    self.updating = Some(id);
+                    self.set_notice(id, "Looking for a newer blitz\u{2026}", None, true);
+                    let proxy = self.proxy.clone();
+                    std::thread::spawn(move || {
+                        let _ = proxy.send_event(UserEvent::Checked(crate::update::check()));
+                    });
+                    return true;
+                };
                 if !crate::update::installed() {
-                    crate::update::open_page();
+                    if !crate::update::open_page() {
+                        let text = format!(
+                            "Could not open a browser; get it at {}",
+                            crate::update::PAGE
+                        );
+                        self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                    }
                     return true;
                 }
                 // Updating restarts blitz, which ends every session.
@@ -2604,15 +2653,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 el.exit();
             }
-            UserEvent::Update(v) => {
-                let how = if crate::update::installed() {
-                    "update and restart"
-                } else {
-                    "open the download page"
+            UserEvent::Update(v, log) => self.offer_update(v, log),
+            UserEvent::Checked(found) => {
+                let text = match found {
+                    Ok(Some(v)) => {
+                        let text = format!("blitz {v} is available");
+                        self.offer_update(v, None);
+                        text
+                    }
+                    Ok(None) => format!("blitz {} is up to date", env!("CARGO_PKG_VERSION")),
+                    Err(e) => format!("Could not look for an update: {e}"),
                 };
-                let text = format!("blitz {v} is available \u{b7} Ctrl+Shift+U to {how}");
-                self.update = Some((v, text));
-                self.request_redraw();
+                if let Some(id) = self.updating.take() {
+                    self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                }
             }
             UserEvent::Settings => match Config::reload() {
                 Some(c) => self.apply_config(c),
