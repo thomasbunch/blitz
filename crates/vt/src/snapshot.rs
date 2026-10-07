@@ -45,6 +45,17 @@ pub mod attr {
     pub const DIM: u16 = 1 << 4;
     pub const STRIKE: u16 = 1 << 5;
     pub const OVERLINE: u16 = 1 << 6;
+
+    // Each is a bit of its own, or the build fails.
+    const _: () = {
+        let bits = [BOLD, ITALIC, UNDERLINE, INVERSE, DIM, STRIKE, OVERLINE];
+        let (mut all, mut i) = (0u16, 0);
+        while i < bits.len() {
+            assert!(bits[i].count_ones() == 1 && all & bits[i] == 0);
+            all |= bits[i];
+            i += 1;
+        }
+    };
 }
 
 /// Longest grapheme cluster a cell holds, in bytes: its first code point
@@ -111,17 +122,5 @@ mod tests {
         let attrs: Vec<u16> = s.cells.iter().map(|c| c.attrs).collect();
         let (st, ov, ul) = (attr::STRIKE, attr::OVERLINE, attr::UNDERLINE);
         assert_eq!(attrs, [st, st | ov, ov, ul, st | ov | ul, 0]);
-        // Each bit is its own.
-        let bits = [
-            attr::BOLD,
-            attr::ITALIC,
-            attr::UNDERLINE,
-            attr::INVERSE,
-            attr::DIM,
-            attr::STRIKE,
-            attr::OVERLINE,
-        ];
-        let all = bits.iter().fold(0, |a, b| a | b);
-        assert_eq!(all.count_ones() as usize, bits.len());
     }
 }
