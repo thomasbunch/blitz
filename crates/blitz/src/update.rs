@@ -612,14 +612,17 @@ mod tests {
     }
 
     /// Setup offers to start blitz at sign-in, for this user, never ticked
-    /// for them, and takes it away when unticked or uninstalled.
+    /// for them, and takes it away when unticked or uninstalled. Only for
+    /// a per-user install: setup for all users may run as an administrator
+    /// whose own sign-in it would start.
     #[test]
     fn setup_can_start_blitz_at_sign_in() {
         let iss = include_str!("../../../.github/blitz.iss");
         let task = (iss.lines())
             .find(|l| l.starts_with("Name: startup;"))
             .expect("the task");
-        assert!(task.ends_with("Flags: unchecked"), "{task}");
+        let only = "Flags: unchecked; Check: not IsAdminInstallMode";
+        assert!(task.ends_with(only), "{task}");
         let run = r#"Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; "#;
         let lines: Vec<&str> = iss.lines().filter_map(|l| l.strip_prefix(run)).collect();
         assert_eq!(
