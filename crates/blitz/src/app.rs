@@ -3,6 +3,7 @@
 // One process hosts every session, so a failed HRESULT must never panic.
 #![deny(clippy::unwrap_used)]
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -2240,7 +2241,9 @@ impl App {
         until: Option<Instant>,
         dim: bool,
     ) {
-        if let Some(v) = self.view_mut(id) {
+        if let Some(v) = self.view_mut(id)
+            && (!dim || hint_fits(v.notice.as_ref()))
+        {
             v.notice = Some(Notice {
                 text: text.into(),
                 until,
@@ -2859,12 +2862,8 @@ impl App {
                     self.close(el, id);
                     return;
                 }
-                self.set_notice(
-                    id,
-                    format!("{} \u{b7} Enter restart \u{b7} Esc close", exit_text(code)),
-                    None,
-                    false,
-                );
+                // `notice_line` says so from now on.
+                self.request_redraw();
             }
             Note::Dead => {
                 self.attention(id, Ev::Error { sticky: true });
@@ -3689,8 +3688,8 @@ impl App {
                     let dim = dimmed.contains(&v.pane.id);
                     let hollow = dim || !self.focused;
                     g.r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
-                    if let Some(n) = &v.notice {
-                        draw_notice(&mut g.r, &pal, at, v.grid, n);
+                    if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code) {
+                        draw_notice(&mut g.r, &pal, at, v.grid, &text, dim);
                     }
                 }
                 g.r.chrome(&chrome);
@@ -4201,13 +4200,33 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
 }
 
 /// Draws a notice over the bottom row of the pane whose grid is at `at`.
-fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &Notice) {
+/// A passing hint shows only where no question or error waits, which
+/// it would take the place of.
+fn hint_fits(n: Option<&Notice>) -> bool {
+    n.is_none_or(|n| n.ask == Ask::Nothing)
+}
+
+/// The bottom row of a pane, and whether it is dim: its notice, else for
+/// a program that exited, how and what Enter and Esc do, which comes
+/// back when a notice over it goes.
+fn notice_line(n: Option<&Notice>, exit: Option<u32>) -> Option<(Cow<'_, str>, bool)> {
+    match (n, exit) {
+        (Some(n), _) => Some((Cow::Borrowed(n.text.as_str()), n.dim)),
+        (None, Some(code)) => {
+            let text = format!("{} \u{b7} Enter restart \u{b7} Esc close", exit_text(code));
+            Some((Cow::Owned(text), false))
+        }
+        (None, None) => None,
+    }
+}
+
+fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text: &str, dim: bool) {
     let (_, ch) = r.cell();
-    let mut s = text_snapshot(&format!(" {}", n.text), grid.0, 1, pal);
-    let bg = if n.dim { pal.bg } else { pal.selection_bg };
+    let mut s = text_snapshot(&format!(" {text}"), grid.0, 1, pal);
+    let bg = if dim { pal.bg } else { pal.selection_bg };
     for c in &mut s.cells {
         c.bg = bg;
-        if n.dim {
+        if dim {
             c.attrs |= vt::snapshot::attr::DIM;
         }
     }
@@ -5882,6 +5901,34 @@ mod tests {
             );
             assert!(Ask::Quit.gone(Some(Action::Palette), here));
         }
+    }
+
+    /// A passing hint leaves a question or an error where it is, and an
+    /// exited program's line comes back once a notice over it goes.
+    #[test]
+    fn notices_over_questions_and_exits() {
+        let notice = |ask, dim| Notice {
+            text: "n".into(),
+            until: None,
+            dim,
+            ask,
+        };
+        assert!(hint_fits(None));
+        assert!(hint_fits(Some(&notice(Ask::Nothing, true))));
+        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit] {
+            assert!(!hint_fits(Some(&notice(ask, false))));
+        }
+        let exited = notice_line(None, Some(2)).expect("a line");
+        assert_eq!(
+            exited,
+            ("exit 2 \u{b7} Enter restart \u{b7} Esc close".into(), false)
+        );
+        let error = notice(Ask::Key, false);
+        assert_eq!(
+            notice_line(Some(&error), Some(2)),
+            Some(("n".into(), false))
+        );
+        assert_eq!(notice_line(None, None), None);
     }
 
     #[test]
