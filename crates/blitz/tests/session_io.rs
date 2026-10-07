@@ -44,8 +44,26 @@ fn session_files_round_trip() {
     assert_eq!(session::load(), None);
     assert_eq!(session::load_output(A), None);
 
+    // Another window's temporary file is not this one's business while
+    // that window may be writing it, but one a crash left goes, on the
+    // first save of a run.
+    std::fs::create_dir_all(&dir).expect("state folder");
+    let (fresh, stale) = (
+        dir.join("session.json.4294967295.tmp"),
+        dir.join("session.json.4294967294.tmp"),
+    );
+    std::fs::write(&fresh, "{").expect("write");
+    std::fs::write(&stale, "{").expect("write");
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    (std::fs::File::options().write(true).open(&stale))
+        .and_then(|f| f.set_modified(hour_ago))
+        .expect("age it");
+
     let (one, two) = (state("one"), state("two"));
     session::save(&one).expect("save");
+    assert!(fresh.exists(), "a fresh one stays");
+    assert!(!stale.exists(), "a stale one goes");
+    std::fs::remove_file(&fresh).expect("remove");
     assert_eq!(session::load(), Some(one.clone()), "with the pane's key");
     // Over an existing file, leaving no temporary one behind.
     session::save(&two).expect("save again");
@@ -87,19 +105,9 @@ fn session_files_round_trip() {
     std::fs::write(&file, b"\xff\xfe{").expect("write");
     assert_eq!(session::load(), None, "not UTF-8");
 
-    // Another window's temporary file is not this one's business while
-    // that window may be writing it, but one left by a crash goes.
-    let other = dir.join("session.json.4294967295.tmp");
-    std::fs::write(&other, "{").expect("write");
+    // The next save puts a good one back.
     session::save(&two).expect("save");
     assert_eq!(session::load(), Some(two.clone()));
-    assert!(other.exists(), "a fresh one stays");
-    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    (std::fs::File::options().write(true).open(&other))
-        .and_then(|f| f.set_modified(hour_ago))
-        .expect("age it");
-    session::save(&two).expect("save");
-    assert!(!other.exists(), "a stale one goes");
 
     // A session saved before panes had keys filed their output by tab and
     // leaf, which the first start after an update still reads.

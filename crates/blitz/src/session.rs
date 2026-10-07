@@ -190,17 +190,21 @@ pub fn save(s: &State) -> io::Result<()> {
     let dir = dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
     std::fs::create_dir_all(&dir)?;
     // A crash between the write and the swap leaves a temporary file named
-    // for a process that is gone; one this old is no live window's.
-    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        let old = (e.metadata().and_then(|m| m.modified()).ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > Duration::from_secs(60));
-        if old && name.starts_with("session.json.") && name.ends_with(".tmp") {
-            let _ = std::fs::remove_file(e.path());
+    // for a process that is gone; one this old is no live window's. Once a
+    // run is enough: a held resize key saves every half second.
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let old = (e.metadata().and_then(|m| m.modified()).ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(60));
+            if old && name.starts_with("session.json.") && name.ends_with(".tmp") {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
-    }
+    });
     let tmp = dir.join(format!("session.json.{}.tmp", std::process::id()));
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
         f.write_all(to_json(s).as_bytes())?;
