@@ -220,8 +220,9 @@ struct Keys {
     chars: bool,
     /// High half of a surrogate pair from WM_CHAR.
     high: Option<u16>,
-    /// The release of this key was already handled as text.
-    skip_up: Option<u16>,
+    /// Keys whose release was already handled as text. Several can be
+    /// down at once, as digits typed fast for an Alt code.
+    skip_up: Eaten,
 }
 
 enum Input {
@@ -284,11 +285,7 @@ impl Keys {
     /// Whether this is the release of a key whose text came as WM_CHAR,
     /// which was handled along with it.
     fn skipped(&mut self, vk: u16, down: bool) -> bool {
-        let skip = !down && self.skip_up == Some(vk);
-        if skip {
-            self.skip_up = None;
-        }
-        skip
+        !down && self.skip_up.release(vk)
     }
 
     /// A key transition from a key message. Its text comes as WM_CHAR
@@ -306,7 +303,7 @@ impl Keys {
             self.dead = false;
         }
         if vk == VK_PACKET || self.chars && down && !modifier {
-            self.skip_up = Some(vk);
+            self.skip_up.press(vk);
         } else {
             self.queue
                 .push(Input::Key(owned(input), input.text.to_string(), held));
@@ -3713,6 +3710,15 @@ mod tests {
         // Without Alt, keypad digits are keys.
         k.key(&pad(0x61, true), false, false);
         assert_eq!(queued(&mut k), ["+61"]);
+        // Typed fast, the next digit goes down before the last comes up;
+        // neither release reaches the program.
+        k.key(&alt(true), false, false);
+        k.key(&pad(0x60, true), true, false);
+        k.key(&pad(0x62, true), true, false);
+        assert!(k.skipped(0x60, false), "the first digit");
+        assert!(k.skipped(0x62, false));
+        k.key(&alt(false), false, false);
+        assert_eq!(queued(&mut k), ["+12", "-12"]);
     }
 
     #[test]
