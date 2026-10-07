@@ -59,6 +59,7 @@ const LEGACY: InputModes = InputModes {
     focus: false,
     mouse: vt::MouseMode::Off,
     mouse_sgr: false,
+    alt_scroll: false,
     alt_screen: false,
 };
 

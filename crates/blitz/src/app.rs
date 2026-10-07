@@ -4090,22 +4090,26 @@ impl App {
             }
             return;
         }
-        if let Some(id) = self.mouse_to_program(&mods).and(self.focus_id()) {
-            let kind = if steps > 0.0 {
-                MouseKind::WheelUp
-            } else {
-                MouseKind::WheelDown
-            };
-            for _ in 0..steps.abs() as u32 {
-                self.mouse_report(id, kind, 0, mods);
+        let Some(v) = self.current() else {
+            return;
+        };
+        let m = lock(&v.pane.term).input_modes();
+        let shift = mods.lshift || mods.rshift;
+        match wheel_does(&m, shift, v.pane.claude.is_some()) {
+            Wheel::Report => {
+                let id = v.pane.id;
+                let kind = if steps > 0.0 {
+                    MouseKind::WheelUp
+                } else {
+                    MouseKind::WheelDown
+                };
+                for _ in 0..steps.abs() as u32 {
+                    self.mouse_report(id, kind, 0, mods);
+                }
             }
-        } else if self.modes().alt_screen {
-            // As in xterm's alternateScroll: pagers such as less and man
-            // have no scrollback to show, but scroll by the arrow keys.
-            let keys = wheel_keys(steps as isize * WHEEL_LINES, &self.modes());
-            self.send(keys);
-        } else {
-            self.scroll(steps as isize * WHEEL_LINES);
+            Wheel::Arrows => self.send(wheel_keys(steps as isize * WHEEL_LINES, &m)),
+            Wheel::Scroll => self.scroll(steps as isize * WHEEL_LINES),
+            Wheel::Nothing => {}
         }
     }
 
@@ -4877,6 +4881,35 @@ fn reveal(term: &mut vt::Terminal, m: Found, rows: u16) -> bool {
     }
     term.scroll_to(m.start.0.saturating_sub(rows / 2));
     term.view_top() != top
+}
+
+/// What the wheel does over a pane whose program is in modes `m`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wheel {
+    /// Wheel reports to the program, which takes the mouse.
+    Report,
+    /// Arrow keys, as in xterm's alternateScroll (mode 1007): pagers have
+    /// no scrollback to show, but scroll by the arrow keys.
+    Arrows,
+    /// Scroll the main screen's view.
+    Scroll,
+    Nothing,
+}
+
+/// What the wheel does over a pane in modes `m`; `shift` keeps it from a
+/// program that takes the mouse. Arrows go only to a program that asked
+/// for them, and never to Claude Code (`claude`), where they walk its
+/// prompt history and replace what was typed.
+fn wheel_does(m: &InputModes, shift: bool, claude: bool) -> Wheel {
+    if m.mouse != MouseMode::Off && !shift {
+        Wheel::Report
+    } else if !m.alt_screen {
+        Wheel::Scroll
+    } else if m.alt_scroll && !claude {
+        Wheel::Arrows
+    } else {
+        Wheel::Nothing
+    }
 }
 
 /// `n` presses of Up, or of Down for a negative `n`, each with its
@@ -6400,6 +6433,45 @@ mod tests {
         // Kitty flags 1 and 2: releases are reported too.
         let kitty = InputModes { kitty: 3, ..legacy };
         assert_eq!(wheel_keys(1, &kitty), b"\x1b[A\x1b[1;1:3A");
+    }
+
+    #[test]
+    fn app_wheel_sends_arrows_only_when_asked_and_never_to_claude() {
+        let alt = InputModes {
+            alt_screen: true,
+            ..InputModes::default()
+        };
+        let asked = InputModes {
+            alt_scroll: true,
+            ..alt
+        };
+        let mouse = InputModes {
+            mouse: MouseMode::Click,
+            ..asked
+        };
+        assert_eq!(
+            wheel_does(&InputModes::default(), false, false),
+            Wheel::Scroll
+        );
+        assert_eq!(wheel_does(&alt, false, false), Wheel::Nothing, "not asked");
+        assert_eq!(wheel_does(&asked, false, false), Wheel::Arrows);
+        assert_eq!(
+            wheel_does(&asked, false, true),
+            Wheel::Nothing,
+            "Claude Code"
+        );
+        assert_eq!(wheel_does(&mouse, false, true), Wheel::Report);
+        assert_eq!(
+            wheel_does(&mouse, true, true),
+            Wheel::Nothing,
+            "Shift over Claude"
+        );
+        assert_eq!(wheel_does(&mouse, true, false), Wheel::Arrows, "Shift");
+        let main = InputModes {
+            mouse: MouseMode::Any,
+            ..InputModes::default()
+        };
+        assert_eq!(wheel_does(&main, true, true), Wheel::Scroll);
     }
 
     #[test]

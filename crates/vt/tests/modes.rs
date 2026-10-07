@@ -17,12 +17,13 @@ fn modes_start_off() {
 
 #[test]
 fn dec_modes_reach_input_modes() {
-    let mut t = term("\x1b[?1h\x1b=\x1b[?2004h\x1b[?1004h\x1b[?9001h\x1b[?1002;1006h");
+    let mut t = term("\x1b[?1h\x1b=\x1b[?2004h\x1b[?1004h\x1b[?9001h\x1b[?1002;1006;1007h");
     let m = t.input_modes();
     assert!(m.decckm && m.deckpam && m.bracketed && m.focus && m.w32im && m.mouse_sgr);
+    assert!(m.alt_scroll);
     assert_eq!(m.mouse, MouseMode::Drag);
 
-    t.feed(b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\x1b[?9001l\x1b[?1002l\x1b[?1006l");
+    t.feed(b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\x1b[?9001l\x1b[?1002l\x1b[?1006;1007l");
     assert_eq!(t.input_modes(), InputModes::default());
 
     t.feed(b"\x1b[?66h");

@@ -33,6 +33,8 @@ pub struct InputModes {
     pub mouse: MouseMode,
     /// Mode 1006.
     pub mouse_sgr: bool,
+    /// Mode 1007: the wheel on the alternate screen sends arrow keys.
+    pub alt_scroll: bool,
     pub alt_screen: bool,
 }
 
@@ -134,6 +136,7 @@ impl Modes {
             }
             1004 => i.focus = on,
             1006 => i.mouse_sgr = on,
+            1007 => i.alt_scroll = on,
             // Programs such as Claude Code set it again on every redraw;
             // only turning it on anew can mean another program reads keys.
             2004 => {
@@ -166,6 +169,7 @@ impl Modes {
             1003 => i.mouse == MouseMode::Any,
             1004 => i.focus,
             1006 => i.mouse_sgr,
+            1007 => i.alt_scroll,
             2004 => i.bracketed,
             2026 => self.sync.is_some(),
             2031 => self.theme_reports,
@@ -176,7 +180,8 @@ impl Modes {
 
     /// Clears the input modes a program can leave behind when it dies
     /// without restoring them: both kitty stacks, modifyOtherKeys, mouse
-    /// tracking, bracketed paste, synchronized output and theme reports.
+    /// tracking and wheel arrows, bracketed paste, synchronized output and
+    /// theme reports.
     /// Otherwise the next program gets CSI-u keys or reports it never asked
     /// for.
     pub fn reset_input(&mut self) {
@@ -184,6 +189,7 @@ impl Modes {
         self.mok = 0;
         self.input.mouse = MouseMode::Off;
         self.input.mouse_sgr = false;
+        self.input.alt_scroll = false;
         self.input.bracketed = false;
         self.paste_confirmed = false;
         self.sync = None;
@@ -246,8 +252,13 @@ mod tests {
             ..Modes::default()
         };
         m.kitty[1].push(1);
+        m.set_dec(1007, true);
         m.reset_input();
         assert_eq!((m.mok, m.kitty[1].flags()), (0, 0));
+        assert!(
+            !m.input.alt_scroll,
+            "a shell would get arrows for the wheel"
+        );
     }
 
     #[test]
