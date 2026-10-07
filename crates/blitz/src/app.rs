@@ -3679,6 +3679,8 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
+        // A narrow window has no room for the sidebar.
+        self.win.fit_width(size.width as f32 / self.scale as f32);
         self.ensure_gfx();
         let Some(g) = &self.gfx else {
             return;

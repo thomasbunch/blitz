@@ -820,6 +820,7 @@ mod gpu {
             tabs: vec![shop, Tab::new("migrate".into(), migrate)],
             active: 0,
             sidebar_expanded: !collapsed,
+            narrow: None,
         };
         let now = Instant::now();
         let ago = |s| now.checked_sub(Duration::from_secs(s)).unwrap_or(now);

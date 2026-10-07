@@ -1524,6 +1524,7 @@ mod tests {
             tabs: vec![a, Tab::new("db".into(), PaneId(3))],
             active: 0,
             sidebar_expanded: expanded,
+            narrow: None,
         };
         let sessions = vec![
             session(1, "api", Attn::NeedsYou, now),

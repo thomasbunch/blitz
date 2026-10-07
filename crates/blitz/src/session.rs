@@ -102,7 +102,7 @@ impl State {
             .collect();
         State {
             window,
-            sidebar_expanded: win.sidebar_expanded,
+            sidebar_expanded: win.chosen_expanded(),
             active: win.active,
             tabs,
         }
@@ -132,6 +132,7 @@ impl State {
             active: self.active.min(tabs.len().saturating_sub(1)),
             tabs,
             sidebar_expanded: self.sidebar_expanded,
+            narrow: None,
         };
         (win, panes)
     }
@@ -802,6 +803,7 @@ mod tests {
             tabs: vec![t],
             active: 0,
             sidebar_expanded: true,
+            narrow: None,
         };
         let s = State::capture(&win, Geometry::default(), |p| PaneMeta {
             cwd: format!("d{}", p.0),
@@ -829,6 +831,21 @@ mod tests {
         let mut renamed = win.tabs[0].clone();
         renamed.root = t.root.clone();
         assert_eq!(renamed.dividers(AREA), win.tabs[0].dividers(AREA));
+    }
+
+    #[test]
+    fn a_sidebar_collapsed_for_a_narrow_window_saves_as_expanded() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("t".into(), PaneId(1)));
+        win.fit_width(600.0);
+        assert!(!win.sidebar_expanded);
+        let s = State::capture(&win, Geometry::default(), |_| PaneMeta {
+            cwd: "d".into(),
+            claude: None,
+            key: String::new(),
+            num: 0,
+        });
+        assert!(s.sidebar_expanded);
     }
 
     #[test]

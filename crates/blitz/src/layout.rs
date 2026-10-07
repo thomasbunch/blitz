@@ -11,6 +11,12 @@ pub const MIN_COLS: i32 = 10;
 /// A split is refused if either half would be shorter than this.
 pub const MIN_ROWS: i32 = 3;
 
+/// Below this window width at 96 DPI the sidebar collapses to its rail,
+/// and from `WIDE` up it expands again; the gap keeps a window dragged
+/// across the line from flipping it back and forth.
+const NARROW: f32 = 800.0;
+const WIDE: f32 = 880.0;
+
 /// Never reused within a process. Exported to the child as `BLITZ_PANE_ID`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PaneId(pub u32);
@@ -523,6 +529,9 @@ pub struct Window {
     /// The session list when true, the narrow dot rail when false. Neither
     /// is shown while there is only one session.
     pub sidebar_expanded: bool,
+    /// Set while the window is too narrow for the sidebar, which it
+    /// collapsed: true when the sidebar expands again once there is room.
+    pub narrow: Option<bool>,
 }
 
 impl Default for Window {
@@ -531,6 +540,7 @@ impl Default for Window {
             tabs: Vec::new(),
             active: 0,
             sidebar_expanded: true,
+            narrow: None,
         }
     }
 }
@@ -543,13 +553,40 @@ impl Window {
     }
 
     /// Expands or collapses the sidebar. Returns false when there is none
-    /// to change, so the key goes to the program.
+    /// to change, so the key goes to the program. The user's choice stands
+    /// when the window gets wide again.
     pub fn toggle_sidebar(&mut self) -> bool {
         if !self.has_sidebar() {
             return false;
         }
         self.sidebar_expanded = !self.sidebar_expanded;
+        if let Some(back) = &mut self.narrow {
+            *back = false;
+        }
         true
+    }
+
+    /// Collapses the sidebar when the window gets narrower than `NARROW`
+    /// px at 96 DPI, and expands it again once it is `WIDE`, unless the
+    /// user chose otherwise in between.
+    pub fn fit_width(&mut self, width: f32) {
+        match self.narrow {
+            None if width < NARROW => {
+                self.narrow = Some(self.sidebar_expanded);
+                self.sidebar_expanded = false;
+            }
+            Some(back) if width >= WIDE => {
+                self.narrow = None;
+                self.sidebar_expanded |= back;
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the sidebar is expanded by the user's choice, which is what
+    /// a session saves: a narrow window's collapse is not.
+    pub fn chosen_expanded(&self) -> bool {
+        self.sidebar_expanded || self.narrow == Some(true)
     }
 
     /// Closes pane `p` wherever it is. Closing a tab's last pane removes
@@ -1060,5 +1097,38 @@ mod tests {
         assert!(!w.sidebar_expanded);
         assert!(w.toggle_sidebar());
         assert!(w.sidebar_expanded);
+    }
+
+    #[test]
+    fn a_narrow_window_collapses_the_sidebar_for_a_while() {
+        let mut w = Window::default();
+        w.tabs.push(Tab::new("t".into(), PaneId(1)));
+        assert!(w.tabs[0].split(Dir::Right, PaneId(2), AREA, MIN));
+        w.fit_width(1200.0);
+        assert!(w.sidebar_expanded);
+        w.fit_width(790.0);
+        assert!(!w.sidebar_expanded && w.chosen_expanded());
+        // Back over the line, but not by enough to flip it back.
+        w.fit_width(820.0);
+        assert!(!w.sidebar_expanded);
+        w.fit_width(880.0);
+        assert!(w.sidebar_expanded && w.narrow.is_none());
+
+        // Collapsed by hand, it stays collapsed when the window widens.
+        w.fit_width(700.0);
+        assert!(w.toggle_sidebar() && w.sidebar_expanded);
+        assert!(w.toggle_sidebar() && !w.sidebar_expanded);
+        assert!(!w.chosen_expanded());
+        w.fit_width(1000.0);
+        assert!(!w.sidebar_expanded);
+        // Expanded by hand while narrow, it stays until the window is
+        // made narrow again.
+        w.fit_width(700.0);
+        assert!(w.toggle_sidebar() && w.sidebar_expanded);
+        w.fit_width(750.0);
+        assert!(w.sidebar_expanded && w.chosen_expanded());
+        w.fit_width(1000.0);
+        w.fit_width(799.0);
+        assert!(!w.sidebar_expanded);
     }
 }
