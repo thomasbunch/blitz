@@ -142,7 +142,8 @@ pub struct Terminal {
     viewport: usize,
     /// The main screen's view while the alternate screen is up.
     other_viewport: usize,
-    /// Counts the times line numbers started over; see [`Self::line_epoch`].
+    /// Counts the times line numbers started over on both screens; see
+    /// [`Self::line_epoch`].
     line_epoch: u32,
     changed: bool,
     modes: Modes,
@@ -567,9 +568,11 @@ impl Terminal {
 
     /// Changes whenever line numbers start over and name other text: the
     /// width changed and the lines were wrapped again, the other screen is
-    /// shown, or the terminal was reset.
+    /// shown, or the terminal was reset. Coming back from the alternate
+    /// screen gives the main screen's numbers back, as its lines are still
+    /// where they were: blitz's own prompt goes there and back each time.
     pub fn line_epoch(&self) -> u32 {
-        self.line_epoch
+        self.line_epoch.wrapping_mul(2) | u32::from(self.alt)
     }
 
     /// Line `n` of the screen being shown, scrollback included, as
@@ -1116,7 +1119,6 @@ impl Terminal {
         if alt != self.alt {
             std::mem::swap(&mut self.screen, &mut self.other);
             self.alt = alt;
-            self.line_epoch = self.line_epoch.wrapping_add(1);
             // The main screen's view comes back on the text it showed.
             std::mem::swap(&mut self.viewport, &mut self.other_viewport);
             self.viewport = self.viewport.min(self.screen.grid.scrollback_len());

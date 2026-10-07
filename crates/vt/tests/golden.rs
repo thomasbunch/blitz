@@ -340,6 +340,9 @@ fn lines_keep_their_numbers_until_they_leave_scrollback() {
     feed(&mut t, "\x1b[?1049h");
     assert_ne!(t.line_epoch(), epoch, "the other screen");
     assert_eq!(t.lines(), 0..4, "has no scrollback");
+    feed(&mut t, "\x1b[?1049l");
+    assert_eq!(t.line_epoch(), epoch, "back on the main screen");
+    feed(&mut t, "\x1b[?1049h");
     let epoch = t.line_epoch();
     feed(&mut t, "\x1bc");
     assert_ne!(t.line_epoch(), epoch, "a reset");

@@ -6310,6 +6310,18 @@ mod tests {
     }
 
     #[test]
+    fn app_selection_outlives_blitz_prompt() {
+        let pal = crate::theme::dark();
+        let mut t = fed(10, 3, "ls\r\na b\r\n");
+        let mut s = Snapshot::default();
+        let mut sel = select(&t, (1, 0), (1, 2));
+        // What blitz's shell integration prints before each prompt.
+        t.feed(b"\x1b[?1049h\x1b[?1049l\x1b[!pPS> ");
+        assert!(refresh(&mut t, &mut s, &pal, Some(&mut sel)));
+        assert_eq!(selection_text(&t, &pal, &sel, 0), "a b");
+    }
+
+    #[test]
     fn app_selection_shows_the_part_in_view() {
         let size = (10, 3);
         let view = |a, b| in_view(a, b, false, 5, size);
