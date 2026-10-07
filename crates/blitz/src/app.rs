@@ -819,6 +819,9 @@ struct App {
     rows: Vec<(PaneId, Rect)>,
     next_id: u32,
     focused: bool,
+    /// A session changed while the user was away from the screen; the
+    /// focused pane counts as seen once they are back.
+    away: bool,
     /// A selection in the focused pane.
     selection: Option<Selection>,
     /// The link under the pointer while Ctrl is held, drawn underlined:
@@ -1087,6 +1090,7 @@ impl App {
             rows: Vec::new(),
             next_id: 1,
             focused: false,
+            away: false,
             selection: None,
             hover: None,
             mouse: Mouse::default(),
@@ -3070,6 +3074,7 @@ impl App {
         // While it is open, it covers the panes: the focused one is not in
         // view. Nor is anything while the user is away from the screen.
         let here = present(self.focused, idle_for());
+        self.away |= !here;
         let attended = here && self.game.is_none() && self.focus_id() == Some(id);
         let away = !here && self.config.flash;
         let Some(v) = self.view_mut(id) else {
@@ -4636,6 +4641,14 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.drain_keys(el);
+        // Back at the screen, with a key or the mouse: the focused pane
+        // is in view again.
+        if self.away && self.game.is_none() && present(self.focused, idle_for()) {
+            self.away = false;
+            if let Some(id) = self.focus_id() {
+                self.attention(id, Ev::Attended);
+            }
+        }
         self.save_session(false);
         let flow = match self.next_deadline() {
             Some(t) => ControlFlow::WaitUntil(t),
