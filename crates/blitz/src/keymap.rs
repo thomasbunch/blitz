@@ -132,6 +132,15 @@ pub fn repeats(k: &KeyInput, panel: bool) -> bool {
     }
 }
 
+/// Whether blitz drops the auto-repeat of a held key: the press was blitz's
+/// (`taken`) or the key is a shortcut, and [`repeats`] says no. A shortcut
+/// counts even when blitz lost track of its press, as when focus left and
+/// came back while it was held, so a held key never answers its own "press
+/// again".
+pub fn drops_repeat(k: &KeyInput, taken: bool, panel: bool) -> bool {
+    (taken || action(k).is_some()) && !repeats(k, panel)
+}
+
 /// Unshifted characters of a US layout by set-1 scan code, NUL where the
 /// key types nothing.
 const US_BY_SCAN: &[u8] =
@@ -876,6 +885,23 @@ mod msg_to_key_tests {
         // Outside a panel, a key blitz took that is no shortcut, as Enter
         // closing an exited pane, does not go on to the next pane.
         assert!(!repeats_with(0x0d, &[], false));
+
+        let drops = |vk: u16, held: &[usize], taken: bool| {
+            let mut t = String::new();
+            let again = lp(0, false, true, 1) | 1 << 30;
+            let k = msg_to_key(vk, again, &state(held, &[]), layout(US), &mut t);
+            drops_repeat(&k, taken, false)
+        };
+        // A held shortcut is dropped even once blitz lost track of its
+        // press, as when focus left and came back while it was held.
+        for (vk, held) in [(0x56, &[0xa2][..]), (0x57, CS), (0x55, CS)] {
+            assert!(drops(vk, held, false), "{vk:#x}");
+        }
+        assert!(drops(0x0d, &[], true), "Enter that closed an exited pane");
+        // Typing, and moving that repeats, go on.
+        assert!(!drops(0x41, &[], false));
+        assert!(!drops(0x0d, &[], false));
+        assert!(!drops(0x09, &[0xa2], true), "CycleTab");
     }
 
     /// Enter and Space type the same on every layout.

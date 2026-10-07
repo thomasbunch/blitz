@@ -1560,9 +1560,9 @@ impl App {
             return;
         }
         // A repeat of a key blitz took goes where its press went, and only
-        // some keys do anything again; see `keymap::repeats`.
+        // some keys do anything again; see `keymap::drops_repeat`.
         let panel = self.picker.is_some() || self.settings.is_some();
-        if held && k.down && self.eaten.0.contains(&k.vk) && !keymap::repeats(k, panel) {
+        if held && k.down && keymap::drops_repeat(k, self.eaten.0.contains(&k.vk), panel) {
             return;
         }
         if let Some((g, _)) = &mut self.game {
