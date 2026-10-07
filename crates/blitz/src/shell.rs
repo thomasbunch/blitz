@@ -520,7 +520,7 @@ pub const POWERSHELL_INTEGRATION: &str = r"if (-not (Test-Path variable:global:_
 /// Windows folder is reported: Git Bash's, or one under WSL's `/mnt`. A
 /// drive's folder is worked out without starting `pwd -W`, which takes
 /// tens of milliseconds under MSYS. Read again, as by `source ~/.bashrc`,
-/// it adds its hooks back where that took them away, and never twice.
+/// it puts its hooks back first and last, and never twice.
 /// Needs bash 4.4 for `PS0`; from bash 5.1 `PROMPT_COMMAND` may be an
 /// array, each of whose commands runs.
 pub const BASH_INTEGRATION: &str = r#"# blitz shell integration: marks each prompt and reports the folder.
@@ -544,18 +544,22 @@ if [ -n "$BLITZ_PANE_TOKEN" ]; then
     case $PS1 in *'\e]133;B'*) ;; *) PS1=$PS1'\[\e]133;B\a\]' ;; esac
     return $__blitz_code
   }
-  # First and last. Lines, not `;`, as the commands there may end with one.
+  # First and last, taken out and put back each time, as an rc read again
+  # may have put its own around them. Lines, not `;`, as the commands
+  # there may end with one.
   if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then
-    case " ${PROMPT_COMMAND[*]} " in
-      *' __blitz_prompt '*) ;;
-      *) PROMPT_COMMAND=(__blitz_status "${PROMPT_COMMAND[@]}" __blitz_prompt) ;;
-    esac
+    __blitz_pc=()
+    for __blitz_c in "${PROMPT_COMMAND[@]}"; do
+      case $__blitz_c in __blitz_status|__blitz_prompt) ;; *) __blitz_pc+=("$__blitz_c") ;; esac
+    done
+    PROMPT_COMMAND=(__blitz_status "${__blitz_pc[@]}" __blitz_prompt)
   else
-    case $PROMPT_COMMAND in
-      *__blitz_prompt*) ;;
-      *) PROMPT_COMMAND=__blitz_status$'\n'${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__blitz_prompt ;;
-    esac
+    __blitz_pc=${PROMPT_COMMAND//__blitz_status$'\n'/}
+    __blitz_pc=${__blitz_pc//$'\n'__blitz_prompt/}
+    [ "$__blitz_pc" = __blitz_prompt ] && __blitz_pc=
+    PROMPT_COMMAND=__blitz_status$'\n'${__blitz_pc:+$__blitz_pc$'\n'}__blitz_prompt
   fi
+  unset __blitz_pc __blitz_c
   # When a command starts. The arithmetic sets the flag and prints nothing.
   case $PS0 in
     *'133;C'*) ;;
@@ -916,8 +920,9 @@ mod tests {
         let file = std::env::temp_dir().join(format!("blitz-rc-{}.sh", std::process::id()));
         std::fs::write(&file, BASH_INTEGRATION).unwrap();
         let script = r#"PROMPT_COMMAND='history -a'; . "$1"; . "$1"; PROMPT_COMMAND='history -a'; . "$1"
+declare -p PROMPT_COMMAND; PROMPT_COMMAND="history -a${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; . "$1"
 declare -p PROMPT_COMMAND; unset PROMPT_COMMAND; PROMPT_COMMAND=(one two); . "$1"; . "$1"
-declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""#;
+PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""#;
         let out = std::process::Command::new(bash)
             .args(["--norc", "-c", script, "x"])
             .arg(&file)
@@ -928,7 +933,8 @@ declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""#;
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             "declare -- PROMPT_COMMAND=$'__blitz_status\\nhistory -a\\n__blitz_prompt'\n\
-             declare -a PROMPT_COMMAND=([0]=\"__blitz_status\" [1]=\"one\" [2]=\"two\" [3]=\"__blitz_prompt\")\n\
+             declare -- PROMPT_COMMAND=$'__blitz_status\\nhistory -a; history -a\\n__blitz_prompt'\n\
+             declare -a PROMPT_COMMAND=([0]=\"__blitz_status\" [1]=\"one\" [2]=\"two\" [3]=\"three\" [4]=\"__blitz_prompt\")\n\
              C\n"
         );
     }
