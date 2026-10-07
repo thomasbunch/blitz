@@ -768,7 +768,8 @@ mod tests {
 
     #[test]
     fn links_know_which_types_have_a_program() {
-        assert!(has_program(Path::new(r"C:\x\a.txt")), "Notepad");
+        // Which known types have one depends on the machine: Windows
+        // Server can leave even .txt without a program's name.
         assert!(!has_program(Path::new(r"C:\x\a.blitz-no-such-type")));
         assert!(!has_program(Path::new(r"C:\x\Makefile")));
     }
