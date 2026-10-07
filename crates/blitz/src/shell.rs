@@ -171,12 +171,15 @@ pub fn quote(arg: &str) -> String {
 /// screen the console host and the terminal both restore the cursor saved
 /// when the program switched. A command's end mark carries the code of the
 /// program it ran, or 1 when it failed otherwise: `$LASTEXITCODE` keeps the
-/// last program's code through later commands, so only a new one counts.
-pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
+/// last program's code through later commands, so it counts when it changed
+/// or no new error says a cmdlet failed. A user's strict mode would stop
+/// the script reading what is not set yet, so it is off in its own scopes.
+pub const POWERSHELL_INTEGRATION: &str = r#"if (-not (Test-Path variable:global:__blitz)) {
   $global:__blitz = @{ Orig = $function:prompt; Exec = $false; Token = $env:BLITZ_PANE_TOKEN }
   function global:prompt {
-    $ok = $global:?; $c = $global:LASTEXITCODE
-    $code = if ($ok) { 0 } elseif ($c -and $c -ne $global:__blitz.Last) { $c } else { 1 }
+    $ok = $global:?; Set-StrictMode -Off; $c = $global:LASTEXITCODE
+    $new = $global:Error.Count -and -not [object]::ReferenceEquals($global:Error[0], $global:__blitz.Err)
+    $code = if ($ok) { 0 } elseif ($c -and ($c -ne $global:__blitz.Last -or -not $new)) { $c } else { 1 }
     $e = [char]27; $b = [char]7; $s = "$e[?1049h$e[?1049l$e[!p$e[?5W"
     if ($global:__blitz.Exec) { $s += "$e]133;D;$code$b"; $global:__blitz.Exec = $false }
     $s += "$e]133;A;blitz=$($global:__blitz.Token)$b"
@@ -190,7 +193,8 @@ pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
   if (Get-Module PSReadLine) {
     $global:__blitz.RL = $function:PSConsoleHostReadLine
     function global:PSConsoleHostReadLine {
-      $l = & $global:__blitz.RL; $global:__blitz.Exec = $true; $global:__blitz.Last = $global:LASTEXITCODE
+      $l = & $global:__blitz.RL; Set-StrictMode -Off; $global:__blitz.Exec = $true
+      $global:__blitz.Last = $global:LASTEXITCODE; $global:__blitz.Err = if ($global:Error.Count) { $global:Error[0] }
       [Console]::Write("$([char]27)]133;C$([char]7)"); $l
     }
   }

@@ -377,12 +377,26 @@ fn pty_shells_print_prompt_marks() {
 }
 
 /// PowerShell marks where each command starts, and ends it with the code
-/// of the program it ran, or 1 for a failed cmdlet, which leaves the last
-/// program's code behind in `$LASTEXITCODE`.
+/// of the program it ran, even the same as last time, or 1 for a failed
+/// cmdlet, which leaves the last program's code behind in `$LASTEXITCODE`.
+/// It does so too when the user's profile turns strict mode on.
 #[test]
 fn pty_powershell_reports_how_commands_end() {
-    for program in shells().into_iter().filter(|p| !p.ends_with("cmd.exe")) {
-        let l = launch(&program);
+    let shells = shells().into_iter().filter(|p| !p.ends_with("cmd.exe"));
+    for (program, strict) in shells.flat_map(|p| [(p.clone(), false), (p, true)]) {
+        let mut l = launch(&program);
+        if strict {
+            let script = format!(
+                "Set-StrictMode -Version Latest\n{}",
+                blitz::shell::POWERSHELL_INTEGRATION
+            );
+            let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let encoded = blitz::shell::base64(&utf16);
+            l.cmdline = format!(
+                "{} -NoProfile -NoLogo -NoExit -EncodedCommand {encoded}",
+                blitz::shell::quote(&program)
+            );
+        }
         let (pty, _, rx) = spawn(&l.cmdline, &l.env);
         let mut out = Vec::new();
         let mark = format!("\x1b]133;A;blitz={TOKEN}");
@@ -393,7 +407,13 @@ fn pty_powershell_reports_how_commands_end() {
         );
         for (line, code) in [
             ("cmd /c exit 3", "3"),
+            ("cmd /c exit 3", "3"),
             ("Get-Item blitz-nothing-here", "1"),
+            ("cmd /c exit 3", "3"),
+            (
+                "Get-Item blitz-nothing-here -ErrorAction SilentlyContinue",
+                "1",
+            ),
             ("cmd /c exit 0", "0"),
         ] {
             out.clear();
@@ -401,7 +421,7 @@ fn pty_powershell_reports_how_commands_end() {
             let end = format!("\x1b]133;D;{code}\x07");
             let ended = wait_for(&rx, &mut out, end.as_bytes());
             let shown = String::from_utf8_lossy(&out);
-            assert!(ended, "{program}: {line}: {shown:?}");
+            assert!(ended, "{program}, strict mode {strict}: {line}: {shown:?}");
             assert!(
                 shown.contains("\x1b]133;C\x07"),
                 "{program}: {line}: {shown:?}"
