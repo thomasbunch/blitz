@@ -17,7 +17,8 @@ fn mods(s: &str) -> Mods {
     m
 }
 
-/// A key-down with the fields every encoding looks at.
+/// A key-down with the fields every encoding looks at. Like the keymap,
+/// it gives keypad keys no US base character.
 fn key<'a>(vk: u16, scan: u16, uc: u16, m: &str, key: Key, text: &'a str) -> KeyInput<'a> {
     KeyInput {
         vk,
@@ -32,7 +33,7 @@ fn key<'a>(vk: u16, scan: u16, uc: u16, m: &str, key: Key, text: &'a str) -> Key
         cs: 0,
         key,
         us_base: match key {
-            Key::Char(c) if c.is_ascii() => Some(c),
+            Key::Char(c) if c.is_ascii() && !(0x60..=0x6f).contains(&vk) => Some(c),
             _ => None,
         },
     }
@@ -253,11 +254,22 @@ fn legacy_keys_decckm_and_deckpam() {
         deckpam: true,
         ..LEGACY
     };
-    let five = key(0x65, 0x4c, 0x35, "", Key::Char('5'), "5");
-    assert_eq!(enc(&five, &LEGACY), "5");
-    assert_eq!(enc(&five, &kpam), "\x1bOu");
-    let plus = key(0x6b, 0x4e, 0x2b, "", Key::Char('+'), "+");
-    assert_eq!(enc(&plus, &kpam), "\x1bOk");
+    // Windows sends the operator keys whatever Num Lock says.
+    for (vk, scan, c, f) in [
+        (0x6a, 0x37, '*', 'j'),
+        (0x6b, 0x4e, '+', 'k'),
+        (0x6c, 0x53, ',', 'l'),
+        (0x6d, 0x4a, '-', 'm'),
+        (0x6f, 0x35, '/', 'o'),
+    ] {
+        let s = c.to_string();
+        let mut input = key(vk, scan, c as u16, "", Key::Char(c), &s);
+        input.extended = vk == 0x6f;
+        assert_eq!(enc(&input, &LEGACY), s);
+        assert_eq!(enc(&input, &kpam), format!("\x1bO{f}"), "{c}");
+        input.locks.num = true;
+        assert_eq!(enc(&input, &kpam), s, "{c} with Num Lock on");
+    }
     let mut kp_enter = key(0x0d, 0x1c, 13, "", Key::Enter, "");
     kp_enter.extended = true;
     assert_eq!(enc(&kp_enter, &LEGACY), "\r");
@@ -266,17 +278,44 @@ fn legacy_keys_decckm_and_deckpam() {
     let enter = key(0x0d, 0x1c, 13, "", Key::Enter, "");
     assert_eq!(enc(&enter, &kpam), "\r");
 
-    // With Num Lock on the keypad types what is printed on it.
-    for (mut input, want) in [(five, "5"), (plus, "+"), (kp_enter, "\r")] {
-        input.locks.num = true;
+    // With Num Lock on the digit keys type their digits.
+    let mut five = key(0x65, 0x4c, 0x35, "", Key::Char('5'), "5");
+    five.locks.num = true;
+    let mut dot = key(0x6e, 0x53, 0x2e, "", Key::Char('.'), ".");
+    dot.locks.num = true;
+    kp_enter.locks.num = true;
+    for (input, want) in [(five, "5"), (dot, "."), (kp_enter, "\r")] {
         assert_eq!(enc(&input, &kpam), want, "{input:?}");
     }
+    // With it off they arrive as the navigation keys printed under the
+    // digits, not extended, and keypad 5 as VK_CLEAR: Begin.
+    let home = key(0x24, 0x47, 0, "", Key::Home, "");
+    let del = key(0x2e, 0x53, 0, "", Key::Delete, "");
+    let begin = key(0x0c, 0x4c, 0, "", Key::Other, "");
+    for m in [LEGACY, kpam] {
+        assert_eq!(enc(&home, &m), "\x1b[H");
+        assert_eq!(enc(&del, &m), "\x1b[3~");
+        assert_eq!(enc(&begin, &m), "\x1b[E");
+    }
+    assert_eq!(enc(&begin, &ckm), "\x1bOE");
+    let mut ctrl_begin = begin;
+    ctrl_begin.mods = mods("c");
+    assert_eq!(enc(&ctrl_begin, &LEGACY), "\x1b[1;5E");
 }
 
 #[test]
-fn legacy_keys_ime_owned_key_sends_nothing() {
+fn ime_owned_key_sends_nothing_in_any_mode() {
     let input = key(0xe5, 0x1e, 0, "", Key::Char('a'), "a");
-    assert_eq!(enc(&input, &LEGACY), "");
+    for m in [
+        LEGACY,
+        W32IM,
+        kitty(1),
+        kitty(31),
+        InputModes { kitty: 31, ..W32IM },
+    ] {
+        assert_eq!(enc(&input, &m), "", "{m:?}");
+        assert_eq!(enc(&up(input), &m), "", "release {m:?}");
+    }
 }
 
 fn kitty(flags: u8) -> InputModes {
@@ -427,6 +466,54 @@ fn kitty_keys_event_types() {
 fn kitty_keys_without_disambiguate_stay_legacy() {
     assert_eq!(enc(&k("c", Key::Char('c'), "c"), &kitty(4)), "\x03");
     assert_eq!(enc(&k("", Key::Escape, ""), &kitty(2)), "\x1b");
+}
+
+#[test]
+fn kitty_keys_keypad_codes() {
+    let m = kitty(8);
+    for (vk, code) in [
+        (0x60, 57399),
+        (0x69, 57408),
+        (0x6e, 57409),
+        (0x6f, 57410),
+        (0x6a, 57411),
+        (0x6d, 57412),
+        (0x6b, 57413),
+        (0x6c, 57416),
+    ] {
+        let input = key(vk, 0, 0, "", Key::Char('x'), "x");
+        assert_eq!(enc(&input, &m), format!("\x1b[{code}u"), "{vk:#x}");
+    }
+    // Num Lock off: the keypad's navigation keys are not extended, the
+    // main ones are. Keypad 5 is Begin, which keeps its letter form.
+    for (vk, scan, k, code) in [
+        (0x21, 0x49, Key::PageUp, 57421),
+        (0x22, 0x51, Key::PageDown, 57422),
+        (0x23, 0x4f, Key::End, 57424),
+        (0x24, 0x47, Key::Home, 57423),
+        (0x25, 0x4b, Key::Left, 57417),
+        (0x26, 0x48, Key::Up, 57419),
+        (0x27, 0x4d, Key::Right, 57418),
+        (0x28, 0x50, Key::Down, 57420),
+        (0x2d, 0x52, Key::Insert, 57425),
+        (0x2e, 0x53, Key::Delete, 57426),
+    ] {
+        let mut input = key(vk, scan, 0, "", k, "");
+        assert_eq!(enc(&input, &m), format!("\x1b[{code}u"), "{k:?}");
+        let plain = enc(&input, &kitty(1));
+        input.extended = true;
+        assert_eq!(enc(&input, &kitty(1)), plain, "{k:?} like the main key");
+        assert_ne!(enc(&input, &m), format!("\x1b[{code}u"), "main {k:?}");
+    }
+    let begin = key(0x0c, 0x4c, 0, "", Key::Other, "");
+    assert_eq!(enc(&begin, &m), "\x1b[E");
+    assert_eq!(enc(&begin, &kitty(1)), "\x1b[E");
+    let mut ctrl_begin = begin;
+    ctrl_begin.mods = mods("c");
+    assert_eq!(enc(&ctrl_begin, &kitty(1)), "\x1b[1;5E");
+    // Keypad keys carry no US base key for the alternates.
+    let five = key(0x65, 0x4c, 0x35, "", Key::Char('5'), "5");
+    assert_eq!(enc(&five, &kitty(4 | 8)), "\x1b[57404u");
 }
 
 const W32IM: InputModes = InputModes {

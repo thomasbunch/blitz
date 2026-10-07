@@ -105,6 +105,8 @@ const ESC: u8 = 0x1b;
 const VK_PROCESSKEY: u16 = 0xe5;
 
 const VK_CANCEL: u16 = 0x03;
+/// Keypad 5 with Num Lock off: Begin.
+const VK_CLEAR: u16 = 0x0c;
 const VK_C: u16 = 0x43;
 
 // Kitty keyboard protocol flags.
@@ -242,18 +244,27 @@ fn ctrl_byte(c: char) -> Option<u8> {
 }
 
 /// SS3 final byte for a keypad key in application keypad mode (DECKPAM).
+/// Only Num Lock off gets here, when Windows reports the digit keys as
+/// the navigation keys printed under them, so only the operators and
+/// Enter are left.
 fn keypad_app(k: &KeyInput) -> Option<u8> {
     Some(match k.vk {
-        0x60..=0x69 => b'p' + (k.vk - 0x60) as u8,
         0x6a => b'j', // multiply
         0x6b => b'k', // add
         0x6c => b'l', // separator
         0x6d => b'm', // subtract
-        0x6e => b'n', // decimal
         0x6f => b'o', // divide
         0x0d if k.extended => b'M',
         _ => return None,
     })
+}
+
+/// Whether this is a cursor key: the arrows, Home and End, and Begin.
+fn is_cursor(k: &KeyInput) -> bool {
+    matches!(
+        k.key,
+        Key::Up | Key::Down | Key::Right | Key::Left | Key::Home | Key::End
+    ) || k.key == Key::Other && k.vk == VK_CLEAR
 }
 
 /// Plain xterm encoding: what a terminal sends when the application asked
@@ -316,7 +327,7 @@ fn legacy(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
             esc_if_alt(out);
             out.push(ESC);
         }
-        Key::Up | Key::Down | Key::Right | Key::Left | Key::Home | Key::End => {
+        _ if is_cursor(k) => {
             let fin = cursor_final(k.key);
             if m1 == 1 && m.decckm {
                 out.extend_from_slice(&[ESC, b'O', fin]);
@@ -347,7 +358,8 @@ fn cursor_final(key: Key) -> u8 {
         Key::Right => b'C',
         Key::Left => b'D',
         Key::Home => b'H',
-        _ => b'F',
+        Key::End => b'F',
+        _ => b'E',
     }
 }
 
@@ -431,9 +443,7 @@ fn kitty(k: &KeyInput, flags: u8, out: &mut Vec<u8>) {
             key(out, code, b'u');
         }
         Key::Escape => key(out, 27, b'u'),
-        Key::Up | Key::Down | Key::Right | Key::Left | Key::Home | Key::End => {
-            key(out, 1, cursor_final(k.key));
-        }
+        _ if is_cursor(k) => key(out, 1, cursor_final(k.key)),
         Key::Insert | Key::Delete | Key::PageUp | Key::PageDown => {
             key(out, tilde_number(k.key), b'~');
         }
@@ -456,7 +466,9 @@ fn single(s: &str) -> Option<char> {
     it.next().filter(|_| it.next().is_none())
 }
 
-/// Kitty's private-use code for a keypad key.
+/// Kitty's private-use code for a keypad key. With Num Lock off the digit
+/// keys arrive as navigation keys that, unlike the main ones, are not
+/// extended. Begin keeps its `CSI E` form, as the spec allows.
 fn keypad_code(k: &KeyInput) -> Option<u32> {
     Some(match k.vk {
         0x60..=0x69 => 57399 + u32::from(k.vk - 0x60),
@@ -467,6 +479,17 @@ fn keypad_code(k: &KeyInput) -> Option<u32> {
         0x6b => 57413, // add
         0x0d if k.extended => 57414,
         0x6c => 57416, // separator
+        _ if k.extended => return None,
+        0x25 => 57417, // left
+        0x27 => 57418, // right
+        0x26 => 57419, // up
+        0x28 => 57420, // down
+        0x21 => 57421, // page up
+        0x22 => 57422, // page down
+        0x24 => 57423, // home
+        0x23 => 57424, // end
+        0x2d => 57425, // insert
+        0x2e => 57426, // delete
         _ => return None,
     })
 }
