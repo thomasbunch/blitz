@@ -969,9 +969,9 @@ impl App {
 
     /// Seconds into the scenery and spark animations; always 0 when
     /// Windows animations are off.
-    fn anim_time(&self) -> f32 {
+    fn anim_time(&self) -> f64 {
         if self.motion {
-            self.started.elapsed().as_secs_f32()
+            self.started.elapsed().as_secs_f64()
         } else {
             0.0
         }

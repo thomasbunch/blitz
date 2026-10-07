@@ -18,7 +18,7 @@ pub fn draw(
     p: &mut Vec<Prim>,
     area: Rect,
     state: Attn,
-    t: f32,
+    t: f64,
     scale: f32,
     ui: &Ui,
     (tw, th): (i32, i32),
@@ -40,7 +40,11 @@ pub fn draw(
     let home = (lo + hi) / 2;
     // The run: a triangle wave from `lo` to `hi`, starting in the middle.
     let span = (hi - lo) as f32;
-    let run = (t * s(48.0) as f32 + span / 2.0) % (2.0 * span).max(1.0);
+    let (fspan, speed) = (f64::from(span), f64::from(s(48.0)));
+    let run = ((t * speed + fspan / 2.0) % (2.0 * fspan).max(1.0)) as f32;
+    // Every other motion repeats within an hour; wrapping keeps f32 exact
+    // however long blitz stays open.
+    let t = (t % 3600.0) as f32;
     // A hop `h` high, `u` of the way through it; on the ground after.
     let arc = |u: f32, h: i32| (4.0 * u * (1.0 - u).max(0.0) * h as f32).round() as i32;
 
@@ -230,7 +234,7 @@ mod tests {
         }
     }
 
-    fn spark(area: Rect, state: Attn, t: f32, scale: f32) -> Vec<Prim> {
+    fn spark(area: Rect, state: Attn, t: f64, scale: f32) -> Vec<Prim> {
         let mut p = Vec::new();
         let ui = crate::theme::blitz(false).ui;
         let cell = (CELL.0 * scale as i32, CELL.1 * scale as i32);
@@ -283,7 +287,7 @@ mod tests {
                     let a = Rect { x: 5, y: 50, w, h };
                     for state in STATES {
                         for i in 0..40 {
-                            let t = i as f32 * 0.137;
+                            let t = f64::from(i) * 0.137;
                             for p in spark(a, state, t, scale) {
                                 let r = bounds(&p, scale);
                                 let inside = r.x >= a.x
@@ -309,7 +313,7 @@ mod tests {
     #[test]
     fn needing_you_shows_an_exclamation_mark() {
         for i in 0..20 {
-            let p = spark(area(), Attn::NeedsYou, i as f32 * 0.1, 1.0);
+            let p = spark(area(), Attn::NeedsYou, f64::from(i) * 0.1, 1.0);
             assert!(texts(&p).contains(&"!"));
         }
     }
@@ -317,7 +321,7 @@ mod tests {
     #[test]
     fn sleeping_shows_a_z() {
         for i in 0..20 {
-            let p = spark(area(), Attn::Idle, i as f32 * 0.3, 1.0);
+            let p = spark(area(), Attn::Idle, f64::from(i) * 0.3, 1.0);
             assert!(texts(&p).iter().any(|t| t.eq_ignore_ascii_case("z")));
         }
     }
@@ -325,14 +329,17 @@ mod tests {
     #[test]
     fn working_runs_across_the_area_and_back() {
         let a = area();
-        let left = |t: f32| {
+        let left = |t: f64| {
             let p = spark(a, Attn::Working, t, 1.0);
             p.iter().map(|p| bounds(p, 1.0).x).min().expect("drawn")
         };
         assert_ne!(left(0.0), left(0.5));
-        let xs: Vec<i32> = (0..200).map(|i| left(i as f32 * 0.05)).collect();
+        let xs: Vec<i32> = (0..200).map(|i| left(f64::from(i) * 0.05)).collect();
         let (min, max) = (xs.iter().min(), xs.iter().max());
         let (min, max) = (*min.expect("min"), *max.expect("max"));
         assert!(min < a.x + 40 && max > a.right() - 80, "{min}..{max}");
+        // Still smooth after a month open, where an f32 second steps by 0.25.
+        let month = 30.0 * 86_400.0;
+        assert_ne!(left(month), left(month + 0.05));
     }
 }

@@ -50,7 +50,7 @@ pub struct ChromeModel<'a> {
     pub settings: Option<Settings<'a>>,
     /// The spark at the foot of the sidebar, when it is on: seconds into
     /// its animation.
-    pub spark: Option<f32>,
+    pub spark: Option<f64>,
     /// blitz run, while it is open.
     pub game: Option<&'a crate::arcade::run::Run>,
 }

@@ -19,7 +19,7 @@ pub const SCENES: &[&str] = &["off", "stars", "hills", "snow"];
 /// Lays out scene `name` from [`SCENES`] at `t` seconds over `area`, the
 /// whole window. `scale` is the DPI scale, 1.0 at 96 DPI. Draws nothing
 /// for `off` or a name it does not know.
-pub fn draw(p: &mut Vec<Prim>, name: &str, area: Rect, t: f32, scale: f32, pal: &Palette) {
+pub fn draw(p: &mut Vec<Prim>, name: &str, area: Rect, t: f64, scale: f32, pal: &Palette) {
     if area.w <= 0 || area.h <= 0 {
         return;
     }
@@ -35,7 +35,6 @@ pub fn draw(p: &mut Vec<Prim>, name: &str, area: Rect, t: f32, scale: f32, pal: 
         rows: (area.h + px - 1) / px,
         rate: f64::from(scale) / f64::from(px),
     };
-    let t = f64::from(t);
     let mut out = Vec::new();
     match name {
         "stars" => stars(&mut out, &g, t, pal),
@@ -388,7 +387,7 @@ mod tests {
         Rect { x, y, w, h }
     }
 
-    fn scene(name: &str, a: Rect, t: f32, scale: f32, pal: &Palette) -> Vec<Prim> {
+    fn scene(name: &str, a: Rect, t: f64, scale: f32, pal: &Palette) -> Vec<Prim> {
         let mut p = Vec::new();
         draw(&mut p, name, a, t, scale, pal);
         p
