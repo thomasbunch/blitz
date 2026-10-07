@@ -475,7 +475,31 @@ pub fn pick(setting: &str, name: &str, system_light: bool) -> String {
 /// The theme the `theme` setting picks now. An unknown name gives the
 /// blitz theme that matches the system.
 pub fn current(setting: &str) -> Theme {
-    current_of(all(), setting, system_is_light())
+    match contrast_for(setting) {
+        Some(c) => high_contrast(c),
+        None => current_of(all(), setting, system_is_light()),
+    }
+}
+
+/// The name [`high_contrast`] gives its theme.
+pub const HIGH_CONTRAST: &str = "high contrast";
+
+/// The colours of Windows high contrast mode while it is on and the
+/// `theme` setting is the default; a theme set by hand wins.
+pub fn contrast_for(setting: &str) -> Option<[u32; 3]> {
+    system_contrast().filter(|_| setting == DEFAULT)
+}
+
+/// The theme of Windows high contrast mode: its window background, text
+/// and highlight colours, as `0xRRGGBB`, the highlight marking sessions
+/// that need you.
+// ponytail: the 16 program colours stay the blitz ones of that lightness;
+// set them here if one is hard to read in a contrast theme
+pub fn high_contrast([window, text, highlight]: [u32; 3]) -> Theme {
+    let file = format!(
+        "background = #{window:06x}\nforeground = #{text:06x}\naccent = #{highlight:06x}\n"
+    );
+    parse(HIGH_CONTRAST, &file)
 }
 
 fn current_of(mut all: Vec<Theme>, setting: &str, light: bool) -> Theme {
@@ -550,6 +574,49 @@ pub fn system_is_light() -> bool {
 #[cfg(not(windows))]
 pub fn system_is_light() -> bool {
     false
+}
+
+/// While Windows high contrast mode is on, its window background, window
+/// text and highlight colours, as `0xRRGGBB`.
+#[cfg(windows)]
+pub fn system_contrast() -> Option<[u32; 3]> {
+    use windows::Win32::Graphics::Gdi::{
+        COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
+    };
+    use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+
+    let mut hc = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `hc` is the struct this action fills, with its size set.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            Some((&raw mut hc).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .ok()?;
+    if !hc.dwFlags.contains(HCF_HIGHCONTRASTON) {
+        return None;
+    }
+    // SAFETY: plain calls with valid indexes. COLORREF is 0x00BBGGRR.
+    let rgb = |i| unsafe { GetSysColor(i) }.swap_bytes() >> 8;
+    Some([
+        rgb(COLOR_WINDOW),
+        rgb(COLOR_WINDOWTEXT),
+        rgb(COLOR_HIGHLIGHT),
+    ])
+}
+
+#[cfg(not(windows))]
+pub fn system_contrast() -> Option<[u32; 3]> {
+    None
 }
 
 #[cfg(test)]
@@ -925,6 +992,38 @@ mod tests {
             assert_eq!(current_of(all(), "light:x,dark:y", light).name, want);
             assert_eq!(current_of(Vec::new(), "nope", light).name, want);
         }
+    }
+
+    /// Windows 11's contrast themes as (window, text, highlight): Aquatic,
+    /// Desert, Dusk and Night sky.
+    const CONTRAST_THEMES: [[u32; 3]; 4] = [
+        [0x202020, 0xffffff, 0x8ee3f0],
+        [0xfffaef, 0x3d3d3d, 0x903909],
+        [0x2d3236, 0xb6f6f0, 0xa1bfde],
+        [0x000000, 0xffffff, 0xd6b4fd],
+    ];
+
+    #[test]
+    fn high_contrast_takes_the_windows_colours() {
+        for c in CONTRAST_THEMES {
+            let t = high_contrast(c);
+            assert_eq!(t.name, HIGH_CONTRAST);
+            assert_eq!((t.pal.bg, t.pal.fg, t.ui.accent), (c[0], c[1], c[2]));
+            assert_eq!(t.light, c[0] == 0xfffaef, "{c:06x?}");
+            let base = if t.light { light() } else { dark() };
+            assert_eq!(t.pal.ansi, base.ansi);
+            let ui = &t.ui;
+            for (what, fg) in [("title", ui.name), ("label", ui.label), ("dim", ui.dim)] {
+                let on = contrast(fg, ui.side_bg);
+                assert!(on >= 3.0, "{c:06x?}: {what} on the sidebar {on:.2}");
+            }
+            let chip = contrast(ui.chip_fg, ui.accent);
+            assert!(chip >= 4.5, "{c:06x?}: text on the accent {chip:.2}");
+        }
+        // A theme set by hand wins over the mode.
+        assert_eq!(contrast_for(DEFAULT), system_contrast());
+        assert_eq!(contrast_for("Rose Pine"), None);
+        assert_eq!(contrast_for(&pick(DEFAULT, "Rose Pine", true)), None);
     }
 
     #[test]

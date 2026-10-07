@@ -1017,6 +1017,8 @@ struct App {
     motion: bool,
     /// Windows hides the pointer while typing.
     vanish: bool,
+    /// The colours of Windows high contrast mode when last looked at.
+    contrast: Option<[u32; 3]>,
     /// The command palette, while it is open.
     commands: Option<Commands>,
     /// Where the command palette and its rows were in the last frame, for
@@ -1531,6 +1533,8 @@ impl App {
             game_ended: None,
             motion: animations_on(),
             vanish: mouse_vanish(),
+            contrast: crate::theme::system_contrast(),
+
             commands: None,
             commands_hits: None,
             font_zoom: 0.0,
@@ -7102,6 +7106,17 @@ impl ApplicationHandler<UserEvent> for App {
                     let _ = unsafe { DestroyCaret() };
                 }
                 self.ime_at = None;
+                // High contrast mode may have been turned on or off while
+                // the window was in the background, and winit passes on no
+                // event for that.
+                if f {
+                    let contrast = crate::theme::system_contrast();
+                    if std::mem::replace(&mut self.contrast, contrast) != contrast
+                        && self.picker.is_none()
+                    {
+                        self.set_theme_from_config();
+                    }
+                }
                 // Ctrl may be let go while another window has the keys.
                 self.set_hover(None);
                 self.hide_pointer(false);

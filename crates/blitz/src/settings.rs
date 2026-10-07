@@ -145,6 +145,9 @@ impl Panel {
     pub fn shown(&self, s: &Setting, c: &Config) -> String {
         match s.kind {
             Kind::Toggle => if c.get(s.key) == "true" { "on" } else { "off" }.into(),
+            Kind::Theme if crate::theme::contrast_for(&c.theme).is_some() => {
+                crate::theme::HIGH_CONTRAST.into()
+            }
             Kind::Theme => {
                 let light = crate::theme::system_is_light();
                 let used = crate::theme::choose(crate::theme::DEFAULT, light);
