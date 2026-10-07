@@ -157,3 +157,90 @@ fn cli_setup_claude_warns_without_the_hook() {
     );
     assert!(Json::parse(&text(&out.stdout)).is_some());
 }
+
+/// The text a version resource gives for `name`, in US English.
+fn version_text(block: &[u8], name: &str) -> String {
+    use windows::Win32::Storage::FileSystem::VerQueryValueW;
+    let key = windows::core::HSTRING::from(format!(r"\StringFileInfo\040904B0\{name}"));
+    let (mut at, mut len) = (std::ptr::null_mut(), 0);
+    // SAFETY: `block` came from GetFileVersionInfoW; the out-pointers are
+    // valid.
+    let found = unsafe { VerQueryValueW(block.as_ptr().cast(), &key, &mut at, &mut len) };
+    assert!(found.as_bool() && !at.is_null(), "{name}");
+    // SAFETY: the text lies inside `block`, `len` characters long.
+    let units = unsafe { std::slice::from_raw_parts(at.cast::<u16>(), len as usize) };
+    String::from_utf16_lossy(units)
+        .trim_end_matches('\0')
+        .to_string()
+}
+
+/// Explorer's Details tab and Task Manager name each exe and its version,
+/// and both always run as the user who started them.
+#[test]
+fn exes_carry_version_information_and_a_manifest() {
+    use windows::Win32::Foundation::FreeLibrary;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+    use windows::Win32::System::LibraryLoader::{
+        FindResourceW, LOAD_LIBRARY_AS_DATAFILE, LOAD_LIBRARY_AS_IMAGE_RESOURCE, LoadLibraryExW,
+        LoadResource, LockResource, SizeofResource,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::RT_MANIFEST;
+    use windows::core::{HSTRING, PCWSTR, w};
+
+    let version = env!("CARGO_PKG_VERSION");
+    let hook = env!("CARGO_BIN_EXE_blitz-hook");
+    for (exe, name, about) in [
+        (BLITZ, "blitz", "blitz"),
+        (hook, "blitz-hook", "blitz hook for Claude Code"),
+    ] {
+        let path = HSTRING::from(exe);
+        // SAFETY: a valid path and no handle out.
+        let size = unsafe { GetFileVersionInfoSizeW(&path, None) };
+        assert!(size > 0, "{exe} has no version information");
+        let mut block = vec![0u8; size as usize];
+        // SAFETY: `block` holds `size` bytes.
+        unsafe { GetFileVersionInfoW(&path, None, size, block.as_mut_ptr().cast()) }
+            .expect("GetFileVersionInfoW");
+        assert_eq!(version_text(&block, "FileVersion"), version);
+        assert_eq!(version_text(&block, "ProductVersion"), version);
+        assert_eq!(version_text(&block, "ProductName"), "blitz");
+        assert_eq!(version_text(&block, "FileDescription"), about);
+        assert_eq!(
+            version_text(&block, "OriginalFilename"),
+            format!("{name}.exe")
+        );
+        let (mut at, mut len) = (std::ptr::null_mut(), 0);
+        // SAFETY: as in `version_text`.
+        let found = unsafe { VerQueryValueW(block.as_ptr().cast(), w!(r"\"), &mut at, &mut len) };
+        assert!(found.as_bool() && len >= 52, "{exe}: no fixed version");
+        // SAFETY: VS_FIXEDFILEINFO is 13 aligned u32s inside `block`.
+        let fixed = unsafe { std::slice::from_raw_parts(at.cast::<u32>(), 13) };
+        let n: Vec<u32> = version.split('.').map(|p| p.parse().unwrap()).collect();
+        assert_eq!(fixed[0], 0xfeef_04bd, "signature");
+        assert_eq!((fixed[2], fixed[3]), (n[0] << 16 | n[1], n[2] << 16));
+
+        // SAFETY: loaded as data only; nothing in it runs.
+        let m = unsafe {
+            LoadLibraryExW(
+                &path,
+                None,
+                LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+            )
+        }
+        .expect("load as data");
+        // SAFETY: a loaded module; resource 1 is the process manifest.
+        let manifest = unsafe {
+            let r = FindResourceW(Some(m), PCWSTR(1 as _), RT_MANIFEST);
+            assert!(!r.is_invalid(), "{exe} has no manifest");
+            let data = LockResource(LoadResource(Some(m), r).expect("LoadResource"));
+            let len = SizeofResource(Some(m), r) as usize;
+            String::from_utf8_lossy(std::slice::from_raw_parts(data.cast::<u8>(), len)).into_owned()
+        };
+        // SAFETY: loaded above and no longer used.
+        let _ = unsafe { FreeLibrary(m) };
+        assert!(manifest.contains(r#"level="asInvoker""#), "{manifest}");
+        assert!(manifest.contains("8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a"));
+    }
+}
