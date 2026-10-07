@@ -306,11 +306,12 @@ pub const POWERSHELL_INTEGRATION: &str = r"if (-not (Test-Path variable:global:_
   }
 }";
 
-/// cmd's prompt with the same marks and reset. cmd cannot report exit
-/// codes, nor expand variables in its prompt, so the token is written in.
-pub fn cmd_prompt(token: &str) -> String {
+/// cmd's prompt `own`, such as `$P$G`, with the same marks and reset. cmd
+/// cannot report exit codes, nor expand variables in its prompt, so the
+/// token is written in.
+pub fn cmd_prompt(token: &str, own: &str) -> String {
     format!(
-        r"$e[?1049h$e[?1049l$e[!p$e[?5W$e]133;D$e\$e]133;A;blitz={token}$e\$e]9;9;$P$e\$P$G$e]133;B$e\"
+        r"$e[?1049h$e[?1049l$e[!p$e[?5W$e]133;D$e\$e]133;A;blitz={token}$e\$e]9;9;$P$e\{own}$e]133;B$e\"
     )
 }
 
@@ -319,6 +320,17 @@ pub fn cmd_prompt(token: &str) -> String {
 /// user's own and is not passed on.
 pub fn is_blitz_prompt(prompt: &std::ffi::OsStr) -> bool {
     prompt.to_string_lossy().contains("]133;A;blitz=")
+}
+
+/// The user's own part of `prompt`, cmd's PROMPT as blitz has it: all of
+/// it, or the prompt a [`cmd_prompt`] wraps.
+fn own_prompt(prompt: &str) -> &str {
+    if !is_blitz_prompt(prompt.as_ref()) {
+        return prompt;
+    }
+    (prompt.split_once(r"$e]9;9;$P$e\"))
+        .and_then(|(_, own)| own.strip_suffix(r"$e]133;B$e\"))
+        .unwrap_or("$P$G")
 }
 
 /// The program a command line starts and the arguments after it, split
@@ -393,8 +405,10 @@ pub fn launch(shell: &str, integrate: bool, token: &str) -> Launch {
                 out.cmdline += " -NoLogo -NoExit -Command ";
                 out.cmdline += &quote(POWERSHELL_INTEGRATION);
             }
-            Kind::Cmd if std::env::var_os("PROMPT").is_none_or(|p| is_blitz_prompt(&p)) => {
-                out.env.push(("PROMPT".into(), cmd_prompt(token)));
+            Kind::Cmd => {
+                let own = std::env::var_os("PROMPT").map(|p| p.to_string_lossy().into_owned());
+                let own = own.as_deref().map_or("$P$G", own_prompt);
+                out.env.push(("PROMPT".into(), cmd_prompt(token, own)));
             }
             _ => {}
         }
@@ -410,8 +424,8 @@ mod tests {
     fn prompts_leave_the_alternate_screen() {
         let reset = "$e[?1049h$e[?1049l$e[!p$e[?5W";
         assert!(POWERSHELL_INTEGRATION.contains(&format!("$s = '{reset}'.Replace('$e', $e)")));
-        assert!(cmd_prompt("1").starts_with(reset));
-        let prompt = cmd_prompt("1").replace("$e", "\x1b");
+        assert!(cmd_prompt("1", "$P$G").starts_with(reset));
+        let prompt = cmd_prompt("1", "$P$G").replace("$e", "\x1b");
         let mut t = vt::Terminal::new(vt::Options::default());
         // On the main screen the cursor stays where it is.
         t.feed(b"\x1b[3;5H");
@@ -472,10 +486,21 @@ mod tests {
     #[test]
     fn only_blitz_prompts_are_its_own() {
         use std::ffi::OsStr;
-        assert!(is_blitz_prompt(OsStr::new(&cmd_prompt("5eed"))));
+        assert!(is_blitz_prompt(OsStr::new(&cmd_prompt("5eed", "$P$G"))));
         assert!(!is_blitz_prompt(OsStr::new("$P$G")));
         // Another terminal's marks are the user's business.
         assert!(!is_blitz_prompt(OsStr::new(r"$e]133;A$e\$P$G")));
+    }
+
+    #[test]
+    fn cmd_keeps_the_users_own_prompt() {
+        let mine = r"$T $e]9;9;$P$e\$P$_$+$G";
+        let wrapped = cmd_prompt("5eed", mine);
+        assert!(wrapped.ends_with(&format!(r"$P$e\{mine}$e]133;B$e\")));
+        assert_eq!(own_prompt(mine), mine);
+        // From a blitz pane: the prompt that pane's wraps.
+        assert_eq!(own_prompt(&wrapped), mine);
+        assert_eq!(own_prompt(&cmd_prompt("5eed", "$P$G")), "$P$G");
     }
 
     #[test]

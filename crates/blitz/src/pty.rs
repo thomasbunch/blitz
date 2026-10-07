@@ -750,7 +750,7 @@ mod tests {
             // From the blitz pane this blitz was started in: its token is
             // that pane's, and the token is a secret.
             ("BLITZ_PANE_TOKEN", "0f1e"),
-            ("PROMPT", crate::shell::cmd_prompt("0f1e").as_str()),
+            ("PROMPT", crate::shell::cmd_prompt("0f1e", "$P$G").as_str()),
             // In tmux or zellij, Claude Code stops turning the mark in its
             // title.
             ("TMUX", "/tmp/tmux-1000/default,1,0"),
@@ -797,9 +797,12 @@ mod tests {
                 .map(|(_, v)| v.to_string_lossy().into_owned())
         };
         assert_eq!(prompt("$P$G$_", &[]).as_deref(), Some("$P$G$_"));
-        let ours = crate::shell::cmd_prompt("5eed");
+        let ours = crate::shell::cmd_prompt("5eed", "$P$G");
         let set = [("PROMPT".to_owned(), ours.clone())];
-        assert_eq!(prompt(&crate::shell::cmd_prompt("0f1e"), &set), Some(ours));
+        assert_eq!(
+            prompt(&crate::shell::cmd_prompt("0f1e", "$P$G"), &set),
+            Some(ours)
+        );
     }
 
     /// The pane's token reaches Claude Code in WSL, and a hook it runs gets

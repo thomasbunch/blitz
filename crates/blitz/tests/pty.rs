@@ -382,10 +382,6 @@ fn pty_shells_print_prompt_marks() {
     let mark = format!("\x1b]133;A;blitz={TOKEN}");
     for program in shells() {
         let launch = launch(&program);
-        if program.ends_with("cmd.exe") && launch.env.len() < 2 {
-            eprintln!("SKIPPED: cmd with the user's own PROMPT, which blitz leaves alone");
-            continue;
-        }
         let (_pty, _, rx) = spawn(&launch.cmdline, &launch.env);
         let mut out = Vec::new();
         assert!(
@@ -401,6 +397,22 @@ fn pty_shells_print_prompt_marks() {
             );
         }
     }
+}
+
+/// cmd shows a prompt the user set, between blitz's marks.
+#[test]
+fn pty_cmd_keeps_the_users_prompt() {
+    let env = [
+        ("PROMPT", blitz::shell::cmd_prompt(TOKEN, "mine$G")),
+        ("BLITZ_PANE_TOKEN", TOKEN.into()),
+    ]
+    .map(|(k, v)| (k.to_string(), v));
+    let (_pty, _, rx) = spawn("cmd.exe", &env);
+    let mut out = Vec::new();
+    let mark = format!("\x1b]133;A;blitz={TOKEN}");
+    let shown =
+        wait_for(&rx, &mut out, mark.as_bytes()) && wait_for(&rx, &mut out, b"mine>\x1b]133;B");
+    assert!(shown, "{:?}", String::from_utf8_lossy(&out));
 }
 
 /// PowerShell marks where each command starts, and ends it with the code
