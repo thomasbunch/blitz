@@ -274,8 +274,10 @@ selects by words or lines.
 
 Holding Ctrl underlines the link under the pointer: a hyperlink a
 program printed, a web address, or the path of a file that exists,
-relative ones from the pane's folder. Only web, mail and local file
-links open. A file that would run when opened, such as a program,
+relative ones from the pane's folder. A path with spaces is a link only
+as a hyperlink, and a path through a symbolic link or junction is none.
+Only web and local file links open. Folders, text, source code, images
+and PDFs open with their program; any other file, such as a program,
 script, shortcut or installer, is shown selected in Explorer instead.
 
 When a program takes the mouse itself, as Claude Code does in
@@ -349,10 +351,11 @@ A chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`:
 a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
 `end`, `pageup`, `pagedown`, `insert`, `delete`, `tab`, `enter`, `esc`,
 `space`, `backspace`, or a punctuation key by its character or its name,
-such as `,` or `comma` and `=` or `plus`. The modifiers must match
-exactly. A binding replaces the default on the same chord, and the other
-defaults stay; Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them.
-Lines blitz cannot read are skipped.
+such as `,` or `comma` and `=` or `plus`. Case and spaces do not
+matter. The modifiers must match exactly. A binding replaces the
+default on the same chord, and the other defaults stay; Ctrl+1 to
+Ctrl+9 go to a tab unless a binding takes them. Lines blitz cannot read
+are skipped.
 
 The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
 `new_tab`, `close_pane`, `close_tab`, `reopen_closed`,

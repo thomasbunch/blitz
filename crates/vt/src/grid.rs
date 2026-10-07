@@ -272,18 +272,28 @@ impl Row {
 
     /// Appends the row's text: blanks as spaces, wide characters once.
     pub fn push_text(&self, out: &mut String) {
-        for (x, c) in self.cells.iter().enumerate() {
-            if c.has(cf::SPACER_TAIL | cf::SPACER_HEAD) {
-                continue;
-            }
-            out.push(match c.cp {
-                0 => ' ',
-                cp => char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
-            });
-            if c.has(cf::GRAPHEME) {
-                out.push_str(self.grapheme(x as u16).unwrap_or_default());
-            }
-        }
+        out.extend(self.chars(self.cells.len()).map(|(_, ch)| ch));
+    }
+
+    /// The text of the row's first `end` cells as [`Self::push_text`]
+    /// writes it, each character with the column it is in.
+    fn chars(&self, end: usize) -> impl Iterator<Item = (u16, char)> + '_ {
+        (self.cells[..end].iter().enumerate())
+            .filter(|(_, c)| !c.has(cf::SPACER_TAIL | cf::SPACER_HEAD))
+            .flat_map(move |(x, c)| {
+                let first = match c.cp {
+                    0 => ' ',
+                    cp => char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
+                };
+                let rest = if c.has(cf::GRAPHEME) {
+                    self.grapheme(x as u16).unwrap_or_default()
+                } else {
+                    ""
+                };
+                std::iter::once(first)
+                    .chain(rest.chars())
+                    .map(move |ch| (x as u16, ch))
+            })
     }
 }
 
@@ -370,7 +380,11 @@ impl Grid {
     /// Every place `query` appears, oldest first. Rows joined by soft wraps
     /// are searched as one line, so a match can run from one into the
     /// next. Case is ignored unless the query has a capital letter. Matches
-    /// do not overlap.
+    /// do not overlap. Characters are compared one code point at a time,
+    /// as written: `cafe` matches the start of a `café` written with a
+    /// combining accent, a `café` with the accent built in does not match
+    /// that one, and a letter whose lower case is more than one character,
+    /// such as `İ`, only matches itself.
     // ponytail: plain substring, regex if asked
     pub fn find(&self, query: &str) -> Vec<Found> {
         let exact = query.chars().any(char::is_uppercase);
@@ -381,8 +395,9 @@ impl Grid {
         if n == 0 {
             return out;
         }
-        // The line so far: its text, the column each character came from,
-        // and where in the text each of its rows starts.
+        // The line so far, from where a match could still start: its text,
+        // the column each character came from, and where in the text each
+        // of its rows starts.
         let mut text: Vec<char> = Vec::new();
         let mut cols: Vec<u16> = Vec::new();
         let mut starts: Vec<(usize, usize)> = Vec::new();
@@ -395,25 +410,9 @@ impl Grid {
                 text_len(&row.cells)
             };
             starts.push((text.len(), i));
-            for (x, c) in row.cells[..end].iter().enumerate() {
-                if c.has(cf::SPACER_TAIL | cf::SPACER_HEAD) {
-                    continue;
-                }
-                let ch = match c.cp {
-                    0 => ' ',
-                    cp => char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
-                };
+            for (x, ch) in row.chars(end) {
                 text.push(fold(ch));
-                cols.push(x as u16);
-                if c.has(cf::GRAPHEME) {
-                    for g in row.grapheme(x as u16).unwrap_or_default().chars() {
-                        text.push(fold(g));
-                        cols.push(x as u16);
-                    }
-                }
-            }
-            if wrapped {
-                continue;
+                cols.push(x);
             }
             let cell = |k: usize| {
                 let r = starts[starts.partition_point(|s| s.0 <= k) - 1].1;
@@ -434,6 +433,17 @@ impl Grid {
                     end: (self.dropped + r, x),
                 });
                 k += n;
+            }
+            if wrapped {
+                // Only the end of the row can start a match that runs on
+                // into the next, so a long line is never held whole.
+                text.drain(..k);
+                cols.drain(..k);
+                starts.drain(..starts.partition_point(|s| s.0 <= k) - 1);
+                for s in &mut starts {
+                    s.0 = s.0.saturating_sub(k);
+                }
+                continue;
             }
             text.clear();
             cols.clear();
@@ -473,6 +483,11 @@ impl Grid {
             } else if let Some(mut row) = self.rows.remove(base + top as usize) {
                 row.reset(self.cols, blank);
                 self.rows.insert(base + bottom as usize, row);
+                // Every row moved up, as when the top one goes to
+                // scrollback, so each keeps its line number.
+                if base == 0 && top == 0 && bottom + 1 == self.lines {
+                    self.dropped += 1;
+                }
             }
         }
         self.trim();

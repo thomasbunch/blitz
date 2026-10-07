@@ -828,6 +828,9 @@ struct App {
     /// The link under the pointer while Ctrl is held, drawn underlined:
     /// the line epoch and its first and last cell.
     hover: Option<(u32, Pos, Pos)>,
+    /// The last path word looked for while Ctrl is held, the pane's folder
+    /// and what was found; see [`Self::resolve`].
+    resolved: RefCell<Option<(String, String, Option<PathBuf>)>>,
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
@@ -995,6 +998,7 @@ impl Find {
     /// Searches `term` again. The current match stays on the one that
     /// starts where it did, or else the nearest one above it; with none
     /// yet, it is the nearest one above the bottom of the `rows` high view.
+    /// With nothing above, it is the first one below.
     fn search(&mut self, term: &vt::Terminal, rows: u16) {
         let anchor = match self.cur.and_then(|i| self.found.get(i)) {
             Some(m) => m.start,
@@ -1094,6 +1098,7 @@ impl App {
             away: false,
             selection: None,
             hover: None,
+            resolved: RefCell::new(None),
             mouse: Mouse::default(),
             preedit: String::new(),
             update: None,
@@ -2065,6 +2070,8 @@ impl App {
     /// came since the last search, moves `by` matches, and scrolls the
     /// current one into view.
     fn find_go(&mut self, search: bool, by: isize) {
+        let text_h = self.gfx.as_ref().map_or(12, |g| g.r.small_cell().1);
+        let covered = bar_rows(text_h, self.scale, self.cell().1);
         let Some(f) = &mut self.find else {
             return;
         };
@@ -2078,7 +2085,7 @@ impl App {
         f.step(by);
         let shown = f.cur.map(|i| f.found[i]);
         if let Some(m) = shown {
-            reveal(&mut term, m, v.grid.1);
+            reveal(&mut term, m, v.grid.1, covered);
         }
         drop(term);
         self.request_redraw();
@@ -3396,14 +3403,25 @@ impl App {
             return Some((Target::Uri(uri.to_owned()), (a, b)));
         }
         let l = Logical::new(&t, &self.theme.pal, at.0);
+        // Output goes on while the line is scanned and the disk looked at.
+        drop(t);
         let here = l.cells[l.index(at)?].0;
         let (range, found) =
             (crate::links::scan(&l.text).into_iter()).find(|(r, _)| r.contains(&here))?;
         let target = match found {
             Link::Url(u) => Target::Uri(u),
-            Link::Path(p) => Target::Path(crate::links::resolve(&p, &v.pane.cwd)?),
+            Link::Path(p) => Target::Path(self.resolve(&p, &v.pane.cwd)?),
         };
         Some((target, l.span(range)))
+    }
+
+    /// [`crate::links::resolve`], answered again without looking at the
+    /// disk while Ctrl stays held over one path: each move of the pointer
+    /// and each repeat of a held key asks, and a slow drive would make
+    /// every one of them wait.
+    fn resolve(&self, word: &str, cwd: &str) -> Option<PathBuf> {
+        let last = &mut self.resolved.borrow_mut();
+        resolve_again(last, word, cwd, crate::links::resolve)
     }
 
     /// Underlines the link under the pointer, and shows the hand, while
@@ -3411,6 +3429,10 @@ impl App {
     fn update_hover(&mut self) {
         let mods = mods_now();
         let ctrl = (mods.lctrl || mods.rctrl) && self.mouse_to_program(&mods).is_none();
+        // A file made since Ctrl was last held counts.
+        if !ctrl {
+            *self.resolved.get_mut() = None;
+        }
         let hover = (ctrl && self.mouse.drag.is_none())
             .then(|| self.link_under(self.mouse.pos))
             .flatten()
@@ -4164,11 +4186,38 @@ fn flash_kind(state: Attn, last: &mut Option<Instant>, now: Instant) -> Option<U
     Some(kind)
 }
 
+/// How many rows of `cell_h` pixels the find bar covers at the top of a
+/// pane, as the chrome draws it: a line of `text_h` pixel text, with 5
+/// pixels at `scale` above and below.
+fn bar_rows(text_h: u32, scale: f64, cell_h: u32) -> u16 {
+    let bar = f64::from(text_h) + (10.0 * scale).round();
+    (bar / f64::from(cell_h.max(1))).ceil() as u16
+}
+
+/// `look` at path `word` in folder `cwd`, unless `last` was the same
+/// question; then its answer.
+fn resolve_again(
+    last: &mut Option<(String, String, Option<PathBuf>)>,
+    word: &str,
+    cwd: &str,
+    look: impl FnOnce(&str, &str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some((w, c, found)) = last
+        && (w.as_str(), c.as_str()) == (word, cwd)
+    {
+        return found.clone();
+    }
+    let found = look(word, cwd);
+    *last = Some((word.to_owned(), cwd.to_owned(), found.clone()));
+    found
+}
+
 /// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
-/// unless it shows already. Returns whether the view moved.
-fn reveal(term: &mut vt::Terminal, m: Found, rows: u16) -> bool {
+/// unless it shows already below the `covered` rows at its top, which the
+/// find bar hides. Returns whether the view moved.
+fn reveal(term: &mut vt::Terminal, m: Found, rows: u16, covered: u16) -> bool {
     let (top, rows) = (term.view_top(), usize::from(rows));
-    if (top..top + rows).contains(&m.start.0) {
+    if (top + usize::from(covered)..top + rows).contains(&m.start.0) {
         return false;
     }
     term.scroll_to(m.start.0.saturating_sub(rows / 2));
@@ -5230,6 +5279,22 @@ mod tests {
     }
 
     #[test]
+    fn app_a_held_ctrl_looks_at_a_path_once() {
+        let mut looks = 0;
+        let mut last = None;
+        for word in ["a.txt", "a.txt", "b.txt"] {
+            resolve_again(&mut last, word, "C:/x", |w, _| {
+                looks += 1;
+                Some(PathBuf::from(w))
+            });
+        }
+        assert_eq!(looks, 2);
+        let again = resolve_again(&mut last, "b.txt", "C:/x", |_, _| None);
+        assert_eq!(again, Some(PathBuf::from("b.txt")));
+        assert_eq!(resolve_again(&mut last, "b.txt", "C:/y", |_, _| None), None);
+    }
+
+    #[test]
     fn app_links_map_back_to_their_cells() {
         let t = fed(10, 3, "go https://e.com/abc now");
         let l = Logical::new(&t, &crate::theme::dark(), 1);
@@ -5516,6 +5581,17 @@ mod tests {
     }
 
     #[test]
+    fn app_find_starts_below_the_view_when_nothing_above_matches() {
+        let mut t = fed(10, 2, "a\r\nb\r\nc\r\nmatch\r\nmatch");
+        t.scroll_viewport(9);
+        assert_eq!(t.view_top(), 0);
+        let mut f = Find::new(PaneId(1));
+        f.query = "match".into();
+        f.search(&t, 2);
+        assert_eq!((f.found.len(), f.cur), (2, Some(0)));
+    }
+
+    #[test]
     fn app_find_keeps_its_place_as_output_goes_on() {
         let mut t = vt::Terminal::new(vt::Options {
             cols: 20,
@@ -5543,9 +5619,14 @@ mod tests {
         f.step(-1);
         assert_eq!(f.cur, Some(11));
         // A match out of view comes into the middle of it.
-        assert!(reveal(&mut t, f.found[2], 3));
+        assert!(reveal(&mut t, f.found[2], 3, 0));
         assert_eq!(t.view_top(), 1);
-        assert!(!reveal(&mut t, f.found[2], 3), "already in view");
+        assert!(!reveal(&mut t, f.found[2], 3, 1), "already in view");
+        // Not under the find bar, which covers the top row.
+        assert!(reveal(&mut t, f.found[1], 3, 1));
+        assert_eq!(t.view_top(), 0);
+        assert_eq!(bar_rows(17, 1.0, 20), 2);
+        assert_eq!(bar_rows(17, 1.0, 27), 1);
 
         f.query = "zzz".into();
         f.search(&t, 3);

@@ -53,6 +53,18 @@ fn a_match_can_run_across_a_soft_wrap() {
 }
 
 #[test]
+fn a_match_can_run_across_many_soft_wraps() {
+    let mut t = term(4, 2, 100);
+    t.feed(b"abcdefghij abcdefghij");
+    // "abcd" "efgh" "ij a" "bcde" "fghi" "j".
+    assert_eq!(
+        t.find("cdefghi"),
+        [found((0, 2), (2, 0)), found((3, 1), (4, 3))]
+    );
+    assert_eq!(t.find("j"), [found((2, 1), (2, 1)), found((5, 0), (5, 0))]);
+}
+
+#[test]
 fn case_is_ignored_unless_the_query_has_a_capital() {
     let mut t = term(40, 2, 0);
     t.feed("Error error ERROR Straße".as_bytes());
@@ -98,6 +110,23 @@ fn the_alternate_screen_searches_only_itself() {
     assert_eq!(t.find("alt").len(), 1);
     t.feed(b"\x1b[?1049l");
     assert_eq!(t.find("main").len(), 3);
+}
+
+#[test]
+fn lines_keep_their_number_as_a_screen_without_scrollback_scrolls() {
+    let mut alt = term(20, 3, 100);
+    alt.feed(b"\x1b[?1049hfoo\r\nbar\r\nbaz");
+    let mut none = term(20, 3, 0);
+    none.feed(b"foo\r\nbar\r\nbaz");
+    for t in [&mut alt, &mut none] {
+        let epoch = t.line_epoch();
+        assert_eq!(t.find("baz"), [found((2, 0), (2, 2))]);
+        t.feed(b"\r\nqux");
+        assert_eq!(t.find("baz"), [found((2, 0), (2, 2))]);
+        assert_eq!(t.find("qux"), [found((3, 0), (3, 2))]);
+        assert_eq!(t.lines(), 1..4);
+        assert_eq!(t.line_epoch(), epoch);
+    }
 }
 
 #[test]
