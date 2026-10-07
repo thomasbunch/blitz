@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{E_FAIL, E_NOINTERFACE, S_OK};
 use windows::Win32::Graphics::DirectWrite::{
@@ -86,8 +87,15 @@ fn weight_style(style: u8) -> (DWRITE_FONT_WEIGHT, DWRITE_FONT_STYLE) {
 
 /// The names of the font families installed, sorted, each with whether it
 /// is fixed-width and no symbol font. Empty when DirectWrite cannot list
-/// them.
-pub fn families() -> Vec<(String, bool)> {
+/// them. Listed once, as that takes long enough to hitch a frame, so the
+/// app has another thread list them after its first frame.
+// ponytail: a font installed while blitz runs is listed after a restart
+pub fn families() -> &'static [(String, bool)] {
+    static FAMILIES: OnceLock<Vec<(String, bool)>> = OnceLock::new();
+    FAMILIES.get_or_init(list_families)
+}
+
+fn list_families() -> Vec<(String, bool)> {
     // SAFETY: COM calls with valid out-pointers and buffers of the length
     // passed.
     let list = || unsafe {
@@ -660,6 +668,19 @@ mod tests {
         // A baseline at the very top, from a broken font at 4 pt.
         assert_eq!(strike_row(0, 2.0), 0);
         assert_eq!(strike_row(-1, 0.0), 0);
+    }
+
+    /// The list another thread made is the one the settings panel gets,
+    /// with no second walk over every font.
+    #[test]
+    fn font_families_are_listed_once_on_any_thread() {
+        let made = std::thread::spawn(families).join().expect("listed");
+        assert!(
+            made.iter().any(|f| f == &("Consolas".into(), true)),
+            "{made:?}"
+        );
+        assert!(made.is_sorted_by_key(|f| f.0.to_lowercase()));
+        assert!(std::ptr::eq(made, families()));
     }
 
     #[test]

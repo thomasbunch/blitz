@@ -1108,8 +1108,8 @@ mod gpu {
             ..Default::default()
         };
         let themes = crate::theme::all().into_iter().map(|t| t.name).collect();
-        let mut panel =
-            crate::settings::Panel::new(super::font::families(), crate::shell::choices(), themes);
+        let fonts = super::font::families().to_vec();
+        let mut panel = crate::settings::Panel::new(fonts, crate::shell::choices(), themes);
         if let Some(sel) = settings {
             panel.sel = sel;
             model.settings = Some(chrome::Settings {

@@ -2380,7 +2380,7 @@ impl App {
 
     /// Opens the settings panel on its first setting.
     fn open_settings(&mut self) {
-        let fonts = crate::render::font::families();
+        let fonts = crate::render::font::families().to_vec();
         let themes = crate::theme::all().into_iter().map(|t| t.name).collect();
         self.settings = Some(Panel::new(fonts, crate::shell::choices(), themes));
         self.request_redraw();
@@ -5356,6 +5356,9 @@ impl App {
                 if self.counters.first_present_ms.is_none() {
                     self.counters.first_present_ms =
                         Some(self.started.elapsed().as_secs_f64() * 1000.0);
+                    // Ready before the settings panel wants them, and
+                    // not in the way of the first frame.
+                    std::thread::spawn(crate::render::font::families);
                 }
                 // Glyphs still waiting for a font lookup come next frame.
                 if self.gfx.as_ref().is_some_and(|g| g.r.pending()) {
