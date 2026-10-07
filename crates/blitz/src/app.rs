@@ -2033,11 +2033,12 @@ impl App {
     /// zoom need, and tells each terminal its new cell size.
     fn reload_font(&mut self) {
         let (px, base) = self.font_px();
-        if let Some(g) = &mut self.gfx
-            && let Err(e) =
-                g.r.set_font(&self.config.font_family, px, base, self.scale as f32)
-        {
-            eprintln!("blitz: font: {e}");
+        if let Some(g) = &mut self.gfx {
+            let scale = self.scale as f32;
+            if let Err(e) = g.r.set_font(&self.config.font_family, px, base, scale) {
+                eprintln!("blitz: font: {e}");
+            }
+            g.r.set_scale(scale);
         }
         let (cw, ch) = self.cell();
         for v in &self.views {
@@ -2268,7 +2269,8 @@ impl App {
             None => Gpu::new(false),
         }
         .and_then(|gpu| Renderer::with_gpu(gpu, family, px, base, scale));
-        let built = built.and_then(|r| {
+        let built = built.and_then(|mut r| {
+            r.set_scale(scale);
             let hwnd = HWND(self.hwnd as *mut c_void);
             let chain = Swapchain::new(&r.gpu, hwnd, size.width, size.height)?;
             chain.set_background(self.theme.pal.bg);
