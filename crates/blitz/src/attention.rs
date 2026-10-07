@@ -338,6 +338,14 @@ impl PaneAttn {
             Ev::Exited => match self.state {
                 Working => Idle,
                 NeedsYou if !self.bell => Idle,
+                // A bell stays, but looking at it must not bring back a
+                // Claude Code at work that has gone.
+                NeedsYou => {
+                    if self.prev == Working {
+                        self.prev = Idle;
+                    }
+                    return false;
+                }
                 s => s,
             },
         };
@@ -569,6 +577,12 @@ mod tests {
         p.apply(Ev::Bell, AWAY, Instant::now());
         assert!(!p.apply(Ev::Exited, AWAY, Instant::now()));
         assert_eq!(p.state, Attn::NeedsYou);
+        // Looking at one rung while Claude Code worked finds it gone.
+        let mut p = pane(Attn::Working);
+        p.apply(Ev::Bell, AWAY, Instant::now());
+        assert!(!p.apply(Ev::Exited, AWAY, Instant::now()));
+        assert!(p.apply(Ev::Attended, HERE, Instant::now()));
+        assert_eq!(p.state, Attn::Idle);
     }
 
     /// A turn runs from the prompt to the result, questions and all.
