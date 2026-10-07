@@ -348,20 +348,33 @@ pub fn build(m: &ChromeModel) -> Chrome {
             term: false,
         });
     };
-    // A dot or ring of diameter `d` centred on (cx, cy).
-    let mark = |p: &mut Vec<Prim>, cx: i32, cy: i32, d: f32, stroke: f32, color| {
-        let d = s(d);
-        p.push(Prim::Shape {
-            r: Rect {
-                x: cx - d / 2,
-                y: cy - d / 2,
-                w: d,
-                h: d,
-            },
-            radius: d as f32 / 2.0,
-            stroke: stroke * m.scale,
-            color,
-        });
+    // A dot of diameter `d` centred on (cx, cy), or a ring with a
+    // `stroke`, or with `round` under 1 a square with rounded corners.
+    let shape =
+        |p: &mut Vec<Prim>, (cx, cy): (i32, i32), d: f32, round: f32, stroke: f32, color| {
+            let d = s(d);
+            p.push(Prim::Shape {
+                r: Rect {
+                    x: cx - d / 2,
+                    y: cy - d / 2,
+                    w: d,
+                    h: d,
+                },
+                radius: d as f32 / 2.0 * round,
+                stroke: stroke * m.scale,
+                color,
+            });
+        };
+    // A session's state as a mark of size `d`: needs you a dot, done a
+    // ring and an error a square, so that the shape tells them apart
+    // without their colours. A question seen but not answered is drawn
+    // with a `seen` stroke.
+    let state_mark = |p: &mut Vec<Prim>, at: (i32, i32), d: f32, state: Attn, seen: f32| match state
+    {
+        Attn::NeedsYou => shape(p, at, d, 1.0, seen, c.mark),
+        Attn::DoneUnseen => shape(p, at, d, 1.0, 1.5, c.name),
+        Attn::Error => shape(p, at, d, 0.4, 0.0, c.error),
+        Attn::Working | Attn::Idle => {}
     };
     // A 2 px line: the track, then the part done filled, or all of it
     // when the program has not said. An error or a pause colours it, and
@@ -428,13 +441,13 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 let room = right - s(15.0) - cx;
                 text(p, cx, ty, &fit_left(&x2.cwd, room, tw), cc, false);
             }
-            let cy = r.y + (hh - 1) / 2;
-            match state {
-                Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, ring(sess), c.mark),
-                Attn::DoneUnseen => mark(p, right - s(4.0), cy, 7.0, 1.5, c.name),
-                Attn::Error => mark(p, right - s(4.0), cy, 7.0, 0.0, c.error),
-                Attn::Working | Attn::Idle => {}
-            }
+            state_mark(
+                p,
+                (right - s(4.0), r.y + (hh - 1) / 2),
+                7.0,
+                state,
+                ring(sess),
+            );
             if state == Attn::Working || reported.is_some() {
                 let line = Rect {
                     y: r.y + hh - 2,
@@ -633,13 +646,8 @@ pub fn build(m: &ChromeModel) -> Chrome {
                         color,
                     });
                 }
-                let (mx, my) = (row.x + s(12.0), y + top + s(5.0) + s(4.0));
-                match x.state {
-                    Attn::NeedsYou => mark(p, mx, my, 8.0, ring(Some(x)), c.mark),
-                    Attn::DoneUnseen => mark(p, mx, my, 8.0, 1.5, c.name),
-                    Attn::Error => mark(p, mx, my, 8.0, 0.0, c.error),
-                    Attn::Working | Attn::Idle => {}
-                }
+                let at = (row.x + s(12.0), y + top + s(5.0) + s(4.0));
+                state_mark(p, at, 8.0, x.state, ring(Some(x)));
 
                 let (left, right) = (row.x + s(24.0), row.right() - s(10.0));
                 let mut ly = y + top;
@@ -791,11 +799,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     tip = Some((x, row));
                 }
                 let (cx, cy) = (row.w / 2, y + row.h / 2);
+                state_mark(p, (cx, cy), 7.0, x.state, ring(Some(x)));
                 match x.state {
-                    Attn::NeedsYou => mark(p, cx, cy, 7.0, ring(Some(x)), c.mark),
-                    Attn::DoneUnseen => mark(p, cx, cy, 8.0, 1.5, c.name),
-                    Attn::Error => mark(p, cx, cy, 7.0, 0.0, c.error),
-                    Attn::Idle => mark(p, cx, cy, 3.0, 0.0, c.idle),
+                    Attn::Idle => shape(p, (cx, cy), 3.0, 1.0, 0.0, c.idle),
                     Attn::Working => {
                         let (bw, bh) = (s(8.0), s(2.0));
                         let r = Rect {
@@ -806,6 +812,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                         };
                         p.push(Prim::Rect(r, c.rail_work));
                     }
+                    Attn::NeedsYou | Attn::DoneUnseen | Attn::Error => {}
                 }
                 y += row.h;
             }
@@ -2208,6 +2215,38 @@ mod tests {
         let lines =
             (c.prims.iter()).filter(|p| matches!(p, Prim::Rect(r, _) if r.x == 0 && r.w == 2));
         assert_eq!(lines.count(), 1);
+    }
+
+    #[test]
+    fn an_error_is_a_square_and_needs_you_a_dot() {
+        for expanded in [true, false] {
+            let (win, mut sessions, now) = fleet(expanded);
+            sessions[1].state = Attn::Error;
+            let m = model(&win, &sessions, now);
+            let c = build(&m);
+            let marks = |color| -> Vec<bool> {
+                (c.prims.iter())
+                    .filter_map(|p| match p {
+                        // Not the needs-you chip, which is wider.
+                        Prim::Shape { r, radius, .. } if color == p_color(p) && r.w == r.h => {
+                            Some(*radius < r.w as f32 / 2.0)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // In the header and the sidebar row, or in the rail.
+            let n = if expanded { 2 } else { 1 };
+            assert_eq!(marks(m.ui.error), vec![true; n], "square corners");
+            assert_eq!(marks(m.ui.mark), vec![false; n], "round");
+        }
+    }
+
+    fn p_color(p: &Prim) -> u32 {
+        match p {
+            Prim::Rect(_, c) | Prim::Branch(_, c) => *c,
+            Prim::Shape { color, .. } | Prim::Text { color, .. } => *color,
+        }
     }
 
     #[test]
