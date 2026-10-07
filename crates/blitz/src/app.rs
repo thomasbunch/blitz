@@ -726,16 +726,21 @@ fn all_text(term: &vt::Terminal, pal: &Palette) -> Option<(usize, usize)> {
 
 /// The first and last line of the last command's output: the lines from
 /// the end of the command at blitz's next to last prompt down to its last
-/// prompt, none blank at the end.
+/// prompt, none blank at the end. The output starts where the shell marked
+/// it, below a prompt or command of more than one line; a shell that does
+/// not mark it, such as cmd, gets the line after the command's last row.
 fn last_output(term: &vt::Terminal, pal: &Palette) -> Option<(usize, usize)> {
     let mut prompts = term.lines().rev().filter(|&n| term.starts_prompt(n));
     let (now, before) = (prompts.next()?, prompts.next()?);
-    let mut first = before;
-    while first < now && term.wraps(first) {
-        first += 1;
-    }
-    let last = (first + 1..now).rev().find(|&n| !blank(term, pal, n))?;
-    Some((first + 1, last))
+    let first = (before..now).find(|&n| term.starts_output(n)).or_else(|| {
+        let mut end = before;
+        while end < now && term.wraps(end) {
+            end += 1;
+        }
+        Some(end + 1)
+    })?;
+    let last = (first..now).rev().find(|&n| !blank(term, pal, n))?;
+    Some((first, last))
 }
 
 /// Whether line `n` holds no text.
@@ -7974,6 +7979,11 @@ mod tests {
     fn app_selects_all_text_or_the_last_command_output() {
         let pal = crate::theme::dark();
         const PROMPT: &str = "\x1b]133;A;blitz=1\x07$ ";
+        let text_of = |t: &vt::Terminal, (a, b): (usize, usize)| {
+            let s = selection_of(t, &pal, (a, 0), (b, u16::MAX));
+            selection_text(t, &pal, &s, 0)
+        };
+
         let text = format!(
             "{PROMPT}ls\r\none\r\n{PROMPT}cargo build --release\r\n\
              Compiling x\r\nFinished\r\n\r\n{PROMPT}"
@@ -7992,9 +8002,22 @@ mod tests {
         let all = all_text(&t, &pal).expect("text");
         assert!(text(all).starts_with("$ ls\r\none\r\n$ cargo build"));
         assert!(text(all).ends_with("Finished\r\n\r\n$"));
+        // A prompt of two lines, and a command of two, where the shell
+        // marks the output's start.
+        let text = format!(
+            "{PROMPT}~/repo\r\n$ git commit\r\n>> -m x\r\n\x1b]133;C\x07\
+             [main 1a2b3c4] x\r\n{PROMPT}"
+        );
+        let t = fed(20, 4, &text);
+        let out = last_output(&t, &pal).expect("output");
+        assert_eq!(text_of(&t, out), "[main 1a2b3c4] x");
+        // A command with no output.
+        let t = fed(20, 4, &format!("{PROMPT}cd x\r\n\x1b]133;C\x07{PROMPT}"));
+        assert_eq!(last_output(&t, &pal), None);
         // One prompt has no command before it.
         let t = fed(12, 4, &format!("hello\r\n{PROMPT}"));
         assert_eq!(last_output(&t, &pal), None);
+
         let t = fed(12, 4, "");
         assert_eq!(all_text(&t, &pal), None, "nothing to select");
     }
