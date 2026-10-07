@@ -99,16 +99,23 @@ fn url_len(s: &str) -> Option<usize> {
 
 /// The length of the run of `ok` chars that starts `s`. A mark or joiner
 /// that builds one character with the char before it stays in the run, as
-/// in a decomposed `é` or `हिन्दी`, but no invisible format character does.
+/// in a decomposed `é` or `हिन्दी`, but no invisible format character does,
+/// and a joiner left at the end joins nothing.
 fn word_len(s: &str, ok: impl Fn(char) -> bool) -> usize {
     let mut prev = None;
-    s.find(|c: char| {
-        let joined = prev.is_some_and(|p| vt::width::joins(p, p, 1, c))
-            && (!vt::width::is_ignorable(c) || matches!(c, '\u{200C}' | '\u{200D}'));
-        prev = Some(c);
-        !ok(c) && !joined
-    })
-    .unwrap_or(s.len())
+    // Marks and joiners are never ASCII or space. A Prepend letter such as
+    // U+0D4E joins whatever follows it, so only those can join after one.
+    let n = s
+        .find(|c: char| {
+            let joined = prev.is_some_and(|p| vt::width::joins(p, p, 1, c))
+                && !c.is_ascii()
+                && !c.is_whitespace()
+                && (!vt::width::is_ignorable(c) || matches!(c, '\u{200C}' | '\u{200D}'));
+            prev = Some(c);
+            !ok(c) && !joined
+        })
+        .unwrap_or(s.len());
+    s[..n].trim_end_matches(['\u{200C}', '\u{200D}']).len()
 }
 
 /// What a path word is made of: anything a Windows file name can hold
@@ -270,7 +277,8 @@ fn plain(path: &Path, from: usize) -> bool {
     (path.ancestors())
         .take_while(|a| a.as_os_str().len() > from)
         .all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| !m.file_type().is_symlink()))
-        && std::fs::symlink_metadata(path).is_ok()
+        // A longer `path` was the first ancestor looked at.
+        && (path.as_os_str().len() > from || std::fs::symlink_metadata(path).is_ok())
 }
 
 /// What opening an OSC 8 link's `uri` does. Only `http`, `https` and
@@ -506,6 +514,11 @@ mod tests {
             "https://x.ir/می\u{200C}خواهم",
         );
         one("https://x.com/a\u{202E}b", "https://x.com/a");
+        // A Prepend letter joins no space or quote, and no joiner ends a URL.
+        one("https://x.com/a\u{D4E} next", "https://x.com/a\u{D4E}");
+        one("https://x.com/a\u{D4E}\"q", "https://x.com/a\u{D4E}");
+        one("https://x.com/\u{111C2}<b>", "https://x.com/\u{111C2}");
+        one("https://x.com/a\u{200C} next", "https://x.com/a");
         one(
             "https://example.com/a/b.html",
             "https://example.com/a/b.html",
@@ -573,6 +586,8 @@ mod tests {
             ".env",
             "~ and ~x",
             "a.b(x)",
+            "docs/a\u{D4E} b.txt rest",
+            "docs\\x\u{111C2}\"y.txt",
         ] {
             assert_eq!(found(none), [], "{none}");
         }

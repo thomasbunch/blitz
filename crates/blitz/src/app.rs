@@ -2917,8 +2917,8 @@ impl App {
     }
 
     /// Says `text` dimly in pane `id`, which nobody asked for, until
-    /// `until`, unless a question, an error or a notice that stays up
-    /// waits there. Whether it did.
+    /// `until`, unless a question, an error, a plain notice or a notice
+    /// that stays up waits there. Whether it did.
     fn hint(&mut self, id: PaneId, text: impl Into<String>, until: Instant) -> bool {
         let shown =
             (self.view_mut(id)).is_some_and(|v| hint_into(&mut v.notice, text.into(), until));
@@ -4127,9 +4127,7 @@ impl App {
             .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
         let size = (size.width as i32, size.height as i32);
         let tw = self.text_cell().0 as i32;
-        let note = self.banner_note.as_ref().map(|n| n.0.as_str());
-        let update = self.update.as_ref();
-        panes_area(&self.win, size, self.scale as f32, update, note, tw)
+        chrome::area(&self.win, size, self.scale as f32, self.banner(), tw)
     }
 
     /// The text of the update strip or cue, which also decides whether
@@ -5722,21 +5720,6 @@ fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) 
     update.map(|u| note.unwrap_or(&u.1))
 }
 
-/// The part of a `size` window that the active tab's panes share, with
-/// the banner strip as the frame draws it: from the note on the update in
-/// hand while there is one, which may need the strip where the offer fit
-/// the sidebar's foot.
-fn panes_area(
-    win: &layout::Window,
-    size: (i32, i32),
-    scale: f32,
-    update: Option<&(String, String)>,
-    note: Option<&str>,
-    tw: i32,
-) -> Rect {
-    chrome::area(win, size, scale, banner_text(update, note), tw)
-}
-
 /// How to flash the taskbar for a session that just changed to `state`
 /// while the window is in the background: urgently when it needs the
 /// user or failed, gently when it finished, and at most once per session
@@ -5906,10 +5889,12 @@ fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
 /// Puts a hint nobody asked for in a pane's notice `slot`, dim until
 /// `until`, unless a question or an error waits there, which it would
 /// take the place of, or a notice that stays up ([`hides_lasting`]).
-/// Whether it did.
+/// Whether it did. Only another dim hint gives way: a plain notice may
+/// be the one word that a session was lost.
 fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
     let old = slot.as_ref();
-    let fits = old.is_none_or(|n| n.ask == Ask::Nothing) && !hides_lasting(old, Some(until), true);
+    let fits = old.is_none_or(|n| n.ask == Ask::Nothing && n.dim)
+        && !hides_lasting(old, Some(until), true);
     if fits {
         *slot = Some(Notice {
             text,
@@ -7338,8 +7323,8 @@ mod tests {
         let offer = crate::update::banner(None, "0.2.0", None, true, "Ctrl+Alt+Shift+F12");
         let offer = offer.expect("an offer");
         let update = ("0.2.0".to_string(), offer);
-        let note = "Sessions are busy, and updating restarts blitz.                     Press Ctrl+Alt+Shift+F12 again";
-        let area = |note| panes_area(&win, (1440, 900), 1.0, Some(&update), note, 7);
+        let note = "Sessions are busy, and updating restarts blitz. Press Ctrl+Alt+Shift+F12 again";
+        let area = |note| chrome::area(&win, (1440, 900), 1.0, banner_text(Some(&update), note), 7);
         assert_eq!(area(None).h, 900, "the offer sits at the sidebar's foot");
         assert!(area(Some(note)).h < 900, "the note needs the strip");
     }
@@ -9164,9 +9149,9 @@ mod tests {
         }
     }
 
-    /// A passing hint leaves a question or an error where it is, and says
-    /// so, to be tried again; an exited program's line comes back once a
-    /// notice over it goes.
+    /// A passing hint leaves a question, an error or a plain notice where
+    /// it is, and says so, to be tried again; an exited program's line
+    /// comes back once a notice over it goes.
     #[test]
     fn notices_over_questions_and_exits() {
         let notice = |ask, dim| Notice {
@@ -9191,7 +9176,7 @@ mod tests {
                 ("hint", Some(until), true)
             );
         }
-        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit] {
+        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit, Ask::Nothing] {
             let mut slot = Some(notice(ask.clone(), false));
             assert!(!hint_into(&mut slot, "hint".into(), until));
             assert!(slot.is_some_and(|n| n.ask == ask && n.text == "n"));

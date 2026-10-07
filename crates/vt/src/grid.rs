@@ -507,8 +507,9 @@ impl Grid {
     }
 
     /// Scrolls screen rows `top..=bottom` down by `n`; blank rows enter at
-    /// the top. True when every screen row moved under its line number while
-    /// the scrollback stayed put, as for [`Self::scroll_up`].
+    /// the top. True when every screen row moved under its line number,
+    /// which a scroll of the whole screen down always does: no number
+    /// above the screen is free for its top row to take.
     pub fn scroll_down(&mut self, top: u16, bottom: u16, n: u16, blank: Cell) -> bool {
         let n = n.min(bottom + 1 - top);
         let base = self.scrollback_len();
@@ -518,7 +519,7 @@ impl Grid {
                 self.rows.insert(base + top as usize, row);
             }
         }
-        n > 0 && base > 0 && top == 0 && bottom + 1 == self.lines
+        n > 0 && top == 0 && bottom + 1 == self.lines
     }
 
     /// Drops all scrollback, keeping the rows for reuse.
