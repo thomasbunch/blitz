@@ -1517,6 +1517,11 @@ impl App {
             self.eaten = Some(k.vk);
             return;
         }
+        // A key whose press was eaten is still held: its autorepeat must not
+        // reach the pane either, as when a needs-you closes blitz run mid-jump.
+        if k.down && self.eaten == Some(k.vk) {
+            return;
+        }
         let Some(v) = self.current() else {
             return;
         };
