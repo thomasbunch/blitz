@@ -2230,7 +2230,7 @@ impl App {
 
     /// Whether pane `id` asks `ask`, which a second run of its action
     /// answers. Takes the question away if so.
-    fn answered(&mut self, id: PaneId, ask: &Ask) -> bool {
+    fn confirmed(&mut self, id: PaneId, ask: &Ask) -> bool {
         let yes = (self.view_mut(id))
             .and_then(|v| v.notice.take_if(|n| n.ask == *ask))
             .is_some();
@@ -2468,7 +2468,7 @@ impl App {
                     let Some(id) = before else {
                         return false;
                     };
-                    if !self.answered(id, &Ask::Paste(text.clone())) {
+                    if !self.confirmed(id, &Ask::Paste(text.clone())) {
                         let lines = text.lines().count();
                         let asked = format!("Paste {lines} lines? Press Ctrl+V again");
                         self.ask(id, asked, Ask::Paste(text));
@@ -2497,7 +2497,7 @@ impl App {
                 };
                 let (id, busy) = (v.pane.id, v.busy());
                 match busy {
-                    Some(what) if !self.answered(id, &Ask::ClosePane) => {
+                    Some(what) if !self.confirmed(id, &Ask::ClosePane) => {
                         let again = again(a, &self.config.keys);
                         let text = format!("This session is {what}. {again} to close it");
                         self.ask(id, text, Ask::ClosePane);
@@ -2513,7 +2513,7 @@ impl App {
                 let busy: Vec<_> = (panes.iter())
                     .filter_map(|&p| self.view(p)?.busy())
                     .collect();
-                if !busy.is_empty() && !self.answered(id, &Ask::CloseTab) {
+                if !busy.is_empty() && !self.confirmed(id, &Ask::CloseTab) {
                     let what = busy_text(&busy, " in this tab");
                     let text = format!("{what}. {} to close it", again(a, &self.config.keys));
                     self.ask(id, text, Ask::CloseTab);
@@ -2637,7 +2637,7 @@ impl App {
                 }
                 // Updating restarts blitz, which ends every session.
                 let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
-                if busy > 0 && !self.answered(id, &Ask::Update) {
+                if busy > 0 && !self.confirmed(id, &Ask::Update) {
                     let what = if busy == 1 {
                         "A session is"
                     } else {
@@ -4438,7 +4438,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => {
                 let busy: Vec<_> = self.views.iter().filter_map(View::busy).collect();
                 match self.focus_id() {
-                    Some(id) if !busy.is_empty() && !self.answered(id, &Ask::Quit) => {
+                    Some(id) if !busy.is_empty() && !self.confirmed(id, &Ask::Quit) => {
                         let them = if busy.len() == 1 { "it" } else { "them" };
                         let text = format!(
                             "{}. Close the window again to end {them}",
