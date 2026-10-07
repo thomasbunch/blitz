@@ -973,7 +973,6 @@ mod tests {
         assert_eq!(g.line(3).unwrap().flags, rf::OUTPUT);
     }
 
-
     #[test]
     fn find_covers_both_halves_of_a_wide_character() {
         let mut g = Grid::new(6, 1, 0);

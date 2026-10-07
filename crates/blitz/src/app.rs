@@ -2811,6 +2811,8 @@ impl App {
         self.set_notice(id, text, Some(Instant::now() + HINT), true);
     }
 
+    /// Shows `text` in pane `id` until `until`, or else until something
+    /// replaces it, unless [`hides_lasting`] says it would hide one.
     fn set_notice(
         &mut self,
         id: PaneId,
@@ -2818,7 +2820,9 @@ impl App {
         until: Option<Instant>,
         dim: bool,
     ) {
-        if let Some(v) = self.view_mut(id) {
+        if let Some(v) = self.view_mut(id)
+            && !hides_lasting(v.notice.as_ref(), until, dim)
+        {
             v.notice = Some(Notice {
                 text: text.into(),
                 until,
@@ -3203,13 +3207,8 @@ impl App {
     }
 
     /// Says in pane `id` what a copy did: briefly and dimly when it
-    /// worked, a while longer when it did not. A brief notice never hides
-    /// one that stays up, such as how to close a pane that exited.
+    /// worked, a while longer when it did not.
     fn notice_copy(&mut self, id: PaneId, text: String, worked: bool) {
-        let stays = |v: &View| v.notice.as_ref().is_some_and(|n| n.until.is_none());
-        if worked && self.view(id).is_some_and(stays) {
-            return;
-        }
         let shown = if worked { BRIEF } else { NOTICE };
         self.set_notice(id, text, Some(Instant::now() + shown), worked);
     }
@@ -6209,7 +6208,15 @@ fn paste_refused(label: &str, code: Option<u32>) -> Option<String> {
     ))
 }
 
+/// Whether a dim notice that goes away at `until` would hide `old`, one
+/// that stays up, such as how to restart a pane that exited or a question
+/// waiting for its answer. News never does.
+fn hides_lasting(old: Option<&Notice>, until: Option<Instant>, dim: bool) -> bool {
+    dim && until.is_some() && old.is_some_and(|n| n.until.is_none())
+}
+
 /// What pasting answers paste question `ask` with, the clipboard holding
+
 /// `now`: the text it asked about, while the clipboard still holds it.
 /// Dropped files are answered whatever the clipboard holds.
 fn answers(ask: Ask, now: Option<&str>) -> Option<String> {
@@ -8956,6 +8963,25 @@ mod tests {
         assert!(!t.paste_trusted(), "asks again");
         hook_confirms_paste(&mut t, Ev::Idle);
         assert!(!t.paste_trusted(), "Claude Code quit");
+    }
+
+    #[test]
+    fn app_news_never_hides_a_notice_that_stays_up() {
+        let notice = |until| Notice {
+            text: "exit 1 \u{b7} Enter restart \u{b7} Esc close".into(),
+            until,
+            dim: false,
+            ask: Ask::Nothing,
+        };
+        let (now, brief) = (Instant::now(), Some(Instant::now() + BRIEF));
+        assert!(hides_lasting(Some(&notice(None)), brief, true));
+        assert!(
+            !hides_lasting(Some(&notice(None)), brief, false),
+            "an error"
+        );
+        assert!(!hides_lasting(Some(&notice(None)), None, true));
+        assert!(!hides_lasting(Some(&notice(Some(now))), brief, true));
+        assert!(!hides_lasting(None, brief, true));
     }
 
     #[test]
