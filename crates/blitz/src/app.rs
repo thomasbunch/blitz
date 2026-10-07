@@ -4086,6 +4086,13 @@ impl App {
                 self.show(id);
                 self.paste(id, &text, false, Ask::Drop);
             }
+            Some(Dropped::Open(dirs)) if dirs.is_empty() => {
+                if let Some(id) = self.focus_id() {
+                    let text = "Only folders open from the sidebar; drop files on a pane";
+                    self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                }
+            }
+
             Some(Dropped::Open(dirs)) => {
                 for dir in dirs {
                     self.add(Some(dir), new_tab);
