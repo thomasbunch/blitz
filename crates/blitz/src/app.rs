@@ -1481,7 +1481,9 @@ impl App {
             hooks_seen: false,
         });
         if let Some(text) = fell_back {
-            self.set_notice(id, text, None, false);
+            // It covers the pane's last row, so it stays only until the
+            // next key there, having been seen.
+            self.error(id, text);
         }
         self.find_branch(id);
         self.next_id = self.next_id.max(id.0 + 1);
@@ -6388,6 +6390,18 @@ mod tests {
             !shell_failed("x", &err, "cmd", None).contains('\u{b7}'),
             "unbound"
         );
+    }
+
+    /// The note about a shell that could not start covers the pane's last
+    /// row, so typing there, having read it, puts it away; a note that a
+    /// session exited or stopped stays.
+    #[test]
+    fn typing_puts_away_only_the_note_it_ends() {
+        // The shell note is an error, which a key in its pane puts away.
+        assert!(Ask::Key.gone(None, true));
+        assert!(!Ask::Key.gone(None, false), "a key in another pane");
+        // A note that a session exited stays.
+        assert!(!Ask::Nothing.gone(None, true));
     }
 
     #[test]
