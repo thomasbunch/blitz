@@ -2501,14 +2501,21 @@ impl App {
             }
             return;
         }
-        // And for the find bar.
+        // And for the find bar, but another shortcut closes it and runs.
         if self.find.is_some() && k.down {
             self.eaten.press(k.vk);
-            if keymap::action(k, &self.config.keys) == Some(Action::Find) {
-                self.find = None;
-                self.request_redraw();
-            } else {
-                self.find_key(k);
+            match keymap::action(k, &self.config.keys).filter(|&a| find_runs(a)) {
+                Some(Action::Find) => {
+                    self.find = None;
+                    self.request_redraw();
+                }
+                Some(a) => {
+                    if self.act(el, a) {
+                        self.find = None;
+                        self.request_redraw();
+                    }
+                }
+                None => self.find_key(k),
             }
             return;
         }
@@ -3593,12 +3600,17 @@ impl App {
             }
             return;
         }
-        // A click on another pane only moves focus.
-        if pressed
-            && let Some(id) = (self.hit(self.mouse.pos).0).filter(|&id| Some(id) != self.focus_id())
-        {
-            self.show(id);
-            return;
+        // A click on another pane only moves focus. One in the focused
+        // pane closes its find bar and goes on.
+        if pressed {
+            let id = self.hit(self.mouse.pos).0;
+            if let Some(id) = id.filter(|&id| Some(id) != self.focus_id()) {
+                self.show(id);
+                return;
+            }
+            if id.is_some() && self.find.take().is_some() {
+                self.request_redraw();
+            }
         }
         let program = self.mouse_to_program(&mods).and(self.focus_id());
         if let Some(id) = route_button(&mut self.mouse.reported, b, pressed, program) {
@@ -4380,6 +4392,12 @@ fn animations_on() -> bool {
         )
     };
     read.is_err() || on.as_bool()
+}
+
+/// Whether a shortcut pressed while the find bar is open runs, which
+/// closes the bar. Paste is left to the bar.
+fn find_runs(a: Action) -> bool {
+    a != Action::Paste
 }
 
 /// How long after a session needing the user closes blitz run a jump key
@@ -6419,6 +6437,19 @@ mod tests {
         f.search(&t, 3);
         f.step(1);
         assert_eq!((f.found.len(), f.cur), (0, None));
+    }
+
+    #[test]
+    fn app_shortcuts_close_the_find_bar_and_run() {
+        for a in [
+            Action::Copy,
+            Action::Palette,
+            Action::SplitRight,
+            Action::Find,
+        ] {
+            assert!(find_runs(a), "{a:?}");
+        }
+        assert!(!find_runs(Action::Paste), "for the bar");
     }
 
     #[test]
