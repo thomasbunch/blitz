@@ -2105,12 +2105,16 @@ impl App {
         }
     }
 
-    /// Shows `text` in pane `id` dimly for a while, unless a hint about
-    /// Claude Code's hooks was shown already.
-    fn hooks_hint(&mut self, id: PaneId, text: impl Into<String>) {
-        if !std::mem::replace(&mut self.hooks_hinted, true) {
-            self.set_notice(id, text, Some(Instant::now() + HINT), true);
+    /// Says dimly in pane `id`, for a while, that Claude Code's hooks are
+    /// not reporting, or are `older` than this blitz, unless a hint about
+    /// them was shown already.
+    fn hooks_hint(&mut self, id: PaneId, older: bool) {
+        if std::mem::replace(&mut self.hooks_hinted, true) {
+            return;
         }
+        let palette = keymap::keys_for(Action::Palette, &self.config.keys);
+        let text = hooks_hint_text(older, palette);
+        self.set_notice(id, text, Some(Instant::now() + HINT), true);
     }
 
     fn set_notice(
@@ -2750,12 +2754,7 @@ impl App {
                     _ => {}
                 }
                 if silent {
-                    let palette = keymap::keys_for(Action::Palette, &self.config.keys)
-                        .map_or_else(|| "the command palette".into(), |k| k + ",");
-                    let text = format!(
-                        "Claude Code's hooks are not reporting to blitz \u{b7} {palette} Claude Code setup"
-                    );
-                    self.hooks_hint(id, text);
+                    self.hooks_hint(id, false);
                 }
             }
             Event::Cwd(dir) => {
@@ -2780,10 +2779,7 @@ impl App {
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
                     v.pane.hooked = ev != Ev::Idle;
                     if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
-                        self.hooks_hint(
-                            id,
-                            "Claude Code runs an older blitz-hook from its settings \u{b7} blitz setup claude says more",
-                        );
+                        self.hooks_hint(id, true);
                     }
                     self.attention(id, ev);
                     if turn_ends(ev) {
@@ -3817,6 +3813,19 @@ fn claude_working_title(title: &str) -> bool {
         .chars()
         .next()
         .is_some_and(|c| ('\u{25d0}'..='\u{25d3}').contains(&c))
+}
+
+/// The hint about Claude Code's hooks, `older` than this blitz or not
+/// reporting, and where to set them up: the palette, by its keys if it has
+/// some. `blitz setup claude` run from a shell prints nothing there.
+fn hooks_hint_text(older: bool, palette: Option<String>) -> String {
+    let what = if older {
+        "Claude Code's settings run an older blitz-hook"
+    } else {
+        "Claude Code's hooks are not reporting to blitz"
+    };
+    let palette = palette.map_or_else(|| "the command palette".into(), |k| k + ",");
+    format!("{what} \u{b7} {palette} Claude Code setup")
 }
 
 /// Whether Claude Code's hooks are not reporting: it has shown it is
@@ -5378,6 +5387,21 @@ mod tests {
             .filter(|e| matches!(e, Event::Notify { title, .. } if Ev::from_notify(title, "0f1e").is_none()))
             .count();
         assert_eq!(untokened, 2);
+    }
+
+    /// Both hints lead to the palette entry that sets the hooks up.
+    #[test]
+    fn app_hooks_hints_name_the_setup() {
+        let keys = Some("Ctrl+Shift+P".to_owned());
+        assert_eq!(
+            hooks_hint_text(false, keys.clone()),
+            "Claude Code's hooks are not reporting to blitz \u{b7} Ctrl+Shift+P, Claude Code setup"
+        );
+        assert_eq!(
+            hooks_hint_text(true, keys),
+            "Claude Code's settings run an older blitz-hook \u{b7} Ctrl+Shift+P, Claude Code setup"
+        );
+        assert!(hooks_hint_text(true, None).ends_with("the command palette Claude Code setup"));
     }
 
     #[test]
