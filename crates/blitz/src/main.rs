@@ -33,8 +33,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    let gui = (a.first())
-        .is_none_or(|f| !matches!(*f, "--version" | "--help" | "-h" | "/?" | "setup" | "debug"));
+    let gui = !console(&a);
     if !gui {
         let _ = attach();
     }
@@ -64,8 +63,40 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Whether `args` ask for something said on the console rather than a
+/// window. `setup` or `debug` alone opens a folder of that name, as
+/// `blitz DIR` does, unless no such folder is there.
+#[cfg(windows)]
+fn console(args: &[&str]) -> bool {
+    match args {
+        ["--version" | "--help" | "-h" | "/?", ..] => true,
+        [tool @ ("setup" | "debug")] => !std::path::Path::new(tool).is_dir(),
+        ["setup" | "debug", ..] => true,
+        _ => false,
+    }
+}
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("blitz: only Windows is supported for now");
     std::process::exit(1);
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    /// The only test in this binary: it changes the current folder.
+    #[test]
+    fn a_folder_named_like_a_command_opens() {
+        let dir = std::env::temp_dir().join(format!("blitz-main-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("setup")).unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let (setup, debug) = (super::console(&["setup"]), super::console(&["debug"]));
+        std::env::set_current_dir(std::env::temp_dir()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!setup);
+        assert!(debug);
+        assert!(super::console(&["setup", "claude"]));
+        assert!(super::console(&["--version"]));
+        assert!(!super::console(&["."]));
+    }
 }
