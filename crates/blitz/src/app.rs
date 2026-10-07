@@ -5028,7 +5028,7 @@ impl App {
 
         let pane = self.current().and_then(|v| v.rect);
         let cell = (cw as i32, ch as i32);
-        if let Some(at) = ime_area(chrome.field, pane, cursor, cell)
+        if let Some(at) = ime_area(chrome.field.map(|f| f.0), pane, cursor, cell)
             && self.ime_at != Some(at)
             && let Some(w) = &self.window
         {
