@@ -2,7 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(windows)]
-const USAGE: &str = "usage: blitz [--version]
+const USAGE: &str = "usage: blitz [--cwd DIR] [--new-window]
+       blitz --version | --help
        blitz setup claude
        blitz debug run --script FILE [--cmd CMD] [--cwd DIR] [--cols N --rows N] [--timeout MS]
        blitz debug render --script FILE --bmp OUT [--warp]";
@@ -25,7 +26,7 @@ fn main() {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     let gui = a
         .first()
-        .is_none_or(|f| f.starts_with("--") && *f != "--version");
+        .is_none_or(|f| f.starts_with("--") && !matches!(*f, "--version" | "--help"));
     if !gui {
         // Subcommands print to the console they were started from.
         // SAFETY: plain Win32 call; failure just means there is no console.
@@ -36,6 +37,10 @@ fn main() {
         _ if gui => blitz::app::run(&args),
         ["--version"] => {
             println!("blitz {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        ["--help" | "-h"] => {
+            println!("{USAGE}");
             0
         }
         ["setup", ..] => blitz::hook::setup(&args[1..]),
