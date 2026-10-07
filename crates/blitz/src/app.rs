@@ -6440,7 +6440,7 @@ fn alt_v(m: &InputModes) -> Vec<u8> {
 /// close the pane, so this one does too.
 fn paste_refused(label: &str, code: Option<u32>) -> Option<String> {
     Some(format!(
-        "{label} exited ({}), so nothing was pasted \u{b7} Enter restart \u{b7} Esc close",
+        "{label}: {}, so nothing was pasted \u{b7} Enter restart \u{b7} Esc close",
         exit_text(code?)
     ))
 }
@@ -9556,11 +9556,12 @@ mod tests {
         assert_eq!(paste_refused("pwsh 3", None), None);
         assert_eq!(
             paste_refused("pwsh 3", Some(1)).as_deref(),
-            Some(
-                "pwsh 3 exited (exit 1), so nothing was pasted \u{b7} Enter restart \u{b7} Esc close"
-            )
+            Some("pwsh 3: exit 1, so nothing was pasted \u{b7} Enter restart \u{b7} Esc close")
         );
-        assert!(paste_refused("cmd 1", Some(0xC000_013A)).is_some_and(|t| t.contains("(Ctrl+C)")));
+        assert!(
+            paste_refused("cmd 1", Some(0xC000_013A))
+                .is_some_and(|t| t.starts_with("cmd 1: Ctrl+C,"))
+        );
     }
 
     #[test]
