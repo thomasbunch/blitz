@@ -382,14 +382,10 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
 }
 
 /// Runs System32's curl.exe over HTTPS only, redirects included, and
-/// returns what it downloaded. Named by its full path: a bare name is
-/// looked for in blitz's own folder first, where a planted curl.exe would
-/// run instead.
+/// returns what it downloaded.
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let ua = concat!("blitz/", env!("CARGO_PKG_VERSION"));
-    let exe = crate::shell::system_root(|k| std::env::var_os(k))
-        .join("System32")
-        .join("curl.exe");
+    let exe = curl_exe();
     // curl does not read Windows' proxy setting itself.
     let proxy = system_proxy();
     // A slow line still finishes the download; one that stalls gives up.
@@ -407,6 +403,14 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
         return Err(curl_error(&out.stderr, out.status.code()));
     }
     Ok(out.stdout)
+}
+
+/// System32's curl.exe, named by its full path: a bare name is looked for
+/// in blitz's own folder first, where a planted curl.exe would run instead.
+fn curl_exe() -> PathBuf {
+    crate::shell::system_root(|k| std::env::var_os(k))
+        .join("System32")
+        .join("curl.exe")
 }
 
 /// curl's options to go through `proxy`. One that asks who is there, as a
@@ -821,7 +825,7 @@ mod tests {
             }
             std::io::Result::Ok(seen)
         });
-        let _ = Command::new("curl.exe")
+        let _ = Command::new(curl_exe())
             .args(["-sS", "--max-time", "10"])
             .args(proxy_args(&at))
             .arg("https://example.invalid/")
