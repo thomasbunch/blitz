@@ -84,6 +84,8 @@ const HINT: Duration = Duration::from_secs(10);
 /// hooks before blitz says they are not reporting. A turn's first hook
 /// lands within a second of it starting.
 const HOOKS_QUIET: Duration = Duration::from_secs(45);
+/// How long a dim notice that only says something worked stays up.
+const BRIEF: Duration = Duration::from_secs(2);
 /// Frame times for blitz run, and for scenery and the spark, which move
 /// slowly.
 const GAME_FRAME: Duration = Duration::from_millis(16);
@@ -2644,27 +2646,47 @@ impl App {
         true
     }
 
+    /// Copies the selection in the focused pane. False when there is none,
+    /// so the key goes on to the program. When another program holds the
+    /// clipboard the selection stays, to copy again.
+    fn copy(&mut self) -> bool {
+        let Some(v) = self.current() else {
+            return false;
+        };
+        let id = v.pane.id;
+        let term = lock(&v.pane.term);
+        let Some(sel) = self.selection.as_ref().filter(|s| s.kept(&term)) else {
+            return false;
+        };
+        let text = selection_text(&term, &self.theme.pal, sel, 0);
+        drop(term);
+        let owner = Some(HWND(self.hwnd as *mut c_void));
+        let copied = crate::clipboard::set_text(owner, &text);
+        if copied {
+            self.selection = None;
+        }
+        self.notice_copy(id, copy_notice(&text, copied), copied);
+        true
+    }
+
+    /// Says in pane `id` what a copy did: briefly and dimly when it
+    /// worked, a while longer when it did not. A brief notice never hides
+    /// one that stays up, such as how to close a pane that exited.
+    fn notice_copy(&mut self, id: PaneId, text: String, worked: bool) {
+        let stays = |v: &View| v.notice.as_ref().is_some_and(|n| n.until.is_none());
+        if worked && self.view(id).is_some_and(stays) {
+            return;
+        }
+        let shown = if worked { BRIEF } else { NOTICE };
+        self.set_notice(id, text, Some(Instant::now() + shown), worked);
+    }
+
     /// Runs a shortcut. Returns false when it does not apply right now, in
     /// which case the key goes to the program.
     fn act(&mut self, el: &ActiveEventLoop, a: Action) -> bool {
         let before = self.focus_id();
         match a {
-            Action::Copy => {
-                let Some(v) = self.current() else {
-                    return false;
-                };
-                let term = lock(&v.pane.term);
-                let Some(sel) = self.selection.as_ref().filter(|s| s.kept(&term)) else {
-                    return false;
-                };
-                let text = selection_text(&term, &self.theme.pal, sel, 0);
-                drop(term);
-                if !crate::clipboard::set_text(Some(HWND(self.hwnd as *mut c_void)), &text) {
-                    eprintln!("blitz: could not copy to the clipboard");
-                }
-                self.selection = None;
-                self.request_redraw();
-            }
+            Action::Copy => return self.copy(),
             Action::Paste => {
                 let Some(id) = before else {
                     return false;
@@ -4918,6 +4940,17 @@ fn label(
     (name.to_owned(), msg.to_owned())
 }
 
+/// What a copy of `text` says: how many lines went to the clipboard, or
+/// that another program held it.
+fn copy_notice(text: &str, copied: bool) -> String {
+    if !copied {
+        return "Clipboard busy; nothing was copied".into();
+    }
+    let lines = text.split('\n').count();
+    let s = if lines == 1 { "" } else { "s" };
+    format!("Copied {lines} line{s}")
+}
+
 /// Whether a copy key that found nothing to copy is kept from the program.
 /// Ctrl+Shift+C would reach it as Ctrl+C and interrupt it, unless kitty
 /// flags make it a key of its own; plain Ctrl+C is meant to interrupt.
@@ -6910,6 +6943,17 @@ mod tests {
         );
         assert!(text.ends_with(r"blitz\config.toml"), "{text}");
         assert_eq!(start_failed("x", None), "blitz could not start: x");
+    }
+
+    #[test]
+    fn app_a_copy_says_what_it_did() {
+        assert_eq!(copy_notice("ls", true), "Copied 1 line");
+        assert_eq!(copy_notice("", true), "Copied 1 line", "a blank line");
+        assert_eq!(copy_notice("a\r\nb\r\n", true), "Copied 3 lines");
+        assert_eq!(
+            copy_notice("a\r\nb", false),
+            "Clipboard busy; nothing was copied"
+        );
     }
 
     #[test]
