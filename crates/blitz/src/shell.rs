@@ -317,6 +317,41 @@ mod tests {
         assert_eq!(quote(r"dir with\ trailing\"), r#""dir with\ trailing\\""#);
     }
 
+    /// What the system itself makes of a quoted argument.
+    #[test]
+    #[cfg(windows)]
+    fn quote_round_trips_through_the_system_parser() {
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::UI::Shell::CommandLineToArgvW;
+        for arg in [
+            r"a\\b c",
+            "\\\"",
+            r"x\",
+            "a\tb",
+            "a\\\\\"b c",
+            "",
+            " ",
+            "\\",
+            r"trailing\\",
+            r"C:\Program Files\x\",
+            "\"\"",
+            "a\"b\"c",
+            "\u{e9}t\u{e9} \u{2713}",
+        ] {
+            let line = windows::core::HSTRING::from(format!("p {}", quote(arg)));
+            let mut n = 0;
+            // SAFETY: a valid string and out pointer; the array is freed below.
+            let got = unsafe {
+                let argv = CommandLineToArgvW(&line, &mut n);
+                assert!(!argv.is_null());
+                let got = (n == 2).then(|| (*argv.add(1)).to_string().unwrap());
+                let _ = LocalFree(Some(HLOCAL(argv.cast())));
+                got
+            };
+            assert_eq!(got.as_deref(), Some(arg), "{arg:?} as {line}");
+        }
+    }
+
     #[test]
     fn only_blitz_prompts_are_its_own() {
         use std::ffi::OsStr;
@@ -324,6 +359,32 @@ mod tests {
         assert!(!is_blitz_prompt(OsStr::new("$P$G")));
         // Another terminal's marks are the user's business.
         assert!(!is_blitz_prompt(OsStr::new(r"$e]133;A$e\$P$G")));
+    }
+
+    #[test]
+    fn other_shells_run_as_configured() {
+        let bash = r"C:\Program Files\Git\bin\bash.exe";
+        let want = Launch {
+            cmdline: format!("\"{bash}\""),
+            env: Vec::new(),
+        };
+        assert_eq!(launch(bash, &[], true, "t"), want);
+        assert_eq!(launch("wsl.exe", &[], true, "t").cmdline, "wsl.exe");
+    }
+
+    #[test]
+    fn choices_start_with_the_automatic_one() {
+        let c = choices();
+        assert!(
+            c[0].0.starts_with("Automatic (") && c[0].1.is_empty(),
+            "{c:?}"
+        );
+        assert!(
+            c[1..]
+                .iter()
+                .all(|(n, p)| !n.is_empty() && Path::new(p).is_file()),
+            "{c:?}"
+        );
     }
 
     #[test]
@@ -387,8 +448,12 @@ mod tests {
             pf.join("PowerShell").join("7").join("pwsh.exe")
         );
         // A relative entry is resolved against the current directory, so it
-        // is never used.
-        let rel = PathBuf::from(format!("blitz-shell-{}", std::process::id()));
+        // is never used. Tests run in the crate's folder; this one stays out
+        // of the sources.
+        let rel = Path::new("..")
+            .join("..")
+            .join("target")
+            .join(format!("blitz-shell-{}", std::process::id()));
         touch(rel.join("pwsh.exe"));
         let with_rel = |k: &str| match k {
             "PATH" => Some(std::env::join_paths([&rel, &on_path]).unwrap()),
