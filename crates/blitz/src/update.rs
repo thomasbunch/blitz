@@ -199,7 +199,10 @@ pub fn install(v: &str) -> Result<(), String> {
     let sums = curl(&[&format!("{base}/SHA256SUMS.txt")])?;
     let sums = String::from_utf8_lossy(&sums);
     let want = sum_for(&sums, &name).ok_or("the release has no checksum for its installer")?;
-    let exe = curl(&["--max-filesize", "64M", &format!("{base}/{name}")])?;
+    // A line that trickles just above the stall floor still ends: 64 MB in
+    // half an hour is 36 KB/s.
+    let url = format!("{base}/{name}");
+    let exe = curl(&["--max-time", "1800", "--max-filesize", "64M", &url])?;
     if !sha256_hex(&exe).is_some_and(|got| got.eq_ignore_ascii_case(want)) {
         return Err("the download does not match its checksum".into());
     }
