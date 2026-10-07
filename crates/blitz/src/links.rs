@@ -187,19 +187,35 @@ fn path_at(s: &str) -> Option<(Range<usize>, usize)> {
 }
 
 /// The length of `s` without the punctuation of a sentence around it, or
-/// a closing bracket it does not open.
-fn trim_end(mut s: &str) -> usize {
-    loop {
-        let unopened =
-            |open, close| s.ends_with(close) && s.matches(open).count() < s.matches(close).count();
-        if s.ends_with(['.', ',', ';', ':', '!', '?', '\'', '"'])
-            || unopened('(', ')')
-            || unopened('[', ']')
-        {
-            s = &s[..s.len() - 1];
-        } else {
-            return s.len();
+/// a closing bracket it does not open. The brackets are counted once, so
+/// a long run of them costs no more than the rest of the text.
+fn trim_end(s: &str) -> usize {
+    // Round and square brackets, opening and closing.
+    let (mut opens, mut closes) = ([0usize; 2], [0usize; 2]);
+    for c in s.chars() {
+        match c {
+            '(' => opens[0] += 1,
+            '[' => opens[1] += 1,
+            ')' => closes[0] += 1,
+            ']' => closes[1] += 1,
+            _ => {}
         }
+    }
+    let mut n = s.len();
+    loop {
+        let k = match s[..n].chars().next_back() {
+            Some('.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"') => None,
+            Some(')') => Some(0),
+            Some(']') => Some(1),
+            _ => return n,
+        };
+        if let Some(k) = k {
+            if opens[k] >= closes[k] {
+                return n;
+            }
+            closes[k] -= 1;
+        }
+        n -= 1;
     }
 }
 
@@ -364,6 +380,16 @@ mod tests {
         ] {
             assert_eq!(found(none), [], "{none}");
         }
+    }
+
+    #[test]
+    fn links_scan_a_long_run_of_brackets_quickly() {
+        let t0 = std::time::Instant::now();
+        for word in ["https://x.com/", "a/b.c"] {
+            let text = format!("{word}{}", ")]".repeat(50_000));
+            assert_eq!(found(&text).len(), 1, "{word}");
+        }
+        assert!(t0.elapsed().as_millis() < 500, "{:?}", t0.elapsed());
     }
 
     #[test]
