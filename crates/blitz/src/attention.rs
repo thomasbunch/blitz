@@ -31,6 +31,9 @@ pub enum Ev {
         sticky: bool,
     },
     Idle,
+    /// blitz's own prompt came back, so Claude Code is gone: whatever it
+    /// was doing or asking is over. A bell and a result stay.
+    Exited,
     /// The user is now looking at the pane.
     Attended,
     /// The user typed, pasted or clicked into the pane, which answers what
@@ -191,6 +194,11 @@ impl PaneAttn {
                 if attended && !sticky { Idle } else { Error }
             }
             Ev::Idle => Idle,
+            Ev::Exited => match self.state {
+                Working => Idle,
+                NeedsYou if !self.bell => Idle,
+                s => s,
+            },
         };
         if next == self.state {
             return false;
@@ -394,6 +402,31 @@ mod tests {
         assert_eq!(p.state, Attn::Working);
     }
 
+    /// Claude Code is gone once the shell's prompt is back, however it
+    /// ended: whatever it was doing or asking is over.
+    #[test]
+    fn the_prompt_coming_back_ends_claude() {
+        for state in [Attn::Working, Attn::NeedsYou] {
+            let mut p = pane(Attn::Working);
+            if state == Attn::NeedsYou {
+                p.apply(Ev::NeedsYou, AWAY, Instant::now());
+            }
+            assert!(p.apply(Ev::Exited, AWAY, Instant::now()));
+            assert_eq!(p.state, Attn::Idle);
+        }
+        // What the user has not seen yet stays.
+        for state in [Attn::Idle, Attn::DoneUnseen, Attn::Error] {
+            let mut p = pane(state);
+            assert!(!p.apply(Ev::Exited, AWAY, Instant::now()));
+            assert_eq!(p.state, state);
+        }
+        // So does a bell, which a command can ring just before its prompt.
+        let mut p = pane(Attn::Idle);
+        p.apply(Ev::Bell, AWAY, Instant::now());
+        assert!(!p.apply(Ev::Exited, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::NeedsYou);
+    }
+
     #[test]
     fn sticky_error_ignores_everything() {
         for start in [Attn::Idle, Attn::Working, Attn::NeedsYou] {
@@ -411,6 +444,7 @@ mod tests {
                 Ev::Answered,
                 Ev::Busy,
                 Ev::Quiet,
+                Ev::Exited,
             ] {
                 assert!(!p.apply(ev, AWAY, Instant::now()), "{ev:?}");
                 assert!(!p.apply(ev, HERE, Instant::now()), "{ev:?}");

@@ -2573,8 +2573,9 @@ impl App {
     }
 
     /// One thing a session's output did. Where Claude Code's signals
-    /// disagree, its title says whether it is working, and its hooks say
-    /// when it needs the user, what to show and which session it is.
+    /// disagree, its title says whether it is working, its hooks say when
+    /// it needs the user, what to show and which session it is, and
+    /// blitz's own prompt coming back says it has exited.
     fn on_term_event(&mut self, id: PaneId, e: Event) {
         let focus = self.focus_id() == Some(id);
         let Some(v) = self.view_mut(id) else {
@@ -2613,9 +2614,16 @@ impl App {
                 self.find_branch(id);
             }
             // The shell is ready for input: bring back its Claude session.
+            // Otherwise whatever ran has ended, Claude Code too, even one
+            // that crashed or was killed and could tell no hook. A resume
+            // that failed is not tried again at the next start either.
             Event::Prompt(PromptMark::A { blitz: true }) => {
                 if let Some((line, _)) = v.resume.take() {
                     v.pane.send(line);
+                } else {
+                    v.pane.claude = None;
+                    v.pane.claude_title = None;
+                    self.attention(id, Ev::Exited);
                 }
             }
             Event::Notify { title, body } => {
