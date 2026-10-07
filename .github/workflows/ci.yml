@@ -21,10 +21,12 @@ permissions:
   contents: read
 
 concurrency:
-  # Called from release.yml, github.workflow names the caller, so the group
-  # starts with a fixed name. The event keeps weekly and release runs from
-  # queueing behind, or cancelling, push and PR runs.
-  group: ci-${{ github.event_name }}-${{ github.ref }}
+  # Called from release.yml, github.workflow and github.event_name are the
+  # caller's, so a release's CI and a CI run of its own never share a group,
+  # even both started by hand on one branch. The event keeps weekly runs
+  # from queueing behind, or cancelling, push and PR runs. release.yml must
+  # not take this same group, or the two would wait on each other.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   # Runs on main always finish, so the cache is saved.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
