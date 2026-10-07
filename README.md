@@ -525,6 +525,24 @@ keybind = ctrl+shift+g=text:git status\r
 keybind = 'alt+c=text:claude --continue # last session\r'
 ```
 
+## Accessibility
+
+- The cursor does not blink, and nothing is animated unless you turn on
+  `scenery` or `mascot`; those keep still while Windows' animation
+  effects are off. `flash = false` stops the taskbar button flashing.
+- With a Windows contrast theme on and the `theme` setting at its
+  default, blitz takes the contrast theme's colours.
+- blitz keeps the system caret, hidden, on the cursor, so Magnifier and
+  other tools that follow the text cursor follow it. Claude Code draws a
+  cursor of its own instead; set `CLAUDE_CODE_ACCESSIBILITY=1` in your
+  environment to have it use the real one.
+- Sessions that need you are marked in the theme's `accent` colour and
+  errors in its `error` colour. If the two are hard to tell apart, set
+  them in a theme file (see [Themes](#themes)). Claude Code's `/theme`
+  has colour-blind-friendly themes for its own output.
+- Ctrl+= and Ctrl+- change the font size; `font_size` sets it.
+- Screen readers cannot read the panes yet.
+
 ## License
 
 [MIT](LICENSE)
