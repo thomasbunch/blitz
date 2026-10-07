@@ -2594,6 +2594,11 @@ impl App {
         let Some(v) = self.view(id).filter(|_| !text.is_empty()) else {
             return;
         };
+        let label = format!("{} {}", v.pane.name, id.0);
+        if let Some(refused) = paste_refused(&label, v.pane.exit_code) {
+            self.set_notice(id, refused, None, false);
+            return;
+        }
         let claude = v.pane.claude.is_some();
         let mut term = lock(&v.pane.term);
         let bracketed = term.input_modes().bracketed;
@@ -4850,6 +4855,16 @@ fn paste_trusted(term: &vt::Terminal, claude: bool) -> bool {
     term.paste_trusted() || claude && term.input_modes().bracketed
 }
 
+/// Why nothing is pasted into the pane `label` names, when its program
+/// exited with `code`. The notice it replaces said how to close the pane,
+/// so this one does too.
+fn paste_refused(label: &str, code: Option<u32>) -> Option<String> {
+    let code = code?;
+    Some(format!(
+        "{label} exited with code {code}, so nothing was pasted \u{b7} Enter close"
+    ))
+}
+
 /// `text` without the line break at its end when that is its only one: a
 /// command copied with its line break is pasted, not run.
 fn trim_paste(text: &str) -> &str {
@@ -6787,6 +6802,15 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn app_nothing_is_pasted_into_an_exited_pane() {
+        assert_eq!(paste_refused("pwsh 3", None), None);
+        assert_eq!(
+            paste_refused("pwsh 3", Some(1)).as_deref(),
+            Some("pwsh 3 exited with code 1, so nothing was pasted \u{b7} Enter close")
+        );
     }
 
     #[test]
