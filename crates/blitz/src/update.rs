@@ -235,20 +235,20 @@ pub fn show_unasked(v: &str, failed: bool, checks: bool, closed: Option<&str>) -
 /// The newest update that `install` started and that did not happen, with
 /// the installer's log: its folder is for a version newer than this build.
 /// The folders of updates to this version or older are removed, and so are
-/// those of updates whose installer never started.
+/// those of updates whose installer never started, unless another blitz
+/// window is open: it may keep one to run when it closes, however long
+/// that takes.
 pub fn failed() -> Option<(String, PathBuf)> {
-    failed_in(
-        &std::env::temp_dir(),
-        env!("CARGO_PKG_VERSION"),
-        SystemTime::now(),
-    )
+    let now = (crate::handoff::others() == 0).then(SystemTime::now);
+    failed_in(&std::env::temp_dir(), env!("CARGO_PKG_VERSION"), now)
 }
 
 /// How long an update's folder may wait for its installer to start, as
 /// another blitz may be about to start it.
 const UNSTARTED: Duration = Duration::from_secs(10 * 60);
 
-fn failed_in(temp: &Path, current: &str, now: SystemTime) -> Option<(String, PathBuf)> {
+/// With no `now`, a folder without a log is left however old it is.
+fn failed_in(temp: &Path, current: &str, now: Option<SystemTime>) -> Option<(String, PathBuf)> {
     let mut out: Option<((u64, u64, u64), String, PathBuf)> = None;
     for e in std::fs::read_dir(temp).ok()?.flatten() {
         let name = e.file_name();
@@ -270,7 +270,7 @@ fn failed_in(temp: &Path, current: &str, now: SystemTime) -> Option<(String, Pat
         let log = e.path().join("setup.log");
         if !log.is_file() {
             let age = (e.metadata().and_then(|m| m.modified()).ok())
-                .and_then(|t| now.duration_since(t).ok());
+                .and_then(|t| now?.duration_since(t).ok());
             if age.is_some_and(|a| a > UNSTARTED) {
                 let _ = std::fs::remove_dir_all(e.path());
             }
@@ -867,7 +867,7 @@ mod tests {
         }
         // Not a folder: left alone.
         std::fs::write(temp.join("blitz-update-0.0.99"), "").unwrap();
-        let got = failed_in(&temp, current, SystemTime::now());
+        let got = failed_in(&temp, current, Some(SystemTime::now()));
         let mut left: Vec<_> = (std::fs::read_dir(&temp).unwrap().flatten())
             .map(|e| e.file_name().into_string().unwrap())
             .collect();
@@ -932,7 +932,7 @@ mod tests {
         let (got, _, _) = failed_with("nothing", &[], "0.0.2");
         assert_eq!(got, None);
         let missing = std::env::temp_dir().join(format!("blitz-no-temp-{}", std::process::id()));
-        assert_eq!(failed_in(&missing, "0.0.2", SystemTime::now()), None);
+        assert_eq!(failed_in(&missing, "0.0.2", Some(SystemTime::now())), None);
     }
 
     #[test]
@@ -941,15 +941,21 @@ mod tests {
         let dir = temp.join("blitz-update-0.0.5");
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&dir).unwrap();
-        let after = |s| SystemTime::now() + Duration::from_secs(s);
+        let after = |s| Some(SystemTime::now() + Duration::from_secs(s));
         // Another blitz may be about to start it.
         let soon = failed_in(&temp, "0.0.2", after(60));
         let kept = dir.exists();
+        // Or, while one is open, keep it to run when it closes.
+        let open = failed_in(&temp, "0.0.2", None);
+        let still = dir.exists();
         // One that has not started in ten minutes never will.
         let later = failed_in(&temp, "0.0.2", after(11 * 60));
         let gone = !dir.exists();
         let _ = std::fs::remove_dir_all(&temp);
-        assert_eq!((soon, kept, later, gone), (None, true, None, true));
+        assert_eq!(
+            (soon, kept, open, still, later, gone),
+            (None, true, None, true, None, true)
+        );
     }
 
     #[test]
