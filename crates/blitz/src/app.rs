@@ -931,6 +931,9 @@ struct App {
     font_zoom: f32,
     /// The find bar of the focused pane, while it is open.
     find: Option<Find>,
+    /// What was last searched for, which the find bar opens with when no
+    /// text is selected.
+    find_last: String,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -1142,6 +1145,9 @@ struct Find {
     cur: Option<usize>,
     /// Output came since the last search.
     stale: bool,
+    /// The query was put there when the bar opened and is drawn selected:
+    /// typing replaces it.
+    fresh: bool,
 }
 
 impl Find {
@@ -1152,7 +1158,32 @@ impl Find {
             found: Vec::new(),
             cur: None,
             stale: false,
+            fresh: false,
         }
+    }
+
+    /// Types `t` into the query, in place of a fresh one.
+    fn type_text(&mut self, t: &str) {
+        if std::mem::take(&mut self.fresh) {
+            self.query.clear();
+        }
+        self.query.push_str(t);
+    }
+
+    /// A key for the query, as [`edit_field`] takes it, except that the
+    /// first edit of a fresh query replaces all of it, and Backspace then
+    /// empties it. False when nothing changed.
+    fn edit(&mut self, k: &KeyInput) -> bool {
+        if !self.fresh {
+            return edit_field(&mut self.query, k);
+        }
+        let mut typed = String::new();
+        if k.vk != VK_BACK && !edit_field(&mut typed, k) {
+            return false;
+        }
+        self.fresh = false;
+        self.query = typed;
+        true
     }
 
     /// Searches `term` again. The current match stays on the one that
@@ -1243,6 +1274,7 @@ impl App {
             commands_hits: None,
             font_zoom: 0.0,
             find: None,
+            find_last: String::new(),
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -1854,6 +1886,8 @@ impl App {
             find: self.find.as_ref().map(|f| chrome::FindBar {
                 query: &f.query,
                 count: f.cur.map(|i| (i + 1, f.found.len())),
+                fresh: f.fresh,
+                screen_only: self.view(f.pane).is_some_and(|v| v.snap.alt_screen),
             }),
             spark: self.config.mascot.then(|| self.anim_time()),
             game: self.game.as_ref().map(|g| &g.0),
@@ -2305,9 +2339,37 @@ impl App {
                 self.request_redraw();
             }
             VK_RETURN | VK_F3 => self.find_go(false, by),
-            _ if edit_field(&mut f.query, k) => self.find_go(true, 0),
+            _ if f.edit(k) => self.find_go(true, 0),
             _ => {}
         }
+    }
+
+    /// Opens the find bar on pane `id` with the first line of its
+    /// selection as the query, or else the last one, drawn selected so
+    /// typing replaces it. The current match is the selected text.
+    fn open_find(&mut self, id: PaneId) {
+        let mut f = Find::new(id);
+        let mut at = None;
+        if let Some(v) = self.view(id) {
+            let term = lock(&v.pane.term);
+            if let Some(s) = v.selection.as_ref().filter(|s| s.kept(&term)) {
+                let text = selection_text(&term, &self.theme.pal, s, 0);
+                f.query = text.lines().next().unwrap_or_default().trim().into();
+                at = Some(s.start);
+            }
+        }
+        if f.query.is_empty() {
+            f.query = self.find_last.clone();
+        }
+        f.fresh = !f.query.is_empty();
+        self.find = Some(f);
+        let v = self.views.iter().find(|v| v.pane.id == id);
+        if let (Some(f), Some(v)) = (&mut self.find, v) {
+            f.search(&lock(&v.pane.term), v.grid.1);
+            let picked = f.found.iter().position(|m| Some(m.start) == at);
+            f.cur = picked.or(f.cur);
+        }
+        self.find_go(false, 0);
     }
 
     /// Searches the find bar's pane again when `search` is set or output
@@ -2323,6 +2385,9 @@ impl App {
         let mut term = lock(&v.pane.term);
         if search || f.stale {
             f.search(&term, v.grid.1);
+        }
+        if search {
+            self.find_last.clone_from(&f.query);
         }
         f.step(by);
         let shown = f.cur.map(|i| f.found[i]);
@@ -2352,7 +2417,7 @@ impl App {
             p.sel = 0;
             self.request_redraw();
         } else if let Some(f) = &mut self.find {
-            f.query.push_str(t);
+            f.type_text(t);
             self.find_go(true, 0);
         } else {
             return false;
@@ -3249,8 +3314,7 @@ impl App {
                 let Some(id) = before else {
                     return false;
                 };
-                self.find = Some(Find::new(id));
-                self.request_redraw();
+                self.open_find(id);
             }
             // The palette's line takes the name, starting from the one the
             // user gave before.
@@ -7089,6 +7153,29 @@ mod tests {
         for a in [Action::Copy, Action::SplitRight, Action::FontSize(1)] {
             assert!(!find_keeps(a), "{a:?}");
         }
+    }
+
+    #[test]
+    fn app_typing_replaces_a_query_find_opened_with() {
+        let back = input(VK_BACK, true, vt::Key::Backspace, "");
+        let n = input(0x4e, true, vt::Key::Char('n'), "n");
+        let e = input(0x45, true, vt::Key::Char('e'), "e");
+        let mut f = Find::new(PaneId(1));
+        f.query = "old".into();
+        f.fresh = true;
+        assert!(!f.edit(&input(0x70, true, vt::Key::F(1), "")), "F1");
+        assert!(f.fresh);
+        assert!(f.edit(&n) && f.edit(&e));
+        assert_eq!((f.query.as_str(), f.fresh), ("ne", false));
+        assert!(f.edit(&back));
+        assert_eq!(f.query, "n");
+        f.fresh = true;
+        assert!(f.edit(&back), "Backspace takes all of a fresh query");
+        assert!(f.query.is_empty() && !f.edit(&back));
+        f.query = "old".into();
+        f.fresh = true;
+        f.type_text("pasted");
+        assert_eq!(f.query, "pasted");
     }
 
     #[test]

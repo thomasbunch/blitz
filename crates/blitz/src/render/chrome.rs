@@ -103,6 +103,10 @@ pub struct FindBar<'a> {
     /// The current match, counting from 1, and how many there are; `None`
     /// when nothing matches.
     pub count: Option<(usize, usize)>,
+    /// The query was put there and is drawn selected: typing replaces it.
+    pub fresh: bool,
+    /// A full-screen program's pane: only its screen is searched.
+    pub screen_only: bool,
 }
 
 /// The theme picker, drawn over everything.
@@ -1077,10 +1081,27 @@ fn find_bar(
         None if f.query.is_empty() => (String::new(), c.dim),
         None => ("no matches".into(), c.error),
     };
+    let mut right = right;
+    if f.screen_only {
+        let note = "screen only";
+        right -= text_w(note, tw);
+        text(p, right, ty, note.into(), c.dim, false);
+        right -= s(8.0);
+    }
     let cx = right - text_w(&count, tw);
     let qx = left + 6 * tw;
-    let caret = caret.then_some(one);
-    let at = (qx, ty, cx - s(8.0));
+    let (caret, at) = (caret.then_some(one), (qx, ty, cx - s(8.0)));
+    if f.fresh && !f.query.is_empty() {
+        // Drawn selected: typing replaces it.
+        let w = text_w(&fit_left(f.query, at.2 - qx, tw), tw);
+        let r = Rect {
+            x: qx,
+            y: ty,
+            w,
+            h: th,
+        };
+        p.push(Prim::Rect(r, c.track));
+    }
     let field = field(p, c, at, (f.query, "type to find"), caret, (tw, th));
     if !count.is_empty() {
         text(p, cx, ty, count, color, false);
@@ -2626,6 +2647,8 @@ mod tests {
         m.find = Some(FindBar {
             query: "ab",
             count: None,
+            fresh: false,
+            screen_only: false,
         });
         let c = build(&m);
         let find = c.field.expect("the find bar's field");
@@ -2672,6 +2695,8 @@ mod tests {
         m.find = Some(FindBar {
             query: "needle",
             count: Some((3, 17)),
+            fresh: false,
+            screen_only: false,
         });
         let c = build(&m);
         let t = texts(&c);
@@ -2692,6 +2717,8 @@ mod tests {
         m.find = Some(FindBar {
             query: "zzz",
             count: None,
+            fresh: false,
+            screen_only: false,
         });
         let c = build(&m);
         let error = m.ui.error;
@@ -2771,6 +2798,8 @@ mod tests {
         m.find = Some(FindBar {
             query: "needle",
             count: Some((3, 17)),
+            fresh: false,
+            screen_only: false,
         });
         let c = build(&m);
         let (x, y) = at(&c, "needle").expect("query");
@@ -2786,6 +2815,39 @@ mod tests {
         });
         let c = build(&m);
         assert_eq!(carets(&c), [at(&c, "type to filter").expect("hint")]);
+    }
+
+    #[test]
+    fn find_bar_shows_a_query_it_was_given_selected_and_says_screen_only() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let track = m.ui.track;
+        // A highlight under the query.
+        let selected = |c: &Chrome| {
+            let at = c.prims.iter().find_map(|p| match p {
+                Prim::Text { text, x, y, .. } if text == "needle" => Some((*x, *y)),
+                _ => None,
+            });
+            (c.prims.iter())
+                .any(|p| matches!(p, Prim::Rect(r, c) if *c == track && Some((r.x, r.y)) == at))
+        };
+        let note = |c: &Chrome| texts(c).contains(&"screen only");
+        m.find = Some(FindBar {
+            query: "needle",
+            count: Some((1, 2)),
+            fresh: true,
+            screen_only: true,
+        });
+        let c = build(&m);
+        assert!(selected(&c) && note(&c));
+        m.find = Some(FindBar {
+            query: "needle",
+            count: Some((1, 2)),
+            fresh: false,
+            screen_only: false,
+        });
+        let c = build(&m);
+        assert!(!selected(&c) && !note(&c));
     }
 
     fn setting_rows() -> Vec<SettingRow> {
