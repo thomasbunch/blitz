@@ -561,10 +561,11 @@ impl Terminal {
     /// The OSC 8 hyperlink in column `col` of line `n`: its URI, and the
     /// first and last cell it covers, following soft wraps.
     pub fn link_at(&self, n: usize, col: u16) -> Option<(&str, LineCol, LineCol)> {
-        let link = |(n, x): LineCol| {
-            let cell = self.line(n)?.cells.get(usize::from(x))?;
-            Some(self.styles.get(cell.style).link)
-        };
+        let cell = |(n, x): LineCol| self.line(n)?.cells.get(usize::from(x)).copied();
+        let link = |p| cell(p).map(|c| self.styles.get(c.style).link);
+        // The blank a wide character left at the end of a row when it
+        // wrapped early carries no link, but the link goes on past it.
+        let gap = |p| cell(p).is_some_and(|c| c.flags & cf::SPACER_HEAD != 0);
         let id = link((n, col)).filter(|&l| l != 0)?;
         let last = self.cols() - 1;
         let back = |&(n, x): &LineCol| match x {
@@ -578,7 +579,8 @@ impl Terminal {
         let end = |step: &dyn Fn(&LineCol) -> Option<LineCol>| {
             std::iter::successors(Some((n, col)), step)
                 .take(MAX_LINK_CELLS)
-                .take_while(|&p| link(p) == Some(id))
+                .take_while(|&p| link(p) == Some(id) || gap(p))
+                .filter(|&p| !gap(p))
                 .last()
         };
         Some((&self.styles.link(id)?.uri, end(&back)?, end(&fwd)?))
