@@ -15,7 +15,8 @@ pub struct Config {
     /// A theme name, or `light:NAME,dark:NAME` to follow the Windows app
     /// theme; see [`crate::theme::choose`].
     pub theme: String,
-    /// Empty means detect: pwsh, then Windows PowerShell, then cmd.
+    /// A program and its arguments; see [`crate::shell::launch`]. Empty
+    /// means detect: pwsh, then Windows PowerShell, then cmd.
     pub shell: String,
     pub shell_integration: bool,
     pub scrollback_lines: usize,
@@ -200,8 +201,9 @@ pub const SETTINGS: &[Setting] = &[
         key: "shell",
         group: "Shell",
         label: "Shell",
-        help: "The program each new pane runs. Automatic picks PowerShell 7, \
-               then Windows PowerShell, then cmd.",
+        help: "The program each new pane runs, with any arguments, as in \
+               wsl.exe -d Ubuntu. Automatic picks PowerShell 7, then Windows \
+               PowerShell, then cmd.",
         kind: Kind::Choice,
         applies: NEW_PANES,
     },

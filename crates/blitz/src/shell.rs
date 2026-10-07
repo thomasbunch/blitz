@@ -215,6 +215,28 @@ pub fn is_blitz_prompt(prompt: &std::ffi::OsStr) -> bool {
     prompt.to_string_lossy().contains("]133;A;blitz=")
 }
 
+/// The program a command line starts and the arguments after it, split
+/// as `CommandLineToArgvW` takes its first argument: a quoted one runs to
+/// the next quote, any other to the first space or tab.
+pub fn split_program(cmdline: &str) -> (&str, &str) {
+    let s = cmdline.trim_start_matches([' ', '\t']);
+    match s.strip_prefix('"') {
+        Some(rest) => rest.split_once('"').unwrap_or((rest, "")),
+        None => s.split_at(s.find([' ', '\t']).unwrap_or(s.len())),
+    }
+}
+
+/// Whether PowerShell `args` already say what to run, which the
+/// integration's own `-Command` would take the place of. PowerShell takes
+/// any start of a parameter's name, and `-e` is `-EncodedCommand`.
+fn runs_command(args: &str) -> bool {
+    args.split_whitespace().any(|a| {
+        let a = a.trim_start_matches(['-', '/']).to_ascii_lowercase();
+        let names = ["command", "file", "encodedcommand", "commandwithargs"];
+        !a.is_empty() && (names.iter().any(|n| n.starts_with(&a)) || a == "ec" || a == "cwa")
+    })
+}
+
 /// A command line ready for `CreateProcessW`, plus variables to add to the
 /// child's environment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -223,21 +245,29 @@ pub struct Launch {
     pub env: Vec<(String, String)>,
 }
 
-/// Builds the command line for `program` (empty means [`detect`]). Shell
+/// Builds the command line for `shell`, the `shell` setting: a program and
+/// its arguments, or empty for [`detect`]. A path to a program that holds
+/// spaces needs no quotes, as the setting once took only a path. Shell
 /// integration is added only when `integrate` is set; otherwise the command
 /// runs exactly as configured. `token` is the pane's `BLITZ_PANE_TOKEN`.
-pub fn launch(program: &str, integrate: bool, token: &str) -> Launch {
-    let program = if program.is_empty() {
-        detect()
+pub fn launch(shell: &str, integrate: bool, token: &str) -> Launch {
+    let shell = shell.trim();
+    let whole = Path::new(shell);
+    let (program, args) = if shell.is_empty() {
+        (detect(), "")
+    } else if whole.is_absolute() && whole.is_file() {
+        (whole.to_path_buf(), "")
     } else {
-        PathBuf::from(program)
+        let (program, args) = split_program(shell);
+        (PathBuf::from(program), args)
     };
     let mut out = Launch {
-        cmdline: quote(&program.to_string_lossy()),
+        cmdline: quote(&program.to_string_lossy()) + args,
         env: Vec::new(),
     };
     if integrate {
         match kind(&program) {
+            Kind::PowerShell if runs_command(args) => {}
             Kind::PowerShell => {
                 // -EncodedCommand still runs when the execution policy forbids
                 // scripts, and the user's profile has already loaded by then.
@@ -364,13 +394,84 @@ mod tests {
 
     #[test]
     fn other_shells_run_as_configured() {
-        let bash = r"C:\Program Files\Git\bin\bash.exe";
+        let bash = r#""C:\Program Files\Git\bin\bash.exe" --login -i"#;
         let want = Launch {
-            cmdline: format!("\"{bash}\""),
+            cmdline: bash.into(),
             env: Vec::new(),
         };
         assert_eq!(launch(bash, true, "t"), want);
         assert_eq!(launch("wsl.exe", true, "t").cmdline, "wsl.exe");
+        assert_eq!(
+            launch(" wsl.exe -d Ubuntu ", true, "t").cmdline,
+            "wsl.exe -d Ubuntu"
+        );
+    }
+
+    /// The setting once took only a path, written without quotes.
+    #[test]
+    fn a_path_with_spaces_is_one_program() {
+        let dir = std::env::temp_dir().join(format!("blitz shell {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = dir.join("sh.exe");
+        std::fs::write(&sh, b"").unwrap();
+        let got = launch(&sh.to_string_lossy(), true, "t").cmdline;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, format!("\"{}\"", sh.display()));
+    }
+
+    #[test]
+    fn powershell_arguments_stay_and_integration_follows_them() {
+        let ps = |s: &str| launch(s, true, "t").cmdline;
+        let integrated = ps("pwsh -NoProfile -ExecutionPolicy Bypass");
+        assert!(
+            integrated.starts_with("pwsh -NoProfile -ExecutionPolicy Bypass -NoLogo -NoExit "),
+            "{integrated}"
+        );
+        assert!(ps("powershell.exe -ex Bypass").len() > 100);
+        // Arguments that run something of their own keep the shell as set.
+        for s in [
+            "pwsh -NoProfile -Command Get-Date",
+            "pwsh -c Get-Date",
+            "powershell.exe /File x.ps1",
+            "pwsh -f x.ps1",
+            "pwsh -e ZQBjAGgAbwA=",
+            "pwsh -ec ZQBjAGgAbwA=",
+            "pwsh -cwa x",
+            "pwsh --command x",
+        ] {
+            assert_eq!(ps(s), s);
+        }
+    }
+
+    /// What the system itself takes as the program.
+    #[test]
+    #[cfg(windows)]
+    fn split_program_agrees_with_the_system_parser() {
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::UI::Shell::CommandLineToArgvW;
+        for line in [
+            "pwsh",
+            "pwsh -NoLogo",
+            "wsl.exe\t-d Ubuntu",
+            r#""C:\Program Files\Git\bin\bash.exe" --login -i"#,
+            r#""C:\Program Files\x.exe""#,
+            r#""C:\a b\x.exe"-i"#,
+            r#"C:\a\"b c" d"#,
+            r#""unterminated x"#,
+        ] {
+            let mut n = 0;
+            // SAFETY: a valid string and out pointer; the array is freed below.
+            let argv0 = unsafe {
+                let argv = CommandLineToArgvW(&windows::core::HSTRING::from(line), &mut n);
+                assert!(!argv.is_null());
+                let first = (*argv).to_string().unwrap();
+                let _ = LocalFree(Some(HLOCAL(argv.cast())));
+                first
+            };
+            assert_eq!(split_program(line).0, argv0, "{line}");
+        }
+        assert_eq!(split_program(r#""a b" -c"#), ("a b", " -c"));
+        assert_eq!(split_program("x"), ("x", ""));
     }
 
     #[test]
@@ -398,7 +499,7 @@ mod tests {
 
     #[test]
     fn launch_integration() {
-        let ps = launch(r"C:\Program Files\PowerShell\7\pwsh.exe", true, "t");
+        let ps = launch(r#""C:\Program Files\PowerShell\7\pwsh.exe""#, true, "t");
         let (head, b64) = ps.cmdline.rsplit_once(' ').unwrap();
         assert_eq!(
             head,

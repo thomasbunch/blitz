@@ -483,11 +483,7 @@ pub fn find_program(
     cmdline: &str,
     var: impl Fn(&str) -> Option<OsString>,
 ) -> io::Result<Option<PathBuf>> {
-    let s = cmdline.trim_start_matches([' ', '\t']);
-    let name = match s.strip_prefix('"') {
-        Some(rest) => rest.split('"').next().unwrap_or(rest),
-        None => s.split([' ', '\t']).next().unwrap_or(s),
-    };
+    let name = crate::shell::split_program(cmdline).0;
     if name.is_empty() || name.contains(['\\', '/', ':']) {
         return Ok(None);
     }

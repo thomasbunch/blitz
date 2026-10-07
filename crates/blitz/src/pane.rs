@@ -232,12 +232,7 @@ pub fn restored(text: &str, stamp: &str, rows: u16) -> Vec<u8> {
 /// The program a command line runs, without directory or extension:
 /// `pwsh` for `"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo`.
 pub fn program_name(cmdline: &str) -> String {
-    let s = cmdline.trim_start();
-    let program = match s.strip_prefix('"') {
-        Some(rest) => rest.split('"').next().unwrap_or(rest),
-        None => s.split_whitespace().next().unwrap_or(s),
-    };
-    Path::new(program)
+    Path::new(crate::shell::split_program(cmdline).0)
         .file_stem()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
