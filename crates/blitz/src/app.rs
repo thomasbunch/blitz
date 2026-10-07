@@ -1181,7 +1181,7 @@ impl App {
         if self.views.is_empty() || self.args.cwd.is_some() {
             let cwd = match &self.args.cwd {
                 Some(dir) => start_dir(dir),
-                None => std::env::current_dir().ok(),
+                None => first_dir(std::env::current_dir().ok(), &not_a_start()),
             };
             let id = PaneId(self.next_id);
             win.tabs.push(Tab::new(String::new(), id));
@@ -4319,6 +4319,32 @@ fn split(dir: Dir) -> impl FnOnce(&mut layout::Window, PaneId) -> bool {
     }
 }
 
+/// Where the first pane starts when no folder was given: `cwd`, where
+/// blitz was started, unless that is one of `avoid`; else the user's
+/// profile folder.
+fn first_dir(cwd: Option<PathBuf>, avoid: &[PathBuf]) -> Option<PathBuf> {
+    let key = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    match cwd {
+        Some(d) if !avoid.iter().any(|a| key(a) == key(&d)) => Some(d),
+        _ => start_dir(""),
+    }
+}
+
+/// Folders nobody means to work in that the Start menu, a pinned icon or
+/// Win+R start blitz in: its own folder and the Windows system folder.
+fn not_a_start() -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    // SAFETY: a buffer the call is told the length of.
+    let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    let system =
+        (n > 0 && n < buf.len()).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])));
+    let exe = std::env::current_exe().ok();
+    let own = exe.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+    [system, own].into_iter().flatten().collect()
+}
+
 /// Puts pane `id` in a new tab after the others and shows that tab. It
 /// goes by the folder of its focused pane until the user names it.
 fn new_tab(win: &mut layout::Window, id: PaneId) -> bool {
@@ -5576,6 +5602,29 @@ mod tests {
         assert!(!c.matches().is_empty());
         let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
         assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
+    }
+
+    /// Started from the Start menu, a pin or Win+R, blitz runs in its own
+    /// folder or System32; the first pane opens in the profile instead.
+    #[test]
+    fn app_the_first_pane_never_opens_in_the_install_or_system_folder() {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let avoid = not_a_start();
+        let exe = std::env::current_exe().expect("exe");
+        let own = exe.parent().expect("folder").to_path_buf();
+        assert!(avoid.contains(&own), "{avoid:?}");
+        let system = avoid
+            .iter()
+            .find(|d| d.ends_with("System32") || d.ends_with("system32"));
+        let system = system.expect("System32").clone();
+        assert_eq!(first_dir(Some(own), &avoid), home);
+        assert_eq!(first_dir(Some(system.clone()), &avoid), home);
+        // However Windows spells it.
+        let shouted = PathBuf::from(format!("{}\\", system.display()).to_uppercase());
+        assert_eq!(first_dir(Some(shouted), &avoid), home);
+        let dev = PathBuf::from(r"C:\dev\shop");
+        assert_eq!(first_dir(Some(dev.clone()), &avoid), Some(dev));
+        assert_eq!(first_dir(None, &avoid), home);
     }
 
     #[test]
