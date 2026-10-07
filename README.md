@@ -355,6 +355,7 @@ that, or typing, goes back to the bottom.
 | Ctrl+Shift+T | New tab |
 | Ctrl+Shift+W | Close pane (the last pane closes its tab) |
 | Ctrl+Tab, Ctrl+Shift+Tab | Next, previous tab |
+| Ctrl+Shift+PgUp, Ctrl+Shift+PgDn | Move the tab left, right |
 | Ctrl+1 to Ctrl+8, Ctrl+9 | Go to that tab, to the last tab |
 | Ctrl+Shift+R | Split right |
 | Ctrl+Shift+D | Split down |
@@ -386,16 +387,16 @@ pane, split or resize.
 The command palette lists every action with its keys. Typing narrows
 the list, the arrow keys choose, and Enter or a click runs the action;
 Esc closes it. Giving the panes equal space, closing a whole tab,
-reopening the last closed pane, renaming a session or a tab, copying
-without indent, clearing the scrollback, resetting the terminal and
-Claude Code setup have no keys by default, so they are only in the
-palette; renaming takes the name on the palette's line. Double-clicking
-the line between panes also gives them equal space. Clearing the
-scrollback also clears the screen above the line the cursor is on, which
-moves to the top, so nothing cleared comes back when the pane is
-resized. Resetting the terminal turns off what a program that crashed
-can leave on, such as mouse reports, a hidden cursor or keys sent as
-escape codes; the text stays.
+reopening the last closed pane, moving a pane to a new tab, renaming a
+session or a tab, copying without indent, clearing the scrollback,
+resetting the terminal and Claude Code setup have no keys by default, so
+they are only in the palette; renaming takes the name on the palette's
+line. Double-clicking the line between panes also gives them equal
+space. Clearing the scrollback also clears the screen above the line the
+cursor is on, which moves to the top, so nothing cleared comes back when
+the pane is resized. Resetting the terminal turns off what a program
+that crashed can leave on, such as mouse reports, a hidden cursor or
+keys sent as escape codes; the text stays.
 
 ## Key bindings
 
@@ -426,7 +427,8 @@ The actions are `copy`, `copy_without_indent`, `paste`,
 `scroll_page_up`, `scroll_page_down`, `scroll_to_top`,
 `scroll_to_bottom`, `clear_scrollback`, `reset_terminal`, `new_tab`,
 `close_pane`, `close_tab`, `reopen_closed`, `rename_session`,
-`rename_tab`, `next_tab`, `previous_tab`, `split_right`, `split_down`,
+`rename_tab`, `next_tab`, `previous_tab`, `move_tab_left`,
+`move_tab_right`, `move_pane_to_new_tab`, `split_right`, `split_down`,
 `focus_left`, `focus_right`, `focus_up`, `focus_down`,
 `jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
 `settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
