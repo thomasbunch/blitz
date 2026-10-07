@@ -4,7 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly: a long chaos run with a new seed, and the usual jobs on whatever
+  # the runner images became since the last change.
+  schedule:
+    - cron: "17 6 * * 1"
   workflow_dispatch:
+    inputs:
+      deep:
+        description: Also run the long chaos run
+        type: boolean
+        default: false
   # release.yml runs this too, so a tag cannot publish untested code.
   workflow_call:
 
@@ -13,8 +22,8 @@ permissions:
 
 concurrency:
   # Called from release.yml, github.workflow names the caller, so the group
-  # starts with a fixed name. The event keeps release runs from queueing
-  # behind, or cancelling, push and PR runs.
+  # starts with a fixed name. The event keeps weekly and release runs from
+  # queueing behind, or cancelling, push and PR runs.
   group: ci-${{ github.event_name }}-${{ github.ref }}
   # Runs on main always finish, so the cache is saved.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -165,3 +174,25 @@ jobs:
           EOF
       - run: cargo run -p vt --example gen_unicode --locked -- "$RUNNER_TEMP/ucd"
       - run: git diff --exit-code crates/vt/src/width_tables.rs
+
+  # The chaos tests with a new seed and many more rounds, optimized but
+  # with overflow checks. A failure prints the seed to rerun it with.
+  chaos:
+    if: github.event_name == 'schedule' || inputs.deep
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - env:
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CHAOS_ROUNDS: "1000000"
+        run: |
+          CHAOS_SEED="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+          export CHAOS_SEED
+          echo "CHAOS_SEED=$CHAOS_SEED CHAOS_ROUNDS=$CHAOS_ROUNDS"
+          cargo test -p vt --release --locked --test chaos -- --nocapture
+        timeout-minutes: 25
