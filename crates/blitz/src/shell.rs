@@ -24,11 +24,18 @@ pub fn detect_with(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     if ps.is_file() {
         return ps;
     }
-    var("ComSpec").map_or_else(|| root.join("System32").join("cmd.exe"), PathBuf::from)
+    absolute(var("ComSpec")).unwrap_or_else(|| root.join("System32").join("cmd.exe"))
 }
 
+/// The Windows folder, from `SystemRoot`. A value that is empty or not an
+/// absolute path is ignored: it would name a folder under the current one,
+/// where a planted program would run.
 pub(crate) fn system_root(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
-    PathBuf::from(var("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+    absolute(var("SystemRoot")).unwrap_or_else(|| r"C:\Windows".into())
+}
+
+fn absolute(v: Option<OsString>) -> Option<PathBuf> {
+    v.map(PathBuf::from).filter(|p| p.is_absolute())
 }
 
 fn windows_powershell(root: &Path) -> PathBuf {
@@ -309,6 +316,33 @@ mod tests {
         assert_eq!(quote(r"C:\Program Files\x"), r#""C:\Program Files\x""#);
         assert_eq!(quote(r#"a"b"#), r#""a\"b""#);
         assert_eq!(quote(r"dir with\ trailing\"), r#""dir with\ trailing\\""#);
+    }
+
+    /// A Windows folder or command shell named relative to the current
+    /// folder is never used: a program planted there would run.
+    #[test]
+    #[cfg(windows)]
+    fn relative_system_folders_are_ignored() {
+        let with =
+            |root: &'static str| move |k: &str| (k == "SystemRoot").then(|| OsString::from(root));
+        assert_eq!(system_root(with(r"D:\Win")), Path::new(r"D:\Win"));
+        for bad in ["", ".", r"System\..", r"\Windows", "C:Windows"] {
+            assert_eq!(system_root(with(bad)), Path::new(r"C:\Windows"), "{bad:?}");
+        }
+        let none = PathBuf::from(r"Z:\no\such");
+        let spec = |c: &'static str| {
+            let none = none.clone();
+            move |k: &str| match k {
+                "SystemRoot" => Some(none.clone().into()),
+                "ComSpec" => Some(c.into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            detect_with(spec(r"cmd.exe")),
+            none.join(r"System32\cmd.exe")
+        );
+        assert_eq!(detect_with(spec(r"D:\cmd.exe")), Path::new(r"D:\cmd.exe"));
     }
 
     /// What the system itself makes of a quoted argument.
