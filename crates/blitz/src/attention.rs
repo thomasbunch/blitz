@@ -126,6 +126,9 @@ pub const LONG_COMMAND: Duration = Duration::from_secs(10);
 /// marks tell: when it started and how it ended.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Command {
+    /// blitz's own prompt shows, so the next start mark is the shell's.
+    /// Other shells print marks too, but never end a command with one.
+    prompt: bool,
     /// From the mark at its start until blitz's next prompt.
     pub running: Option<Instant>,
     /// The exit code its end mark gave.
@@ -141,7 +144,7 @@ impl Command {
     /// was stopped with Ctrl+C, else an error.
     pub fn mark(&mut self, m: PromptMark, now: Instant) -> Option<(Ev, String)> {
         match m {
-            PromptMark::C if self.running.is_none() => {
+            PromptMark::C if self.prompt => {
                 *self = Command {
                     running: Some(now),
                     ..Command::default()
@@ -149,7 +152,7 @@ impl Command {
             }
             PromptMark::D(code) => self.code = code,
             PromptMark::A { blitz: true } => {
-                let ended = std::mem::take(self);
+                let ended = std::mem::replace(self, Command::at_prompt());
                 let took = now.saturating_duration_since(ended.running?);
                 if took < LONG_COMMAND || ended.hooked {
                     return None;
@@ -165,6 +168,14 @@ impl Command {
             _ => {}
         }
         None
+    }
+
+    /// At blitz's prompt, with nothing running.
+    fn at_prompt() -> Command {
+        Command {
+            prompt: true,
+            ..Command::default()
+        }
     }
 }
 
@@ -955,7 +966,7 @@ mod tests {
     /// later with `code`.
     fn command(secs: u64, code: Option<i32>) -> (Command, Option<(Ev, String)>) {
         let t0 = Instant::now();
-        let mut c = Command::default();
+        let mut c = Command::at_prompt();
         assert_eq!(c.mark(PromptMark::C, t0), None);
         assert_eq!(c.running, Some(t0));
         assert_eq!(c.mark(PromptMark::D(code), t0), None);
@@ -983,13 +994,13 @@ mod tests {
         );
         assert_eq!(command(60, Some(130)).1.map(|e| e.0), Some(Ev::Done));
         // The next prompt ends it either way.
-        assert_eq!(command(60, Some(1)).0, Command::default());
+        assert_eq!(command(60, Some(1)).0, Command::at_prompt());
     }
 
     #[test]
     fn a_short_command_or_one_with_no_code_is_not_news() {
-        assert_eq!(command(9, Some(1)), (Command::default(), None));
-        assert_eq!(command(600, None), (Command::default(), None));
+        assert_eq!(command(9, Some(1)), (Command::at_prompt(), None));
+        assert_eq!(command(600, None), (Command::at_prompt(), None));
     }
 
     /// Claude Code's hooks say how its turns went; quitting it after an
@@ -997,7 +1008,7 @@ mod tests {
     #[test]
     fn a_command_a_hook_spoke_in_is_not_news() {
         let t0 = Instant::now();
-        let mut c = Command::default();
+        let mut c = Command::at_prompt();
         c.mark(PromptMark::C, t0);
         c.hooked = true;
         c.mark(PromptMark::D(Some(0)), t0);
@@ -1017,7 +1028,7 @@ mod tests {
     fn only_blitz_prompts_end_a_command() {
         let t0 = Instant::now();
         let later = t0 + Duration::from_secs(30);
-        let mut c = Command::default();
+        let mut c = Command::at_prompt();
         c.mark(PromptMark::C, t0);
         c.mark(PromptMark::D(Some(3)), t0);
         assert_eq!(c.mark(PromptMark::A { blitz: false }, later), None);
@@ -1029,6 +1040,21 @@ mod tests {
         assert_eq!(end, Some((Ev::Done, "exit 0 \u{b7} 30s".into())));
         // A prompt with no command before it.
         assert_eq!(c.mark(PromptMark::A { blitz: true }, later), None);
+    }
+
+    /// A shell without blitz's prompt, as nushell, prints the marks too,
+    /// but never ends a command with blitz's prompt, so none starts one.
+    #[test]
+    fn only_a_command_after_a_blitz_prompt_runs() {
+        let t0 = Instant::now();
+        let mut c = Command::default();
+        for m in [PromptMark::A { blitz: false }, PromptMark::B, PromptMark::C] {
+            assert_eq!(c.mark(m, t0), None);
+        }
+        assert_eq!(c.running, None);
+        c.mark(PromptMark::A { blitz: true }, t0);
+        c.mark(PromptMark::C, t0);
+        assert_eq!(c.running, Some(t0));
     }
 
     #[test]
