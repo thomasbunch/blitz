@@ -300,6 +300,12 @@ pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: Option<&str>, tw
     }
 }
 
+/// Whether a pane without focus in a tab of several is drawn dimmed: not
+/// when it needs you, which is when it most needs reading.
+pub fn dims(split: bool, state: Attn) -> bool {
+    split && state != Attn::NeedsYou
+}
+
 /// What a pane's tile holds besides its terminal grid: the padding left
 /// and right, and the header strip and padding above the grid. A tab of
 /// one pane has no header. Beside the rail, the pane's name goes in a
@@ -461,14 +467,22 @@ pub fn build(m: &ChromeModel) -> Chrome {
             let line = Rect { h: s(2.0), ..r };
             progress(p, line, reported, Some(c.top_track), c.rail_work);
         }
-        if multi && !expanded {
-            if let Some(x) = sess {
-                let (label, num) = name_parts(x, r.w / 2, tw);
-                let color = if focused { c.label_focus } else { c.label };
-                let nx = r.right() - s(16.0) - text_w(&num, tw);
-                let (lx, ly) = (nx - text_w(&label, tw), r.y + s(3.0));
-                text(p, lx, ly, &label, color, false);
-                text(p, nx, ly, &num, c.dim, false);
+        if multi
+            && !expanded
+            && let Some(x) = sess
+        {
+            let (label, num) = name_parts(x, r.w / 2, tw);
+            let color = if focused { c.label_focus } else { c.label };
+            let nx = r.right() - s(16.0) - text_w(&num, tw);
+            let (lx, ly) = (nx - text_w(&label, tw), r.y + s(3.0));
+            text(p, lx, ly, &label, color, false);
+            text(p, nx, ly, &num, c.dim, false);
+        }
+        if multi {
+            // Which pane keys go to, now that the one that needs you is
+            // not dimmed either.
+            if focused {
+                p.push(Prim::Rect(Rect { w: s(2.0), ..r }, c.dim));
             }
             if state == Attn::NeedsYou {
                 let b = s(2.0);
@@ -645,6 +659,14 @@ pub fn build(m: &ChromeModel) -> Chrome {
                         stroke: 0.0,
                         color,
                     });
+                    // Clear of the rounded corners.
+                    let bar = Rect {
+                        y: row.y + s(8.0),
+                        w: s(2.0),
+                        h: row.h - s(16.0),
+                        ..row
+                    };
+                    p.push(Prim::Rect(bar, c.dim));
                 }
                 let at = (row.x + s(12.0), y + top + s(5.0) + s(4.0));
                 state_mark(p, at, 8.0, x.state, ring(Some(x)));
@@ -777,7 +799,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             c.border,
         ));
         out.side.rail = Some(rail);
-        let mut tip = None;
+        let (mut tip, mut bar) = (None, None);
         let mut y = s(12.0);
         for (ti, t) in m.win.tabs.iter().enumerate() {
             if ti > 0 {
@@ -794,6 +816,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 out.side.rows.push((x.id, row));
                 if ti == m.win.active && x.id == t.focus {
                     p.push(Prim::Rect(row, c.rail_focus));
+                    bar = Some(Rect { w: s(2.0), ..row });
                 }
                 if m.hover == Some(x.id) {
                     tip = Some((x, row));
@@ -827,6 +850,11 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 };
                 p.push(Prim::Rect(line, c.idle));
             }
+        }
+        // The focused row's bar goes over the group's line, which shares
+        // its edge.
+        if let Some(bar) = bar {
+            p.push(Prim::Rect(bar, c.dim));
         }
         // The dot under the pointer is named beside the rail.
         if let Some((x, row)) = tip {
@@ -2212,9 +2240,59 @@ mod tests {
             .1;
         let tint = at(&Prim::Rect(focus, ui.rail_focus)).expect("focused row");
         assert!(at(&line).expect("group line") > tint);
-        let lines =
-            (c.prims.iter()).filter(|p| matches!(p, Prim::Rect(r, _) if r.x == 0 && r.w == 2));
+        let lines = (c.prims.iter())
+            .filter(|p| matches!(p, Prim::Rect(r, k) if r.x == 0 && r.w == 2 && *k == ui.idle));
         assert_eq!(lines.count(), 1);
+        // The focused row's bar shows over it.
+        let bar = at(&Prim::Rect(Rect { w: 2, ..focus }, ui.dim)).expect("focus bar");
+        assert!(bar > at(&line).expect("group line"));
+    }
+
+    #[test]
+    fn a_pane_that_needs_you_is_ringed_and_never_dimmed() {
+        assert!(!dims(true, Attn::NeedsYou));
+        assert!(dims(true, Attn::Working) && dims(true, Attn::Error));
+        assert!(!dims(false, Attn::Idle), "nothing to tell apart");
+        for expanded in [true, false] {
+            let (win, sessions, now) = fleet(expanded);
+            let m = model(&win, &sessions, now);
+            let c = build(&m);
+            let tile = win.tabs[0].rects(area(&win, m.size, 1.0, None, 7))[0].1;
+            let ring = |p: &Prim| {
+                matches!(p, Prim::Rect(r, color)
+                    if *color == m.ui.mark && (r.x, r.y, r.w) == (tile.x, tile.y, tile.w))
+            };
+            assert!(c.prims.iter().any(ring), "expanded {expanded}");
+        }
+    }
+
+    #[test]
+    fn a_neutral_bar_marks_focus_in_the_pane_and_its_row() {
+        for expanded in [true, false] {
+            let (win, sessions, now) = fleet(expanded);
+            let m = model(&win, &sessions, now);
+            let c = build(&m);
+            let bars: Vec<Rect> = (c.prims.iter())
+                .filter_map(|p| match p {
+                    Prim::Rect(r, color) if *color == m.ui.dim && r.w == 2 => Some(*r),
+                    _ => None,
+                })
+                .collect();
+            // The focused pane's tile, and its row in the sidebar or rail.
+            let tiles = win.tabs[0].rects(area(&win, m.size, 1.0, None, 7));
+            let tile = tiles.iter().find(|t| t.0 == PaneId(2)).expect("tile").1;
+            let row = c
+                .side
+                .rows
+                .iter()
+                .find(|r| r.0 == PaneId(2))
+                .expect("row")
+                .1;
+            assert_eq!(bars.len(), 2, "expanded {expanded}: {bars:?}");
+            let on_tile = |b: &Rect| (b.x, b.y, b.h) == (tile.x, tile.y, tile.h);
+            let on_row = |b: &Rect| b.x == row.x && b.y >= row.y && b.bottom() <= row.bottom();
+            assert!(bars.iter().any(on_tile) && bars.iter().any(on_row));
+        }
     }
 
     #[test]
@@ -2264,6 +2342,7 @@ mod tests {
             filter: "",
             items: vec![("Split right", String::new())],
             sel: 0,
+            rename: None,
         });
         let c = build(&m);
         let amber = |p: &Prim| p_color(p) == m.ui.accent;

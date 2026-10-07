@@ -3816,7 +3816,7 @@ impl App {
                 v.snap.block = sel.is_some_and(|s| s.drag.block);
                 let hover = self.hover.filter(|h| h.0 == term.line_epoch());
                 v.snap.hover = hover.and_then(|(_, a, b)| in_view(a, b, false, top, size));
-            } else if split {
+            } else if chrome::dims(split, v.pane.attn.state) {
                 dimmed.push(id);
             }
         }

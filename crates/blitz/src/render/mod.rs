@@ -1044,7 +1044,9 @@ mod gpu {
                 if *id == web {
                     r.snapshot(snap, &pal, rect.x, rect.y);
                 } else {
-                    r.unfocused(snap, &pal, rect.x, rect.y, true);
+                    let state = (sessions.iter().find(|s| s.id == *id)).map(|s| s.state);
+                    let dim = chrome::dims(true, state.unwrap_or_default());
+                    r.unfocused(snap, &pal, rect.x, rect.y, dim);
                 }
             }
             r.chrome(&chrome);
