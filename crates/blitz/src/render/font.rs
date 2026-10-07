@@ -310,12 +310,18 @@ impl Font {
     pub fn raster(&mut self, text: &str, style: u8, width: u8) -> Result<Option<Raster>> {
         // No shaping. A cluster is drawn as its base character
         // plus the marks the same font has; emoji ZWJ sequences show their
-        // first emoji only (color emoji are not drawn as color anyway).
+        // first emoji only (color emoji are not drawn as color anyway), and
+        // a skin tone, which in one colour would only cover its emoji, is
+        // left out.
         let chars: Vec<char> = if text.contains('\u{200D}') {
             text.chars().take(1).collect()
         } else {
-            text.chars()
-                .filter(|c| !matches!(c, '\u{FE0E}' | '\u{FE0F}'))
+            (text.chars().enumerate())
+                .filter(|&(i, c)| {
+                    !matches!(c, '\u{FE0E}' | '\u{FE0F}')
+                        && !(i > 0 && matches!(c, '\u{1F3FB}'..='\u{1F3FF}'))
+                })
+                .map(|(_, c)| c)
                 .collect()
         };
         let Some(&first) = chars.first() else {
@@ -331,28 +337,51 @@ impl Font {
                 None => (own, true),
             }
         };
+        // Each glyph with whether it takes a column of its own.
         let mut glyphs = vec![glyph_index(&face, first)];
-        glyphs.extend(
-            chars[1..]
-                .iter()
-                .map(|&c| glyph_index(&face, c))
-                .filter(|&g| g != 0),
-        );
+        let mut spacing = vec![true];
+        for &c in &chars[1..] {
+            let g = glyph_index(&face, c);
+            if g != 0 {
+                glyphs.push(g);
+                spacing.push(vt::width::char_width(c) > 0);
+            }
+        }
         let n = glyphs.len();
-        let mut g = DWRITE_GLYPH_METRICS::default();
+        let mut gm = vec![DWRITE_GLYPH_METRICS::default(); n];
         let mut fm = DWRITE_FONT_METRICS::default();
-        // SAFETY: one glyph's metrics into `g`.
+        // SAFETY: `gm` has room for `n` metrics.
         unsafe {
-            face.GetDesignGlyphMetrics(glyphs.as_ptr(), 1, &mut g, false)?;
+            face.GetDesignGlyphMetrics(glyphs.as_ptr(), n as u32, gm.as_mut_ptr(), false)?;
             face.GetMetrics(&mut fm);
         }
+        let g = &gm[0];
         let upem = f32::from(fm.designUnitsPerEm.max(1));
         let to_px = self.px / upem;
+        // Where each glyph's pen is, in design units. A combining mark
+        // starts where the glyph before it does: fixed-width fonts draw it
+        // over that character from there (Cascadia Mono's have no
+        // advance, Consolas' reach back), so the base's advance would push
+        // the mark into the next cell. A flag's second letter still goes
+        // after its first.
+        let mut pens = vec![0i32; n];
+        for i in 1..n {
+            let step = if spacing[i] {
+                gm[i - 1].advanceWidth
+            } else {
+                0
+            };
+            pens[i] = pens[i - 1] + step as i32;
+        }
         // Fallback fonts (Segoe UI Symbol and friends) have wide
         // advances around small ink, so fitting by advance shrinks symbols
-        // like U+273B to a dot. Fit and centre the ink box instead; the
-        // baseline stays put.
-        let ink_w = (g.advanceWidth as i32 - g.leftSideBearing - g.rightSideBearing) as f32 * to_px;
+        // like U+273B to a dot. Fit and centre the ink box of all the
+        // glyphs instead; the baseline stays put.
+        let (l, r) = (gm.iter().zip(&pens)).fold((i32::MAX, i32::MIN), |(l, r), (m, &p)| {
+            let right = p + m.advanceWidth as i32 - m.rightSideBearing;
+            (l.min(p + m.leftSideBearing), r.max(right))
+        });
+        let ink_w = (r - l) as f32 * to_px;
         let ink_h =
             (g.advanceHeight as i32 - g.topSideBearing - g.bottomSideBearing) as f32 * to_px;
         let cells = (self.cell_w * u32::from(width.max(1))) as f32;
@@ -362,14 +391,15 @@ impl Font {
             let k = (cells / ink_w)
                 .min(self.cell_h as f32 / ink_h.max(1.0))
                 .min(1.0);
-            let left = g.leftSideBearing as f32 * to_px * k;
+            let left = l as f32 * to_px * k;
             (self.px * k, ((cells - ink_w * k) / 2.0 - left).round())
         };
-        // Every glyph starts where its cluster does. Fixed-width fonts
-        // draw a combining mark over the character before it from there
-        // (Cascadia Mono's have no advance, Consolas' reach back), so the
-        // base's advance would push the mark into the next cell.
-        let advances = vec![0f32; n];
+        let advances: Vec<f32> = (0..n)
+            .map(|i| {
+                pens.get(i + 1)
+                    .map_or(0.0, |&p| (p - pens[i]) as f32 * em / upem)
+            })
+            .collect();
         let run = DWRITE_GLYPH_RUN {
             fontFace: ManuallyDrop::new(Some(face)),
             fontEmSize: em,
@@ -757,6 +787,23 @@ mod tests {
             let r = gear.expect("raster").expect(&name);
             assert!(ink(&r) > 0, "{name}");
         }
+    }
+
+    #[test]
+    fn a_flag_shows_both_letters_and_a_skin_tone_leaves_its_emoji() {
+        let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        let cells = 2 * font.cell_w as i32;
+        let mut raster = |s: &str| font.raster(s, 0, 2).expect("raster").expect("ink");
+        // A flag's two letters stand side by side, not on top of each other.
+        let (u, us) = (raster("\u{1F1FA}"), raster("\u{1F1FA}\u{1F1F8}"));
+        assert!(us.w > u.w * 3 / 2, "{} px for U, {} px for US", u.w, us.w);
+        assert!(
+            us.dx >= 0 && us.dx + us.w as i32 <= cells,
+            "within its cells"
+        );
+        // Drawn in one colour, a skin tone would only cover its emoji.
+        let (up, toned) = (raster("\u{1F44D}"), raster("\u{1F44D}\u{1F3FD}"));
+        assert_eq!((toned.w, toned.h, toned.alpha), (up.w, up.h, up.alpha));
     }
 
     #[test]
