@@ -999,6 +999,14 @@ impl Picker {
     }
 }
 
+/// What a row of the command palette does when picked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pick {
+    Run(Action),
+    /// Open the settings panel on what was typed.
+    Settings,
+}
+
 /// The open command palette.
 #[derive(Default)]
 struct Commands {
@@ -1022,25 +1030,31 @@ enum Rename {
 }
 
 impl Commands {
-    /// The matching actions and their labels, in [`keymap::ACTIONS`] order.
-    /// The palette leaves out itself, going to a tab by number and the
-    /// `hidden` actions.
-    fn matches(&self) -> Vec<(Action, &'static str)> {
+    /// The matching rows, each what it does and its label: actions in
+    /// [`keymap::ACTIONS`] order, leaving out the palette itself, going to
+    /// a tab by number and the `hidden` actions. When none matches what
+    /// was typed, one row searches the settings for it instead.
+    fn matches(&self) -> Vec<(Pick, String)> {
         if self.rename.is_some() {
             return Vec::new();
         }
         let words: Vec<String> = (self.filter.split_whitespace())
             .map(str::to_lowercase)
             .collect();
-        (keymap::ACTIONS.iter())
+        let mut rows: Vec<(Pick, String)> = (keymap::ACTIONS.iter())
             .filter(|a| !matches!(a.0, Action::Palette | Action::GoToTab(_) | Action::LastTab))
             .filter(|a| !self.hidden.contains(&a.0))
             .filter(|a| {
                 let text = format!("{} {}", a.2, a.1).to_lowercase();
                 words.iter().all(|w| text.contains(w.as_str()))
             })
-            .map(|a| (a.0, a.2))
-            .collect()
+            .map(|a| (Pick::Run(a.0), a.2.to_string()))
+            .collect();
+        let typed = self.filter.trim();
+        if rows.is_empty() && !typed.is_empty() {
+            rows.push((Pick::Settings, format!("Search settings for \"{typed}\"")));
+        }
+        rows
     }
 
     /// Moves the highlight `by` rows, stopping at either end.
@@ -1748,8 +1762,11 @@ impl App {
             commands: self.commands.as_ref().map(|cm| chrome::Commands {
                 filter: &cm.filter,
                 items: (cm.matches().into_iter())
-                    .map(|(a, label)| {
-                        let keys = keymap::keys_for(a, &self.config.keys);
+                    .map(|(pick, label)| {
+                        let keys = match pick {
+                            Pick::Run(a) => keymap::keys_for(a, &self.config.keys),
+                            Pick::Settings => None,
+                        };
                         (label, keys.unwrap_or_default())
                     })
                     .collect(),
@@ -2100,13 +2117,14 @@ impl App {
         match k.vk {
             VK_ESCAPE => self.commands = None,
             VK_RETURN => {
-                let picked = cm.matches().get(cm.sel).map(|a| a.0);
+                let picked = cm.matches().get(cm.sel).map(|r| r.0);
+                let typed = cm.filter.trim().to_string();
                 let rename = cm.rename.map(|r| (r, crate::hook::one_line(&cm.filter)));
                 self.commands = None;
                 if let Some((r, name)) = rename {
                     self.rename(r, name);
-                } else if let Some(a) = picked {
-                    self.run_picked(el, a);
+                } else if let Some(p) = picked {
+                    self.pick(el, p, typed);
                 }
             }
             VK_UP => cm.move_by(-1),
@@ -2153,22 +2171,33 @@ impl App {
         let Some(&(i, _)) = rows.iter().find(|r| inside(&r.1)) else {
             return;
         };
-        let picked = (self.commands.as_ref()).and_then(|cm| cm.matches().get(i).map(|a| a.0));
-        self.commands = None;
+        let Some(cm) = self.commands.take() else {
+            return;
+        };
         self.request_redraw();
-        if let Some(a) = picked {
-            self.run_picked(el, a);
+        if let Some(&(p, _)) = cm.matches().get(i) {
+            self.pick(el, p, cm.filter.trim().to_string());
         }
     }
 
-    /// Runs an action picked in the command palette, or says it has
-    /// nothing to do.
-    fn run_picked(&mut self, el: &ActiveEventLoop, a: Action) {
-        if !self.act(el, a)
-            && let Some(id) = self.focus_id()
-        {
-            let text = format!("Nothing to do: {}", keymap::label(a));
-            self.set_notice(id, text, Some(Instant::now() + NOTHING), true);
+    /// Does what a row picked in the command palette does, where `typed`
+    /// is what was typed there. An action with nothing to do says so.
+    fn pick(&mut self, el: &ActiveEventLoop, p: Pick, typed: String) {
+        match p {
+            Pick::Run(a) => {
+                if !self.act(el, a)
+                    && let Some(id) = self.focus_id()
+                {
+                    let text = format!("Nothing to do: {}", keymap::label(a));
+                    self.set_notice(id, text, Some(Instant::now() + NOTHING), true);
+                }
+            }
+            Pick::Settings => {
+                self.open_settings();
+                if let Some(p) = &mut self.settings {
+                    p.filter = typed;
+                }
+            }
         }
     }
 
@@ -7252,37 +7281,50 @@ mod tests {
     #[test]
     fn palette_matches_every_word_of_the_label_or_name() {
         let mut c = Commands::default();
+        let run = |a| (Pick::Run(a), keymap::label(a).to_string());
         assert_eq!(c.matches().len(), keymap::ACTIONS.len() - 10, "not itself");
         c.filter = "tab".into();
         assert!(c.matches().iter().all(|m| m.1 != "Go to the last tab"));
         c.filter = "Split R".into();
-        assert_eq!(c.matches(), [(Action::SplitRight, "Split right")]);
+        assert_eq!(c.matches(), [run(Action::SplitRight)]);
         c.filter = "font_size_up".into();
-        assert_eq!(c.matches(), [(Action::FontSize(1), "Bigger font")]);
+        assert_eq!(c.matches(), [run(Action::FontSize(1))]);
         c.filter = "claude".into();
-        assert_eq!(c.matches(), [(Action::ClaudeSetup, "Claude Code setup")]);
+        assert_eq!(c.matches(), [run(Action::ClaudeSetup)]);
         // Actions with no keys are here too.
         c.filter = "claude".into();
-        assert_eq!(
-            c.matches(),
-            [(Action::NewClaude, "New Claude Code session")]
-        );
+        assert_eq!(c.matches(), [run(Action::NewClaude)]);
         c.filter = "reset term".into();
-        assert_eq!(c.matches(), [(Action::Reset, "Reset the terminal")]);
+        assert_eq!(c.matches(), [run(Action::Reset)]);
         c.filter = "clear".into();
-        assert_eq!(
-            c.matches(),
-            [(Action::ClearScrollback, "Clear the scrollback and screen")]
-        );
+        assert_eq!(c.matches(), [run(Action::ClearScrollback)]);
         c.move_by(5);
         assert_eq!(c.sel, 0, "one match");
-        c.filter = "zzz".into();
-        assert!(c.matches().is_empty());
         // What has nothing to do is left out.
         c.filter = "update".into();
-        assert_eq!(c.matches(), [(Action::Update, "Update blitz")]);
+        assert_eq!(c.matches(), [run(Action::Update)]);
         c.hidden = vec![Action::Update];
-        assert!(c.matches().is_empty());
+        let search = (Pick::Settings, "Search settings for \"update\"".into());
+        assert_eq!(c.matches(), [search]);
+    }
+
+    #[test]
+    fn palette_searches_the_settings_when_no_action_matches() {
+        let mut c = Commands {
+            filter: " scroll lines ".into(),
+            ..Commands::default()
+        };
+        let search = (
+            Pick::Settings,
+            "Search settings for \"scroll lines\"".into(),
+        );
+        assert_eq!(c.matches(), [search]);
+        c.filter = "  ".into();
+        assert_eq!(
+            c.matches().len(),
+            keymap::ACTIONS.len() - 10,
+            "nothing typed"
+        );
     }
 
     #[test]

@@ -118,7 +118,7 @@ pub struct Commands<'a> {
     /// What was typed to narrow the list.
     pub filter: &'a str,
     /// The actions that match it, each with the keys that run it, if any.
-    pub items: Vec<(&'a str, String)>,
+    pub items: Vec<(String, String)>,
     /// The highlighted item.
     pub sel: usize,
     /// What the typed line renames, such as `Rename session`, instead of
@@ -1224,7 +1224,7 @@ fn commands(
         None => List {
             title: "Commands",
             filter: cm.filter,
-            names: cm.items.iter().map(|i| i.0).collect(),
+            names: cm.items.iter().map(|i| i.0.as_str()).collect(),
             sel: cm.sel,
             empty: "no command matches",
             hint: "\u{2191}\u{2193} choose  \u{b7}  Enter run  \u{b7}  Esc close",
@@ -2433,7 +2433,7 @@ mod tests {
         });
         m.commands = Some(Commands {
             filter: "",
-            items: vec![("Split right", String::new())],
+            items: vec![("Split right".into(), String::new())],
             sel: 0,
             rename: None,
         });
@@ -2654,7 +2654,7 @@ mod tests {
         // caret comes before the hint.
         m.commands = Some(Commands {
             filter: "",
-            items: vec![("Split right", String::new())],
+            items: vec![("Split right".into(), String::new())],
             sel: 0,
             rename: None,
         });
@@ -2733,7 +2733,7 @@ mod tests {
         });
         m.commands = Some(Commands {
             filter: "",
-            items: vec![("Split right", String::new())],
+            items: vec![("Split right".into(), String::new())],
             sel: 0,
             rename: None,
         });
@@ -2785,7 +2785,7 @@ mod tests {
         let (win, sessions, now) = fleet(true);
         let mut m = model(&win, &sessions, now);
         let items = (0..20)
-            .map(|i| ("Split right", format!("Ctrl+{i}")))
+            .map(|i| ("Split right".to_string(), format!("Ctrl+{i}")))
             .collect();
         m.commands = Some(Commands {
             filter: "",
