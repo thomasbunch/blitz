@@ -11,8 +11,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   git branch and state: *needs you*, *working*, *done*, *error*.
   Ctrl+Shift+B collapses it to a narrow rail of status dots.
 - Claude Code's title tells blitz when a session works and when it
-  stops, and its hooks when it needs input; the taskbar button flashes
-  if blitz is in the background.
+  stops, and its hooks, which blitz sets up itself, when it needs input;
+  the taskbar button flashes if blitz is in the background.
 - Progress a program reports (OSC 9;4) shows in the sidebar and on the
   taskbar button.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
@@ -69,26 +69,80 @@ drops some features such as synchronized output.
 
 ## Claude Code
 
+Claude Code 2.1.280 or later reports to blitz with nothing to set up.
+blitz keeps a small Claude Code plugin in
+`%LOCALAPPDATA%\blitz\claude-plugin`, whose hooks run the
+`blitz-hook.exe` next to `blitz.exe`, and every pane loads it through
+`CLAUDE_CODE_PLUGIN_DIRS`. blitz never edits Claude Code's settings. If
+Claude Code works for a while and no hook reports, blitz says so once.
+
+An older Claude Code, or managed settings that turn off plugin folders,
+needs the hooks in `~/.claude/settings.json`. **Claude Code setup** in
+the command palette copies them; merge their `"hooks"` into that file.
+The installer puts blitz in `%LOCALAPPDATA%\Programs\blitz` (in
+`Program Files` when installed for all users), and from PowerShell
+
 ```
-blitz setup claude
+& "$env:LOCALAPPDATA\Programs\blitz\blitz.exe" setup claude | Out-Host
 ```
 
-prints the hook settings to add to `~/.claude/settings.json`; blitz never
-edits that file itself. The hooks run `blitz-hook.exe`, which does
-nothing when Claude Code runs outside blitz. Remove them before you move
-or uninstall blitz: Claude Code keeps running whatever is at that path.
+prints them too, and points out hooks the file already runs, which with
+a newer Claude Code report every event twice. Remove pasted hooks before
+you move or uninstall blitz: Claude Code keeps running whatever is at
+that path, and the uninstaller reminds you. For Claude Code inside WSL,
+`setup claude --wsl` prints the hooks for `~/.claude/settings.json` in
+WSL; panes pass their token into WSL, so the hooks find their pane.
 
 Without the hooks blitz still sees from Claude Code's title when a
-session starts working and when it stops, and a bell or a notification
-(OSC 9 or 777) marks it as needing you until you look. The hooks add
-what the title cannot show: a question waiting for you, the prompt and
-the reply under the session's name, and the conversation to resume.
+session starts working and when it stops, and with `bell_attention` on
+a bell or a notification (OSC 9 or 777) in a pane you are not looking
+at marks it as needing you until you look. Claude Code rings one when
+it waits for you if its settings have
+`"preferredNotifChannel": "terminal_bell"`. The hooks add what the title
+cannot show: a question waiting for you, the prompt and the reply under
+the session's name, and the conversation to resume.
 
-A question stays marked until you answer it by typing, pasting or
-clicking in its pane; looking only outlines it. Ctrl+Shift+J goes to
-questions you have not seen first, then those you have, then finished
-sessions, then failed ones. Half a minute without a key or mouse touch
-counts as away, even with blitz in front.
+
+### Session marks
+
+| Mark | State | Set when | Cleared when |
+|---|---|---|---|
+| Dot in the accent colour, *needs you* | needs you | Claude Code asks for permission or a decision, or has a plan ready; a bell rings in a pane you are not looking at | you answer a question by typing, pasting or clicking in its pane (looking only outlines it), or the next hook says what it does now; a bell's mark clears when you look |
+| Thin bar under the session, *working · 4m* | working | a prompt is sent, or the title shows Claude Code working | the turn ends |
+| Hollow ring, *done* | done | a turn ends while you look elsewhere | you look at it |
+| Red dot, *error* | error | Claude Code stops on an error, or the program exits with a failure code | you look at it; a program that exited stays until its pane closes |
+| None | idle | nothing is running, or Claude Code has ended | |
+
+You look at a session when its pane has focus and blitz is the window in
+front; half a minute without a key or mouse touch counts as away, even
+with blitz in front. Ctrl+Shift+J goes to questions you have not seen
+first, then those you have, then finished sessions, then failed ones.
+
+### Other agents
+
+Agents with hooks of their own can report the same way: `blitz-hook
+notify <state> [message]`, where the state is `working`, `needs-you`,
+`done`, `error` or `idle`, writes to the pane's console, past the output
+the agent reads, and does nothing outside blitz. For blitz installed for
+the current user, with your user name in the path:
+
+Codex, in `~/.codex/config.toml`; Codex adds its last reply as the message:
+
+```toml
+notify = ['C:\Users\you\AppData\Local\Programs\blitz\blitz-hook.exe', 'notify', 'done']
+```
+
+Gemini CLI, in `~/.gemini/settings.json`:
+
+```json
+{
+  "hooks": {
+    "BeforeAgent": [{ "hooks": [{ "type": "command", "command": "C:\\Users\\you\\AppData\\Local\\Programs\\blitz\\blitz-hook.exe notify working" }] }],
+    "AfterAgent": [{ "hooks": [{ "type": "command", "command": "C:\\Users\\you\\AppData\\Local\\Programs\\blitz\\blitz-hook.exe notify done" }] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "C:\\Users\\you\\AppData\\Local\\Programs\\blitz\\blitz-hook.exe notify needs-you" }] }]
+  }
+}
+```
 
 ## Sessions
 
@@ -260,9 +314,9 @@ pane, split or resize.
 
 The command palette lists every action with its keys. Typing narrows
 the list, the arrow keys choose, and Enter or a click runs the action;
-Esc closes it. Giving the panes equal space and renaming a session or a
-tab have no keys by default, so they are only in the palette; renaming
-takes the name on the palette's line.
+Esc closes it. Giving the panes equal space, renaming a session or a
+tab and Claude Code setup have no keys by default, so they are only in
+the palette; renaming takes the name on the palette's line.
 
 ## Key bindings
 
@@ -292,8 +346,8 @@ The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
 `resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
 `swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
 `font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
-`find`, `previous_prompt` and `next_prompt`. Typing a name in the
-command palette finds its action.
+`find`, `previous_prompt`, `next_prompt` and `claude_setup`. Typing a
+name in the command palette finds its action.
 
 ## License
 
