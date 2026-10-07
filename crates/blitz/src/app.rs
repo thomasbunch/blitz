@@ -1699,7 +1699,8 @@ impl App {
 
     /// Window frame in the theme's colours: dark or light everywhere, and
     /// on Windows 11 the title bar, title text and border too (older
-    /// Windows refuses those and keeps the dark or light frame).
+    /// Windows refuses those and keeps the dark or light frame). So is what
+    /// a live resize shows past the last frame.
     fn frame_theme(&self) {
         let hwnd = HWND(self.hwnd as *mut c_void);
         let dark = windows::core::BOOL::from(!self.theme.light);
@@ -1724,6 +1725,9 @@ impl App {
             let _ = unsafe {
                 DwmSetWindowAttribute(hwnd, attr, (&raw const c).cast(), size_of_val(&c) as u32)
             };
+        }
+        if let Some(g) = &self.gfx {
+            g.chain.set_background(self.theme.pal.bg);
         }
     }
 
@@ -2188,6 +2192,7 @@ impl App {
         let built = built.and_then(|r| {
             let hwnd = HWND(self.hwnd as *mut c_void);
             let chain = Swapchain::new(&r.gpu, hwnd, size.width, size.height)?;
+            chain.set_background(self.theme.pal.bg);
             Ok(Gfx { r, chain })
         });
         match built {
