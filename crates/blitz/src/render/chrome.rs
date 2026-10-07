@@ -598,12 +598,22 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 w: side - 1,
                 h: h - bottom,
             };
-            out.banner = Some(foot);
+            // The x that closes it sits at the top right, clear of the
+            // text, which wraps short of it.
+            let bw = s(BANNER_H).min(foot.h);
+            let close = Rect {
+                x: foot.right() - bw,
+                w: bw,
+                h: bw,
+                ..foot
+            };
+            (out.banner, out.banner_close) = (Some(foot), Some(close));
             p.push(Prim::Rect(foot, c.hdr_bg));
             p.push(Prim::Rect(Rect { h: 1, ..foot }, c.hdr_line));
+            let first = bottom + s(5.0) + (lh - th) / 2;
+            text(p, close.x + (bw - tw) / 2, first, "\u{d7}", c.dim, false);
             for (i, l) in lines.iter().enumerate() {
-                let ly = bottom + s(5.0) + i as i32 * lh + (lh - th) / 2;
-                text(p, s(16.0), ly, l, c.dim, false);
+                text(p, s(16.0), first + i as i32 * lh, l, c.dim, false);
             }
         }
         let (gh, gap) = (s(26.0), s(2.0));
@@ -1632,7 +1642,12 @@ fn settings(
 /// `side` px wide, or None when it does not fit there whole, such as a
 /// failure that names the installer's long log path.
 fn foot_lines(msg: &str, side: i32, scale: f32, tw: i32) -> Option<Vec<String>> {
-    let lines = wrap(msg, side - (32.0 * scale).round() as i32, tw, 3);
+    let lines = wrap(
+        msg,
+        side - ((32.0 + BANNER_H) * scale).round() as i32,
+        tw,
+        3,
+    );
     let words = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
     (words(&lines.join(" ")) == words(msg)).then_some(lines)
 }
@@ -2616,6 +2631,17 @@ mod tests {
         assert!(t.contains(&"blitz 0.0.2 is available \u{b7}"), "{t:?}");
         assert!(t.contains(&"Ctrl+Shift+U to update and") && t.contains(&"restart"));
         assert!(c.side.rows.iter().all(|(_, r)| r.bottom() <= foot.y));
+        // With its x at the top right, which the text stays clear of.
+        let close = c.banner_close.expect("a close box");
+        assert_eq!((close.right(), close.y), (foot.right(), foot.y));
+        assert!(t.contains(&"\u{d7}"));
+        let ends = (c.prims.iter()).filter_map(|p| match p {
+            Prim::Text { x, y, text, .. } if *y >= foot.y && text != "\u{d7}" => {
+                Some(x + text_w(text, 7))
+            }
+            _ => None,
+        });
+        assert!(ends.into_iter().all(|end| end <= close.x));
     }
 
     #[test]
