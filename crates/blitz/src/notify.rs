@@ -229,18 +229,20 @@ fn register() {
 }
 
 /// The notification's XML: `lines`, the first in bold, and no sound when
-/// `silent`. Empty lines are left out.
+/// `silent`. Empty lines are left out. Program output chose the text, so
+/// each line loses the controls and format characters a title does, bidi
+/// overrides among them, and stops at [`TOAST_LINE`] characters.
 pub fn toast_xml(lines: &[&str], silent: bool) -> String {
     let mut xml = String::from(r#"<toast><visual><binding template="ToastGeneric">"#);
     for l in lines.iter().filter(|l| !l.is_empty()) {
         xml.push_str("<text>");
-        for c in l.chars() {
+        for c in vt::osc::clean(l, TOAST_LINE).chars() {
             match c {
                 '&' => xml.push_str("&amp;"),
                 '<' => xml.push_str("&lt;"),
                 '>' => xml.push_str("&gt;"),
-                // XML has no place for most of them.
-                c if c.is_control() || c == '\u{fffe}' || c == '\u{ffff}' => xml.push(' '),
+                // XML has no place for them.
+                '\u{fffe}' | '\u{ffff}' => xml.push(' '),
                 c => xml.push(c),
             }
         }
@@ -253,6 +255,9 @@ pub fn toast_xml(lines: &[&str], silent: bool) -> String {
     xml.push_str("</toast>");
     xml
 }
+
+/// The most characters a notification line keeps.
+const TOAST_LINE: usize = 200;
 
 /// Tells apart the notifications of two blitz processes, whose panes may
 /// have the same ids.
@@ -394,14 +399,20 @@ mod tests {
     #[test]
     fn notifications_carry_their_text_safely() {
         let text = "Bash: a <b> & \"c\"\x07\u{fffe}\u{ffff}";
-        let xml = toast_xml(&["pwsh 3 needs you", "", text], true);
+        // A folder from program output may hold bidi overrides.
+        let dir = "C:\\x\u{202e}gpj.exe\u{2066}";
+        let xml = toast_xml(&["pwsh 3 needs you", "", text, dir], true);
         assert_eq!(
             xml,
             "<toast><visual><binding template=\"ToastGeneric\">\
              <text>pwsh 3 needs you</text>\
-             <text>Bash: a &lt;b&gt; &amp; \"c\"   </text>\
+             <text>Bash: a &lt;b&gt; &amp; \"c\"  </text>\
+             <text>C:\\xgpj.exe</text>\
              </binding></visual><audio silent=\"true\"/></toast>"
         );
+        let long = "y".repeat(1000);
+        let xml = toast_xml(&[&long], true);
+        assert_eq!(xml.matches('y').count(), TOAST_LINE);
         // Windows reads it; nothing is shown.
         let doc = XmlDocument::new().expect("an XML document");
         doc.LoadXml(&HSTRING::from(xml)).expect("well-formed");
