@@ -382,7 +382,9 @@ mod tests {
             let text = format!("{word}{}", ")]".repeat(50_000));
             assert_eq!(found(&text).len(), 1, "{word}");
         }
-        assert!(t0.elapsed().as_millis() < 500, "{:?}", t0.elapsed());
+        // One pass takes milliseconds and the old quadratic trim took over
+        // half a minute, so a slow, busy runner still has room.
+        assert!(t0.elapsed().as_secs() < 5, "{:?}", t0.elapsed());
     }
 
     #[test]
