@@ -4,22 +4,32 @@
 //! prereleases. HTTP goes through Windows' own curl.exe.
 
 use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use windows::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::w;
+use windows::core::{HSTRING, w};
 
 const REPO: &str = "thomasbunch/blitz";
+/// The latest release's page.
+pub const PAGE: &str = "https://github.com/thomasbunch/blitz/releases/latest";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The latest release's version when it is newer than this build.
-pub fn check() -> Option<String> {
+/// The latest release's version when it is newer than this build, or why
+/// GitHub could not say.
+pub fn check() -> Result<Option<String>, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let body = curl(&["-H", "Accept: application/vnd.github+json", &url]).ok()?;
-    let json = crate::hook::Json::parse(std::str::from_utf8(&body).ok()?)?;
-    newer(env!("CARGO_PKG_VERSION"), json.get("tag_name")?.as_str()?)
+    let body = curl(&["-H", "Accept: application/vnd.github+json", &url])?;
+    let json = std::str::from_utf8(&body)
+        .ok()
+        .and_then(crate::hook::Json::parse);
+    let tag = json.as_ref().and_then(|j| j.get("tag_name")?.as_str());
+    Ok(newer(
+        env!("CARGO_PKG_VERSION"),
+        tag.ok_or("GitHub sent no release")?,
+    ))
 }
 
 /// The version `tag` names when it is newer than `current`, rebuilt from
@@ -51,19 +61,45 @@ pub fn installed() -> bool {
         .unwrap_or(false)
 }
 
-/// Opens the latest release's page in the browser.
-pub fn open_page() {
-    // SAFETY: static strings and no window.
-    unsafe {
+/// Opens the latest release's page in the browser; false if it could not.
+pub fn open_page() -> bool {
+    // SAFETY: valid strings and no window.
+    let h = unsafe {
         ShellExecuteW(
             None,
             w!("open"),
-            w!("https://github.com/thomasbunch/blitz/releases/latest"),
+            &HSTRING::from(PAGE),
             None,
             None,
             SW_SHOWNORMAL,
         )
     };
+    // Above 32 is success.
+    h.0 as isize > 32
+}
+
+/// The update that `install` started and that did not happen, with the
+/// installer's log: its folder is for a version newer than this build.
+/// The folders of updates that did happen are removed.
+pub fn failed() -> Option<(String, PathBuf)> {
+    failed_in(&std::env::temp_dir(), env!("CARGO_PKG_VERSION"))
+}
+
+fn failed_in(temp: &Path, current: &str) -> Option<(String, PathBuf)> {
+    let mut out = None;
+    for e in std::fs::read_dir(temp).ok()?.flatten() {
+        let name = e.file_name();
+        let Some(v) = name.to_str().and_then(|n| n.strip_prefix("blitz-update-")) else {
+            continue;
+        };
+        // No log: the installer never ran, so there is nothing to show.
+        let log = e.path().join("setup.log");
+        match newer(current, v) {
+            Some(v) if log.is_file() => out = Some((v, log)),
+            _ => drop(std::fs::remove_dir_all(e.path())),
+        }
+    }
+    out
 }
 
 /// Downloads the installer for version `v` (from `newer`), checks it
@@ -89,12 +125,16 @@ pub fn install(v: &str) -> Result<(), String> {
     std::fs::create_dir_all(&dir)
         .and_then(|()| std::fs::write(&path, &exe))
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    // blitz is gone by the time the installer could fail, so the log is
+    // what `failed` finds on the next start.
+    let log = format!("/LOG={}", dir.join("setup.log").display());
     Command::new(&path)
         .args([
             "/VERYSILENT",
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/relaunch=1",
+            &log,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -177,6 +217,32 @@ mod tests {
         assert_eq!(sum_for(&sums, "blitz-0.0.1.zip"), Some(b));
         assert_eq!(sum_for(&sums, "blitz-0.0.1"), None);
         assert_eq!(sum_for("abc *x.exe", "x.exe"), None, "short hash");
+    }
+
+    #[test]
+    fn a_newer_update_with_a_log_failed() {
+        let temp = std::env::temp_dir().join(format!("blitz-failed-{}", std::process::id()));
+        for (dir, log) in [
+            ("blitz-update-0.0.1", true),
+            ("blitz-update-0.0.3", true),
+            ("blitz-update-0.0.4", false),
+            ("other", true),
+        ] {
+            std::fs::create_dir_all(temp.join(dir)).unwrap();
+            if log {
+                std::fs::write(temp.join(dir).join("setup.log"), "").unwrap();
+            }
+        }
+        let got = failed_in(&temp, "0.0.2");
+        let mut left: Vec<_> = (std::fs::read_dir(&temp).unwrap().flatten())
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        std::fs::remove_dir_all(&temp).unwrap();
+        let log = temp.join("blitz-update-0.0.3").join("setup.log");
+        assert_eq!(got, Some(("0.0.3".into(), log)));
+        // Done, and never started, are gone; what is not blitz's stays.
+        assert_eq!(left, ["blitz-update-0.0.3", "other"]);
     }
 
     #[test]

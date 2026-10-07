@@ -78,7 +78,29 @@ Filename: "{app}\blitz.exe"; Description: "{cm:LaunchProgram,blitz}"; Flags: now
 Filename: "{app}\blitz.exe"; Flags: nowait runasoriginaluser; Check: Relaunch
 
 [Code]
+var
+  Installed: Boolean;
+
 function Relaunch: Boolean;
 begin
   Result := WizardSilent and (ExpandConstant('{param:relaunch|0}') = '1');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    Installed := True;
+end;
+
+// An update that failed starts the old blitz again, which shows the log.
+procedure DeinitializeSetup;
+var
+  Code: Integer;
+begin
+  if Relaunch and not Installed then
+    try
+      ExecAsOriginalUser(ExpandConstant('{app}\blitz.exe'), '', '', SW_SHOWNORMAL, ewNoWait, Code);
+    except
+      // Setup stopped before it knew the folder.
+    end;
 end;

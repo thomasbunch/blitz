@@ -35,12 +35,14 @@ and drives; on Windows 11 it is under **Show more options**.
 Shift+right-click also offers **Open in new blitz window**. Untick the
 option during setup to leave the menu alone.
 
-blitz asks GitHub for the latest release when it starts and once a day.
-If there is a newer one, a strip under the panes says so. Ctrl+Shift+U
+blitz asks GitHub for the latest release when it starts and every six
+hours. If there is a newer one, a strip under the panes says so. Ctrl+Shift+U
 downloads the installer, checks it against the release's `SHA256SUMS.txt`
 and restarts blitz on the new version. That ends every session, so blitz
 asks you to press it twice if one is busy. A copy run from the zip opens
-the release page instead.
+the release page instead. If the installer fails, blitz starts again on
+the old version and the strip names the installer's log. With no strip,
+Ctrl+Shift+U asks GitHub right away and says what it found.
 
 ## Build
 
@@ -167,7 +169,7 @@ good place to start.
 | Ctrl+Alt+Shift+Arrows | Swap the focused pane with its neighbour |
 | Ctrl+Shift+J | Jump to the next session that needs you |
 | Ctrl+Shift+B | Expand or collapse the sidebar |
-| Ctrl+Shift+U | Update, when a newer release is available |
+| Ctrl+Shift+U | Update, or look for a newer release now |
 | Ctrl+Shift+K | Pick a theme |
 | Ctrl+, | Settings |
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
