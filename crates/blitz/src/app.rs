@@ -2588,7 +2588,8 @@ impl App {
             }
             return;
         }
-        // And for the find bar, but another shortcut closes it and runs.
+        // And for the find bar, but another shortcut runs, and closes it
+        // unless it scrolls.
         if self.find.is_some() && k.down {
             self.eaten.press(k.vk);
             match keymap::action(k, &self.config.keys).filter(|&a| find_runs(a)) {
@@ -2597,7 +2598,7 @@ impl App {
                     self.request_redraw();
                 }
                 Some(a) => {
-                    if self.act(el, a) {
+                    if self.act(el, a) && !find_keeps(a) {
                         self.find = None;
                         self.request_redraw();
                     }
@@ -4627,6 +4628,15 @@ fn ime_area(
 /// closes the bar. Paste is left to the bar.
 fn find_runs(a: Action) -> bool {
     a != Action::Paste
+}
+
+/// Whether the find bar stays open after shortcut `a` ran: scrolling
+/// through what was found keeps it, as the wheel does.
+fn find_keeps(a: Action) -> bool {
+    matches!(
+        a,
+        Action::ScrollPage(_) | Action::ScrollEnd(_) | Action::JumpToPrompt(_)
+    )
 }
 
 /// How long after a session needing the user closes blitz run a jump key
@@ -6756,6 +6766,17 @@ mod tests {
             assert!(find_runs(a), "{a:?}");
         }
         assert!(!find_runs(Action::Paste), "for the bar");
+        // Scrolling looks through the matches; the rest leave the bar.
+        for a in [
+            Action::ScrollPage(1),
+            Action::ScrollEnd(-1),
+            Action::JumpToPrompt(1),
+        ] {
+            assert!(find_runs(a) && find_keeps(a), "{a:?}");
+        }
+        for a in [Action::Copy, Action::SplitRight, Action::FontSize(1)] {
+            assert!(!find_keeps(a), "{a:?}");
+        }
     }
 
     #[test]
