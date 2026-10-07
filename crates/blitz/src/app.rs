@@ -2683,8 +2683,9 @@ impl App {
     /// Copies the selection in the focused pane, or else the text of one
     /// that output just rewrote. False when there is neither, so the key
     /// goes on to the program. When another program holds the clipboard
-    /// the selection stays, to copy again.
-    fn copy(&mut self) -> bool {
+    /// the selection stays, to copy again. With `unindent`, the text goes
+    /// as [`without_indent`] leaves it.
+    fn copy(&mut self, unindent: bool) -> bool {
         let Some(v) = self.current() else {
             return false;
         };
@@ -2698,6 +2699,11 @@ impl App {
             },
         };
         drop(term);
+        let text = if unindent {
+            without_indent(&text)
+        } else {
+            text
+        };
         let owner = Some(HWND(self.hwnd as *mut c_void));
         let copied = crate::clipboard::set_text(owner, &text);
         if copied {
@@ -2725,7 +2731,8 @@ impl App {
     fn act(&mut self, el: &ActiveEventLoop, a: Action) -> bool {
         let before = self.focus_id();
         match a {
-            Action::Copy => return self.copy(),
+            Action::Copy => return self.copy(false),
+            Action::CopyUnindented => return self.copy(true),
             Action::Paste => {
                 let Some(id) = before else {
                     return false;
@@ -4981,6 +4988,32 @@ fn label(
     (name.to_owned(), msg.to_owned())
 }
 
+/// `text` without Claude Code's gutter: the mark that starts a reply (⏺,
+/// or ● outside macOS) and the ⎿ before a tool's output become spaces,
+/// then the indent every line shares goes. Lines are never joined.
+fn without_indent(text: &str) -> String {
+    let lines: Vec<String> = (text.lines())
+        .map(|l| {
+            let body = l.trim_start_matches(' ');
+            match body.chars().next() {
+                Some(c @ ('\u{23FA}' | '\u{25CF}' | '\u{23BF}')) => {
+                    format!("{} {}", &l[..l.len() - body.len()], &body[c.len_utf8()..])
+                }
+                _ => l.to_owned(),
+            }
+        })
+        .collect();
+    let common = (lines.iter())
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start_matches(' ').len())
+        .min()
+        .unwrap_or(0);
+    let lines: Vec<&str> = (lines.iter())
+        .map(|l| l.get(common..).unwrap_or_default().trim_end())
+        .collect();
+    lines.join("\r\n")
+}
+
 /// What a copy of `text` says: how many lines went to the clipboard, and
 /// whether they were the selection output then rewrote, or that another
 /// program held the clipboard.
@@ -6997,6 +7030,23 @@ mod tests {
         );
         assert!(text.ends_with(r"blitz\config.toml"), "{text}");
         assert_eq!(start_failed("x", None), "blitz could not start: x");
+    }
+
+    #[test]
+    fn app_copy_without_indent_drops_claude_codes_gutter() {
+        let reply = "\u{23FA} Here is the fix:\r\n  fn main() {\r\n      run();\r\n  }";
+        assert_eq!(
+            without_indent(reply),
+            "Here is the fix:\r\nfn main() {\r\n    run();\r\n}"
+        );
+        let tool = "  \u{23BF}  src/a.rs\r\n     src/b.rs";
+        assert_eq!(without_indent(tool), "src/a.rs\r\nsrc/b.rs");
+        // Claude Code marks replies with ● outside macOS.
+        let both = "\u{25CF} Bash(ls)\r\n  \u{23BF}  a.rs\r\n     b.rs";
+        assert_eq!(without_indent(both), "Bash(ls)\r\n   a.rs\r\n   b.rs");
+        // Blank lines stay, and lines are never joined.
+        assert_eq!(without_indent("    a\r\n\r\n      b"), "a\r\n\r\n  b");
+        assert_eq!(without_indent("x \u{23BF} y"), "x \u{23BF} y");
     }
 
     #[test]

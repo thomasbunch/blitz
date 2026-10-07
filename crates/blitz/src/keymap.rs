@@ -11,6 +11,9 @@ pub enum Action {
     /// Copy the selection, or one that output just rewrote. Without one
     /// the key goes to the program.
     Copy,
+    /// Copy the selection without Claude Code's gutter and the indent its
+    /// lines share.
+    CopyUnindented,
     /// Paste clipboard text. Without text the key goes to the program.
     Paste,
     /// Scroll the main screen by a page; positive is up.
@@ -76,6 +79,7 @@ pub enum Action {
 #[rustfmt::skip]
 pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Copy, "copy", "Copy"),
+    (Action::CopyUnindented, "copy_without_indent", "Copy without indent"),
     (Action::Paste, "paste", "Paste"),
     (Action::ScrollPage(1), "scroll_page_up", "Scroll up a page"),
     (Action::ScrollPage(-1), "scroll_page_down", "Scroll down a page"),
