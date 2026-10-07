@@ -269,7 +269,10 @@ fn full_path(word: &str, cwd: &str, home: Option<&str>) -> Option<PathBuf> {
         _ if vt::osc::local_dir(word) => return Some(PathBuf::from(word)),
         _ => (cwd, word),
     };
-    vt::osc::local_dir(base).then(|| Path::new(base).join(rest))
+    // A rest that is itself absolute, such as `\\host\share`, replaces
+    // the base when joined, so the result is checked too.
+    let full = Path::new(base).join(rest);
+    (vt::osc::local_dir(base) && vt::osc::local_dir(&full.to_string_lossy())).then_some(full)
 }
 
 /// What opening an OSC 8 link's `uri` does. Only `http`, `https`,
@@ -605,6 +608,13 @@ mod tests {
         assert_eq!(full_path("~/x", r"D:\work", None), None, "no home");
         assert_eq!(full_path("~/x", r"D:\work", Some(r"\\server\me")), None);
         assert_eq!(full_path("a.rs", r"\\server\share", home), None);
+        for unc in [
+            r"~/\\host\share\x.txt",
+            r"~\\\host\share\x.txt",
+            r"\\host\share\x.txt",
+        ] {
+            assert_eq!(full(unc), None, "{unc}");
+        }
     }
 
     #[test]
