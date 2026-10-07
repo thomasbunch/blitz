@@ -3471,6 +3471,7 @@ impl App {
                 Some(Side::More(ids)) => self.show_hidden(&ids),
                 Some(Side::Rail) => {
                     self.win.toggle_sidebar();
+                    self.fit_min_size();
                     self.request_redraw();
                 }
                 None => {}
@@ -3811,7 +3812,9 @@ impl App {
             return;
         }
         // A narrow window has no room for the sidebar.
-        self.win.fit_width(size.width as f32 / self.scale as f32);
+        if self.win.fit_width(size.width as f32 / self.scale as f32) {
+            self.fit_min_size();
+        }
         self.ensure_gfx();
         let Some(g) = &self.gfx else {
             return;
