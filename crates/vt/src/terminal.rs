@@ -536,11 +536,11 @@ impl Terminal {
     /// whether it is `listening`. Yes confirms pastes as the user would;
     /// while bracketed paste is off, for the next time it is turned on
     /// and that time only, since the program may turn it on after saying
-    /// so. No forgets such a yes.
+    /// so. No forgets such a yes, and what it has already confirmed.
     pub fn vouch_paste(&mut self, listening: bool) {
         let on = self.modes.input.bracketed;
-        if listening && on {
-            self.modes.paste_confirmed = true;
+        if on || !listening {
+            self.modes.paste_confirmed = listening;
         }
         self.modes.paste_vouched = listening && !on;
     }
