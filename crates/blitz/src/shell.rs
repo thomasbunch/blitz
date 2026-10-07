@@ -217,10 +217,9 @@ pub struct Launch {
 }
 
 /// Builds the command line for `program` (empty means [`detect`]). Shell
-/// integration is added only when `integrate` is set and there are no user
-/// arguments; otherwise the command runs exactly as configured. `token` is
-/// the pane's `BLITZ_PANE_TOKEN`.
-pub fn launch(program: &str, args: &[String], integrate: bool, token: &str) -> Launch {
+/// integration is added only when `integrate` is set; otherwise the command
+/// runs exactly as configured. `token` is the pane's `BLITZ_PANE_TOKEN`.
+pub fn launch(program: &str, integrate: bool, token: &str) -> Launch {
     let program = if program.is_empty() {
         detect()
     } else {
@@ -230,7 +229,7 @@ pub fn launch(program: &str, args: &[String], integrate: bool, token: &str) -> L
         cmdline: quote(&program.to_string_lossy()),
         env: Vec::new(),
     };
-    if integrate && args.is_empty() {
+    if integrate {
         match kind(&program) {
             Kind::PowerShell => {
                 // -EncodedCommand still runs when the execution policy forbids
@@ -247,11 +246,6 @@ pub fn launch(program: &str, args: &[String], integrate: bool, token: &str) -> L
             }
             _ => {}
         }
-        return out;
-    }
-    for a in args {
-        out.cmdline.push(' ');
-        out.cmdline += &quote(a);
     }
     out
 }
@@ -368,8 +362,8 @@ mod tests {
             cmdline: format!("\"{bash}\""),
             env: Vec::new(),
         };
-        assert_eq!(launch(bash, &[], true, "t"), want);
-        assert_eq!(launch("wsl.exe", &[], true, "t").cmdline, "wsl.exe");
+        assert_eq!(launch(bash, true, "t"), want);
+        assert_eq!(launch("wsl.exe", true, "t").cmdline, "wsl.exe");
     }
 
     #[test]
@@ -397,20 +391,14 @@ mod tests {
 
     #[test]
     fn launch_integration() {
-        let ps = launch(r"C:\Program Files\PowerShell\7\pwsh.exe", &[], true, "t");
+        let ps = launch(r"C:\Program Files\PowerShell\7\pwsh.exe", true, "t");
         let (head, b64) = ps.cmdline.rsplit_once(' ').unwrap();
         assert_eq!(
             head,
             r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit -EncodedCommand"#
         );
         assert!(b64.len() > 1000 && b64.len() < 8000);
-        // User arguments turn integration off.
-        let args = ["-NoProfile".to_owned(), "a b".to_owned()];
-        assert_eq!(
-            launch("pwsh.exe", &args, true, "t").cmdline,
-            r#"pwsh.exe -NoProfile "a b""#
-        );
-        assert_eq!(launch("pwsh.exe", &[], false, "t").cmdline, "pwsh.exe");
+        assert_eq!(launch("pwsh.exe", false, "t").cmdline, "pwsh.exe");
     }
 
     #[test]

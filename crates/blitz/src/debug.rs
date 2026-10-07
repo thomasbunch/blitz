@@ -398,7 +398,7 @@ impl Runner {
         let (cmdline, mut env) = match &o.cmd {
             Some(c) => (c.clone(), Vec::new()),
             None => {
-                let l = crate::shell::launch("", &[], true, &token);
+                let l = crate::shell::launch("", true, &token);
                 (l.cmdline, l.env)
             }
         };

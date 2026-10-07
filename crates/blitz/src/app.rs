@@ -843,12 +843,7 @@ impl App {
                 cmdline: c.to_string(),
                 env: Vec::new(),
             },
-            None => crate::shell::launch(
-                &self.config.shell,
-                &[],
-                self.config.shell_integration,
-                &token,
-            ),
+            None => crate::shell::launch(&self.config.shell, self.config.shell_integration, &token),
         };
         let proxy = self.proxy.clone();
         let mut pane = Pane::spawn(
