@@ -444,9 +444,9 @@ pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
         (m.lalt || m.ralt, ALT),
     ];
     let mods = held.iter().filter(|h| h.0).fold(0, |a, h| a | h.1);
-    // Windows reports AltGr as Ctrl+Alt: a key it types a character with
-    // is typing, not a Ctrl+Alt chord.
-    let typed = char::from_u32(k.uc.into()).is_some_and(|c| !c.is_control());
+    // Windows reports AltGr as Ctrl+Alt: a key it types a character with,
+    // or a dead key that starts one, is typing, not a Ctrl+Alt chord.
+    let typed = char::from_u32(k.uc.into()).is_some_and(|c| !c.is_control()) || k.key == Key::Other;
     if mods & (CTRL | ALT) == CTRL | ALT && typed {
         return None;
     }
@@ -1301,10 +1301,14 @@ mod msg_to_key_tests {
 
     #[test]
     fn keymap_altgr_types_rather_than_running_a_ctrl_alt_binding() {
-        let user: Vec<Binding> = ["ctrl+alt+q=new_tab", "ctrl+alt+left=split_right"]
-            .into_iter()
-            .filter_map(binding)
-            .collect();
+        let user: Vec<Binding> = [
+            "ctrl+alt+q=new_tab",
+            "ctrl+alt+1=new_tab",
+            "ctrl+alt+left=split_right",
+        ]
+        .into_iter()
+        .filter_map(binding)
+        .collect();
         let press = |vk, rows, held: &[usize]| {
             let mut t = String::new();
             let lp = lp(0x10, false, true, 1);
@@ -1314,6 +1318,7 @@ mod msg_to_key_tests {
         let altgr = [0xa2, 0xa5];
         assert_eq!(press(0x51, DE, &altgr), None, "AltGr+Q types @");
         assert_eq!(press(0x51, PL, &altgr), None, "AltGr+Q types \\");
+        assert_eq!(press(0x31, CZ, &altgr), None, "AltGr+1 is a dead ~");
         // Without a character for AltGr it is the chord.
         assert_eq!(press(0x51, US, &altgr), Some(Action::NewTab));
         assert_eq!(press(0x25, DE, &altgr), Some(Action::SplitRight), "arrows");
