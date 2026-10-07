@@ -2,13 +2,46 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 /// Finds the shell to start when none is configured: `pwsh.exe` on PATH,
 /// then the newest `%ProgramFiles%\PowerShell\<n>\pwsh.exe`, then Windows
-/// PowerShell, then `%ComSpec%`. Looked up for each pane, so one installed
-/// while blitz runs is found.
+/// PowerShell, then `%ComSpec%`. Looked up again when a new pane's PATH
+/// changed, so one installed while blitz runs is found.
 pub fn detect() -> PathBuf {
-    detect_with(pane_var)
+    static LAST: Mutex<Option<(Option<OsString>, PathBuf)>> = Mutex::new(None);
+    memo(&LAST, pane_var("PATH"), |path| detect_with(pane_env(path.clone())))
+}
+
+/// `make(key)`, kept in `last` and made again only once `key` changed.
+/// Looking for a program stats a file in each PATH folder, which takes
+/// seconds on a network drive that is not there; the PATH changes when a
+/// program is installed.
+fn memo<K: PartialEq, T: Clone>(
+    last: &Mutex<Option<(K, T)>>,
+    key: K,
+    make: impl FnOnce(&K) -> T,
+) -> T {
+    let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((k, v)) = &*last
+        && *k == key
+    {
+        return v.clone();
+    }
+    let v = make(&key);
+    *last = Some((key, v.clone()));
+    v
+}
+
+/// The environment of a new pane whose PATH is `path`, from [`pane_var`].
+pub fn pane_env(path: Option<OsString>) -> impl Fn(&str) -> Option<OsString> {
+    move |k| {
+        if k.eq_ignore_ascii_case("PATH") {
+            path.clone()
+        } else {
+            std::env::var_os(k)
+        }
+    }
 }
 
 /// A variable as a new pane gets it: PATH from [`fresh_path`], the rest as
@@ -294,7 +327,12 @@ fn pwsh(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 /// The shells the settings panel offers, as (name, `shell` setting): first
 /// the automatic choice, whose setting is empty, then each one installed.
 pub fn choices() -> Vec<(String, String)> {
-    let found = installed_with(pane_var, wsl_distros());
+    type Found = Vec<(String, String)>;
+    static LAST: Mutex<Option<((Option<OsString>, Vec<String>), Found)>> = Mutex::new(None);
+    let key = (pane_var("PATH"), wsl_distros());
+    let found = memo(&LAST, key, |(path, distros)| {
+        installed_with(pane_env(path.clone()), distros.clone())
+    });
     let auto = detect();
     let name = (found.iter())
         .find(|(_, p)| Path::new(p) == auto)
@@ -1010,6 +1048,21 @@ mod tests {
         }
         assert_eq!(split_program(r#""a b" -c"#), ("a b", " -c"));
         assert_eq!(split_program("x"), ("x", ""));
+    }
+
+    /// Each new pane and each palette would otherwise walk PATH again.
+    #[test]
+    fn shells_are_looked_for_again_only_when_the_path_changes() {
+        let last = Mutex::new(None);
+        let walks = std::cell::Cell::new(0);
+        let look = |path: &str| {
+            memo(&last, path.to_string(), |p| {
+                walks.set(walks.get() + 1);
+                p.len()
+            })
+        };
+        assert_eq!((look("a;b"), look("a;b"), walks.get()), (3, 3, 1));
+        assert_eq!((look("a;b;c"), walks.get()), (5, 2));
     }
 
     #[test]

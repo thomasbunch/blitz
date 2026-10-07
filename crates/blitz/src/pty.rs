@@ -265,7 +265,10 @@ impl Pty {
         mut on_event: impl FnMut(PtyEvent<'_>, &Writer) + Send + 'static,
     ) -> io::Result<Pty> {
         let api = conpty().ok_or_else(|| io::Error::other("ConPTY is not available"))?;
-        let program = find_program(opts.cmdline, crate::shell::pane_var)?;
+        // Worked out once: it reads the registry, and the program is found
+        // on the PATH the child gets.
+        let path = crate::shell::pane_var("PATH");
+        let program = find_program(opts.cmdline, crate::shell::pane_env(path.clone()))?;
         let (in_r, in_w) = pipe()?;
         let (out_r, out_w) = pipe()?;
         let size = COORD {
@@ -290,7 +293,7 @@ impl Pty {
         drop((in_r, out_w));
         // Started before the handle goes into its mutex: a lock taken in the
         // match below would be held through it, and closing takes it again.
-        let process = start(opts, program.as_deref(), hpc);
+        let process = start(opts, program.as_deref(), path, hpc);
         let hpc = Arc::new(Mutex::new(hpc));
         let process = match process {
             Ok(p) => Arc::new(p),
@@ -509,8 +512,14 @@ pub fn find_program(
 }
 
 /// Creates the child process attached to pseudoconsole `hpc`, running
-/// `program` when given, else the first word of the command line.
-fn start(opts: &SpawnOpts, program: Option<&Path>, hpc: isize) -> io::Result<OwnedHandle> {
+/// `program` when given, else the first word of the command line, with
+/// `path` as its PATH.
+fn start(
+    opts: &SpawnOpts,
+    program: Option<&Path>,
+    path: Option<OsString>,
+    hpc: isize,
+) -> io::Result<OwnedHandle> {
     let mut size = 0;
     // SAFETY: a size query; it fails by design with the size filled in.
     let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
@@ -543,7 +552,7 @@ fn start(opts: &SpawnOpts, program: Option<&Path>, hpc: isize) -> io::Result<Own
         si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
         si.lpAttributeList = list;
 
-        let parent = with_path(std::env::vars_os(), crate::shell::pane_var("PATH"));
+        let parent = with_path(std::env::vars_os(), path);
         let env = env_block(&child_env(parent, opts.pane_id, opts.env));
         let mut cmd: Vec<u16> = opts.cmdline.encode_utf16().chain([0]).collect();
         let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
