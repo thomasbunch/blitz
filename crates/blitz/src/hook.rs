@@ -428,15 +428,24 @@ fn exposed(_hook: &Path) -> bool {
 }
 
 /// `CLAUDE_CODE_PLUGIN_DIRS` for a pane: the folders blitz itself was
-/// given, if any, and blitz's plugin once.
+/// given, if any, and blitz's plugin once. Another copy of blitz's plugin,
+/// which a blitz started in a blitz pane inherits, is left out, or every
+/// hook would report twice.
 pub fn plugin_dirs(inherited: Option<&str>, ours: &str) -> String {
     let mut dirs: Vec<&str> = (inherited.unwrap_or("").split(';'))
-        .filter(|d| !d.is_empty())
+        .filter(|d| !d.is_empty() && !blitz_plugin(d))
         .collect();
-    if !dirs.iter().any(|d| d.eq_ignore_ascii_case(ours)) {
-        dirs.push(ours);
-    }
+    dirs.push(ours);
     dirs.join(";")
+}
+
+/// Whether `dir` is a plugin folder some copy of blitz wrote, as
+/// [`plugin_dir`] names them, under a release or a debug build's state.
+fn blitz_plugin(dir: &str) -> bool {
+    let mut up = dir.trim_end_matches(['\\', '/']).rsplit(['\\', '/']);
+    let (name, state) = (up.next().unwrap_or(""), up.next().unwrap_or(""));
+    (name.get(..13)).is_some_and(|n| n.eq_ignore_ascii_case("claude-plugin"))
+        && ["blitz", "blitz.dev"].contains(&state.to_ascii_lowercase().as_str())
 }
 
 /// `blitz setup <app>`. Returns the process exit code.
@@ -1234,16 +1243,29 @@ mod tests {
 
     #[test]
     fn plugin_dirs_keep_the_users_own() {
-        let ours = r"C:\Users\me\AppData\Local\blitz\claude-plugin";
+        let ours = r"C:\Users\me\AppData\Local\blitz\claude-plugin-bc19ae5af3c1512f";
+        let mine = format!(r"C:\mine;{ours}");
         assert_eq!(plugin_dirs(None, ours), ours);
         assert_eq!(plugin_dirs(Some(""), ours), ours);
         assert_eq!(
             plugin_dirs(Some(r"C:\mine;D:\more;"), ours),
             format!(r"C:\mine;D:\more;{ours}")
         );
-        // A blitz started in a blitz pane already has it.
-        let both = format!(r"C:\mine;{}", ours.to_uppercase());
-        assert_eq!(plugin_dirs(Some(&both), ours), both);
+        // A blitz started in a blitz pane has it already, or another copy's:
+        // a release or debug build's, or an older blitz's. Its hooks would
+        // report a second time.
+        for theirs in [
+            ours.to_uppercase().as_str(),
+            r"C:\Users\me\AppData\Local\blitz\claude-plugin-0123456789abcdef",
+            r"C:\Users\me\AppData\Local\blitz.dev\claude-plugin-0123456789abcdef\",
+            r"C:\Users\me\AppData\Local\blitz\claude-plugin",
+        ] {
+            let both = format!(r"{theirs};C:\mine");
+            assert_eq!(plugin_dirs(Some(&both), ours), mine, "{theirs}");
+        }
+        // A plugin of the user's own by that name stays.
+        let own = r"C:\plugins\claude-plugin-x";
+        assert_eq!(plugin_dirs(Some(own), ours), format!("{own};{ours}"));
     }
 
     #[test]

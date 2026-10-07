@@ -1637,8 +1637,11 @@ impl App {
         }
         self.selection = None;
         self.find = None;
-        if let Some(v) = before.and_then(|id| self.view_mut(id)) {
-            v.notice.take_if(|n| n.ask.of_pane());
+        if let Some(left) = before {
+            focus_left(
+                self.views.iter_mut().map(|v| (v.pane.id, &mut v.notice)),
+                left,
+            );
         }
         self.mouse.drag = None;
         // A drag belongs to the tab it started in.
@@ -2388,16 +2391,29 @@ impl App {
 
     /// Says dimly in pane `id`, for a while, that Claude Code's hooks are
     /// not reporting, or are `older` than this blitz, unless a hint about
-    /// them was shown already.
+    /// them was shown already. One a question keeps out comes at the next
+    /// title or hook.
     fn hooks_hint(&mut self, id: PaneId, older: bool) {
-        if std::mem::replace(&mut self.hooks_hinted, true) {
+        if self.hooks_hinted {
             return;
         }
         let palette = keymap::keys_for(Action::Palette, &self.config.keys);
         let text = hooks_hint_text(older, palette);
-        self.set_notice(id, text, Some(Instant::now() + HINT), true);
+        self.hooks_hinted = self.hint(id, text, Instant::now() + HINT);
     }
 
+    /// Says `text` dimly in pane `id`, which nobody asked for, until
+    /// `until`, unless a question or an error waits there. Whether it did.
+    fn hint(&mut self, id: PaneId, text: impl Into<String>, until: Instant) -> bool {
+        let shown =
+            (self.view_mut(id)).is_some_and(|v| hint_into(&mut v.notice, text.into(), until));
+        self.request_redraw();
+        shown
+    }
+
+    /// Shows `text` in pane `id` in place of any notice there, as what a
+    /// user's action led to does; a hint nobody asked for goes through
+    /// [`App::hint`].
     fn set_notice(
         &mut self,
         id: PaneId,
@@ -2405,9 +2421,7 @@ impl App {
         until: Option<Instant>,
         dim: bool,
     ) {
-        if let Some(v) = self.view_mut(id)
-            && (!dim || hint_fits(v.notice.as_ref()))
-        {
+        if let Some(v) = self.view_mut(id) {
             v.notice = Some(Notice {
                 text: text.into(),
                 until,
@@ -3026,7 +3040,7 @@ impl App {
                     if let Some(text) = crate::pty::inbox_notice() {
                         self.counters.inbox = true;
                         eprintln!("blitz: {text}");
-                        self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                        self.hint(id, text, Instant::now() + NOTICE);
                     }
                 }
                 if shown {
@@ -4423,6 +4437,23 @@ fn tell_focus(v: &View, focused: bool) {
     drop(term);
 }
 
+/// Whether the user, `away` when a pane changed, is back to see the
+/// focused pane: blitz run does not cover it, and they are `here`, which
+/// is asked only then. Clears `away` if so.
+fn back_at_screen(away: &mut bool, game_open: bool, here: impl FnOnce() -> bool) -> bool {
+    let back = *away && !game_open && here();
+    *away &= !back;
+    back
+}
+
+/// Takes a question about pane `left`, which focus just left, off it, so
+/// a press in another pane never answers it. Other notices stay.
+fn focus_left<'a>(notices: impl Iterator<Item = (PaneId, &'a mut Option<Notice>)>, left: PaneId) {
+    for (_, n) in notices.filter(|(id, _)| *id == left) {
+        n.take_if(|n| n.ask.of_pane());
+    }
+}
+
 /// Whether the user is at the window: it is in front, and they touched a
 /// key or the mouse in the last `AWAY_AFTER`, `idle` being how long ago.
 /// Walking away from blitz must not let a question pass as seen.
@@ -4620,11 +4651,20 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
     out
 }
 
-/// Draws a notice over the bottom row of the pane whose grid is at `at`.
-/// A passing hint shows only where no question or error waits, which
-/// it would take the place of.
-fn hint_fits(n: Option<&Notice>) -> bool {
-    n.is_none_or(|n| n.ask == Ask::Nothing)
+/// Puts a hint nobody asked for in a pane's notice `slot`, dim until
+/// `until`, unless a question or an error waits there, which it would
+/// take the place of. Whether it did.
+fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
+    let fits = slot.as_ref().is_none_or(|n| n.ask == Ask::Nothing);
+    if fits {
+        *slot = Some(Notice {
+            text,
+            until: Some(until),
+            dim: true,
+            ask: Ask::Nothing,
+        });
+    }
+    fits
 }
 
 /// The bottom row of a pane, and whether it is dim: its notice, else for
@@ -4641,6 +4681,7 @@ fn notice_line(n: Option<&Notice>, exit: Option<u32>) -> Option<(Cow<'_, str>, b
     }
 }
 
+/// Draws a notice over the bottom row of the pane whose grid is at `at`.
 fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text: &str, dim: bool) {
     let (_, ch) = r.cell();
     let mut s = text_snapshot(&format!(" {text}"), grid.0, 1, pal);
@@ -5343,11 +5384,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.drain_keys(el);
         // Back at the screen, with a key or the mouse: the focused pane
         // is in view again.
-        if self.away && self.game.is_none() && present(self.focused, idle_for()) {
-            self.away = false;
-            if let Some(id) = self.focus_id() {
-                self.attention(id, Ev::Attended);
-            }
+        let game = self.game.is_some();
+        if back_at_screen(&mut self.away, game, || present(self.focused, idle_for()))
+            && let Some(id) = self.focus_id()
+        {
+            self.attention(id, Ev::Attended);
         }
         self.save_session(false);
         // Here, after every batch of events, rather than at each change:
@@ -6984,8 +7025,9 @@ mod tests {
         }
     }
 
-    /// A passing hint leaves a question or an error where it is, and an
-    /// exited program's line comes back once a notice over it goes.
+    /// A passing hint leaves a question or an error where it is, and says
+    /// so, to be tried again; an exited program's line comes back once a
+    /// notice over it goes.
     #[test]
     fn notices_over_questions_and_exits() {
         let notice = |ask, dim| Notice {
@@ -6994,10 +7036,19 @@ mod tests {
             dim,
             ask,
         };
-        assert!(hint_fits(None));
-        assert!(hint_fits(Some(&notice(Ask::Nothing, true))));
+        let until = Instant::now();
+        for mut slot in [None, Some(notice(Ask::Nothing, true))] {
+            assert!(hint_into(&mut slot, "hint".into(), until));
+            let n = slot.expect("the hint");
+            assert_eq!(
+                (n.text.as_str(), n.until, n.dim),
+                ("hint", Some(until), true)
+            );
+        }
         for ask in [Ask::ClosePane, Ask::Key, Ask::Quit] {
-            assert!(!hint_fits(Some(&notice(ask, false))));
+            let mut slot = Some(notice(ask.clone(), false));
+            assert!(!hint_into(&mut slot, "hint".into(), until));
+            assert!(slot.is_some_and(|n| n.ask == ask && n.text == "n"));
         }
         let exited = notice_line(None, Some(2)).expect("a line");
         assert_eq!(
@@ -7010,6 +7061,46 @@ mod tests {
             Some(("n".into(), false))
         );
         assert_eq!(notice_line(None, None), None);
+    }
+
+    /// Focus leaving a pane takes its close or paste question with it, and
+    /// leaves every other notice, there and in other panes.
+    #[test]
+    fn focus_leaving_a_pane_takes_its_question() {
+        let notice = |ask| {
+            Some(Notice {
+                text: "n".into(),
+                until: None,
+                dim: false,
+                ask,
+            })
+        };
+        for ask in [Ask::ClosePane, Ask::CloseTab, Ask::Paste(String::new())] {
+            let mut notices = [(PaneId(1), notice(ask.clone())), (PaneId(2), notice(ask))];
+            focus_left(notices.iter_mut().map(|(id, n)| (*id, n)), PaneId(1));
+            assert!(notices[0].1.is_none());
+            assert!(notices[1].1.is_some(), "only the pane focus left");
+        }
+        for ask in [Ask::Key, Ask::Update, Ask::Quit, Ask::Nothing] {
+            let mut notices = [(PaneId(1), notice(ask))];
+            focus_left(notices.iter_mut().map(|(id, n)| (*id, n)), PaneId(1));
+            assert!(notices[0].1.is_some());
+        }
+    }
+
+    /// Coming back to the screen after a change while away sees the
+    /// focused pane, once, unless blitz run covers it.
+    #[test]
+    fn back_at_the_screen_sees_the_focused_pane() {
+        let mut away = false;
+        assert!(!back_at_screen(&mut away, false, || unreachable!()));
+        away = true;
+        assert!(!back_at_screen(&mut away, true, || true));
+        assert!(!back_at_screen(&mut away, false, || false));
+        assert!(away, "still away");
+        assert!(back_at_screen(&mut away, false, || true));
+        assert!(!away);
+        assert!(!back_at_screen(&mut away, false, || true), "once");
     }
 
     #[test]

@@ -470,8 +470,11 @@ impl Grid {
     /// Scrolls screen rows `top..=bottom` up by `n`; blank rows enter at the
     /// bottom. With `keep`, the rows leaving at the top go to scrollback
     /// instead of being dropped, which is only meaningful when `top` is 0.
-    pub fn scroll_up(&mut self, top: u16, bottom: u16, n: u16, blank: Cell, keep: bool) {
+    /// True when every screen row moved under its line number while the
+    /// scrollback stayed put, so the screen's numbers now name other text.
+    pub fn scroll_up(&mut self, top: u16, bottom: u16, n: u16, blank: Cell, keep: bool) -> bool {
         let n = n.min(bottom + 1 - top);
+        let mut moved = false;
         for _ in 0..n {
             let base = self.scrollback_len();
             if keep && self.max_scrollback > 0 {
@@ -484,18 +487,25 @@ impl Grid {
                 row.reset(self.cols, blank);
                 self.rows.insert(base + bottom as usize, row);
                 // Every row moved up, as when the top one goes to
-                // scrollback, so each keeps its line number.
-                if base == 0 && top == 0 && bottom + 1 == self.lines {
-                    self.dropped += 1;
+                // scrollback, so each keeps its line number. Scrollback
+                // above can't move with them.
+                if top == 0 && bottom + 1 == self.lines {
+                    if base == 0 {
+                        self.dropped += 1;
+                    } else {
+                        moved = true;
+                    }
                 }
             }
         }
         self.trim();
+        moved
     }
 
     /// Scrolls screen rows `top..=bottom` down by `n`; blank rows enter at
-    /// the top.
-    pub fn scroll_down(&mut self, top: u16, bottom: u16, n: u16, blank: Cell) {
+    /// the top. True when every screen row moved under its line number while
+    /// the scrollback stayed put, as for [`Self::scroll_up`].
+    pub fn scroll_down(&mut self, top: u16, bottom: u16, n: u16, blank: Cell) -> bool {
         let n = n.min(bottom + 1 - top);
         let base = self.scrollback_len();
         for _ in 0..n {
@@ -504,6 +514,7 @@ impl Grid {
                 self.rows.insert(base + top as usize, row);
             }
         }
+        n > 0 && base > 0 && top == 0 && bottom + 1 == self.lines
     }
 
     /// Drops all scrollback, keeping the rows for reuse.

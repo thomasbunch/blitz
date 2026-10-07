@@ -86,8 +86,22 @@ fn url_len(s: &str) -> Option<usize> {
         c.is_ascii_graphic() && !matches!(c, '<' | '>' | '"' | '`' | '{' | '}' | '|' | '\\' | '^')
             || !c.is_ascii() && c.is_alphanumeric()
     };
-    let n = trim_end(&s[..s.find(|c| !url_char(c)).unwrap_or(s.len())]);
+    let n = trim_end(&s[..word_len(s, url_char)]);
     (n > scheme.len()).then_some(n)
+}
+
+/// The length of the run of `ok` chars that starts `s`. A mark or joiner
+/// that builds one character with the char before it stays in the run, as
+/// in a decomposed `é` or `हिन्दी`, but no invisible format character does.
+fn word_len(s: &str, ok: impl Fn(char) -> bool) -> usize {
+    let mut prev = None;
+    s.find(|c: char| {
+        let joined = prev.is_some_and(|p| vt::width::joins(p, p, 1, c))
+            && (!vt::width::is_ignorable(c) || matches!(c, '\u{200C}' | '\u{200D}'));
+        prev = Some(c);
+        !ok(c) && !joined
+    })
+    .unwrap_or(s.len())
 }
 
 /// What a path word is made of: anything a Windows file name can hold
@@ -109,7 +123,7 @@ fn path_at(s: &str) -> Option<(Range<usize>, usize)> {
     let drive =
         b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
     let from = if drive { 2 } else { 0 };
-    let word = from + p[from..].find(|c| !path_char(c)).unwrap_or(p.len() - from);
+    let word = from + word_len(&p[from..], path_char);
     let path = &p[..trim_end(&p[..word])];
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let named = name.rsplit_once('.').is_some_and(|(stem, ext)| {
@@ -184,13 +198,15 @@ pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
 }
 
 /// Whether each folder and file `path` names after its first `from`
-/// bytes is there and is no symbolic link or junction. Each is looked at
-/// without following it: a link can lead to another machine, and looking
-/// at a file there makes Windows sign in to it.
+/// bytes is there and is no symbolic link or junction, and whether `path`
+/// is there when it is no more than those bytes, as `Z:\` is. Each is
+/// looked at without following it: a link can lead to another machine,
+/// and looking at a file there makes Windows sign in to it.
 fn plain(path: &Path, from: usize) -> bool {
     (path.ancestors())
         .take_while(|a| a.as_os_str().len() > from)
         .all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| !m.file_type().is_symlink()))
+        && std::fs::symlink_metadata(path).is_ok()
 }
 
 /// What opening an OSC 8 link's `uri` does. Only `http`, `https` and
@@ -334,6 +350,17 @@ mod tests {
         one("see https://bücher.de/x.", "https://bücher.de/x");
         one("“https://example.com/café”", "https://example.com/café");
         one("https://例え.jp/パス。", "https://例え.jp/パス");
+        // Marks and joiners that build a letter, but no bidi control.
+        one(
+            "https://example.com/cafe\u{301}.",
+            "https://example.com/cafe\u{301}",
+        );
+        one("https://हिन्दी.भारत/", "https://हिन्दी.भारत/");
+        one(
+            "https://x.ir/می\u{200C}خواهم",
+            "https://x.ir/می\u{200C}خواهم",
+        );
+        one("https://x.com/a\u{202E}b", "https://x.com/a");
         one(
             "https://example.com/a/b.html",
             "https://example.com/a/b.html",
@@ -355,7 +382,9 @@ mod tests {
             let text = format!("{word}{}", ")]".repeat(50_000));
             assert_eq!(found(&text).len(), 1, "{word}");
         }
-        assert!(t0.elapsed().as_millis() < 500, "{:?}", t0.elapsed());
+        // One pass takes milliseconds and the old quadratic trim took over
+        // half a minute, so a slow, busy runner still has room.
+        assert!(t0.elapsed().as_secs() < 5, "{:?}", t0.elapsed());
     }
 
     #[test]
@@ -386,6 +415,8 @@ mod tests {
             found("`../x/y.toml`"),
             [("../x/y.toml", path("../x/y.toml"))]
         );
+        let accent = "docs/cafe\u{301}.md";
+        assert_eq!(found(accent), [(accent, path(accent))]);
         for none in [
             "file.txt",
             "a/b",
@@ -515,6 +546,11 @@ mod tests {
         assert!(matches!(notes_plan, Some(Open::File(p)) if p.ends_with(r"sub\notes.txt")));
         assert!(matches!(tool_plan, Some(Open::Reveal(p)) if p.ends_with("tool.cmd")));
         assert_eq!((gone, far), (None, None));
+        // A bare drive root counts only when the drive is there.
+        let root = |l: char| format!(r"{l}:\");
+        let missing = ('A'..='Z').rev().map(root).find(|r| !Path::new(r).exists());
+        assert_eq!(resolve(&missing.expect("a free drive letter"), ""), None);
+        assert!(resolve(&root('C'), "").is_some());
     }
 
     #[test]
