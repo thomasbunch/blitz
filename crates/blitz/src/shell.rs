@@ -580,11 +580,18 @@ pub fn label(shell: &str) -> String {
 /// configured. `token` is the pane's `BLITZ_PANE_TOKEN`.
 pub fn launch(shell: &str, integrate: bool, token: &str) -> Launch {
     let (program, args) = match parts(shell) {
-        ("", _) => (detect(), ""),
+        ("", args) => (detect(), args),
         (program, args) => (PathBuf::from(program), args),
     };
+    // `"pwsh"-NoLogo` names the program apart; quoted again, it needs a
+    // space to.
+    let gap = if args.is_empty() || args.starts_with([' ', '\t']) {
+        ""
+    } else {
+        " "
+    };
     let mut out = Launch {
-        cmdline: quote(&program.to_string_lossy()) + args,
+        cmdline: quote(&program.to_string_lossy()) + gap + args,
         env: Vec::new(),
     };
     if integrate {
@@ -757,6 +764,10 @@ mod tests {
             launch(" wsl.exe -d Ubuntu ", true, "t").cmdline,
             "wsl.exe -d Ubuntu"
         );
+        assert_eq!(launch(r#""bash"-i"#, true, "t").cmdline, "bash -i");
+        // The shell blitz finds, with the arguments given.
+        let auto = launch(r#""" -x"#, false, "t").cmdline;
+        assert!(auto.ends_with(" -x") && auto.len() > 3, "{auto}");
     }
 
     #[test]
