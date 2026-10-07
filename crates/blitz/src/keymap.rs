@@ -1406,6 +1406,17 @@ mod msg_to_key_tests {
     }
 
     #[test]
+    fn readme_names_every_action() {
+        let readme = include_str!("../../../README.md");
+        for &(a, name, _) in ACTIONS {
+            // Listed as `go_to_tab_1` to `go_to_tab_8`.
+            let between = matches!(a, Action::GoToTab(1..=6));
+            let named = readme.contains(&format!("`{name}`"));
+            assert!(named || between, "README.md does not name {name}");
+        }
+    }
+
+    #[test]
     fn keymap_auto_repeat() {
         assert!(!held_before(lp(0x16, false, true, 1)), "a first press");
         assert!(held_before(lp(0x16, false, true, 1) | 1 << 30), "a repeat");
