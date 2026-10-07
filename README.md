@@ -355,7 +355,7 @@ that, or typing, goes back to the bottom.
 | Ctrl+Shift+T | New tab |
 | Ctrl+Shift+W | Close pane (the last pane closes its tab) |
 | Ctrl+Tab, Ctrl+Shift+Tab | Next, previous tab |
-| Ctrl+1 to Ctrl+9 | Go to tab |
+| Ctrl+1 to Ctrl+8, Ctrl+9 | Go to that tab, to the last tab |
 | Ctrl+Shift+R | Split right |
 | Ctrl+Shift+D | Split down |
 | Ctrl+Alt+Arrows | Move focus between panes |
@@ -405,7 +405,10 @@ a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
 `space`, `backspace`, or a punctuation key by its character or its name,
 such as `,` or `comma` and `=` or `plus`. The modifiers must match
 exactly. A binding replaces the default on the same chord, and the other
-defaults stay; Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them.
+defaults stay. Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them,
+on layouts where those keys type digits; on others, such as French
+AZERTY, they go to the program unless bound to `go_to_tab_1` to
+`go_to_tab_8` or `last_tab`.
 Lines blitz cannot read are skipped.
 
 The actions are `copy`, `copy_without_indent`, `paste`,
@@ -417,8 +420,9 @@ The actions are `copy`, `copy_without_indent`, `paste`,
 `resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
 `swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
 `font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
-`find`, `previous_prompt`, `next_prompt`, `system_menu` and
-`claude_setup`. Typing a name in the command palette finds its action.
+`find`, `previous_prompt`, `next_prompt`, `system_menu`,
+`claude_setup`, `go_to_tab_1` to `go_to_tab_8` and `last_tab`. Typing a
+name in the command palette finds its action.
 
 ## License
 
