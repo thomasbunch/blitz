@@ -1,5 +1,6 @@
 //! The blitz terminal application.
 
+pub mod arcade;
 pub mod attention;
 pub mod config;
 pub mod hook;
