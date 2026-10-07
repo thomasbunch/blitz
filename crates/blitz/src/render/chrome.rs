@@ -152,30 +152,53 @@ pub const RAIL_W: f32 = 15.0;
 /// Height of the banner strip at 96 DPI.
 pub const BANNER_H: f32 = 22.0;
 
+/// Height of a pane's header strip at 96 DPI.
+const HEADER_H: f32 = 22.0;
+
+/// The part of a `size` window that the active tab's panes share: all of
+/// it but the sidebar or rail, shown once there are two sessions, and the
+/// banner strip.
+pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: bool) -> Rect {
+    let s = |v: f32| (v * scale).round() as i32;
+    let fleet = win.tabs.iter().map(|t| t.panes().len()).sum::<usize>() >= 2;
+    let side = match (fleet, win.sidebar_expanded) {
+        (false, _) => 0,
+        (true, true) => s(SIDEBAR_W),
+        (true, false) => s(RAIL_W),
+    };
+    let bh = if banner { s(BANNER_H) } else { 0 };
+    Rect {
+        x: side,
+        y: 0,
+        w: (size.0 - side).max(0),
+        h: (size.1 - bh).max(0),
+    }
+}
+
+/// What a pane's tile holds besides its terminal grid: the padding left
+/// and right, and the header strip and padding above the grid. A tab of
+/// one pane has no header.
+pub fn pane_frame(scale: f32, expanded: bool, multi: bool) -> (i32, i32) {
+    let s = |v: f32| (v * scale).round() as i32;
+    let header = if multi && expanded { s(HEADER_H) } else { 0 };
+    let (px, py) = if expanded { (14.0, 8.0) } else { (16.0, 12.0) };
+    (2 * s(px), header + s(py))
+}
+
 /// Lays out the chrome for one frame.
 pub fn build(m: &ChromeModel) -> Chrome {
     let c = &m.ui;
     let s = |v: f32| (v * m.scale).round() as i32;
     let (tw, th) = (m.text_cell.0 as i32, m.text_cell.1 as i32);
-    let (w, h) = m.size;
+    let h = m.size.1;
     let mut out = Chrome::default();
     let Some(tab) = m.win.tabs.get(m.win.active) else {
         return out;
     };
     let fleet = m.win.tabs.iter().map(|t| t.panes().len()).sum::<usize>() >= 2;
     let expanded = m.win.sidebar_expanded;
-    let side = match (fleet, expanded) {
-        (false, _) => 0,
-        (true, true) => s(SIDEBAR_W),
-        (true, false) => s(RAIL_W),
-    };
-    let bh = m.banner.map_or(0, |_| s(BANNER_H));
-    let area = Rect {
-        x: side,
-        y: 0,
-        w: (w - side).max(0),
-        h: (h - bh).max(0),
-    };
+    let area = area(m.win, m.size, m.scale, m.banner.is_some());
+    let (side, bh) = (area.x, m.banner.map_or(0, |_| s(BANNER_H)));
     let session = |id: PaneId| m.sessions.iter().find(|x| x.id == id);
     // A tab's sessions, in the order the caller lists them.
     let members = |t: &Tab| -> Vec<&Session> {
@@ -232,9 +255,8 @@ pub fn build(m: &ChromeModel) -> Chrome {
         let sess = session(id);
         let state = sess.map_or(Attn::Idle, |x| x.state);
         let focused = id == tab.focus;
-        let mut content = r;
         if multi && expanded {
-            let hh = s(22.0);
+            let hh = s(HEADER_H);
             if focused {
                 p.push(Prim::Rect(Rect { h: hh, ..r }, c.hdr_bg));
             }
@@ -276,8 +298,6 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 Attn::Idle => {}
             }
-            content.y += hh;
-            content.h -= hh;
         }
         if fleet && !expanded && state == Attn::Working {
             let line = Rect { h: s(2.0), ..r };
@@ -317,13 +337,14 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
             }
         }
-        let (px, py) = if expanded { (14.0, 8.0) } else { (16.0, 12.0) };
-        let (px, py) = (s(px), s(py));
-        content = Rect {
-            x: content.x + px,
-            y: content.y + py,
-            w: (content.w - 2 * px).max(0),
-            h: (content.h - py).max(0),
+        // The grid stays inside its tile, however small the tile is.
+        let (fw, fh) = pane_frame(m.scale, expanded, multi);
+        let (x, y) = ((r.x + fw / 2).min(r.right()), (r.y + fh).min(r.bottom()));
+        let content = Rect {
+            x,
+            y,
+            w: (r.w - fw).clamp(0, r.right() - x),
+            h: (r.h - fh).clamp(0, r.bottom() - y),
         };
         out.panes.push((id, content));
     }
@@ -561,12 +582,15 @@ pub fn build(m: &ChromeModel) -> Chrome {
     }
     if let (Some((col, row, t)), Some(r)) = (m.preedit, pane(tab.focus)) {
         let (x, y) = (r.x + i32::from(col) * cw, r.y + i32::from(row) * ch);
-        let pw = text_w(t, cw).min(r.right() - x).max(0);
+        // Cut at the pane's edge, so a long composition cannot draw over
+        // the next pane or the sidebar.
+        let t = fit(t, r.right() - x, cw);
+        let pw = text_w(&t, cw);
         extra.push(Prim::Rect(Rect { x, y, w: pw, h: ch }, c.term_bg));
         extra.push(Prim::Text {
             x,
             y,
-            text: t.to_string(),
+            text: t,
             color: c.term_fg,
             bold: false,
             term: true,
@@ -1228,10 +1252,11 @@ mod tests {
         let t = texts(&c);
         assert_eq!(t, ["api", "web"], "only the pane labels");
         // The needs-you pane gets a 2 px accent ring.
+        let accent = crate::theme::blitz(false).ui.accent;
         let ring = c
             .prims
             .iter()
-            .filter(|p| matches!(p, Prim::Rect(r, 0xf2b84b) if r.w == 2 || r.h == 2))
+            .filter(|p| matches!(p, Prim::Rect(r, a) if *a == accent && (r.w == 2 || r.h == 2)))
             .count();
         assert_eq!(ring, 4);
         // Three rail marks: needs-you dot, working bar, idle dot.
@@ -1410,5 +1435,169 @@ mod tests {
         let icon = branch_mask(10);
         assert!(icon[5 * 10 + 2] > 128, "the line between the left commits");
         assert_eq!(icon[9 * 10 + 9], 0, "nothing bottom right");
+    }
+
+    #[test]
+    fn layout_holds_at_fractional_scales() {
+        let (win, sessions, now) = fleet(true);
+        for scale in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let mut m = model(&win, &sessions, now);
+            m.scale = scale;
+            m.banner = Some("u");
+            let c = build(&m);
+            let side = (SIDEBAR_W * scale).round() as i32;
+            let strip = c.banner.expect("banner");
+            let a = area(&win, m.size, scale, true);
+            assert_eq!(
+                (a.x, a.right(), a.bottom()),
+                (side, AREA.w, strip.y),
+                "{scale}"
+            );
+            // Each grid is its tile less the frame.
+            let (fw, fh) = pane_frame(scale, true, true);
+            let tiles = win.tabs[0].rects(a);
+            assert_eq!(c.panes.len(), tiles.len());
+            for ((id, p), (tid, t)) in c.panes.iter().zip(&tiles) {
+                assert_eq!(id, tid);
+                assert_eq!(
+                    (p.x, p.y, p.w, p.h),
+                    (t.x + fw / 2, t.y + fh, t.w - fw, t.h - fh)
+                );
+            }
+            assert!(c.rows.iter().all(|(_, r)| r.right() <= side), "{scale}");
+            assert!(c.rows.windows(2).all(|w| w[0].1.bottom() <= w[1].1.y));
+        }
+    }
+
+    #[test]
+    fn tiny_tiles_keep_their_grid_inside() {
+        let (win, sessions, now) = fleet(true);
+        for size in [(260, 30), (241, 1), (250, 0), (0, 0)] {
+            let mut m = model(&win, &sessions, now);
+            m.size = size;
+            let c = build(&m);
+            let tiles = win.tabs[0].rects(area(&win, size, 1.0, false));
+            for ((_, p), (_, t)) in c.panes.iter().zip(&tiles) {
+                assert!(p.w >= 0 && p.h >= 0, "{size:?} {p:?}");
+                assert!(
+                    p.x >= t.x && p.right() <= t.right().max(t.x),
+                    "{size:?} {p:?} {t:?}"
+                );
+                assert!(
+                    p.y >= t.y && p.bottom() <= t.bottom().max(t.y),
+                    "{size:?} {p:?} {t:?}"
+                );
+            }
+        }
+        // Without a header, a tab of one pane loses only the padding.
+        assert_eq!(pane_frame(1.0, true, false), (28, 8));
+        assert_eq!(pane_frame(1.0, true, true), (28, 30));
+        assert_eq!(pane_frame(1.0, false, true), (32, 12));
+        assert_eq!(pane_frame(1.5, true, true), (42, 45));
+    }
+
+    #[test]
+    fn preedit_is_cut_at_the_pane_edge() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let long = "\u{65e5}".repeat(200);
+        m.preedit = Some((0, 0, &long));
+        let c = build(&m);
+        let pane = c.panes.iter().find(|p| p.0 == PaneId(2)).expect("pane").1;
+        let (text, x) = (c.prims.iter())
+            .find_map(|p| match p {
+                Prim::Text {
+                    text,
+                    x,
+                    term: true,
+                    ..
+                } => Some((text.clone(), *x)),
+                _ => None,
+            })
+            .expect("preedit text");
+        assert!(
+            x + text_w(&text, 9) <= pane.right(),
+            "{} cells",
+            text.chars().count()
+        );
+        assert!(text.ends_with('\u{2026}'));
+        // Its background and underline stay inside too.
+        let ui = crate::theme::blitz(false).ui;
+        for p in &c.prims {
+            if let Prim::Rect(r, color) = p
+                && (*color == ui.term_bg || *color == ui.term_fg)
+            {
+                assert!(r.right() <= pane.right(), "{r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn picker_keeps_the_highlight_in_view() {
+        let (win, sessions, now) = fleet(true);
+        let themes: Vec<Theme> = (0..20)
+            .map(|i| crate::theme::parse(&format!("t{i:02}"), ""))
+            .collect();
+        let shown = |sel: usize, size: (i32, i32)| {
+            let mut m = model(&win, &sessions, now);
+            m.size = size;
+            m.picker = Some(Picker {
+                filter: "",
+                items: themes.iter().collect(),
+                sel,
+            });
+            let c = build(&m);
+            let names: Vec<String> = (texts(&c).into_iter())
+                .filter(|t| t.starts_with('t') && t.len() == 3)
+                .map(str::to_string)
+                .collect();
+            names
+        };
+        let top = shown(0, (AREA.w, AREA.h));
+        assert_eq!(top.len(), PICKER_ROWS);
+        assert_eq!(top.first().map(String::as_str), Some("t00"));
+        // The last theme scrolls the window so it is the last row shown.
+        let end = shown(19, (AREA.w, AREA.h));
+        assert_eq!(end.len(), PICKER_ROWS);
+        assert_eq!(end.last().map(String::as_str), Some("t19"));
+        assert_eq!(end.first().map(String::as_str), Some("t08"));
+        // A tiny window still lays out, with no negative sizes.
+        let mut m = model(&win, &sessions, now);
+        m.size = (40, 30);
+        m.picker = Some(Picker {
+            filter: "",
+            items: themes.iter().collect(),
+            sel: 5,
+        });
+        let c = build(&m);
+        assert!(c.prims.iter().all(|p| match p {
+            Prim::Rect(r, _) | Prim::Shape { r, .. } => r.w >= 0 && r.h >= 0,
+            _ => true,
+        }));
+
+        let mut m = model(&win, &sessions, now);
+        m.picker = Some(Picker {
+            filter: "zzz",
+            items: Vec::new(),
+            sel: 0,
+        });
+        let c = build(&m);
+        assert!(texts(&c).contains(&"no theme matches"));
+        assert!(texts(&c).contains(&"zzz"));
+    }
+
+    #[test]
+    fn fit_handles_wide_and_negative_widths() {
+        assert_eq!(fit("ab\u{4e2d}c", 28, 7), "ab\u{2026}");
+        assert_eq!(fit("ab\u{4e2d}c", 35, 7), "ab\u{4e2d}c");
+        assert_eq!(fit("abc", 6, 7), "");
+        assert_eq!(fit("abc", 0, 7), "");
+        assert_eq!(fit("abc", -5, 7), "");
+        assert_eq!(fit("", -5, 7), "");
+        assert_eq!(fit_left("\u{4e2d}\u{6587}x", 21, 7), "\u{2026}x");
+        assert_eq!(fit_left("abc", -1, 7), "");
+        assert_eq!(text_w("a\u{4e2d}", 7), 21);
+        assert_eq!(elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(elapsed(Duration::from_secs(3600)), "1h 0m");
     }
 }
