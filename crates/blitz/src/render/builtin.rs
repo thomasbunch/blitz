@@ -1,5 +1,6 @@
-//! Box drawing, block elements, braille and powerline glyphs, drawn
-//! procedurally so they join up exactly at any cell size.
+//! Box drawing, block elements, braille and powerline glyphs, the DEC
+//! scan lines and `⎿`, drawn procedurally so they join up exactly at any
+//! cell size.
 
 const LIGHT: u8 = 1;
 const HEAVY: u8 = 2;
@@ -7,7 +8,14 @@ const DOUBLE: u8 = 3;
 
 /// Whether `c` is drawn here instead of taken from a font.
 pub fn is_builtin(c: char) -> bool {
-    matches!(c, '\u{2500}'..='\u{259F}' | '\u{2800}'..='\u{28FF}' | '\u{E0B0}'..='\u{E0BF}')
+    matches!(
+        c,
+        '\u{23BA}'..='\u{23BD}'
+            | '\u{23BF}'
+            | '\u{2500}'..='\u{259F}'
+            | '\u{2800}'..='\u{28FF}'
+            | '\u{E0B0}'..='\u{E0BF}'
+    )
 }
 
 /// Coverage mask (`w * h` bytes, row-major) for a builtin glyph one cell
@@ -23,6 +31,7 @@ pub fn draw(c: char, w: usize, h: usize) -> Option<Vec<u8>> {
     };
     let cp = c as u32;
     match cp {
+        0x23BA..=0x23BF => scan_line(&mut cv, cp),
         0x2500..=0x257F => box_drawing(&mut cv, cp),
         0x2580..=0x259F => block(&mut cv, cp),
         0x2800..=0x28FF => braille(&mut cv, cp),
@@ -139,6 +148,22 @@ fn box_drawing(cv: &mut Canvas, cp: u32) {
         _ if dashes > 0 => dashed(cv, ARMS[(cp - 0x2500) as usize], dashes),
         _ => lines(cv, ARMS[(cp - 0x2500) as usize]),
     }
+}
+
+/// The DEC scan lines U+23BA to U+23BD, lines 1, 3, 7 and 9 of nine from
+/// the top, where `─` is line 5; and U+23BF `⎿`, which Claude Code puts
+/// before each tool's result: a `│` that turns right along line 9.
+fn scan_line(cv: &mut Canvas, cp: u32) {
+    let (w, h, t) = (cv.w as i32, cv.h as i32, cv.t());
+    let line = |n: i32| (n - 1) * (h - t) / 8;
+    if cp == 0x23BF {
+        let (x0, x1) = band(LIGHT, w, t);
+        cv.rect(x0, 0, x1, h, 255);
+        cv.rect(x0, line(9), w, h, 255);
+        return;
+    }
+    let y = line([1, 3, 7, 9][(cp - 0x23BA) as usize]);
+    cv.rect(0, y, w, y + t, 255);
 }
 
 /// Start and end of a stroke band of `style` centred in `extent` pixels.
@@ -448,6 +473,18 @@ mod tests {
     }
 
     #[test]
+    fn scan_lines_and_the_tool_result_corner() {
+        // 9×19 cell, 1 px lines: scan line 5 is `─`'s row 9.
+        let row = |c| ascii(c, 9, 19).iter().position(|r| r == "#########");
+        let rows: Vec<_> = ['⎺', '⎻', '─', '⎼', '⎽'].into_iter().map(row).collect();
+        assert_eq!(rows, [Some(0), Some(4), Some(9), Some(13), Some(18)]);
+        // `⎿` joins `│` above it and `⎽` beside it.
+        let g = ascii('⎿', 9, 19);
+        assert!(g[..18].iter().all(|r| r == "....#...."));
+        assert_eq!(g[18], "....#####");
+    }
+
+    #[test]
     fn blocks_and_quadrants() {
         assert!(ascii('█', 8, 16).iter().all(|r| r == "########"));
         let half = ascii('▐', 8, 16);
@@ -498,7 +535,9 @@ mod tests {
 
     #[test]
     fn every_builtin_draws_at_tiny_and_odd_sizes() {
-        let all = ('\u{2500}'..='\u{259F}')
+        let all = ('\u{23BA}'..='\u{23BD}')
+            .chain(['\u{23BF}'])
+            .chain('\u{2500}'..='\u{259F}')
             .chain('\u{2800}'..='\u{28FF}')
             .chain('\u{E0B0}'..='\u{E0BF}');
         for c in all {
@@ -530,6 +569,8 @@ mod tests {
         assert!(!is_builtin('\u{24FF}') && !is_builtin('\u{25A0}'));
         assert!(!is_builtin('\u{27FF}') && !is_builtin('\u{2900}'));
         assert!(!is_builtin('\u{E0AF}') && !is_builtin('\u{E0C0}'));
+        assert!(!is_builtin('\u{23B9}') && !is_builtin('\u{23BE}'));
+        assert!(!is_builtin('\u{23C0}'));
     }
 
     #[test]
