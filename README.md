@@ -196,6 +196,27 @@ Esc closes the pane.
 
 Saved state lives in `%LOCALAPPDATA%\blitz`.
 
+## Shells
+
+Besides the shell in the settings, the command palette opens a tab on
+any shell installed: PowerShell, cmd, Git Bash or a WSL distribution.
+The pane keeps its shell when blitz reopens it. New panes get the PATH
+Windows has now, so a program installed while blitz runs is found
+without restarting blitz.
+
+With shell integration on, PowerShell and cmd mark each prompt and tell
+blitz their folder, around the prompt you have, also one that
+oh-my-posh or posh-git sets later. For bash in Git Bash or WSL,
+
+```
+blitz setup shell bash
+```
+
+prints lines to add to `~/.bashrc` (`zsh` prints them for `~/.zshrc`).
+They do nothing outside blitz. blitz follows only Windows folders, so in
+WSL only folders under `/mnt` are reported, and the lines need
+`BLITZ_PANE_TOKEN`, which reaches WSL only when `WSLENV` lists it.
+
 ## Settings
 
 Ctrl+, opens the settings panel. Up and down choose a setting, left and
@@ -206,9 +227,12 @@ size and the theme change at once; the panel says when the others take
 effect. A dot marks each setting changed from its default.
 
 The panel saves to `%APPDATA%\blitz\config.toml`, which you can also edit
-yourself: one `key = value` per line, `#` starts a comment. blitz reads
-the file again whenever it is saved, and keeps your comments when it
-writes it.
+yourself: one `key = value` per line, `#` starts a comment. **Open
+config.toml** in the command palette opens it, in Notepad when no program
+opens `.toml` files. blitz reads the file again whenever it is saved, and
+keeps your comments when it writes it. A line it cannot use is skipped,
+and a dim notice in the pane says which. A theme or font that is not
+there shows in the panel with what blitz uses instead.
 
 | Key | Default | |
 |---|---|---|
@@ -216,7 +240,7 @@ writes it.
 | `font_family` | `"Cascadia Mono"` | Falls back to Cascadia Mono, then Consolas, when not installed. Icons the font lacks come from an installed Nerd Font |
 | `font_size` | `11` | In points, 4 to 72 |
 | `line_height` | `1` | Space between the lines in the panes, 0.8 to 2 times the font's own |
-| `shell` | `""` | Path of the program new panes run; empty picks PowerShell 7, then Windows PowerShell, then cmd |
+| `shell` | `""` | The program new panes run, with any arguments, such as `wsl.exe -d Ubuntu`; empty picks PowerShell 7, then Windows PowerShell, then cmd |
 | `shell_integration` | `true` | Let PowerShell and cmd report their folder and prompts to blitz |
 | `scrollback_lines` | `10000` | Lines of history each new pane keeps, up to 100000 |
 | `restore_session` | `true` | Reopen the last window's tabs, splits and folders |
@@ -234,6 +258,7 @@ writes it.
 | `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
 | `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
 | `keybind` | | Binds a key to an action; one line per key. See [Key bindings](#key-bindings) |
+| `env` | | Sets a variable in new panes, as in `env = RUST_LOG=debug`; one line per variable |
 
 blitz run, the last row of the panel, is a game rather than a setting:
 Enter starts it, and it keeps its best score in
@@ -252,8 +277,9 @@ Built in: **blitz** dark and light (the default), **blitz ember** and
 GitHub Dark and Light, Gruvbox Dark and Light, Rose Pine and Rose Pine
 Dawn, Solarized Dark and Light, and Tokyo Night and Tokyo Night Day.
 
-To make your own, put a file in `%APPDATA%\blitz\themes`; its file name,
-without a `.conf` ending, is the theme's name. The format is Ghostty's,
+To make your own, put a file in `%APPDATA%\blitz\themes`, which **Open
+themes folder** in the command palette opens; its file name, without a
+`.conf` ending, is the theme's name. The format is Ghostty's,
 so the files from
 [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/ghostty)
 work as they are. Edits show up while blitz runs.
@@ -427,22 +453,23 @@ A zoomed pane stays zoomed until you zoom again, move focus to another
 pane, split or resize. With `global_jump` on, Ctrl+Alt+J jumps from any
 program: it brings blitz to the front on the session that needs you.
 
-The command palette lists every action with its keys. Typing narrows
-the list, the arrow keys choose, and Enter or a click runs the action;
-Esc closes it. When no action matches, Enter looks for what you typed in
-the settings instead. Starting a new Claude Code session in a split,
-giving the panes equal space, closing a whole tab, reopening the last
-closed pane, moving a pane to a new tab, renaming a session or a tab,
-copying without indent, selecting all, selecting the last command's
-output, clearing the scrollback, resetting the terminal and Claude Code
-setup have no keys by default, so they are only in the palette; renaming
-takes the name on the palette's line. Double-clicking the line between
-panes also gives them equal space. Clearing the scrollback also clears
-the screen above the line the cursor is on, which moves to the top, so
-nothing cleared comes back when the pane is resized. Resetting the
-terminal turns off what a program that crashed can leave on, such as
-mouse reports, a hidden cursor or keys sent as escape codes; the text
-stays.
+The command palette lists every action with its keys, and a **New tab**
+for each shell installed. Typing narrows the list, the arrow keys
+choose, and Enter or a click runs the action; Esc closes it. When no
+action matches, Enter looks for what you typed in the settings instead.
+Starting a new Claude Code session in a split, giving the panes equal
+space, closing a whole tab, reopening the last closed pane, moving a
+pane to a new tab, renaming a session or a tab, copying without indent,
+selecting all, selecting the last command's output, clearing the
+scrollback, resetting the terminal, opening config.toml or the themes
+folder and Claude Code setup have no keys by default, so they are only
+in the palette; renaming takes the name on the palette's line.
+Double-clicking the line between panes also gives them equal space.
+Clearing the scrollback also clears the screen above the line the cursor
+is on, which moves to the top, so nothing cleared comes back when the
+pane is resized. Resetting the terminal turns off what a program that
+crashed can leave on, such as mouse reports, a hidden cursor or keys
+sent as escape codes; the text stays.
 **Report an issue**, also only in the palette, starts a GitHub issue
 that says which blitz, Windows, renderer and ConPTY you run, but no file
 or folder names.
@@ -480,14 +507,14 @@ The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
 `move_tab_left`, `move_tab_right`, `move_pane_to_new_tab`,
 `split_right`, `split_down`, `new_claude`, `focus_left`, `focus_right`,
 `focus_up`, `focus_down`, `jump_to_attention`, `go_to_session`,
-`toggle_sidebar`, `update`, `theme_picker`, `settings`, `zoom`,
-`resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
-`swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
-`font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
-`find`, `quick_select`, `previous_prompt`, `next_prompt`,
-`system_menu`, `claude_setup`, `report_issue`, `go_to_tab_1` to
-`go_to_tab_8` and `last_tab`. Typing a name in the command palette finds
-its action.
+`toggle_sidebar`, `update`, `theme_picker`, `settings`, `open_config`,
+`open_themes`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
+`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
+`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
+`fullscreen`, `command_palette`, `find`, `quick_select`,
+`previous_prompt`, `next_prompt`, `system_menu`, `claude_setup`,
+`report_issue`, `go_to_tab_1` to `go_to_tab_8` and `last_tab`. Typing a
+name in the command palette finds its action.
 
 A binding can also type text into the focused pane: `text:` and the
 text, with `\e` for Esc, `\r` for Enter, `\n`, `\t`, `\s` for a space,
