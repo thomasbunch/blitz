@@ -202,8 +202,9 @@ writes it.
 | Key | Default | |
 |---|---|---|
 | `theme` | `"light:blitz light,dark:blitz dark"` | A theme name, or a light and a dark one to follow the Windows app mode. See [Themes](#themes) |
-| `font_family` | `"Cascadia Mono"` | Falls back to Cascadia Mono, then Consolas, when not installed |
+| `font_family` | `"Cascadia Mono"` | Falls back to Cascadia Mono, then Consolas, when not installed. Icons the font lacks come from an installed Nerd Font |
 | `font_size` | `11` | In points, 4 to 72 |
+| `line_height` | `1` | Space between the lines in the panes, 0.8 to 2 times the font's own |
 | `shell` | `""` | Path of the program new panes run; empty picks PowerShell 7, then Windows PowerShell, then cmd |
 | `shell_integration` | `true` | Let PowerShell and cmd report their folder and prompts to blitz |
 | `scrollback_lines` | `10000` | Lines of history each new pane keeps, up to 100000 |
@@ -252,11 +253,13 @@ palette = 1=#e06c75
 accent = #f2b84b
 ```
 
-`palette` sets colours 0 to 15. Colours a file leaves out come from the
-blitz theme of the same lightness. The sidebar and pane headers are mixed
-from the background and foreground; to choose them yourself, add any of
-`accent` (marks sessions that need you; its dots are made darker or
-lighter until they stand out), `sidebar-background`, `border`,
+`palette` sets colours 0 to 15, and `selection-foreground` and
+`cursor-text` the colour of selected text and of text on the cursor.
+Colours a file leaves out come from the blitz theme of the same
+lightness. The sidebar and pane headers are mixed from the background
+and foreground; to choose them yourself, add any of `accent` (marks
+sessions that need you; its dots are made darker or lighter until they
+stand out), `sidebar-background`, `border`,
 `rule`, `row-focus`, `title`, `dim`, `message`, `track`, `progress`,
 `error`, `header-background`, `header-line`, `header-title`,
 `header-cwd`, `rail-focus`, `rail-work`, `idle`, `label`, `label-focus`
