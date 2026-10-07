@@ -38,68 +38,14 @@ pub enum Open {
     Reveal(PathBuf),
 }
 
-/// File types that run when opened, besides those in `%PATHEXT%`.
-const RUNS: &[&str] = &[
-    "exe",
-    "com",
-    "bat",
-    "cmd",
-    "pif",
-    "lnk",
-    "url",
-    "scf",
-    "hta",
-    "msi",
-    "msc",
-    "ps1",
-    "vbs",
-    "vbe",
-    "js",
-    "jse",
-    "wsf",
-    "wsh",
-    "reg",
-    "scr",
-    "cpl",
-    "jar",
-    "appref-ms",
-    "application",
-    "settingcontent-ms",
-    // Run by an interpreter when one is installed.
-    "py",
-    "pyw",
-    "pyz",
-    "pyzw",
-    "pyc",
-    "rb",
-    "rbw",
-    "pl",
-    "tcl",
-    "ahk",
-    "au3",
-    // Run code or change settings when opened, without being programs.
-    "ws",
-    "wsc",
-    "sct",
-    "chm",
-    "diagcab",
-    "theme",
-    "themepack",
-    "desktopthemepackfile",
-    "library-ms",
-    "searchconnector-ms",
-    "website",
-    "xbap",
-    "gadget",
-    "msp",
-    "mst",
-    "msix",
-    "msixbundle",
-    "appx",
-    "appxbundle",
-    "appinstaller",
-    "xll",
-    "iqy",
+/// File types that open with their program: text, source code, images
+/// and PDFs, which a program shows rather than runs. Any other type is
+/// shown in Explorer: Windows and the programs on it keep adding types
+/// that run or install when opened, so no list of those is ever complete.
+const OPENS: &[&str] = &[
+    "txt", "md", "markdown", "log", "json", "jsonc", "jsonl", "toml", "yaml", "yml", "ini", "sql",
+    "rs", "c", "h", "cc", "cpp", "cxx", "hpp", "cs", "go", "java", "kt", "swift", "ts", "tsx",
+    "css", "scss", "html", "htm", "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "svg", "pdf",
 ];
 
 /// Every URL and path-like word in `text`, the logical line under the
@@ -257,7 +203,8 @@ pub fn plan_uri(uri: &str, pathext: &str) -> Option<Open> {
 }
 
 /// What opening the file or folder `path` does. It must be a plain drive
-/// path. Never runs it: a type in `pathext` or [`RUNS`] is shown in
+/// path. Never runs it: only a folder, a file with no type and the types
+/// in [`OPENS`] open; anything else, or a type `pathext` runs, is shown in
 /// Explorer instead.
 pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
     let s = path.to_str()?;
@@ -270,9 +217,8 @@ pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
         .unwrap_or_default()
         .trim_end_matches(['.', ' ']);
     let runs = name.rsplit_once('.').is_some_and(|(_, ext)| {
-        let mut types =
-            (RUNS.iter().copied()).chain(pathext.split(';').map(|t| t.trim_start_matches('.')));
-        types.any(|t| !t.is_empty() && t.eq_ignore_ascii_case(ext))
+        let is = |t: &str| !t.is_empty() && t.eq_ignore_ascii_case(ext);
+        !OPENS.iter().any(|t| is(t)) || pathext.split(';').any(|t| is(t.trim_start_matches('.')))
     });
     Some(if runs {
         Open::Reveal(path.into())
@@ -500,10 +446,32 @@ mod tests {
             "chm",
             "diagcab",
             "themepack",
+            // Types a list of what runs did not have, until each was found.
+            "deskthemepack",
+            "wsb",
+            "rdp",
+            "msu",
+            "psc1",
+            "jnlp",
+            "diagcfg",
+            "search-ms",
+            "vhdx",
+            "iso",
+            "docm",
+            "xlsm",
+            "one",
+            "accde",
+            "made-up",
         ] {
             let p = format!(r"C:\x\a.{t}");
             assert_eq!(plan_path(Path::new(&p), ""), reveal(&p), "{t}");
         }
+        for t in ["a.txt", "a.MD", "a.rs", "a.png", "a.pdf", "README", "dir"] {
+            let p = format!(r"C:\x\{t}");
+            assert_eq!(plan_path(Path::new(&p), ""), file(&p), "{t}");
+        }
+        let toml = r"C:\x\a.toml";
+        assert_eq!(plan_path(Path::new(toml), ".TOML"), reveal(toml), "PATHEXT");
         assert_eq!(plan_path(Path::new(r"\\?\C:\x.txt"), pathext), None);
         assert_eq!(plan_path(Path::new("x.txt"), pathext), None);
     }
