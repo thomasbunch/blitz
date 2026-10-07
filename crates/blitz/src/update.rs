@@ -352,13 +352,13 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let ua = concat!("blitz/", env!("CARGO_PKG_VERSION"));
     // curl does not read Windows' proxy setting itself.
-    let proxy = system_proxy().map(|p| vec!["--proxy".to_string(), p]);
+    let proxy = system_proxy();
     // A slow line still finishes the download; one that stalls gives up.
     let out = Command::new("curl.exe")
         .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https"])
         .args(["--connect-timeout", "20", "--speed-limit", "1000"])
         .args(["--speed-time", "30", "-A", ua])
-        .args(proxy.unwrap_or_default())
+        .args(proxy.as_deref().map(proxy_args).into_iter().flatten())
         .args(args)
         .stdin(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
@@ -368,6 +368,13 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
         return Err(curl_error(&out.stderr, out.status.code()));
     }
     Ok(out.stdout)
+}
+
+/// curl's options to go through `proxy`. One that asks who is there, as a
+/// work network's often does, is answered as the Windows user, the way
+/// browsers do, and with no password asked for.
+fn proxy_args(proxy: &str) -> [&str; 5] {
+    ["--proxy", proxy, "--proxy-anyauth", "--proxy-user", ":"]
 }
 
 /// The proxy for HTTPS that Windows' proxy settings name, if any.
@@ -751,6 +758,45 @@ mod tests {
         }
         // Reads, and frees, this machine's own setting.
         let _ = system_proxy();
+    }
+
+    /// curl tells a proxy that asks who is there the Windows user, signed
+    /// in by Windows itself.
+    #[test]
+    fn a_proxy_that_asks_is_told_the_windows_user() {
+        use std::io::{Read, Write};
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let at = proxy.local_addr().expect("its address").to_string();
+        let asked = std::thread::spawn(move || {
+            let (mut c, _) = proxy.accept()?;
+            c.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+            let (mut seen, mut buf) = (String::new(), [0; 4096]);
+            // The first try, and the one that answers the 407.
+            for _ in 0..2 {
+                let n = c.read(&mut buf)?;
+                seen += &String::from_utf8_lossy(&buf[..n]);
+                c.write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                      Proxy-Authenticate: Negotiate\r\nContent-Length: 0\r\n\r\n",
+                )?;
+            }
+            std::io::Result::Ok(seen)
+        });
+        let _ = Command::new("curl.exe")
+            .args(["-sS", "--max-time", "10"])
+            .args(proxy_args(&at))
+            .arg("https://example.invalid/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        // Wakes the proxy if curl never came.
+        let _ = std::net::TcpStream::connect(&at);
+        let seen = asked.join().expect("the proxy").expect("a request");
+        assert!(seen.contains("CONNECT example.invalid:443"), "{seen}");
+        let auth = "\r\nProxy-Authorization: Negotiate ";
+        assert!(seen.contains(auth), "{seen}");
     }
 
     #[test]
