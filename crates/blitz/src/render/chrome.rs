@@ -2155,8 +2155,10 @@ mod tests {
         assert!(!texts(&c).contains(&"1"), "{:?}", texts(&c));
         win.sidebar_expanded = false;
         let c = build(&model(&win, &sessions, now));
-        let lines =
-            (c.prims.iter()).filter(|p| matches!(p, Prim::Rect(r, _) if r.x == 0 && r.w == 2));
+        // The focused row's bar is there, but no group line.
+        let idle = crate::theme::blitz(false).ui.idle;
+        let lines = (c.prims.iter())
+            .filter(|p| matches!(p, Prim::Rect(r, k) if r.x == 0 && r.w == 2 && *k == idle));
         assert_eq!(lines.count(), 0);
     }
 
@@ -2313,7 +2315,7 @@ mod tests {
         assert_eq!(dots, 2);
         // The active tab's two rows have a line down the left edge, over
         // the focused row's tint.
-        let ui = crate::theme::blitz(false).ui;
+        let ui = &m.ui;
         let (first, last) = (c.side.rows[0].1, c.side.rows[1].1);
         let line = Prim::Rect(
             Rect {
