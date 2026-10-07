@@ -699,7 +699,12 @@ impl App {
         if let Some(s) = &saved {
             match self.restore(s) {
                 Ok(()) => win = self.win.clone(),
-                Err(e) => eprintln!("blitz: restoring the last session: {e}"),
+                Err(e) => {
+                    eprintln!("blitz: restoring the last session: {e}");
+                    // Keep it for the next start rather than saving this
+                    // run's fresh tab over it.
+                    self.persist = false;
+                }
             }
         }
         // A folder from Explorer gets a tab of its own after the restored ones.
@@ -780,7 +785,9 @@ impl App {
     }
 
     /// Starts every pane of a saved session, each in its folder, and shows
-    /// its layout. Starts none if one fails.
+    /// its layout. A pane whose folder a process cannot start in (too long
+    /// a path for one, say) starts where blitz runs instead. Starts none if
+    /// one still fails.
     fn restore(&mut self, s: &session::State) -> Result<(), String> {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
@@ -790,7 +797,9 @@ impl App {
                 .then(|| keys.iter().find(|k| k.0 == id))
                 .flatten()
                 .and_then(|&(_, tab, leaf)| session::load_output(tab, leaf));
-            if let Err(e) = self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()) {
+            let started = (self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()))
+                .or_else(|_| self.spawn(id, &grids, None, None, old.as_deref()));
+            if let Err(e) = started {
                 self.views.clear();
                 return Err(e);
             }
