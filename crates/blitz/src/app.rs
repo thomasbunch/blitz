@@ -2317,7 +2317,7 @@ impl App {
     /// highlights it, and one outside the panel closes it.
     fn settings_click(&mut self) {
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let Some(h) = &self.settings_hits else {
             return;
         };
@@ -2489,7 +2489,7 @@ impl App {
     /// runs it, and one outside the palette closes it.
     fn commands_click(&mut self, el: &ActiveEventLoop) {
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let Some((panel, rows)) = &self.commands_hits else {
             return;
         };
@@ -4046,7 +4046,7 @@ impl App {
     /// or a row of the sidebar. The second value is true for the sidebar.
     fn hit(&self, pos: PhysicalPosition<f64>) -> (Option<PaneId>, bool) {
         let (x, y) = (pos.x as i32, pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let area = self.tab_area();
         let (rects, side) = match self.win.tabs.get(self.win.active) {
             Some(_) if x < area.x => (self.side.rows.clone(), true),
@@ -4226,14 +4226,12 @@ impl App {
             return;
         }
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let on_banner = (self.banner)
-            .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        let on_banner = (self.banner).is_some_and(|r| r.contains(x, y));
         if pressed && b == 0 && on_banner {
             self.act(el, Action::Update);
             return;
         }
-        let chip = (self.below.iter())
-            .find(|(_, r)| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        let chip = (self.below.iter()).find(|(_, r)| r.contains(x, y));
         if pressed
             && b == 0
             && let Some(&(id, _)) = chip
@@ -4245,8 +4243,7 @@ impl App {
             return;
         }
         // A click on the find bar keeps it, where one below it closes it.
-        let on_find = (self.find_bar)
-            .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        let on_find = (self.find_bar).is_some_and(|r| r.contains(x, y));
         if pressed && on_find && self.find.is_some() {
             return;
         }
@@ -4299,7 +4296,7 @@ impl App {
             }
             let on_grid = (self.current())
                 .and_then(|v| v.rect)
-                .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+                .is_some_and(|r| r.contains(x, y));
             if !on_grid {
                 return;
             }
@@ -4533,7 +4530,7 @@ impl App {
     fn update_pointer(&mut self) {
         let pos = self.mouse.pos;
         let (x, y) = (pos.x as i32, pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let panel = self.commands.is_some()
             || self.settings.is_some()
             || self.picker.is_some()

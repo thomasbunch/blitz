@@ -258,7 +258,7 @@ pub enum Side {
 impl SideHits {
     /// What is at (`x`, `y`).
     pub fn at(&self, x: i32, y: i32) -> Option<Side> {
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         if let Some(&(id, _)) = self.rows.iter().find(|r| inside(&r.1)) {
             return Some(Side::Session(id));
         }

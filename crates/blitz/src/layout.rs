@@ -63,6 +63,12 @@ impl Rect {
         self.y + self.h
     }
 
+    /// Whether the point (`x`, `y`) is inside: the right and bottom edges
+    /// are the next rect's.
+    pub fn contains(self, x: i32, y: i32) -> bool {
+        (self.x..self.right()).contains(&x) && (self.y..self.bottom()).contains(&y)
+    }
+
     /// Splits off a divider along `axis`. `a` gets `ratio` of what is left
     /// after the divider, rounded, and `b` gets the rest.
     /// Returns `(a, divider, b)`.
@@ -682,6 +688,13 @@ mod tests {
 
     fn ids(v: &[u32]) -> Vec<PaneId> {
         v.iter().map(|&n| PaneId(n)).collect()
+    }
+
+    #[test]
+    fn rects_hold_points_up_to_their_right_and_bottom_edges() {
+        let a = r(10, 20, 5, 4);
+        assert!(a.contains(10, 20) && a.contains(14, 23));
+        assert!(!a.contains(15, 20) && !a.contains(10, 24) && !a.contains(9, 21));
     }
 
     #[test]
