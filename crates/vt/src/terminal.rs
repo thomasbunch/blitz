@@ -517,8 +517,8 @@ impl Terminal {
 
     /// Changes whenever line numbers start over and name other text: the
     /// width changed and the lines were wrapped again, the other screen is
-    /// shown, the whole screen scrolled under scrollback that stayed put,
-    /// or the terminal was reset.
+    /// shown, the whole screen scrolled up under scrollback that stayed put
+    /// or scrolled down, or the terminal was reset.
     pub fn line_epoch(&self) -> u32 {
         self.line_epoch
     }
