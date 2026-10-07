@@ -213,10 +213,16 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
                 Some(Json::Arr(tasks)) => &tasks[..],
                 _ => &[],
             };
-            // Agents report back and wake Claude up; a shell or a server
-            // started in the background may run for hours.
+            // Agents, here or in the cloud, report back and wake Claude
+            // up; a shell, a server or a monitor started in the background
+            // may run for hours.
             let agents = (tasks.iter())
-                .filter(|t| matches!(field(t, "type"), "subagent" | "workflow" | "teammate"))
+                .filter(|t| {
+                    matches!(
+                        field(t, "type"),
+                        "subagent" | "workflow" | "teammate" | "cloud session"
+                    )
+                })
                 .count();
             if agents > 0 {
                 let s = if agents == 1 { "" } else { "s" };
@@ -1018,6 +1024,10 @@ mod tests {
             (
                 r#"{"hook_event_name":"Stop","background_tasks":[{"type":"workflow"},{"type":"shell"},{"type":"teammate"}]}"#,
                 Some(("working", "waiting on 2 agents")),
+            ),
+            (
+                r#"{"hook_event_name":"Stop","background_tasks":[{"type":"cloud session"},{"type":"monitor"},{"type":"MCP task"}]}"#,
+                Some(("working", "waiting on 1 agent")),
             ),
             (
                 r#"{"hook_event_name":"Stop","background_tasks":[{"type":"shell","command":"npm run dev"}],"last_assistant_message":"Server is up."}"#,
