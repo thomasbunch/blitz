@@ -269,12 +269,18 @@ pub fn quote(arg: &str) -> String {
 /// It goes on the command line as it is, so `Get-Process` or Task Manager
 /// shows what blitz runs. It holds no double quote, which Windows
 /// PowerShell and PowerShell 7 read differently in an argument.
+///
+/// A prompt defined later, as oh-my-posh or posh-git may, is wrapped again
+/// when the next command is read. Each wrapper keeps the prompt it wraps,
+/// and one called from inside another, as by a prompt that calls the one
+/// it replaced, adds no marks of its own.
 pub const POWERSHELL_INTEGRATION: &str = r"if (-not (Test-Path variable:global:__blitz)) {
-  $global:__blitz = @{ Orig = $function:prompt; Exec = $false; Token = $env:BLITZ_PANE_TOKEN }
-  function global:prompt {
+  $global:__blitz = @{ Exec = $false; In = $false; Token = $env:BLITZ_PANE_TOKEN }
+  $global:__blitz.Wrap = { param($orig) {
     $ok = $global:?; Set-StrictMode -Off; $c = $global:LASTEXITCODE
     $new = $global:Error.Count -and -not [object]::ReferenceEquals($global:Error[0], $global:__blitz.Err)
     $code = if ($ok) { 0 } elseif ($c -and ($c -ne $global:__blitz.Last -or -not $new)) { $c } else { 1 }
+    if ($global:__blitz.In) { return & $orig }
     $e = [string][char]27; $b = [char]7; $s = '$e[?1049h$e[?1049l$e[!p$e[?5W'.Replace('$e', $e)
     if ($global:__blitz.Exec) { $s += $e + ']133;D;' + $code + $b; $global:__blitz.Exec = $false }
     $s += $e + ']133;A;blitz=' + $global:__blitz.Token + $b
@@ -282,14 +288,19 @@ pub const POWERSHELL_INTEGRATION: &str = r"if (-not (Test-Path variable:global:_
       $p = $PWD.ProviderPath -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
       try { $s += $e + ']7;' + [Uri]::new($p).AbsoluteUri + $b } catch {}
     }
+    $global:__blitz.In = $true
     if (-not $ok) { Write-Error 'x' -ErrorAction Ignore }
-    $s + (& $global:__blitz.Orig) + $e + ']133;B' + $b
-  }
+    try { $s + (& $orig) + $e + ']133;B' + $b } finally { $global:__blitz.In = $false }
+  }.GetNewClosure() }
+  $function:global:prompt = & $global:__blitz.Wrap $function:prompt
   if (Get-Module PSReadLine) {
     $global:__blitz.RL = $function:PSConsoleHostReadLine
     function global:PSConsoleHostReadLine {
       $l = & $global:__blitz.RL; Set-StrictMode -Off; $global:__blitz.Exec = $true
       $global:__blitz.Last = $global:LASTEXITCODE; $global:__blitz.Err = if ($global:Error.Count) { $global:Error[0] }
+      if ($function:prompt -and [string]$function:prompt -notlike '*__blitz*') {
+        $function:global:prompt = & $global:__blitz.Wrap $function:prompt
+      }
       [Console]::Write([string][char]27 + ']133;C' + [char]7); $l
     }
   }

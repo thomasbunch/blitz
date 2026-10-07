@@ -457,6 +457,40 @@ fn pty_powershell_reports_how_commands_end() {
     }
 }
 
+/// A prompt defined after blitz's, as oh-my-posh or posh-git can, is
+/// marked again from the next command on: once, though it calls the one
+/// it replaced as conda's does, and still told when a command failed.
+#[test]
+fn pty_powershell_marks_a_prompt_defined_later() {
+    let mark = format!("\x1b]133;A;blitz={TOKEN}");
+    for program in shells().iter().filter(|p| !p.ends_with("cmd.exe")) {
+        let l = launch(program);
+        let (pty, _, rx) = spawn(&l.cmdline, &l.env);
+        let mut out = Vec::new();
+        // Each step looks only at the output that came after it.
+        let mut step = |typed: &str, shown: &str| {
+            pty.writer().send(typed.as_bytes());
+            let mut new = Vec::new();
+            let seen = wait_for(&rx, &mut new, shown.as_bytes());
+            out.extend(new);
+            seen
+        };
+        let ok = step("", &mark)
+            && step(
+                "function global:prompt { if ($global:?) { 'ok> ' } else { 'no> ' } }\r",
+                "ok> ",
+            )
+            && step("\r", "ok> \x1b]133;B\x07")
+            && step("Get-Item nope-4b1d\r", "no> \x1b]133;B\x07")
+            && step(
+                "$old = $function:prompt; function global:prompt { 'W' + (& $old) }\r",
+                "ok> \x1b]133;B\x07",
+            )
+            && step("\r", "Wok> \x1b]133;B\x07");
+        assert!(ok, "{program}: {:?}", String::from_utf8_lossy(&out));
+    }
+}
+
 /// A shell started in a `\\?\` folder still marks its prompt and reports
 /// the folder.
 #[test]
