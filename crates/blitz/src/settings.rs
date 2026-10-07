@@ -105,12 +105,7 @@ impl Panel {
             let shown = match s.key {
                 "font_size" => format!("{} pt", c.font_size),
                 "scrollback_lines" => format!("{} lines", thousands(c.scrollback_lines)),
-                "shell" => c
-                    .shell
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .unwrap_or_default()
-                    .into(),
+                "shell" => crate::shell::label(&c.shell),
                 _ => c.get(s.key).trim_matches(['"', '\'']).into(),
             };
             out.push((shown, now));
@@ -309,9 +304,13 @@ mod tests {
         assert!(c.set("shell", &next));
         assert_eq!(c.shell, r"C:\Windows\System32\cmd.exe");
         assert_eq!(p.shown(shell, &c), "Command Prompt");
-        // A shell set by hand shows its file name.
+        // A shell set by hand shows its file name and arguments.
         c.shell = r"D:\tools\nu.exe".into();
         assert_eq!(p.shown(shell, &c), "nu.exe");
+        c.shell = r#""C:\Program Files\Git\bin\bash.exe" --login -i"#.into();
+        assert_eq!(p.shown(shell, &c), "bash.exe --login -i");
+        c.shell = r"C:\Windows\System32\wsl.exe -d Ubuntu".into();
+        assert_eq!(p.shown(shell, &c), "wsl.exe -d Ubuntu");
         // Font names match whatever their case in config.toml.
         c.font_family = "consolas".into();
         assert_eq!(p.shown(setting("font_family"), &c), "Consolas");

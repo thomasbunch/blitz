@@ -245,21 +245,34 @@ pub struct Launch {
     pub env: Vec<(String, String)>,
 }
 
-/// Builds the command line for `shell`, the `shell` setting: a program and
-/// its arguments, or empty for [`detect`]. A path to a program that holds
-/// spaces needs no quotes, as the setting once took only a path. Shell
-/// integration is added only when `integrate` is set; otherwise the command
-/// runs exactly as configured. `token` is the pane's `BLITZ_PANE_TOKEN`.
-pub fn launch(shell: &str, integrate: bool, token: &str) -> Launch {
+/// The program and arguments of a `shell` setting. A path to a program
+/// that holds spaces needs no quotes, as the setting once took only a path.
+fn parts(shell: &str) -> (&str, &str) {
     let shell = shell.trim();
     let whole = Path::new(shell);
-    let (program, args) = if shell.is_empty() {
-        (detect(), "")
-    } else if whole.is_absolute() && whole.is_file() {
-        (whole.to_path_buf(), "")
+    if whole.is_absolute() && whole.is_file() {
+        (shell, "")
     } else {
-        let (program, args) = split_program(shell);
-        (PathBuf::from(program), args)
+        split_program(shell)
+    }
+}
+
+/// A `shell` setting as the settings panel shows one it does not list:
+/// the program's file name, then the arguments as typed.
+pub fn label(shell: &str) -> String {
+    let (program, args) = parts(shell);
+    let name = program.rsplit(['\\', '/']).next().unwrap_or_default();
+    format!("{name}{args}")
+}
+
+/// Builds the command line for `shell`, the `shell` setting: a program and
+/// its arguments, or empty for [`detect`]. Shell integration is added only
+/// when `integrate` is set; otherwise the command runs exactly as
+/// configured. `token` is the pane's `BLITZ_PANE_TOKEN`.
+pub fn launch(shell: &str, integrate: bool, token: &str) -> Launch {
+    let (program, args) = match parts(shell) {
+        ("", _) => (detect(), ""),
+        (program, args) => (PathBuf::from(program), args),
     };
     let mut out = Launch {
         cmdline: quote(&program.to_string_lossy()) + args,
