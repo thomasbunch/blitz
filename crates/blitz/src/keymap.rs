@@ -16,6 +16,8 @@ pub enum Action {
     ScrollPage(i8),
     NewTab,
     ClosePane,
+    /// Close every pane of the active tab.
+    CloseTab,
     /// Next (1) or previous (-1) tab.
     CycleTab(i8),
     /// Tab 1 to 9, 0-based.
@@ -73,6 +75,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::ScrollPage(-1), "scroll_page_down", "Scroll down a page"),
     (Action::NewTab, "new_tab", "New tab"),
     (Action::ClosePane, "close_pane", "Close pane"),
+    (Action::CloseTab, "close_tab", "Close tab"),
     (Action::RenameSession, "rename_session", "Rename session"),
     (Action::RenameTab, "rename_tab", "Rename tab"),
     (Action::CycleTab(1), "next_tab", "Next tab"),
@@ -984,6 +987,10 @@ mod msg_to_key_tests {
         assert_eq!(
             binding("ctrl+shift+w=none"),
             Some((CTRL | SHIFT, 0x57, None))
+        );
+        assert_eq!(
+            binding("ctrl+shift+q=close_tab"),
+            Some((CTRL | SHIFT, 0x51, Some(Action::CloseTab)))
         );
         // Punctuation by character or by name.
         let plus = Some((CTRL, 0xbb, Some(Action::Copy)));

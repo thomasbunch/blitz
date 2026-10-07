@@ -432,6 +432,7 @@ enum Ask {
     /// other key takes it away and goes on to do what it does.
     Paste(String),
     ClosePane,
+    CloseTab,
     Update,
     /// Closing the window again confirms; any key takes it away.
     Quit,
@@ -447,6 +448,7 @@ impl Ask {
             Ask::Key => return here,
             Ask::Paste(_) => Action::Paste,
             Ask::ClosePane => Action::ClosePane,
+            Ask::CloseTab => Action::CloseTab,
             Ask::Update => Action::Update,
             Ask::Quit => return true,
         };
@@ -2458,6 +2460,24 @@ impl App {
                         self.ask(id, text, Ask::ClosePane);
                     }
                     _ => self.close(el, id),
+                }
+            }
+            Action::CloseTab => {
+                let (Some(id), Some(t)) = (before, self.win.tabs.get(self.win.active)) else {
+                    return true;
+                };
+                let panes = t.panes();
+                let busy: Vec<_> = (panes.iter())
+                    .filter_map(|&p| self.view(p)?.busy())
+                    .collect();
+                if !busy.is_empty() && !self.answered(id, &Ask::CloseTab) {
+                    let what = busy_text(&busy, " in this tab");
+                    let text = format!("{what}. {} to close it", again(a, &self.config.keys));
+                    self.ask(id, text, Ask::CloseTab);
+                    return true;
+                }
+                for p in panes {
+                    self.close(el, p);
                 }
             }
             Action::CycleTab(step) => {
@@ -5670,6 +5690,8 @@ mod tests {
             assert_eq!(Ask::Key.gone(None, here), here, "an error, read");
             assert_eq!(Ask::Key.gone(close, here), here);
             assert!(!Ask::Nothing.gone(None, here));
+            assert!(!Ask::CloseTab.gone(Some(Action::CloseTab), here));
+            assert!(Ask::CloseTab.gone(close, here), "not the whole tab");
             assert!(
                 Ask::Quit.gone(None, here),
                 "closing the window, then typing"
