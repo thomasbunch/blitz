@@ -514,6 +514,8 @@ struct Mouse {
     /// The last press that went to selection: when, on which cell, and
     /// how many clicks it made.
     click: Option<(Instant, Pos, u8)>,
+    /// The same for the last press on a divider, by its index.
+    divider_click: Option<(Instant, Pos, u8)>,
 }
 
 /// A cell as a line number and a column. Line numbers stay with their
@@ -568,6 +570,15 @@ fn clicks(last: Option<(Instant, Pos, u8)>, at: Pos, now: Instant, within: Durat
         Some((t, p, n)) if p == at && now.saturating_duration_since(t) <= within => n % 3 + 1,
         _ => 1,
     }
+}
+
+/// Whether a press on divider `i` double-clicks it, which gives the panes
+/// equal space. `last` holds the last press on a divider and takes this
+/// one.
+fn evens(last: &mut Option<(Instant, Pos, u8)>, i: usize, now: Instant, within: Duration) -> bool {
+    let n = clicks(*last, (i, 0), now, within);
+    *last = Some((now, (i, 0), n));
+    n == 2
 }
 
 /// Selected cells in the focused pane.
@@ -3303,7 +3314,13 @@ impl App {
             .divider_at(self.mouse.pos)
             .filter(|_| pressed && b == 0)
         {
-            self.mouse.divider = Some((i, self.min_pane()));
+            // SAFETY: a plain query.
+            let within = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+            if evens(&mut self.mouse.divider_click, i, Instant::now(), within) {
+                self.act(el, Action::Equalize);
+            } else {
+                self.mouse.divider = Some((i, self.min_pane()));
+            }
             return;
         }
         // A click on another pane or in the sidebar only moves focus.
@@ -5834,6 +5851,26 @@ mod tests {
         assert_eq!(resize_wait(Some(t0), t0 + ms(30)), Some(t0 + RESIZE_GAP));
         assert_eq!(resize_wait(Some(t0), t0 + RESIZE_GAP), None);
         assert_eq!(RESIZE_GAP, ms(80));
+    }
+
+    /// A second press on the same divider in time gives the panes equal
+    /// space; one on another divider does not.
+    #[test]
+    fn app_a_double_click_on_a_divider_evens_the_panes() {
+        let (t0, ms, within) = (
+            Instant::now(),
+            Duration::from_millis,
+            Duration::from_millis(500),
+        );
+        let mut last = None;
+        assert!(!evens(&mut last, 1, t0, within), "a drag starts");
+        assert!(evens(&mut last, 1, t0 + ms(200), within), "the second");
+        assert!(!evens(&mut last, 1, t0 + ms(400), within), "a third drags");
+        assert!(
+            !evens(&mut last, 2, t0 + ms(500), within),
+            "another divider"
+        );
+        assert!(!evens(&mut last, 2, t0 + ms(1100), within), "too late");
     }
 
     /// Restored panes in tabs not shown start at their real size, so Claude
