@@ -524,6 +524,31 @@ impl Picker {
             .filter(|t| t.name.to_lowercase().contains(&f))
             .collect()
     }
+
+    /// Arrows and Page Up and Down move the highlight, which stays on the
+    /// list; typing narrows the list and Backspace widens it, each going
+    /// back to the first match. Returns false for keys it has no use for.
+    fn key(&mut self, k: &KeyInput) -> bool {
+        let m = &k.mods;
+        // Ctrl and Alt together are AltGr when the layout gives a character.
+        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+        let chord = ctrl != alt || (ctrl && k.uc == 0);
+        let (sel, last) = (self.sel as isize, self.matches().len().saturating_sub(1));
+        let step = |by: isize| (sel + by).clamp(0, last as isize) as usize;
+        match k.vk {
+            VK_UP => self.sel = step(-1),
+            VK_DOWN => self.sel = step(1),
+            VK_PRIOR => self.sel = step(-(chrome::PICKER_ROWS as isize)),
+            VK_NEXT => self.sel = step(chrome::PICKER_ROWS as isize),
+            VK_BACK if self.filter.pop().is_some() => self.sel = 0,
+            _ if !chord && !k.text.is_empty() => {
+                self.filter.push_str(k.text);
+                self.sel = 0;
+            }
+            _ => return false,
+        }
+        true
+    }
 }
 
 /// Sends [`UserEvent::Settings`] whenever a file in `%APPDATA%\blitz`, or
@@ -1107,20 +1132,10 @@ impl App {
         let Some(pk) = &mut self.picker else {
             return;
         };
-        let n = pk.matches().len();
-        let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
-        let step = |by: isize| {
-            let last = n.saturating_sub(1) as isize;
-            (pk.sel as isize + by).clamp(0, last) as usize
-        };
         match k.vk {
             VK_ESCAPE => {
                 self.picker = None;
                 self.set_theme_from_config();
-                return;
             }
             VK_RETURN => {
                 let picked = pk.matches().get(pk.sel).map(|t| (*t).clone());
@@ -1146,21 +1161,10 @@ impl App {
                     }
                     None => self.set_theme_from_config(),
                 }
-                return;
             }
-            VK_UP => pk.sel = step(-1),
-            VK_DOWN => pk.sel = step(1),
-            VK_PRIOR => pk.sel = step(-(chrome::PICKER_ROWS as isize)),
-            VK_NEXT => pk.sel = step(chrome::PICKER_ROWS as isize),
-            VK_BACK if pk.filter.pop().is_some() => pk.sel = 0,
-            VK_BACK => return,
-            _ if !chord && !k.text.is_empty() => {
-                pk.filter.push_str(k.text);
-                pk.sel = 0;
-            }
-            _ => return,
+            _ if pk.key(k) => self.preview(),
+            _ => {}
         }
-        self.preview();
     }
 
     /// Shows the theme highlighted in the picker.
@@ -3518,6 +3522,56 @@ mod tests {
         assert_eq!(queued(&mut k), ["\u{1F600}", "x"]);
         assert!(k.skipped(VK_PACKET, false));
         assert!(!k.skipped(VK_PACKET, false), "only once");
+    }
+
+    #[test]
+    fn app_picker_keys_move_and_filter() {
+        let names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"];
+        let mut p = Picker {
+            themes: (names.iter()).map(|n| crate::theme::parse(n, "")).collect(),
+            filter: String::new(),
+            sel: 0,
+        };
+        let key = |vk, text| input(vk, true, vt::Key::Other, text);
+        assert!(p.key(&key(VK_UP, "")) && p.sel == 0, "stays on the list");
+        assert!(p.key(&key(VK_DOWN, "")) && p.sel == 1);
+        assert!(
+            p.key(&key(VK_NEXT, "")) && p.sel == 4,
+            "a page stops at the end"
+        );
+        assert!(p.key(&key(VK_DOWN, "")) && p.sel == 4);
+        assert!(p.key(&key(VK_PRIOR, "")) && p.sel == 0);
+        // Typing narrows the list, case-insensitively, from its top.
+        p.sel = 3;
+        assert!(p.key(&key(0x54, "T")));
+        assert_eq!((p.filter.as_str(), p.sel, p.matches().len()), ("T", 0, 2));
+        assert!(p.key(&key(0x41, "A")));
+        let shown: Vec<&str> = p.matches().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(shown, ["Beta", "Delta"]);
+        assert!(p.key(&key(VK_DOWN, "")) && p.sel == 1);
+        assert!(p.key(&key(VK_BACK, "")));
+        assert_eq!((p.filter.as_str(), p.sel), ("T", 0));
+        assert!(p.key(&key(VK_BACK, "")));
+        assert!(!p.key(&key(VK_BACK, "")), "nothing left to delete");
+        // Nothing matches: the highlight has nowhere to go.
+        p.filter = "zzz".into();
+        assert!(p.key(&key(VK_DOWN, "")) && p.sel == 0);
+        // Ctrl or Alt with a letter is a chord, not text; with both, the
+        // layout's AltGr character is text.
+        p.filter.clear();
+        let mut ctrl = key(0x41, "a");
+        ctrl.mods.lctrl = true;
+        assert!(!p.key(&ctrl));
+        let mut alt = key(0x41, "a");
+        alt.mods.lalt = true;
+        assert!(!p.key(&alt));
+        let mut altgr = key(0x51, "@");
+        (altgr.mods.lctrl, altgr.mods.ralt, altgr.uc) = (true, true, u16::from(b'@'));
+        assert!(p.key(&altgr) && p.filter == "@");
+        let mut ctrl_alt = key(0x51, "q");
+        (ctrl_alt.mods.lctrl, ctrl_alt.mods.lalt) = (true, true);
+        assert!(!p.key(&ctrl_alt), "Ctrl+Alt with no character");
+        assert!(!p.key(&key(0x70, "")), "F1");
     }
 
     #[test]
