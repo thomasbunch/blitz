@@ -59,7 +59,12 @@ fn hook_prints_each_event() {
     let cases = [
         (
             r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#,
-            notify("working", ""),
+            notify("working", "hi"),
+        ),
+        // A prompt of several lines shows as one.
+        (
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"fix the\n\nlogin  bug\u001b[2J"}"#,
+            notify("working", "fix the login bug[2J"),
         ),
         (
             r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"cargo test"}}"#,

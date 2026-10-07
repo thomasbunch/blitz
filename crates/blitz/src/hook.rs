@@ -76,7 +76,8 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
     let tool = field(ev, "tool_name");
     let input = ev.get("tool_input").unwrap_or(&Json::Null);
     Some(match field(ev, "hook_event_name") {
-        "UserPromptSubmit" => ("working", String::new()),
+        // What the user asked, so the sidebar says what the turn is about.
+        "UserPromptSubmit" => ("working", field(ev, "prompt").to_owned()),
         "PermissionRequest" => {
             let detail = match field(input, "command") {
                 "" => field(input, "file_path"),
@@ -608,6 +609,10 @@ mod tests {
         let cases: &[(&str, Option<(&str, &str)>)] = &[
             (
                 r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#,
+                Some(("working", "hi")),
+            ),
+            (
+                r#"{"hook_event_name":"UserPromptSubmit"}"#,
                 Some(("working", "")),
             ),
             (
