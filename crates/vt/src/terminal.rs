@@ -450,13 +450,8 @@ impl Terminal {
         }
         self.changed = false;
         self.pal = [pal.fg, pal.bg, pal.cursor];
-        let [fg, bg, cursor] = self.colors;
-        let pal = &Palette {
-            fg: fg.unwrap_or(pal.fg),
-            bg: bg.unwrap_or(pal.bg),
-            cursor: cursor.unwrap_or(pal.cursor),
-            ..*pal
-        };
+        let cursor = self.colors[2];
+        let pal = &self.shown_pal(pal);
         out.cols = cols;
         out.rows = rows;
         out.cursor_color = cursor;
@@ -472,12 +467,7 @@ impl Terminal {
             let row = g.line(i).unwrap_or(&empty);
             out.wrapped.push(row.flags & rf::WRAPPED != 0);
             for x in 0..cols {
-                let mut cell = row.cells.get(x as usize).copied().unwrap_or_default();
-                // Scrollback is not rewrapped for a one-column screen, so
-                // a wide character there can end past the edge.
-                if cell.flags & cf::WIDE != 0 && x + 1 == cols {
-                    cell = Cell::blank(cell.style);
-                }
+                let cell = shown_cell(row, x, cols);
                 out.cells
                     .push(render_cell(cell, row, x, self.styles.get(cell.style), pal));
             }
@@ -610,16 +600,10 @@ impl Terminal {
     /// `None` when the line is not kept.
     pub fn line_cells(&self, n: usize, pal: &Palette, out: &mut Vec<RenderCell>) -> Option<bool> {
         let row = self.line(n)?;
-        let [fg, bg, cursor] = self.colors;
-        let pal = &Palette {
-            fg: fg.unwrap_or(pal.fg),
-            bg: bg.unwrap_or(pal.bg),
-            cursor: cursor.unwrap_or(pal.cursor),
-            ..*pal
-        };
+        let pal = &self.shown_pal(pal);
         out.clear();
         out.extend((0..self.cols()).map(|x| {
-            let cell = row.cells.get(usize::from(x)).copied().unwrap_or_default();
+            let cell = shown_cell(row, x, self.cols());
             render_cell(cell, row, x, self.styles.get(cell.style), pal)
         }));
         Some(row.flags & rf::WRAPPED != 0)
@@ -643,10 +627,11 @@ impl Terminal {
     /// The OSC 8 hyperlink in column `col` of line `n`: its URI, and the
     /// first and last cell it covers, following soft wraps.
     pub fn link_at(&self, n: usize, col: u16) -> Option<(&str, LineCol, LineCol)> {
-        let link = |(n, x): LineCol| {
-            let cell = self.line(n)?.cells.get(usize::from(x))?;
-            Some(self.styles.get(cell.style).link)
-        };
+        let cell = |(n, x): LineCol| self.line(n)?.cells.get(usize::from(x)).copied();
+        let link = |p| cell(p).map(|c| self.styles.get(c.style).link);
+        // The blank a wide character left at the end of a row when it
+        // wrapped early carries no link, but the link goes on past it.
+        let gap = |p| cell(p).is_some_and(|c| c.flags & cf::SPACER_HEAD != 0);
         let id = link((n, col)).filter(|&l| l != 0)?;
         let last = self.cols() - 1;
         let back = |&(n, x): &LineCol| match x {
@@ -660,7 +645,8 @@ impl Terminal {
         let end = |step: &dyn Fn(&LineCol) -> Option<LineCol>| {
             std::iter::successors(Some((n, col)), step)
                 .take(MAX_LINK_CELLS)
-                .take_while(|&p| link(p) == Some(id))
+                .take_while(|&p| link(p) == Some(id) || gap(p))
+                .filter(|&p| !gap(p))
                 .last()
         };
         Some((&self.styles.link(id)?.uri, end(&back)?, end(&fwd)?))
@@ -668,6 +654,17 @@ impl Terminal {
 
     fn cols(&self) -> u16 {
         self.opts.cols
+    }
+
+    /// `pal` with the colours the program set in their place.
+    fn shown_pal(&self, pal: &Palette) -> Palette {
+        let [fg, bg, cursor] = self.colors;
+        Palette {
+            fg: fg.unwrap_or(pal.fg),
+            bg: bg.unwrap_or(pal.bg),
+            cursor: cursor.unwrap_or(pal.cursor),
+            ..*pal
+        }
     }
 
     fn rows(&self) -> u16 {
@@ -1783,6 +1780,18 @@ const RENDER_ATTRS: u16 = attr::BOLD
     | attr::INVERSE
     | attr::STRIKE
     | attr::OVERLINE;
+
+/// Cell `x` of `row` as a `cols` wide screen shows it. Scrollback is not
+/// rewrapped for a one-column screen, so a wide character there can end
+/// past the edge; it shows as a blank.
+fn shown_cell(row: &Row, x: u16, cols: u16) -> Cell {
+    let cell = row.cells.get(usize::from(x)).copied().unwrap_or_default();
+    if cell.flags & cf::WIDE != 0 && x + 1 == cols {
+        Cell::blank(cell.style)
+    } else {
+        cell
+    }
+}
 
 fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> RenderCell {
     let a = style.attrs;

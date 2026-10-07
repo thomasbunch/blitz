@@ -18,9 +18,9 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   stops, and its hooks, which blitz sets up itself, when it needs input.
   The window title starts with how many need you, as in `(2) pwsh`, and
   the taskbar button flashes if blitz is in the background.
-- In PowerShell, a command that runs for 10 seconds or more and ends in
-  a pane you are not looking at marks it *done*, or *error* with its exit
-  code.
+- In PowerShell with PSReadLine (its default), a command that runs for 10
+  seconds or more and ends in a pane you are not looking at marks it
+  *done*, or *error* with its exit code.
 - Progress a program reports (OSC 9;4) shows in the sidebar and on the
   taskbar button.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
@@ -83,10 +83,12 @@ drops some features such as synchronized output.
 
 Claude Code 2.1.280 or later reports to blitz with nothing to set up.
 blitz keeps a small Claude Code plugin in
-`%LOCALAPPDATA%\blitz\claude-plugin`, whose hooks run the
-`blitz-hook.exe` next to `blitz.exe`, and every pane loads it through
-`CLAUDE_CODE_PLUGIN_DIRS`. blitz never edits Claude Code's settings. If
-Claude Code works for a while and no hook reports, blitz says so once.
+`%LOCALAPPDATA%\blitz\claude-plugin-…`, one for each copy of blitz, whose
+hooks run the `blitz-hook.exe` next to `blitz.exe`, and every pane
+loads it through `CLAUDE_CODE_PLUGIN_DIRS`. blitz never edits Claude
+Code's settings, and writes no plugin where other users could replace
+`blitz-hook.exe`. If Claude Code works for a while and no hook reports,
+blitz says so once.
 
 An older Claude Code, or managed settings that turn off plugin folders,
 needs the hooks in `~/.claude/settings.json`. **Claude Code setup** in
@@ -112,7 +114,8 @@ at marks it as needing you until you look. Claude Code rings one when
 it waits for you if its settings have
 `"preferredNotifChannel": "terminal_bell"`. The hooks add what the title
 cannot show: a question waiting for you, the prompt and the reply under
-the session's name, and the conversation to resume.
+the session's name, the conversation to resume, and that the pane runs
+Claude Code at all, which names the session after its task.
 
 
 ### Session marks
@@ -312,10 +315,12 @@ Holding Ctrl underlines the link under the pointer: a hyperlink a
 program printed, a web address, or the path of a file that exists,
 relative ones from the pane's folder and `~` from your user folder. A
 path counts in Claude Code's `Update(src/app.rs)`, in a Markdown link,
-and as a bare `name.ext` when that file is in the pane's folder. Only
-web, mail and local file links open. A file that would run when
-opened, such as a program, script, shortcut or installer, is shown
-selected in Explorer instead, and so is one no program opens.
+and as a bare `name.ext` when that file is in the pane's folder. A path
+with spaces is a link only as a hyperlink, and a path through a
+symbolic link or junction is none. Only web and local file links open.
+Folders, text, source code, images and PDFs open with their program;
+any other file, such as a program, script, shortcut or installer, is
+shown selected in Explorer instead, and so is one no program opens.
 
 With an editor set in `editor_uri`, Ctrl+click opens a file there at
 the line and column after its path, as in `src/app.rs:12:5` or
@@ -450,12 +455,12 @@ a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
 `space`, `backspace`, or a punctuation key by its character or its name,
 such as `,` or `comma` and `=` or `plus`, and on the keypad `numpad0` to
 `numpad9`, `numpadadd`, `numpadsubtract`, `numpadmultiply`,
-`numpaddivide` and `numpaddecimal`. The modifiers must match
-exactly. A binding replaces the default on the same chord, and the other
-defaults stay. Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them,
-on layouts where those keys type digits; on others, such as French
-AZERTY, they go to the program unless bound to `go_to_tab_1` to
-`go_to_tab_8` or `last_tab`.
+`numpaddivide` and `numpaddecimal`. Case and spaces do not matter. The
+modifiers must match exactly. A binding replaces the default on the
+same chord, and the other defaults stay. Ctrl+1 to Ctrl+9 go to a tab
+unless a binding takes them, on layouts where those keys type digits;
+on others, such as French AZERTY, they go to the program unless bound
+to `go_to_tab_1` to `go_to_tab_8` or `last_tab`.
 Lines blitz cannot read are skipped.
 
 The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,

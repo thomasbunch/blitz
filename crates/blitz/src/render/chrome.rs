@@ -798,8 +798,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
             }
         }
         if !hidden.is_empty() {
-            // Accent when a session out of sight needs you.
-            let urgent = (hidden.iter()).any(|x| matches!(x.state, Attn::NeedsYou | Attn::Error));
+            // Accent when a session out of sight needs you, dark or light
+            // enough to read as text.
+            let urgent = (hidden.iter()).any(|x| x.state == Attn::NeedsYou);
             let r = Rect {
                 x: s(8.0),
                 y,
@@ -807,7 +808,10 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 h: more_h,
             };
             let label = format!("+{} more", hidden.len());
-            let color = if urgent { c.accent } else { c.dim };
+            let color = match urgent {
+                true => crate::theme::readable(c.accent, c.side_bg, 4.5),
+                false => c.dim,
+            };
             text(
                 p,
                 r.x + s(24.0),
@@ -1130,7 +1134,7 @@ struct List<'a> {
     /// The names that match it, and the highlighted one.
     names: Vec<&'a str>,
     sel: usize,
-    /// Shown when nothing matches.
+    /// Shown when nothing matches; for a name, what leaving it empty does.
     empty: &'a str,
     hint: &'a str,
     /// Shown in place of an empty filter.
@@ -1306,7 +1310,11 @@ fn commands(
             filter: cm.filter,
             names: Vec::new(),
             sel: 0,
-            empty: "With no name, blitz picks one again",
+            // What an empty name does, while it is empty.
+            empty: match cm.filter {
+                "" => "With no name, blitz picks one again",
+                _ => "",
+            },
             hint: "Enter rename  \u{b7}  Esc cancel",
             prompt: "type a name",
             width: 460.0,
@@ -2304,14 +2312,23 @@ mod tests {
         assert_eq!(c.side.at(row.1.x, row.1.y), Some(Side::Session(row.0)));
         assert_eq!(c.side.at(foot.x + 1, foot.bottom()), None);
         let label = format!("+{} more", hidden.len());
-        let ui = crate::theme::blitz(false).ui;
-        assert!(
-            c.prims.iter().any(
-                |p| matches!(p, Prim::Text { text, color, .. } if *text == label && *color == ui.accent)
-            ),
-            "{:?}",
-            texts(&c)
-        );
+        let color = |c: &Chrome| {
+            (c.prims.iter()).find_map(|p| match p {
+                Prim::Text { text, color, .. } if *text == label => Some(*color),
+                _ => None,
+            })
+        };
+        assert_eq!(color(&c), Some(m.ui.accent), "{:?}", texts(&c));
+        // Readable on a light theme too, where amber is faint.
+        m.ui = crate::theme::blitz(true).ui;
+        let amber = color(&build(&m)).expect("footer");
+        assert!(crate::theme::contrast(amber, m.ui.side_bg) >= 4.5);
+        // A hidden error does not need you.
+        let mut sessions = sessions.clone();
+        sessions[11].state = Attn::Error;
+        let mut m = model(&win, &sessions, now);
+        m.scale = 1.5;
+        assert_eq!(color(&build(&m)), Some(m.ui.dim));
     }
 
     #[test]
@@ -3057,6 +3074,8 @@ mod tests {
         });
         let t: Vec<String> = texts(&build(&m)).iter().map(|t| t.to_string()).collect();
         assert!(t.contains(&"Rename tab".into()) && t.contains(&"type a name".into()));
+        let unnamed = "With no name, blitz picks one again";
+        assert!(t.contains(&unnamed.into()));
         m.commands = Some(Commands {
             filter: "shop api",
             items: Vec::new(),
@@ -3066,6 +3085,7 @@ mod tests {
         });
         let c = build(&m);
         assert!(texts(&c).contains(&"shop api"));
+        assert!(!texts(&c).contains(&unnamed), "a name is typed");
         assert!(c.commands.expect("palette").1.is_empty(), "no rows to pick");
     }
 

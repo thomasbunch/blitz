@@ -64,9 +64,12 @@ pub fn prompt_mark(body: &str, token: &str) -> Option<PromptMark> {
 
 /// The local path in an OSC 7 `file://host/path` URL, percent-decoded.
 /// `file:///C:/x` gives `C:\x`. On Windows a URL naming another host gives
-/// nothing: its path is not on this machine.
+/// nothing: its path is not on this machine. The scheme's case does not
+/// matter, as in any URL.
 pub fn file_url_path(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("file://")?;
+    let rest = url
+        .get(7..)
+        .filter(|_| url[..7].eq_ignore_ascii_case("file://"))?;
     let (host, path) = rest.split_at(rest.find('/')?);
     if cfg!(windows) && !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
         return None;
@@ -303,6 +306,7 @@ mod tests {
     fn file_urls() {
         let p = |u: &str| file_url_path(u);
         assert_eq!(p("file:///C:/x").as_deref(), Some("C:\\x"));
+        assert_eq!(p("FILE:///C:/x").as_deref(), Some("C:\\x"));
         assert_eq!(
             p("file:///C:/Users/me/My%20Dir/a%23b").as_deref(),
             Some("C:\\Users\\me\\My Dir\\a#b")

@@ -233,6 +233,20 @@ fn link_at_covers_the_link_across_a_wrap() {
 }
 
 #[test]
+fn link_at_goes_on_past_a_wide_character_that_wrapped_early() {
+    let mut t = Terminal::new(Options {
+        cols: 6,
+        rows: 3,
+        ..Options::default()
+    });
+    t.feed("\x1b]8;;u\x1b\\abcde中f\x1b]8;;\x1b\\".as_bytes());
+    let link = Some(("u", (0, 0), (1, 2)));
+    assert_eq!(t.link_at(0, 0), link);
+    assert_eq!(t.link_at(1, 0), link);
+    assert_eq!(t.link_at(0, 5), None, "the blank it left");
+}
+
+#[test]
 fn ignored_strings_leave_no_trace() {
     let mut t = Terminal::new(Options::default());
     t.feed(b"\x1b]52;c;?\x07\x1b]104\x07\x1b]1337;SetUserVar=a=b\x07\x1bP+q544e\x1b\\ok");
