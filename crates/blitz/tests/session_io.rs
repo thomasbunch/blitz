@@ -6,11 +6,15 @@ use std::path::{Path, PathBuf};
 
 use blitz::session::{self, State};
 
+const A: &str = "0123456789abcdef0123456789abcdef";
+const B: &str = "fedcba9876543210fedcba9876543210";
+
 fn state(cwd: &str) -> State {
     session::from_json(&format!(
         "{{\"v\":1,\"window\":{{\"x\":0,\"y\":0,\"w\":800,\"h\":600,\"maximized\":false}},\
          \"sidebar_expanded\":true,\"active\":0,\"tabs\":[{{\"name\":\"t\",\"focus\":0,\
-         \"zoom\":null,\"root\":{{\"pane\":{{\"cwd\":\"{cwd}\",\"claude\":null}}}}}}]}}"
+         \"zoom\":null,\"root\":{{\"pane\":{{\"cwd\":\"{cwd}\",\"claude\":null,\
+         \"key\":\"{A}\"}}}}}}]}}"
     ))
     .expect("a valid session")
 }
@@ -38,31 +42,40 @@ fn session_files_round_trip() {
 
     // Nothing saved yet.
     assert_eq!(session::load(), None);
-    assert_eq!(session::load_output(0, 0), None);
+    assert_eq!(session::load_output(A), None);
 
     let (one, two) = (state("one"), state("two"));
     session::save(&one).expect("save");
-    assert_eq!(session::load(), Some(one.clone()));
+    assert_eq!(session::load(), Some(one.clone()), "with the pane's key");
     // Over an existing file, leaving no temporary one behind.
     session::save(&two).expect("save again");
     assert_eq!(session::load(), Some(two.clone()));
     assert_eq!(names(&dir), ["session.json"]);
 
     // Output of panes that closed since the last save does not come back.
-    let out = |v: &[(usize, usize, &str)]| {
-        let v: Vec<_> = v.iter().map(|&(t, l, s)| (t, l, s.to_owned())).collect();
+    let out = |v: &[(&str, &str)]| {
+        let v: Vec<_> = v
+            .iter()
+            .map(|&(k, s)| (k.to_owned(), s.to_owned()))
+            .collect();
         session::save_output(&v).expect("save output");
     };
-    out(&[(0, 0, "a"), (1, 0, "b")]);
-    assert_eq!(session::load_output(1, 0).as_deref(), Some("b"));
-    out(&[(0, 0, "c")]);
-    assert_eq!(session::load_output(0, 0).as_deref(), Some("c"));
-    assert_eq!(session::load_output(1, 0), None);
+    out(&[(A, "a"), (B, "b")]);
+    assert_eq!(session::load_output(B).as_deref(), Some("b"));
+    out(&[(A, "c")]);
+    assert_eq!(session::load_output(A).as_deref(), Some("c"));
+    assert_eq!(session::load_output(B), None);
 
-    // Output is filed by tab and leaf of the layout it was saved with, so a
-    // new layout drops it: after a crash it would show in the wrong pane.
+    // Output is filed by its pane's own key, so saving another layout keeps
+    // it: it can only come back into the pane it came from, so a start after
+    // a crash or a shutdown still shows it.
     session::save(&one).expect("save");
-    assert_eq!(session::load_output(0, 0), None);
+    assert_eq!(session::load_output(A).as_deref(), Some("c"));
+    // Nothing else in the folder is ever read.
+    std::fs::write(dir.join("scrollback").join("x.txt"), "x").expect("write");
+    for k in ["x", "", r"..\session.json", "../scrollback/x"] {
+        assert_eq!(session::load_output(k), None, "{k:?}");
+    }
 
     // A file torn or edited by hand.
     let file = dir.join("session.json");
@@ -81,27 +94,9 @@ fn session_files_round_trip() {
     assert_eq!(session::load(), Some(two.clone()));
     std::fs::remove_file(&other).expect("remove");
 
-    // Output that cannot be removed keeps the old layout with it rather
-    // than pairing it with the new one.
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        out(&[(0, 0, "kept")]);
-        let held = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(dir.join("scrollback").join("0-0.txt"))
-            .expect("hold");
-        assert!(session::save(&one).is_err());
-        drop(held);
-        assert_eq!(session::load(), Some(two.clone()));
-        assert_eq!(session::load_output(0, 0).as_deref(), Some("kept"));
-        assert_eq!(names(&dir), ["scrollback", "session.json"]);
-    }
-
     session::clear();
     assert_eq!(session::load(), None);
-    assert_eq!(session::load_output(0, 0), None);
+    assert_eq!(session::load_output(A), None);
     assert!(!dir.join("scrollback").exists());
 
     // SAFETY: as above.

@@ -436,6 +436,8 @@ struct View {
     /// When the program's open synchronized update times out, as of the
     /// last look at its terminal.
     sync_until: Option<Instant>,
+    /// Names the session's saved output; kept across restarts.
+    key: String,
 }
 
 struct App {
@@ -791,17 +793,20 @@ impl App {
     fn restore(&mut self, s: &session::State) -> Result<(), String> {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
-        let keys = leaf_keys(&win);
         for (id, meta) in panes {
             let old = (self.config.restore_scrollback)
-                .then(|| keys.iter().find(|k| k.0 == id))
-                .flatten()
-                .and_then(|&(_, tab, leaf)| session::load_output(tab, leaf));
+                .then(|| session::load_output(&meta.key))
+                .flatten();
             let started = (self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()))
                 .or_else(|_| self.spawn(id, &grids, None, None, old.as_deref()));
             if let Err(e) = started {
                 self.views.clear();
                 return Err(e);
+            }
+            if let Some(v) = self.views.last_mut()
+                && session::is_key(&meta.key)
+            {
+                v.key = meta.key.clone();
             }
             if let Some(line) = resume_line(self.config.restore_claude, meta.claude.as_deref())
                 && let Some(v) = self.views.last_mut()
@@ -838,6 +843,8 @@ impl App {
             crate::pane::restored(text, stamp, grid.1)
         });
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
+        // Not the token, which is a secret between the pane and its child.
+        let key = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         let launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
@@ -879,6 +886,7 @@ impl App {
             finding_branch: false,
             resume: None,
             sync_until: None,
+            key,
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
@@ -2384,6 +2392,7 @@ impl App {
             PaneMeta {
                 cwd: v.map(|v| v.pane.cwd.clone()).unwrap_or_default(),
                 claude: v.and_then(|v| v.pane.claude.clone()),
+                key: v.map(|v| v.key.clone()).unwrap_or_default(),
             }
         };
         let mut s = session::State::capture(&self.win, self.placed, meta);
@@ -2415,9 +2424,8 @@ impl App {
                 ..self.placed
             };
         }
-        // Saving the layout drops output saved for the last one, so output,
-        // which changes all the time and is saved only at exit, comes after
-        // it, and only when the layout it is filed by was written.
+        // Output, which changes all the time, is saved only at exit, and
+        // only once the layout holding the keys it is filed by was written.
         match session::save(&s) {
             Ok(()) if force => self.save_output(),
             Ok(()) => {}
@@ -2431,14 +2439,10 @@ impl App {
     /// deletes what an earlier run saved when it is off.
     fn save_output(&self) {
         let stamp = local_stamp();
-        let keys = if self.config.restore_scrollback {
-            leaf_keys(&self.win)
-        } else {
-            Vec::new()
-        };
-        let panes: Vec<_> = (keys.into_iter())
-            .filter_map(|(id, tab, leaf)| {
-                let term = lock(&self.view(id)?.pane.term);
+        let views = (self.views.iter()).filter(|_| self.config.restore_scrollback);
+        let panes: Vec<_> = views
+            .filter_map(|v| {
+                let term = lock(&v.pane.term);
                 let mut text = term.scrollback_text();
                 // A full-screen program's screen is not output.
                 if !term.input_modes().alt_screen {
@@ -2446,7 +2450,7 @@ impl App {
                     text += &term.screen_text();
                 }
                 let text = last_lines(&text, SAVED_LINES);
-                (!text.is_empty()).then(|| (tab, leaf, format!("{stamp}\n{text}")))
+                (!text.is_empty()).then(|| (v.key.clone(), format!("{stamp}\n{text}")))
             })
             .collect();
         if let Err(e) = session::save_output(&panes) {
@@ -2609,14 +2613,6 @@ fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
 fn resume_line(enabled: bool, claude: Option<&str>) -> Option<String> {
     let id = claude.filter(|id| enabled && crate::hook::is_session_id(id))?;
     Some(format!("claude --resume {id}\r"))
-}
-
-/// Every pane of `win` with its tab and leaf index, which its saved output
-/// is filed under.
-fn leaf_keys(win: &layout::Window) -> Vec<(PaneId, usize, usize)> {
-    (win.tabs.iter().enumerate())
-        .flat_map(|(t, tab)| (tab.panes().into_iter().enumerate()).map(move |(l, id)| (id, t, l)))
-        .collect()
 }
 
 /// The last `n` lines of `text`, without blank lines at either end.
@@ -3724,25 +3720,5 @@ mod tests {
         assert_eq!(last_lines("a\n\nb", 10), "a\n\nb");
         assert_eq!(last_lines("  a\n", 10), "  a");
         assert_eq!(last_lines("\n\n", 10), "");
-    }
-
-    #[test]
-    fn leaf_keys_follow_tabs_and_tree_order() {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            w: 800,
-            h: 600,
-        };
-        let mut a = Tab::new("a".into(), PaneId(1));
-        assert!(a.split(layout::Dir::Right, PaneId(2), area, (1, 1)));
-        let win = layout::Window {
-            tabs: vec![a, Tab::new("b".into(), PaneId(3))],
-            ..Default::default()
-        };
-        assert_eq!(
-            leaf_keys(&win),
-            [(PaneId(1), 0, 0), (PaneId(2), 0, 1), (PaneId(3), 1, 0)]
-        );
     }
 }

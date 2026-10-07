@@ -61,6 +61,8 @@ pub struct PaneMeta {
     pub cwd: String,
     /// The Claude Code session running in the pane.
     pub claude: Option<String>,
+    /// Names the pane's saved output (see [`is_key`]); empty for none.
+    pub key: String,
 }
 
 impl NodeState {
@@ -183,13 +185,9 @@ pub fn load() -> Option<State> {
 /// mid-write never leaves a torn file. The temporary file is this
 /// process's own, so two windows saving at once cannot swap in each
 /// other's half-written one.
-///
-/// Saved output is filed by the tab and leaf of the layout it was saved
-/// with, so it goes first: a crash must never pair it with another layout.
 pub fn save(s: &State) -> io::Result<()> {
     let dir = dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
     std::fs::create_dir_all(&dir)?;
-    save_output(&[])?;
     let tmp = dir.join(format!("session.json.{}.tmp", std::process::id()));
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
         f.write_all(to_json(s).as_bytes())?;
@@ -210,20 +208,30 @@ pub fn clear() {
     let _ = save_output(&[]);
 }
 
-/// Where each pane's saved output goes: `<tab>-<leaf>.txt`, by the same
-/// indexes as the session.
+/// Where each pane's saved output goes: `<key>.txt`, by the key the pane
+/// has in the session. A key stays with its pane, so however the layout
+/// changes, and whatever was saved when, output only ever comes back into
+/// the pane it came from.
 fn output_dir() -> Option<PathBuf> {
     dir().map(|d| d.join("scrollback"))
 }
 
-/// The saved output of leaf `leaf` of tab `tab`.
-pub fn load_output(tab: usize, leaf: usize) -> Option<String> {
-    std::fs::read_to_string(output_dir()?.join(format!("{tab}-{leaf}.txt"))).ok()
+/// Whether `k` can name saved output: 32 hex digits, as made by
+/// [`crate::pty::pane_token`]. A key read from the session file names no
+/// other file.
+pub fn is_key(k: &str) -> bool {
+    k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Replaces every pane's saved output with `panes`, as (tab, leaf, text).
-/// None deletes it all.
-pub fn save_output(panes: &[(usize, usize, String)]) -> io::Result<()> {
+/// The saved output of the pane with key `key`.
+pub fn load_output(key: &str) -> Option<String> {
+    let dir = output_dir().filter(|_| is_key(key))?;
+    std::fs::read_to_string(dir.join(format!("{key}.txt"))).ok()
+}
+
+/// Replaces every pane's saved output with `panes`, as (key, text). None
+/// deletes it all.
+pub fn save_output(panes: &[(String, String)]) -> io::Result<()> {
     let dir =
         output_dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
     // Panes that closed since the last save must not come back.
@@ -235,8 +243,8 @@ pub fn save_output(panes: &[(usize, usize, String)]) -> io::Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(&dir)?;
-    for (tab, leaf, text) in panes {
-        std::fs::write(dir.join(format!("{tab}-{leaf}.txt")), text)?;
+    for (key, text) in panes.iter().filter(|p| is_key(&p.0)) {
+        std::fs::write(dir.join(format!("{key}.txt")), text)?;
     }
     Ok(())
 }
@@ -285,7 +293,9 @@ fn node_json(n: &NodeState, out: &mut String) {
                 }
                 None => out.push_str("null"),
             }
-            out.push_str("}}");
+            out.push_str(",\"key\":\"");
+            escape_json(&m.key, out);
+            out.push_str("\"}}");
         }
         NodeState::Split { axis, ratio, a, b } => {
             let axis = match axis {
@@ -366,7 +376,12 @@ fn node(j: &Json) -> Option<NodeState> {
             Some(c) => Some(c.as_str()?.into()),
         };
         let cwd = p.get("cwd")?.as_str()?.into();
-        return Some(NodeState::Pane(PaneMeta { cwd, claude }));
+        // Sessions saved before keys have none, and a bad one names nothing.
+        let key = (p.get("key").and_then(Json::as_str))
+            .filter(|k| is_key(k))
+            .unwrap_or_default()
+            .into();
+        return Some(NodeState::Pane(PaneMeta { cwd, claude, key }));
     }
     let axis = match j.get("split")?.as_str()? {
         "row" => Axis::Row,
@@ -452,6 +467,7 @@ mod tests {
         NodeState::Pane(PaneMeta {
             cwd: cwd.into(),
             claude: claude.map(Into::into),
+            key: String::new(),
         })
     }
 
@@ -566,11 +582,30 @@ mod tests {
     }
 
     #[test]
+    fn keys_name_no_other_file() {
+        assert!(is_key("0123456789abcdefABCDEF0123456789"));
+        let long = "0".repeat(33);
+        for k in [
+            "",
+            "0123",
+            r"..\session.json",
+            "0123456789abcdef0123456789abcdeg",
+            &long,
+        ] {
+            assert!(!is_key(k), "{k:?}");
+        }
+        // One read from a file edited by hand is dropped, not the session.
+        let bad = to_json(&sample()).replacen("\"key\":\"\"", r#""key":"..\\x""#, 1);
+        let s = from_json(&bad).expect("still a session");
+        assert!(s.layout(1).1.iter().all(|(_, p)| p.key.is_empty()));
+    }
+
+    #[test]
     fn fields_it_does_not_know_are_ignored() {
         let good = to_json(&sample());
         let more = good
             .replacen("{\"v\":1,", "{\"v\":1,\"later\":[1,{\"x\":null}],", 1)
-            .replace("\"claude\":null}", "\"claude\":null,\"shell\":\"pwsh\"}");
+            .replace("\"key\":\"\"}", "\"key\":\"\",\"shell\":\"pwsh\"}");
         assert_ne!(more, good);
         assert_eq!(from_json(&more), Some(sample()));
     }
@@ -650,6 +685,7 @@ mod tests {
         let s = State::capture(&win, Geometry::default(), |p| PaneMeta {
             cwd: format!("d{}", p.0),
             claude: None,
+            key: format!("{:032x}", p.0),
         });
         let s = from_json(&to_json(&s)).expect("reads back");
         // Leaf order is 1, 2, 4, 3: the left split put 4 before 3.
@@ -657,6 +693,13 @@ mod tests {
         let (back, panes) = s.layout(1);
         let cwds: Vec<&str> = panes.iter().map(|p| p.1.cwd.as_str()).collect();
         assert_eq!(cwds, ["d1", "d2", "d4", "d3"]);
+        // Each key stays with its pane, whatever the new numbering.
+        for (_, p) in &panes {
+            assert_eq!(
+                p.key,
+                format!("{:032x}", p.cwd[1..].parse::<u32>().unwrap())
+            );
+        }
         // Same shape and ratios, renumbered in tree order.
         let t = &back.tabs[0];
         assert_eq!(t.rects(AREA), vec![(PaneId(2), AREA)]);
