@@ -16,6 +16,11 @@ pub enum Action {
     CopyUnindented,
     /// Paste clipboard text. Without text the key goes to the program.
     Paste,
+    /// Select all of the focused pane's text, its scrollback too.
+    SelectAll,
+    /// Select the last command's output: the lines between blitz's last
+    /// two prompts.
+    SelectOutput,
     /// Scroll the main screen by a page; positive is up.
     ScrollPage(i8),
     /// Scroll the main screen to the top of the scrollback (1) or to the
@@ -101,6 +106,8 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Copy, "copy", "Copy"),
     (Action::CopyUnindented, "copy_without_indent", "Copy without indent"),
     (Action::Paste, "paste", "Paste"),
+    (Action::SelectAll, "select_all", "Select all"),
+    (Action::SelectOutput, "select_last_output", "Select the last command's output"),
     (Action::ScrollPage(1), "scroll_page_up", "Scroll up a page"),
     (Action::ScrollPage(-1), "scroll_page_down", "Scroll down a page"),
     (Action::ScrollEnd(1), "scroll_to_top", "Scroll to the top"),

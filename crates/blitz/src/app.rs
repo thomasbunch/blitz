@@ -687,15 +687,43 @@ impl Selection {
     }
 }
 
-/// A selection of the text of match `m`.
-fn found_selection(term: &vt::Terminal, pal: &Palette, m: Found) -> Selection {
+/// A selection of the cells from `start` to `end`, as made in code.
+fn selection_of(term: &vt::Terminal, pal: &Palette, start: Pos, end: Pos) -> Selection {
     let drag = Drag {
         epoch: term.line_epoch(),
-        anchor: (m.start, m.end),
+        anchor: (start, end),
         unit: 1,
         block: false,
     };
-    Selection::new(term, pal, drag, m.start)
+    Selection::new(term, pal, drag, start)
+}
+
+/// The first and last line of the text in `term`: none blank at the end.
+fn all_text(term: &vt::Terminal, pal: &Palette) -> Option<(usize, usize)> {
+    let lines = term.lines();
+    let last = (lines.clone()).rev().find(|&n| !blank(term, pal, n))?;
+    Some((lines.start, last))
+}
+
+/// The first and last line of the last command's output: the lines from
+/// the end of the command at blitz's next to last prompt down to its last
+/// prompt, none blank at the end.
+fn last_output(term: &vt::Terminal, pal: &Palette) -> Option<(usize, usize)> {
+    let mut prompts = term.lines().rev().filter(|&n| term.starts_prompt(n));
+    let (now, before) = (prompts.next()?, prompts.next()?);
+    let mut first = before;
+    while first < now && term.wraps(first) {
+        first += 1;
+    }
+    let last = (first + 1..now).rev().find(|&n| !blank(term, pal, n))?;
+    Some((first + 1, last))
+}
+
+/// Whether line `n` holds no text.
+fn blank(term: &vt::Terminal, pal: &Palette, n: usize) -> bool {
+    let mut cells = Vec::new();
+    term.line_cells(n, pal, &mut cells);
+    cells.iter().all(|c| c.len == 0)
 }
 
 /// The cells from `start` to `end`, or the block they are the corners
@@ -2348,7 +2376,8 @@ impl App {
                     if f.stale {
                         f.search(&term, v.grid.1);
                     }
-                    let sel = f.cur.map(|i| found_selection(&term, &pal, f.found[i]));
+                    let found = f.cur.map(|i| f.found[i]);
+                    let sel = found.map(|m| selection_of(&term, &pal, m.start, m.end));
                     drop(term);
                     v.selection = sel.or(v.selection.take());
                 }
@@ -2995,6 +3024,31 @@ impl App {
                     },
                 };
                 self.paste(id, &text, false);
+            }
+            Action::SelectAll | Action::SelectOutput => {
+                let pal = self.theme.pal;
+                let Some(v) = self.current_mut() else {
+                    return false;
+                };
+                let mut term = lock(&v.pane.term);
+                let found = match a {
+                    Action::SelectAll => all_text(&term, &pal),
+                    _ => last_output(&term, &pal),
+                };
+                let Some((first, last)) = found else {
+                    return false;
+                };
+                let sel = selection_of(&term, &pal, (first, 0), (last, u16::MAX));
+                if a == Action::SelectOutput {
+                    let m = Found {
+                        start: (first, 0),
+                        end: (last, 0),
+                    };
+                    reveal(&mut term, m, v.grid.1);
+                }
+                drop(term);
+                v.selection = Some(sel);
+                self.request_redraw();
             }
             Action::ScrollPage(dir) => {
                 if self.modes().alt_screen {
@@ -7216,6 +7270,35 @@ mod tests {
     }
 
     #[test]
+    fn app_selects_all_text_or_the_last_command_output() {
+        let pal = crate::theme::dark();
+        const PROMPT: &str = "\x1b]133;A;blitz=1\x07$ ";
+        let text = format!(
+            "{PROMPT}ls\r\none\r\n{PROMPT}cargo build --release\r\n\
+             Compiling x\r\nFinished\r\n\r\n{PROMPT}"
+        );
+        let t = fed(12, 4, &text);
+        let text = |(a, b): (usize, usize)| {
+            let s = selection_of(&t, &pal, (a, 0), (b, u16::MAX));
+            selection_text(&t, &pal, &s, 0)
+        };
+        let out = last_output(&t, &pal).expect("output");
+        assert_eq!(
+            text(out),
+            "Compiling x\r\nFinished",
+            "past the wrapped command"
+        );
+        let all = all_text(&t, &pal).expect("text");
+        assert!(text(all).starts_with("$ ls\r\none\r\n$ cargo build"));
+        assert!(text(all).ends_with("Finished\r\n\r\n$"));
+        // One prompt has no command before it.
+        let t = fed(12, 4, &format!("hello\r\n{PROMPT}"));
+        assert_eq!(last_output(&t, &pal), None);
+        let t = fed(12, 4, "");
+        assert_eq!(all_text(&t, &pal), None, "nothing to select");
+    }
+
+    #[test]
     fn app_closing_find_leaves_the_match_selected() {
         let pal = crate::theme::dark();
         let mut t = fed(6, 3, "one Needle, \u{4e2d}x");
@@ -7223,7 +7306,7 @@ mod tests {
         f.query = "needle, \u{4e2d}".into();
         f.search(&t, 3);
         let m = f.found[f.cur.expect("a match")];
-        let mut sel = found_selection(&t, &pal, m);
+        let mut sel = selection_of(&t, &pal, m.start, m.end);
         assert_eq!(selection_text(&t, &pal, &sel, 0), "Needle, \u{4e2d}");
         let mut s = Snapshot::default();
         assert!(
