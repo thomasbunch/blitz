@@ -2219,11 +2219,13 @@ impl App {
         let started = Instant::now();
         let mut waited = Duration::ZERO;
         if let Some((g, at)) = &mut self.game {
-            // A long gap, as while the window was in the background,
-            // counts as one short step: the game waits rather than jumps.
-            let dt = started
-                .saturating_duration_since(*at)
-                .min(Duration::from_millis(50));
+            // The game waits while the window is in the background, and a
+            // long frame counts as one short step rather than a jump.
+            let dt = if self.focused {
+                (started.saturating_duration_since(*at)).min(Duration::from_millis(50))
+            } else {
+                Duration::ZERO
+            };
             *at = started;
             if g.step(dt.as_secs_f32()) && g.best > run::load_best() {
                 run::save_best(g.best);

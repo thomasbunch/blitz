@@ -270,16 +270,10 @@ mod gpu {
             self.grid(snap, pal, x, y, false, true);
         }
 
-        /// [`Self::snapshot`] as [`dim`] would leave it, without copying
-        /// the snapshot.
-        pub fn dimmed(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
-            self.grid(snap, pal, x, y, true, true);
-        }
-
-        /// [`Self::snapshot`], or [`Self::dimmed`] with `dim`. Without
-        /// `clear`, the grid's own background is left to what is already
-        /// drawn under it, such as scenery; cells in other colours still
-        /// cover it.
+        /// [`Self::snapshot`], or with `dim` as [`dim`] would leave it,
+        /// without copying the snapshot. Without `clear`, the grid's own
+        /// background is left to what is already drawn under it, such as
+        /// scenery; cells in other colours still cover it.
         pub fn grid(
             &mut self,
             snap: &Snapshot,

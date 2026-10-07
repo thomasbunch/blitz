@@ -210,7 +210,7 @@ impl Run {
 
     /// Moves the game on by `dt` seconds. True when this step ended it.
     pub fn step(&mut self, dt: f32) -> bool {
-        // ponytail: the app already keeps dt under 0.05; this only bounds
+        // The app already keeps dt under 0.05; this only bounds
         // the loop below.
         let dt = dt.min(0.25);
         if dt.is_nan() || dt <= 0.0 {
