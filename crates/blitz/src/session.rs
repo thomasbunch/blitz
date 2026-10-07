@@ -2,7 +2,7 @@
 //! where the window was, in `%LOCALAPPDATA%\blitz\session.json`.
 
 use std::fmt::Write;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 
 use crate::hook::{Json, escape_json};
@@ -172,19 +172,34 @@ fn file() -> Option<PathBuf> {
     dir().map(|d| d.join("session.json"))
 }
 
-/// The saved session. A missing or broken file reads as none.
+/// The saved session. A missing or broken file reads as none. A byte order
+/// mark, which an editor may add, is skipped.
 pub fn load() -> Option<State> {
-    from_json(&std::fs::read_to_string(file()?).ok()?)
+    let text = std::fs::read_to_string(file()?).ok()?;
+    from_json(text.strip_prefix('\u{feff}').unwrap_or(&text))
 }
 
 /// Writes the session next to the old one, then swaps it in, so a crash
-/// mid-write never leaves a torn file.
+/// mid-write never leaves a torn file. The temporary file is this
+/// process's own, so two windows saving at once cannot swap in each
+/// other's half-written one.
+///
+/// Saved output is filed by the tab and leaf of the layout it was saved
+/// with, so it goes first: a crash must never pair it with another layout.
 pub fn save(s: &State) -> io::Result<()> {
     let dir = dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
     std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join("session.json.tmp");
-    std::fs::write(&tmp, to_json(s))?;
-    std::fs::rename(tmp, dir.join("session.json"))
+    save_output(&[])?;
+    let tmp = dir.join(format!("session.json.{}.tmp", std::process::id()));
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(to_json(s).as_bytes())?;
+        f.sync_all()
+    });
+    let swapped = written.and_then(|()| std::fs::rename(&tmp, dir.join("session.json")));
+    if swapped.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    swapped
 }
 
 /// Forgets the session and its saved output, so the next start is fresh.

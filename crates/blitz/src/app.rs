@@ -2377,10 +2377,6 @@ impl App {
             }
         };
         let mut s = session::State::capture(&self.win, self.placed, meta);
-        // Output changes all the time, so it is saved only at exit.
-        if force {
-            self.save_output();
-        }
         let same = self.saved.as_ref().is_some_and(|old| {
             (old.sidebar_expanded, old.active, &old.tabs) == (s.sidebar_expanded, s.active, &s.tabs)
         });
@@ -2409,8 +2405,13 @@ impl App {
                 ..self.placed
             };
         }
-        if let Err(e) = session::save(&s) {
-            eprintln!("blitz: saving the session: {e}");
+        // Saving the layout drops output saved for the last one, so output,
+        // which changes all the time and is saved only at exit, comes after
+        // it, and only when the layout it is filed by was written.
+        match session::save(&s) {
+            Ok(()) if force => self.save_output(),
+            Ok(()) => {}
+            Err(e) => eprintln!("blitz: saving the session: {e}"),
         }
         // Kept even when the write failed, so it is not retried every turn.
         self.saved = Some(s);
