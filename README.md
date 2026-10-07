@@ -13,6 +13,9 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 - Claude Code's title tells blitz when a session works and when it
   stops, and its hooks, which blitz sets up itself, when it needs input;
   the taskbar button flashes if blitz is in the background.
+- In PowerShell, a command that runs for 10 seconds or more and ends in
+  a pane you are not looking at marks it *done*, or *error* with its exit
+  code.
 - Progress a program reports (OSC 9;4) shows in the sidebar and on the
   taskbar button.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
@@ -160,6 +163,15 @@ once its shell is ready (this needs the hooks above). Typing `exit` in
 the last pane ends it all, and the next start is fresh. **Open in blitz**
 adds a tab to the running window, or to the reopened one; **Open in new
 blitz window** opens a separate window that is never saved.
+
+Closing a pane, a tab or the window ends what runs in it, so blitz asks
+first while a session there is busy: Claude Code working or waiting for
+you, or a shell command running. Do the same again to close it; any other
+key leaves it open and does what it always does. **Reopen the last closed
+pane** in the command palette brings it back beside the focused pane,
+resuming its Claude Code conversation. A program that exits with an error
+leaves its pane open with the exit code: Enter starts it again in place,
+Esc closes the pane.
 
 Saved state lives in `%LOCALAPPDATA%\blitz`.
 
@@ -314,9 +326,10 @@ pane, split or resize.
 
 The command palette lists every action with its keys. Typing narrows
 the list, the arrow keys choose, and Enter or a click runs the action;
-Esc closes it. Giving the panes equal space, renaming a session or a
-tab and Claude Code setup have no keys by default, so they are only in
-the palette; renaming takes the name on the palette's line.
+Esc closes it. Giving the panes equal space, closing a whole tab,
+reopening the last closed pane, renaming a session or a tab and Claude
+Code setup have no keys by default, so they are only in the palette;
+renaming takes the name on the palette's line.
 
 ## Key bindings
 
@@ -339,15 +352,16 @@ defaults stay; Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them.
 Lines blitz cannot read are skipped.
 
 The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
-`new_tab`, `close_pane`, `rename_session`, `rename_tab`, `next_tab`,
-`previous_tab`, `split_right`, `split_down`, `focus_left`,
-`focus_right`, `focus_up`, `focus_down`, `jump_to_attention`,
-`toggle_sidebar`, `update`, `theme_picker`, `settings`, `zoom`,
-`resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
-`swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
-`font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
-`find`, `previous_prompt`, `next_prompt` and `claude_setup`. Typing a
-name in the command palette finds its action.
+`new_tab`, `close_pane`, `close_tab`, `reopen_closed`,
+`rename_session`, `rename_tab`, `next_tab`, `previous_tab`,
+`split_right`, `split_down`, `focus_left`, `focus_right`, `focus_up`,
+`focus_down`, `jump_to_attention`, `toggle_sidebar`, `update`,
+`theme_picker`, `settings`, `zoom`, `resize_left`, `resize_right`,
+`resize_up`, `resize_down`, `swap_left`, `swap_right`, `swap_up`,
+`swap_down`, `equalize`, `font_size_up`, `font_size_down`,
+`font_size_reset`, `fullscreen`, `command_palette`, `find`,
+`previous_prompt`, `next_prompt` and `claude_setup`. Typing a name in
+the command palette finds its action.
 
 ## License
 
