@@ -144,11 +144,12 @@ pub enum UserEvent {
     /// Exit with this code: the self-test finished, or `--exit-after`
     /// ran out.
     Finish(i32),
-    /// A newer release, by version, with the installer's log when an
-    /// update to it failed.
-    Update(String, Option<PathBuf>),
-    /// What a look for a newer release that Ctrl+Shift+U asked for found.
-    Checked(Result<Option<String>, String>),
+    /// The update to this newer release failed and wrote this installer
+    /// log.
+    Failed(String, PathBuf),
+    /// What a look for a newer release found, and whether Ctrl+Shift+U
+    /// asked for it.
+    Checked(Result<Option<String>, String>, bool),
     /// The installer started, so blitz exits; or why it did not.
     Installed(Result<(), String>),
     /// Another launch asks the window to come to the front, and maybe to
@@ -1037,6 +1038,8 @@ struct App {
     /// Said in the banner in place of the offer for now: the question that
     /// running Update again answers, or that the update is downloading.
     banner_note: Option<(String, Ask)>,
+    /// Why the last look for a release, or the last update, failed.
+    update_error: Option<String>,
     /// The banner strip and the x that closes it in the last frame, for
     /// clicks.
     banner: Option<(Rect, Rect)>,
@@ -1480,6 +1483,7 @@ impl App {
             updating: None,
             closed: None,
             banner_note: None,
+            update_error: None,
             banner: None,
             below: Vec::new(),
             find_bar: None,
@@ -1619,17 +1623,16 @@ impl App {
                 // Ctrl+Shift+U updates with checks off too, so a failed
                 // update is shown, and old ones cleared, either way.
                 if let Some((v, log)) = crate::update::failed() {
-                    let _ = proxy.send_event(UserEvent::Update(v, Some(log)));
+                    let _ = proxy.send_event(UserEvent::Failed(v, log));
                 }
                 if !look {
                     return;
                 }
                 loop {
-                    // Quiet when it fails, as offline is normal; Ctrl+Shift+U
-                    // says why.
-                    if let Ok(Some(v)) = crate::update::check()
-                        && proxy.send_event(UserEvent::Update(v, None)).is_err()
-                    {
+                    // Quiet when it fails, as offline is normal; the
+                    // settings panel and Ctrl+Shift+U say why.
+                    let found = crate::update::check();
+                    if proxy.send_event(UserEvent::Checked(found, false)).is_err() {
                         return;
                     }
                     std::thread::sleep(UPDATE_EVERY);
@@ -2058,7 +2061,7 @@ impl App {
             }),
             settings: self.settings.as_ref().map(|p| chrome::Settings {
                 filter: &p.filter,
-                rows: p.rows(&self.config),
+                rows: p.rows(&self.config, self.update_error.as_deref()),
                 sel: p.sel,
                 top: p.top,
                 error: p.error.as_deref(),
@@ -2817,6 +2820,14 @@ impl App {
         }
     }
 
+    /// Whether release `v`, found without Ctrl+Shift+U, or the update to
+    /// it that `failed`, gets the banner: not after checks were turned off,
+    /// and not one whose banner was closed.
+    fn unasked(&self, v: &str, failed: bool) -> bool {
+        let closed = session::dir().and_then(|d| crate::update::dismissed_in(&d));
+        crate::update::show_unasked(v, failed, self.config.check_updates, closed.as_deref())
+    }
+
     /// Shows the banner for release `v`, or for the update to it that
     /// failed and wrote `log`.
     fn offer_update(&mut self, v: String, log: Option<PathBuf>) {
@@ -3524,7 +3535,7 @@ impl App {
                         // Always answered, or Ctrl+Shift+U stays busy.
                         let found = std::panic::catch_unwind(crate::update::check)
                             .unwrap_or_else(|_| Err(INTERNAL.into()));
-                        let _ = proxy.send_event(UserEvent::Checked(found));
+                        let _ = proxy.send_event(UserEvent::Checked(found, true));
                     });
                     return true;
                 };
@@ -6780,21 +6791,22 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 el.exit();
             }
-            // Unasked for: not after checks were turned off, and not one
-            // whose banner was closed.
-            UserEvent::Update(v, log) => {
-                let closed = session::dir().and_then(|d| crate::update::dismissed_in(&d));
-                let checks = self.config.check_updates;
-                if crate::update::show_unasked(&v, log.is_some(), checks, closed.as_deref()) {
-                    self.offer_update(v, log);
+            UserEvent::Failed(v, log) => {
+                if self.unasked(&v, true) {
+                    self.offer_update(v, Some(log));
                 }
             }
-            UserEvent::Checked(found) => {
+            UserEvent::Checked(found, asked) => {
                 let (text, failed) = (crate::update::found(&found), found.is_err());
-                if let Ok(Some(v)) = found {
+                self.update_error = failed.then(|| text.clone());
+                if let Ok(Some(v)) = found
+                    && (asked || self.unasked(&v, false))
+                {
                     self.offer_update(v, None);
                 }
-                match self.updating.take() {
+                // A look nobody asked for leaves an update under way alone.
+                let id = if asked { self.updating.take() } else { None };
+                match id {
                     Some(id) if failed => self.error(id, text),
                     Some(id) => self.set_notice(id, text, Some(Instant::now() + NOTICE), false),
                     None => {}
@@ -6811,8 +6823,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Installed(Err(e)) => {
                 eprintln!("blitz: update: {e}");
                 self.banner_note = None;
+                let text = format!("Update failed: {e}");
+                self.update_error = Some(text.clone());
                 if let Some(id) = self.updating.take() {
-                    self.error(id, format!("Update failed: {e}"));
+                    self.error(id, text);
                 }
             }
             // Explorer restarted. A new TaskbarList too, as the old one

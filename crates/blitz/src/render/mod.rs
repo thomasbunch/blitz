@@ -1113,7 +1113,7 @@ mod gpu {
             panel.sel = sel;
             model.settings = Some(chrome::Settings {
                 filter: "",
-                rows: panel.rows(&config),
+                rows: panel.rows(&config, None),
                 sel,
                 top: 0,
                 error: None,

@@ -167,6 +167,9 @@ pub struct SettingRow {
     pub more: bool,
     /// The default value, as shown.
     pub default: String,
+    /// Said in place of when a change applies: why the last look for an
+    /// update failed.
+    pub note: Option<String>,
     /// The value is not the default.
     pub changed: bool,
 }
@@ -1618,8 +1621,11 @@ fn settings(
             text(p, left, y + k as i32 * help_line, l, c.msg, false);
         }
         if st.error.is_none() {
-            let meta = format!("{} \u{b7} default {}", r.applies, r.default);
-            text(p, left, meta_y, fit(&meta, right - left, tw), c.dim, false);
+            let (meta, color) = match &r.note {
+                Some(note) => (note.clone(), c.error),
+                None => (format!("{} \u{b7} default {}", r.applies, r.default), c.dim),
+            };
+            text(p, left, meta_y, fit(&meta, right - left, tw), color, false);
         }
     }
     if let Some(e) = st.error {
@@ -2913,6 +2919,7 @@ mod tests {
             less: true,
             more: true,
             default: "on".into(),
+            note: None,
             changed: false,
         };
         vec![
@@ -2942,6 +2949,7 @@ mod tests {
             assert!(t.contains(&want), "missing {want:?} in {t:?}");
         }
         assert!(t.contains(&"Help for this setting."));
+        assert!(t.contains(&"Applies now \u{b7} default on"));
         // Every row is shown, inside the panel, with its control on it.
         let inside = |a: Rect, b: Rect| {
             a.x >= b.x && a.y >= b.y && a.right() <= b.right() && a.bottom() <= b.bottom()
@@ -2954,6 +2962,22 @@ mod tests {
                 .all(|&(_, row, ctl)| { inside(row, hits.panel) && inside(ctl, row) && ctl.w > 0 })
         );
         assert_eq!(hits.top, 0);
+
+        // A note takes the place of when the setting applies.
+        let mut rows = setting_rows();
+        rows[1].note = Some("Could not look for an update: offline".into());
+        m.settings = Some(Settings {
+            filter: "",
+            rows,
+            sel: 1,
+            top: 0,
+            error: None,
+        });
+        let c = build(&m);
+        let error = m.ui.error;
+        let note = |p: &Prim| matches!(p, Prim::Text { text, color, .. } if text == "Could not look for an update: offline" && *color == error);
+        assert!(c.prims.iter().any(note));
+        assert!(!texts(&c).contains(&"Applies now \u{b7} default on"));
     }
 
     #[test]

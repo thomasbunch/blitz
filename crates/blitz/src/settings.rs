@@ -169,10 +169,14 @@ impl Panel {
     }
 
     /// The rows the chrome draws: each matching setting with its value.
-    pub fn rows(&self, c: &Config) -> Vec<SettingRow> {
+    /// Checking for updates also says why the last look or update failed.
+    pub fn rows(&self, c: &Config, update_error: Option<&str>) -> Vec<SettingRow> {
         let d = Config::default();
         (self.matches().into_iter())
             .map(|s| SettingRow {
+                note: update_error
+                    .filter(|_| s.key == "check_updates")
+                    .map(Into::into),
                 group: s.group,
                 label: s.label,
                 help: s.help,
@@ -403,8 +407,9 @@ mod tests {
             restore_scrollback: true,
             ..Config::default()
         };
-        let rows = p.rows(&c);
+        let rows = p.rows(&c, None);
         assert_eq!(rows.len(), SETTINGS.len());
+        assert!(rows.iter().all(|r| r.note.is_none()));
         let row = |label| rows.iter().find(|r| r.label == label).expect(label);
         let out = row("Restore output");
         assert!(out.changed && out.on == Some(true) && out.default == "off");
@@ -413,5 +418,16 @@ mod tests {
         assert!(size.less && size.more);
         let font = row("Font");
         assert!(!font.less && font.more, "Cascadia Mono comes first");
+    }
+
+    #[test]
+    fn checking_for_updates_says_why_the_last_look_failed() {
+        let p = panel();
+        let why = "Could not look for an update: curl: (7) Failed to connect";
+        let rows = p.rows(&Config::default(), Some(why));
+        let noted: Vec<_> = (rows.iter())
+            .filter_map(|r| Some((r.label, r.note.as_deref()?)))
+            .collect();
+        assert_eq!(noted, [("Check for updates", why)]);
     }
 }
