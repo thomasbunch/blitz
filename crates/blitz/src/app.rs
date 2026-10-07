@@ -1062,6 +1062,8 @@ struct App {
     title: String,
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
+    /// A Claude Code hook has reported from a pane since blitz started.
+    hooked: bool,
     capture_then_exit: bool,
     /// This is the main window, whose layout is saved for the next start.
     /// Separate windows and scripted runs leave the saved one alone.
@@ -1499,6 +1501,7 @@ impl App {
             ime_at: None,
             title: "blitz".into(),
             checked_conpty: false,
+            hooked: false,
             capture_then_exit: false,
             persist,
             admin: false,
@@ -3766,8 +3769,43 @@ impl App {
                 };
                 self.typed(text.clone());
             }
+            Action::ReportIssue => self.report_issue(),
         }
         true
+    }
+
+    /// Opens a new GitHub issue with what a report needs to know about
+    /// this blitz filled in.
+    fn report_issue(&mut self) {
+        let renderer = match self.gfx.as_ref().map(|g| g.r.gpu.warp) {
+            Some(false) => "Direct3D 11",
+            Some(true) => "Direct3D 11 WARP, in software",
+            None => "none",
+        };
+        let conpty = match crate::pty::inbox_notice() {
+            Some(_) => "the Windows console host",
+            None => "bundled",
+        };
+        let hooks = if self.hooked { "seen" } else { "not seen" };
+        let windows = windows_version();
+        let facts = [
+            ("blitz", env!("CARGO_PKG_VERSION")),
+            ("Windows", &windows),
+            ("renderer", renderer),
+            ("ConPTY", conpty),
+            ("Claude Code hooks", hooks),
+            (
+                "last update error",
+                self.update_error.as_deref().unwrap_or("none"),
+            ),
+        ];
+        let url = crate::update::issue(&facts);
+        if !crate::update::open(&url)
+            && let Some(id) = self.focus_id()
+        {
+            let text = "Could not open a browser to report an issue";
+            self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+        }
     }
 
     fn on_pane(&mut self, el: &ActiveEventLoop, id: PaneId, note: Note) {
@@ -3907,6 +3945,7 @@ impl App {
                     v.pane.cmd.hooked = true;
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
                     v.pane.hooked = ev != Ev::Idle;
+                    self.hooked = true;
                     if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
                         self.hooks_hint(id, true);
                     }
@@ -6011,6 +6050,24 @@ fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &
     let banner = Palette { bg, ..*pal };
     let y = at.y + i32::from(grid.1.saturating_sub(rows)) * ch as i32;
     r.snapshot(&s, &banner, at.x, y);
+}
+
+/// The Windows version, such as `10.0.26200`. The manifest build.rs links
+/// in keeps Windows from giving an older one.
+fn windows_version() -> String {
+    use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+    let mut v = OSVERSIONINFOW {
+        dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a struct to fill, its size set as the call needs.
+    match unsafe { GetVersionExW(&mut v) } {
+        Ok(()) => format!(
+            "{}.{}.{}",
+            v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber
+        ),
+        Err(_) => "unknown".into(),
+    }
 }
 
 /// The title bar icon size, so Windows picks the hand-tuned small icon

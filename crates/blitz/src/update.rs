@@ -177,6 +177,29 @@ pub fn open(url: &str) -> bool {
     h.0 as isize > 32
 }
 
+/// The page for a new issue about blitz, its text ending in `facts` as
+/// a list of `name: value`. A word with a backslash, a file or folder
+/// that could hold the user's name, is left out.
+pub fn issue(facts: &[(&str, &str)]) -> String {
+    let mut body =
+        String::from("<!-- What happened, and how can it be made to happen again? -->\n\n\n");
+    for (name, value) in facts {
+        let words: Vec<&str> = (value.split(' '))
+            .map(|w| if w.contains('\\') { "(path)" } else { w })
+            .collect();
+        body += &format!("- {name}: {}\n", words.join(" "));
+    }
+    let body: String = (body.bytes())
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("https://github.com/{REPO}/issues/new?body={body}")
+}
+
 /// Where the release whose banner was closed is kept.
 const DISMISSED: &str = "update-dismissed";
 
@@ -271,9 +294,10 @@ pub fn fetch(v: &str) -> Result<PathBuf, String> {
     // the check and the start.
     let dir = std::env::temp_dir().join(format!("blitz-update-{v}"));
     let path = dir.join(&name);
+    // The error names no path: it can end up in an issue report.
     std::fs::create_dir_all(&dir)
         .and_then(|()| std::fs::write(&path, &exe))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        .map_err(|e| format!("could not save the installer: {e}"))?;
     Ok(path)
 }
 
@@ -583,6 +607,49 @@ mod tests {
         dismiss_in(&dir, None);
         assert_eq!(dismissed_in(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_issue_says_what_blitz_runs_on_but_names_no_path() {
+        let url = issue(&[
+            ("blitz", "0.0.4"),
+            ("ConPTY", "the Windows console host"),
+            (
+                "last update error",
+                r"C:\Users\Jo Smith\AppData\Local\Temp\x: Access is denied. (os error 5)",
+            ),
+        ]);
+        let query = url
+            .strip_prefix("https://github.com/thomasbunch/blitz/issues/new?body=")
+            .expect("the new issue page");
+        assert!(
+            query
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~%".contains(&b)),
+            "{query}"
+        );
+        // Undo the escapes.
+        let mut body = Vec::new();
+        let mut bytes = query.bytes();
+        while let Some(b) = bytes.next() {
+            match b {
+                b'%' => {
+                    let hex = [bytes.next().unwrap(), bytes.next().unwrap()];
+                    let hex = std::str::from_utf8(&hex).unwrap();
+                    body.push(u8::from_str_radix(hex, 16).unwrap());
+                }
+                b => body.push(b),
+            }
+        }
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.starts_with("<!-- What happened"), "{body}");
+        assert!(
+            body.ends_with(
+                "\n- blitz: 0.0.4\n- ConPTY: the Windows console host\n\
+                 - last update error: (path) (path) Access is denied. (os error 5)\n"
+            ),
+            "{body}"
+        );
     }
 
     #[test]

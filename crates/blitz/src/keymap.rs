@@ -100,6 +100,9 @@ pub enum Action {
     /// Label the URLs, paths and commit hashes in view, to copy or open
     /// one by its label.
     QuickSelect,
+    /// Open a new GitHub issue with what a report needs to know about
+    /// this blitz filled in.
+    ReportIssue,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -162,6 +165,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
     (Action::SystemMenu, "system_menu", "Window menu"),
     (Action::QuickSelect, "quick_select", "Quick select a link, path or hash"),
+    (Action::ReportIssue, "report_issue", "Report an issue"),
     (Action::GoToTab(0), "go_to_tab_1", "Go to tab 1"),
     (Action::GoToTab(1), "go_to_tab_2", "Go to tab 2"),
     (Action::GoToTab(2), "go_to_tab_3", "Go to tab 3"),
