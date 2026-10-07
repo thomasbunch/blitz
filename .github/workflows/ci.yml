@@ -31,6 +31,28 @@ jobs:
           [ -z "$bad" ] || { echo "::error::tracked files excluded by .gitignore:"; echo "$bad"; exit 1; }
       - run: rustup toolchain install
       - run: cargo fmt --all --check
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.20.2
+      # Releases only accept these licenses (cargo-about in release.yml).
+      # Checking here fails the pull request that brings in a crate under
+      # another license, or from anywhere but crates.io, instead of the
+      # next release. Unlike cargo-about this also checks build
+      # dependencies, which cargo-deny cannot leave out.
+      - name: Licenses and sources
+        run: |
+          cat > "$RUNNER_TEMP/deny.toml" <<'EOF'
+          [licenses]
+          allow = ["MIT", "Apache-2.0", "Zlib", "Unicode-3.0"]
+
+          [sources]
+          unknown-registry = "deny"
+          unknown-git = "deny"
+          EOF
+          # Licenses cover what ships: Windows, no dev dependencies.
+          cargo deny --config "$RUNNER_TEMP/deny.toml" --locked --target x86_64-pc-windows-msvc --exclude-dev check licenses
+          # Sources cover every crate CI builds, on every target.
+          cargo deny --config "$RUNNER_TEMP/deny.toml" --locked check sources
 
   test:
     name: test (${{ matrix.os }})
