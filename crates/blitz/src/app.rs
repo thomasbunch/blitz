@@ -1724,8 +1724,10 @@ impl App {
         self.note_ignored();
 
         // A dev build is left alone; a scripted run and a separate window
-        // have nothing to come back to.
-        if self.persist && !cfg!(debug_assertions) {
+        // have nothing to come back to. Set to start at sign-in, blitz
+        // starts then anyway, and a second start racing it would restore
+        // the same sessions in a second main window.
+        if self.persist && !cfg!(debug_assertions) && !starts_at_sign_in() {
             restart_after_reboot();
         }
         // Once there is a pane to say it failed in.
@@ -6490,6 +6492,25 @@ fn restart_after_reboot() {
     };
     // SAFETY: no command line, so blitz starts with none.
     let _ = unsafe { RegisterApplicationRestart(None, RESTART_NO_CRASH | RESTART_NO_HANG) };
+}
+
+/// Whether setup made blitz start when the user signs in.
+fn starts_at_sign_in() -> bool {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_ANY, RegGetValueW};
+    let run = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    // SAFETY: no buffer, so only whether the value is there comes back.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            run,
+            windows::core::w!("blitz"),
+            RRF_RT_ANY,
+            None,
+            None,
+            None,
+        )
+    };
+    r.is_ok()
 }
 
 /// Whether a session `now` differs from the one last `saved`. The window's
