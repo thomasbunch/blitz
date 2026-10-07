@@ -621,10 +621,15 @@ pub fn encode_paste(text: &str, bracketed: bool, out: &mut Vec<u8>) {
 /// `type` on a file can turn the mode on while cmd or another program
 /// that knows nothing of it reads the keys, and conhost then runs every
 /// line. So `trusted` is [`crate::Terminal::paste_trusted`]: bracketed
-/// paste on, and a paste under it already confirmed by the user.
-pub fn needs_paste_confirm(text: &str, trusted: bool) -> bool {
-    !trusted && text.contains(['\r', '\n'])
+/// paste on, and a paste under it already confirmed by the user. A paste
+/// of more than [`LARGE_PASTE`] bytes without bracketed paste is confirmed
+/// too, even on one line, as in Windows Terminal: it is typed in key by key.
+pub fn needs_paste_confirm(text: &str, bracketed: bool, trusted: bool) -> bool {
+    !trusted && (text.contains(['\r', '\n']) || !bracketed && text.len() > LARGE_PASTE)
 }
+
+/// Bytes of text above which a paste without bracketed paste is confirmed.
+pub const LARGE_PASTE: usize = 5 * 1024;
 
 /// Appends a focus report when mode 1004 is set.
 pub fn encode_focus(focused: bool, m: &InputModes, out: &mut Vec<u8>) {

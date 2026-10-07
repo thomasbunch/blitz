@@ -2615,7 +2615,7 @@ impl App {
                 let trusted = self
                     .current()
                     .is_some_and(|v| lock(&v.pane.term).paste_trusted());
-                if vt::keys::needs_paste_confirm(&text, trusted) {
+                if vt::keys::needs_paste_confirm(&text, bracketed, trusted) {
                     let Some(id) = before else {
                         return false;
                     };

@@ -1076,11 +1076,26 @@ fn paste_cannot_break_out_of_the_bracket() {
 #[test]
 fn paste_confirm_only_for_untrusted_line_breaks() {
     use vt::keys::needs_paste_confirm;
-    assert!(!needs_paste_confirm("ls -la", false));
-    assert!(needs_paste_confirm("echo 1\necho 2", false));
-    assert!(needs_paste_confirm("echo 1\r", false));
-    assert!(!needs_paste_confirm("echo 1\necho 2", true));
-    assert!(!needs_paste_confirm("", false));
+    for bracketed in [false, true] {
+        assert!(!needs_paste_confirm("ls -la", bracketed, false));
+        assert!(needs_paste_confirm("echo 1\necho 2", bracketed, false));
+        assert!(needs_paste_confirm("echo 1\r", bracketed, false));
+        assert!(!needs_paste_confirm("", bracketed, false));
+    }
+    assert!(!needs_paste_confirm("echo 1\necho 2", true, true));
+}
+
+/// A long line without bracketed paste is typed in key by key, so it is
+/// confirmed first, as Windows Terminal's large paste warning does.
+#[test]
+fn paste_confirm_for_large_unbracketed_text() {
+    use vt::keys::{LARGE_PASTE, needs_paste_confirm};
+    let line = "x".repeat(LARGE_PASTE);
+    assert!(!needs_paste_confirm(&line, false, false), "at the limit");
+    let big = "x".repeat(LARGE_PASTE + 1);
+    assert!(needs_paste_confirm(&big, false, false));
+    assert!(!needs_paste_confirm(&big, true, false), "bracketed");
+    assert!(!needs_paste_confirm(&big, true, true));
 }
 
 /// Any output can turn bracketed paste on, also for a program that does
