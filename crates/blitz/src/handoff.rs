@@ -326,10 +326,10 @@ mod tests {
         let h = |n: usize| HWND(n as *mut c_void);
         let next = |w: HWND| h(w.0 as usize + 1);
         assert!(down_from(h(1), next, |_| false).is_empty(), "all hidden");
-        let every_other = down_from(h(1), next, |w| w.0 as usize % 2 == 0);
+        let every_other = down_from(h(1), next, |w| (w.0 as usize).is_multiple_of(2));
         assert_eq!(every_other.len(), 64);
         assert_eq!(every_other[0], h(2));
-        let few = down_from(h(1), next, |w| w.0 as usize % 100 == 0);
+        let few = down_from(h(1), next, |w| (w.0 as usize).is_multiple_of(100));
         assert_eq!(few, (1..=10).map(|i| h(i * 100)).collect::<Vec<_>>());
         assert!(down_from(h(0), next, |_| true).is_empty(), "none");
     }
