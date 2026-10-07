@@ -270,6 +270,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
             return Ok(0);
         }
     }
+    catch_crashes();
     // Loading the graphics driver is most of the time to the first
     // frame; it runs while the window is made.
     let gpu = std::thread::spawn(|| Gpu::new(false));
@@ -296,6 +297,26 @@ pub fn run(args: &[String]) -> Result<i32, String> {
         return Ok(1);
     }
     Ok(app.code)
+}
+
+/// Writes a panic on this thread, the window's, to the crash file before
+/// it takes blitz down, since a release build has no console to say it
+/// on. Other threads catch their own: a pane's reader, an update.
+pub fn catch_crashes() {
+    let ui = std::thread::current().id();
+    let next = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == ui {
+            let text = format!(
+                "blitz {} stopped at {}\n{info}\n\n{}\n",
+                env!("CARGO_PKG_VERSION"),
+                local_stamp(),
+                std::backtrace::Backtrace::force_capture()
+            );
+            let _ = session::write_crash(&text);
+        }
+        next(info);
+    }));
 }
 
 /// Key input taken from raw window messages, waiting for the app.
@@ -1696,6 +1717,17 @@ impl App {
                     std::thread::sleep(UPDATE_EVERY);
                 }
             });
+        }
+        // Told once, in the window, as a release build has no console.
+        if !scripted
+            && let Some(id) = self.focus_id()
+            && let Some(file) = session::take_crash()
+        {
+            let text = format!(
+                "blitz stopped after an internal error last time; details are in {}",
+                file.display()
+            );
+            self.set_notice(id, text, None, false);
         }
         Ok(())
     }

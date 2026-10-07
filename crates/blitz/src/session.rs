@@ -247,6 +247,24 @@ pub fn save(s: &State) -> io::Result<()> {
     swapped
 }
 
+/// Writes down why blitz is about to go, for the next start to point at;
+/// see [`take_crash`].
+pub fn write_crash(text: &str) -> io::Result<()> {
+    let dir = dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("crash.txt"), text)
+}
+
+/// Where the last run wrote down its crash, if it did and no start has
+/// told of it yet. Moved to `last-crash.txt`, replacing an older one, so
+/// it is told of once and still there to read.
+pub fn take_crash() -> Option<PathBuf> {
+    let dir = dir()?;
+    let last = dir.join("last-crash.txt");
+    std::fs::rename(dir.join("crash.txt"), &last).ok()?;
+    Some(last)
+}
+
 /// Forgets the session and its saved output, so the next start is fresh.
 pub fn clear() {
     if let Some(f) = file() {
