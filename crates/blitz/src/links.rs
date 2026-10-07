@@ -213,7 +213,8 @@ fn plain(path: &Path, from: usize) -> bool {
     (path.ancestors())
         .take_while(|a| a.as_os_str().len() > from)
         .all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| !m.file_type().is_symlink()))
-        && std::fs::symlink_metadata(path).is_ok()
+        // A longer `path` was the first ancestor looked at.
+        && (path.as_os_str().len() > from || std::fs::symlink_metadata(path).is_ok())
 }
 
 /// What opening an OSC 8 link's `uri` does. Only `http`, `https` and
