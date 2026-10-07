@@ -181,10 +181,11 @@ pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
     full.exists().then_some(full)
 }
 
-/// What opening an OSC 8 link's `uri` does. Only `http`, `https`,
-/// `mailto` and local `file` URIs open: any other scheme starts whatever
-/// program registered it, and some (`ms-msdt:`, `search-ms:`) have been
-/// used to attack Windows.
+/// What opening an OSC 8 link's `uri` does. Only `http`, `https` and
+/// local `file` URIs open: any other scheme starts whatever program
+/// registered it, and some (`ms-msdt:`, `search-ms:`) have been used to
+/// attack Windows. Even `mailto:` hands a message the program wrote,
+/// attachments included in some mail programs, to the one registered.
 pub fn plan_uri(uri: &str, pathext: &str) -> Option<Open> {
     // A space or quote could split the command line that starts the
     // program.
@@ -196,7 +197,7 @@ pub fn plan_uri(uri: &str, pathext: &str) -> Option<Open> {
     }
     let (scheme, _) = uri.split_once(':')?;
     match scheme.to_ascii_lowercase().as_str() {
-        "http" | "https" | "mailto" => Some(Open::Uri(uri.to_owned())),
+        "http" | "https" => Some(Open::Uri(uri.to_owned())),
         "file" => plan_path(Path::new(&vt::osc::file_url_path(uri)?), pathext),
         _ => None,
     }
@@ -262,7 +263,7 @@ pub fn open(t: &Target) -> Result<(), &'static str> {
                 format!("/select,\"{}\"", p.display()),
             )
         }
-        None => return Err("blitz opens only web and mail links and files on this computer"),
+        None => return Err("blitz opens only web links and files on this computer"),
     };
     // SAFETY: NUL-terminated strings that outlive the call, and no window.
     let done = unsafe {
@@ -389,7 +390,6 @@ mod tests {
             uri("https://example.com/a?b")
         );
         assert_eq!(plan("HTTP://x.com"), uri("HTTP://x.com"));
-        assert_eq!(plan("mailto:a@b.c"), uri("mailto:a@b.c"));
         for bad in [
             "ms-msdt:/id PCWDiagnostic",
             "ms-msdt:-id",
@@ -397,6 +397,7 @@ mod tests {
             "javascript:alert(1)",
             "vbscript:x",
             "ms-settings:",
+            "mailto:a@b.c?attach=C:/x/secret.txt",
             r"\\server\share\x.txt",
             "file://server/share/x.txt",
             "file:///C:/x/a%0a.txt",
