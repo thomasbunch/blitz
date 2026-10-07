@@ -5765,7 +5765,7 @@ mod tests {
         win.tabs.push(Tab::new("b".into(), PaneId(2)));
         let offer = crate::update::banner(None, "0.2.0", None, true).expect("an offer");
         let update = ("0.2.0".to_string(), offer);
-        let note = "Sessions are busy, and updating restarts blitz.                     Press Ctrl+Alt+Shift+F12 again";
+        let note = "Sessions are busy, and updating restarts blitz. Press Ctrl+Alt+Shift+F12 again";
         let area = |note| chrome::area(&win, (1440, 900), 1.0, banner_text(Some(&update), note), 7);
         assert_eq!(area(None).h, 900, "the offer sits at the sidebar's foot");
         assert!(area(Some(note)).h < 900, "the note needs the strip");
