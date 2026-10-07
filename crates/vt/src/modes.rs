@@ -114,6 +114,10 @@ pub struct Modes {
     /// turned on. Any program's output can turn it on, so until then it does
     /// not show that a program reading pastes safely is listening.
     pub paste_confirmed: bool,
+    /// A program that reads every paste as text said it listens while
+    /// bracketed paste was off: the next turn on is its own and counts as
+    /// confirmed.
+    pub paste_vouched: bool,
     /// Mode 2031: report dark/light changes unasked, as `CSI ? 997 ; n n`.
     pub theme_reports: bool,
 }
@@ -129,6 +133,7 @@ impl Default for Modes {
             mok: 0,
             sync: None,
             paste_confirmed: false,
+            paste_vouched: false,
             theme_reports: false,
         }
     }
@@ -159,7 +164,7 @@ impl Modes {
             // only turning it on anew can mean another program reads keys.
             2004 => {
                 if on && !i.bracketed {
-                    self.paste_confirmed = false;
+                    self.paste_confirmed = std::mem::take(&mut self.paste_vouched);
                 }
                 i.bracketed = on;
             }
@@ -210,6 +215,7 @@ impl Modes {
         self.input.alt_scroll = true;
         self.input.bracketed = false;
         self.paste_confirmed = false;
+        self.paste_vouched = false;
         self.sync = None;
         self.theme_reports = false;
     }

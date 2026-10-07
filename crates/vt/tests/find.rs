@@ -132,6 +132,32 @@ fn lines_keep_their_number_as_a_screen_without_scrollback_scrolls() {
 }
 
 #[test]
+fn lines_start_over_as_the_screen_scrolls_under_scrollback() {
+    // SU, DL on the top row, SD and RI at the top move every screen row
+    // while the scrollback above stays, so no line number can follow.
+    for (seq, d) in [
+        (&b"\x1b[S"[..], 2),
+        (b"\x1b[H\x1b[M", 2),
+        (b"\x1b[T", 4),
+        (b"\x1b[H\x1bM", 4),
+    ] {
+        let mut t = term(20, 3, 100);
+        t.feed(b"a\r\nb\r\nc\r\nd\r\ne");
+        let epoch = t.line_epoch();
+        assert_eq!(t.find("d"), [found((3, 0), (3, 0))]);
+        t.feed(seq);
+        assert_eq!(t.find("d"), [found((d, 0), (d, 0))], "{seq:?}");
+        assert_ne!(t.line_epoch(), epoch, "{seq:?}");
+    }
+    // A region short of the whole screen leaves the epoch alone.
+    let mut t = term(20, 3, 100);
+    t.feed(b"a\r\nb\r\nc\r\nd\r\ne");
+    let epoch = t.line_epoch();
+    t.feed(b"\x1b[2;3r\x1b[S");
+    assert_eq!(t.line_epoch(), epoch);
+}
+
+#[test]
 fn snapshots_mark_the_matches_in_view() {
     let mut t = term(10, 2, 100);
     // Lines: "ab", "0123456789" wrapping into "ab", then "ab".

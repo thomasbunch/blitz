@@ -182,8 +182,8 @@ pub struct SettingsHits {
     pub rows: Vec<(usize, Rect, Rect)>,
     /// The first list line shown.
     pub top: usize,
-    /// Where typed text goes next.
-    pub field: Rect,
+    /// Where typed text goes next, and where the field starts.
+    pub field: (Rect, i32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -230,8 +230,9 @@ pub struct Chrome {
     pub settings: Option<SettingsHits>,
     /// The command palette and each row it shows, by index, for clicks.
     pub commands: Option<(Rect, Vec<(usize, Rect)>)>,
-    /// Where text typed into the open panel or bar goes next, for the IME.
-    pub field: Option<Rect>,
+    /// Where text typed into the open panel or bar goes next, for the IME,
+    /// and where its field starts.
+    pub field: Option<(Rect, i32)>,
 }
 
 /// Where the sidebar or rail put what a click there acts on.
@@ -1021,8 +1022,8 @@ pub fn build(m: &ChromeModel) -> Chrome {
         out.commands = Some((panel, rows));
         out.field = out.field.or(to_commands.then_some(at));
     }
-    if let (Some((_, _, t)), Some(f)) = (m.preedit, out.field) {
-        let f = ime_rect(f, text_w(t, tw));
+    if let (Some((_, _, t)), Some((f, left))) = (m.preedit, out.field) {
+        let f = ime_rect(f, left, text_w(t, tw));
         // Over the hint an empty field shows.
         extra.push(Prim::Rect(f, c.side_bg));
         composition(&mut extra, t, f, tw, false, (c.side_bg, c.msg), s(1.0));
@@ -1031,11 +1032,11 @@ pub fn build(m: &ChromeModel) -> Chrome {
     out
 }
 
-/// Where a composition `w` wide goes in a field whose typed text goes
-/// next at `f`: there, or over the right end of the typed text when that
-/// leaves too little room.
-fn ime_rect(f: Rect, w: i32) -> Rect {
-    let x = f.x.min(f.right() - w).max(0);
+/// Where a composition `w` wide goes in a field from `left` whose typed
+/// text goes next at `f`: there, or over the right end of the typed text
+/// when that leaves too little room, never left of the field.
+fn ime_rect(f: Rect, left: i32, w: i32) -> Rect {
+    let x = f.x.min(f.right() - w).max(left);
     Rect {
         x,
         w: f.right() - x,
@@ -1087,7 +1088,7 @@ fn find_bar(
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
     caret: bool,
-) -> (Rect, Rect) {
+) -> (Rect, (Rect, i32)) {
     let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
         p.push(Prim::Text {
             x,
@@ -1181,7 +1182,7 @@ fn list(
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
     mut side: impl FnMut(&mut Vec<Prim>, usize, Rect, i32) -> i32,
-) -> (Rect, Vec<(usize, Rect)>, Rect) {
+) -> (Rect, Vec<(usize, Rect)>, (Rect, i32)) {
     let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
         p.push(Prim::Text {
             x,
@@ -1270,7 +1271,7 @@ fn picker(
     s: impl Fn(f32) -> i32,
     cells: (i32, i32),
     caret: bool,
-) -> Rect {
+) -> (Rect, i32) {
     let l = List {
         title: "Theme",
         filter: pk.filter,
@@ -1326,7 +1327,7 @@ fn commands(
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
     caret: bool,
-) -> (Rect, Vec<(usize, Rect)>, Rect) {
+) -> (Rect, Vec<(usize, Rect)>, (Rect, i32)) {
     let hint;
     let l = match cm.rename {
         Some(title) => List {
@@ -1381,7 +1382,7 @@ fn commands(
 /// A one-line text field from (`x`, `y`) to `right`: what was typed, the
 /// end of it when it is long, or the `hint` while it is empty, and with a
 /// `caret` of that width the caret where typing goes. Returns where typed
-/// text goes next: after the text, or over the hint at its start.
+/// text goes next: after the text, or over the hint at its start; and `x`.
 fn field(
     p: &mut Vec<Prim>,
     c: &Ui,
@@ -1389,7 +1390,7 @@ fn field(
     (typed, hint): (&str, &str),
     caret: Option<i32>,
     (tw, th): (i32, i32),
-) -> Rect {
+) -> (Rect, i32) {
     let (shown, color, end) = if typed.is_empty() {
         (fit(hint, right - x, tw), c.dim, x)
     } else {
@@ -1417,12 +1418,13 @@ fn field(
         ));
     }
     let end = end.min(right);
-    Rect {
+    let at = Rect {
         x: end,
         y,
         w: right - end,
         h: th,
-    }
+    };
+    (at, x)
 }
 
 /// `r` shrunk by `by` on every side.
@@ -1511,7 +1513,7 @@ fn settings(
         panel,
         rows: Vec::new(),
         top: first,
-        field: Rect::default(),
+        field: Default::default(),
     };
     p.push(Prim::Rect(panel, c.border));
     let inner = Rect {
@@ -2736,7 +2738,7 @@ mod tests {
             screen_only: false,
         });
         let c = build(&m);
-        let find = c.field.expect("the find bar's field");
+        let (find, _) = c.field.expect("the find bar's field");
         let composed = |c: &Chrome| {
             (c.prims.iter()).find_map(|p| match p {
                 Prim::Text {
@@ -2762,7 +2764,7 @@ mod tests {
             sessions: false,
         });
         let c = build(&m);
-        let field = c.field.expect("the palette's field");
+        let (field, _) = c.field.expect("the palette's field");
         assert!(field.y < find.y || field.x != find.x);
         assert_eq!(composed(&c), Some((field.x, field.y, false)));
         let hint = Prim::Rect(field, crate::theme::blitz(false).ui.side_bg);
@@ -2867,21 +2869,23 @@ mod tests {
             w: 40,
             h: 16,
         };
-        assert_eq!(ime_rect(room, 24), room, "after the typed text");
+        assert_eq!(ime_rect(room, 60, 24), room, "after the typed text");
         let full = Rect {
             x: 139,
             w: 1,
             ..room
         };
         assert_eq!(
-            ime_rect(full, 24),
+            ime_rect(full, 60, 24),
             Rect {
                 x: 116,
                 w: 24,
                 ..room
             }
         );
-        assert_eq!(ime_rect(full, 500).x, 0);
+        // Wider than the whole field: from its start, cut at its end.
+        let wide = ime_rect(full, 60, 500);
+        assert_eq!((wide.x, wide.right()), (60, room.right()));
     }
 
     #[test]
