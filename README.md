@@ -229,9 +229,9 @@ size and the theme change at once; the panel says when the others take
 effect. A dot marks each setting changed from its default.
 
 The panel saves to `%APPDATA%\blitz\config.toml`, which you can also edit
-yourself: one `key = value` per line, `#` starts a comment. **Open
-config.toml** in the command palette opens it, in Notepad when no program
-opens `.toml` files. blitz reads the file again whenever it is saved, and
+yourself: one `key = value` per line, `#` after a space starts a
+comment. **Open config.toml** in the command palette opens it, in
+Notepad when no program opens `.toml` files. blitz reads the file again whenever it is saved, and
 keeps your comments when it writes it. A line it cannot use is skipped,
 and a dim notice in the pane says which. A theme or font that is not
 there shows in the panel with what blitz uses instead.
