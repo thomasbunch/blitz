@@ -468,6 +468,15 @@ impl Terminal {
         self.changed = true;
     }
 
+    /// Undoes what a crashed program can leave behind, for the user's
+    /// Reset terminal: what DECSTR resets, such as a hidden cursor, and
+    /// what blitz's own prompt does. The screen, the scrollback and the
+    /// modes ConPTY owns stay.
+    pub fn reset_modes(&mut self) {
+        self.soft_reset();
+        self.prompt_reset();
+    }
+
     /// Drops the main screen's scrollback, as `CSI 3 J` there does.
     pub fn clear_scrollback(&mut self) {
         let main = if self.alt {

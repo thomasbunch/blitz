@@ -211,6 +211,30 @@ fn blitz_prompt_resets_input_modes() {
     assert_clean(&t);
 }
 
+#[test]
+fn the_host_resets_what_a_program_left() {
+    let mut t = leftovers();
+    t.feed(b"xyz\x1b[?25l\x1b[4h\x1b[31m");
+    t.reset_modes();
+    let m = t.input_modes();
+    assert_eq!(
+        (t.kitty_stack(false), t.kitty_stack(true)),
+        (&[][..], &[][..])
+    );
+    assert_eq!(
+        (m.mouse, m.mouse_sgr, m.bracketed, m.decckm),
+        (MouseMode::Off, false, false, false)
+    );
+    assert!(m.w32im && m.focus, "ConPTY's own modes stay");
+    assert!(t.cursor().2, "the cursor shows");
+    // Insert mode is off and the colour is gone; the text stays.
+    t.feed(b"\x1b[Ha");
+    assert_eq!(t.screen_text().lines().next(), Some("ayz"));
+    let mut s = vt::Snapshot::default();
+    t.snapshot(&mut s, &PAL);
+    assert_eq!(s.cells[0].fg, PAL.fg);
+}
+
 /// Display state a program can leave behind that would garble or hide
 /// whatever the shell and later programs print.
 #[test]
