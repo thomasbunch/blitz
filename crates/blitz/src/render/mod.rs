@@ -16,6 +16,16 @@ use std::path::Path;
 
 use vt::{Palette, RenderCell, Snapshot};
 
+/// Sidebar and label text size relative to the terminal font.
+const CHROME_TEXT: f32 = 0.75;
+
+/// The chrome font size for a terminal font of `px` pixels at DPI
+/// `scale`: three quarters of it, but never under 12 px at 96 DPI, so the
+/// sidebar stays readable beside a small terminal font.
+pub fn chrome_px(px: f32, scale: f32) -> f32 {
+    (px * CHROME_TEXT).max(12.0 * scale)
+}
+
 /// Creates `path` as a new file for a capture or log. Whatever is there is
 /// removed first rather than opened, so a link planted at the path cannot
 /// send the write to another file.
@@ -154,8 +164,6 @@ mod gpu {
 
     /// Default font size: 12 pt at 96 DPI.
     pub const DEFAULT_PX: f32 = 16.0;
-    /// Sidebar and label text size relative to the terminal font.
-    pub const CHROME_TEXT: f32 = 0.75;
 
     /// [`GlyphKey::style`] bits beyond bold and italic: the glyph comes
     /// from the chrome font, or is a shape from [`shape_mask`].
@@ -183,25 +191,26 @@ mod gpu {
     }
 
     /// The terminal font and the chrome font: `family`, or the first of
-    /// the defaults installed.
-    fn fonts(family: &str, px: f32) -> Result<(Font, Font)> {
+    /// the defaults installed, at DPI `scale`.
+    fn fonts(family: &str, px: f32, scale: f32) -> Result<(Font, Font)> {
         let families: Vec<&str> = (std::iter::once(family).filter(|f| !f.is_empty()))
             .chain(DEFAULT_FAMILIES.iter().copied())
             .collect();
         Ok((
             Font::new(&families, px)?,
-            Font::new(&families, px * CHROME_TEXT)?,
+            Font::new(&families, super::chrome_px(px, scale))?,
         ))
     }
 
     impl Renderer {
         pub fn new(warp: bool, px: f32) -> Result<Self> {
-            Self::with_gpu(Gpu::new(warp)?, "", px)
+            Self::with_gpu(Gpu::new(warp)?, "", px, px / DEFAULT_PX)
         }
 
-        /// [`Self::new`] on a device made elsewhere, in font `family`.
-        pub fn with_gpu(mut gpu: Gpu, family: &str, px: f32) -> Result<Self> {
-            let (font, small) = fonts(family, px)?;
+        /// [`Self::new`] on a device made elsewhere, in font `family`, at
+        /// DPI `scale`.
+        pub fn with_gpu(mut gpu: Gpu, family: &str, px: f32, scale: f32) -> Result<Self> {
+            let (font, small) = fonts(family, px, scale)?;
             gpu.set_text_params(font.gamma, font.contrast);
             Ok(Self {
                 gpu,
@@ -216,8 +225,8 @@ mod gpu {
         }
 
         /// Loads another font, or the same at a new size after a DPI change.
-        pub fn set_font(&mut self, family: &str, px: f32) -> Result<()> {
-            (self.font, self.small) = fonts(family, px)?;
+        pub fn set_font(&mut self, family: &str, px: f32, scale: f32) -> Result<()> {
+            (self.font, self.small) = fonts(family, px, scale)?;
             self.atlas.clear();
             Ok(())
         }
@@ -1150,6 +1159,15 @@ mod tests {
     }
 
     #[test]
+    fn chrome_text_has_a_floor() {
+        assert_eq!(chrome_px(16.0, 1.0), 12.0);
+        assert_eq!(chrome_px(32.0, 1.0), 24.0);
+        // A 9 pt terminal font, at 96 and 144 DPI.
+        assert_eq!(chrome_px(12.0, 1.0), 12.0);
+        assert_eq!(chrome_px(18.0, 1.5), 18.0);
+    }
+
+    #[test]
     fn text_snapshot_lays_out_wide_and_narrow_cells() {
         let s = text_snapshot("a中b\n\u{2500}", 5, 3, &pal());
         assert_eq!((s.cols, s.rows, s.cells.len()), (5, 3, 15));
@@ -1317,7 +1335,7 @@ mod tests {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         render_offscreen(&mut r, &snap, &p).expect("render");
         let small = r.cell();
-        r.set_font("", 24.0).expect("font");
+        r.set_font("", 24.0, 1.0).expect("font");
         assert!(r.cell().1 > small.1, "{:?} after {small:?}", r.cell());
         let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
         assert_eq!((w, h), r.cell());
@@ -1326,7 +1344,7 @@ mod tests {
         assert_eq!(pixel(&px, w, w - 1, h - 1), p.fg, "bottom right");
         assert_eq!(pixel(&px, w, 0, 0), p.fg, "top left");
         // A family that is not installed falls back to the defaults.
-        r.set_font("No Such Font 4b1d", 16.0)
+        r.set_font("No Such Font 4b1d", 16.0, 1.0)
             .expect("fallback font");
         assert_eq!(r.cell(), small);
     }
