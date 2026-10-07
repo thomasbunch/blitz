@@ -2062,6 +2062,10 @@ impl App {
             }
             return;
         }
+        // blitz run covers the panes and keeps the sidebar where it is.
+        if pressed && self.game.is_some() {
+            return;
+        }
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
         let on_banner = (self.banner)
             .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
@@ -2169,6 +2173,9 @@ impl App {
         if let Some(p) = self.settings.as_mut().filter(|_| self.picker.is_none()) {
             p.move_by(-steps as isize);
             self.request_redraw();
+            return;
+        }
+        if self.game.is_some() {
             return;
         }
         // Over another pane, the wheel scrolls that pane's history without
