@@ -68,13 +68,13 @@ pub fn prompt_mark(body: &str, token: &str) -> Option<PromptMark> {
 pub fn file_url_path(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
     let (host, path) = rest.split_at(rest.find('/')?);
+    if cfg!(windows) && !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
     let path = percent_decode(path);
     let b = path.as_bytes();
     if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
         return Some(path[1..].replace('/', "\\"));
-    }
-    if cfg!(windows) && !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
-        return None;
     }
     Some(path)
 }
@@ -290,6 +290,9 @@ mod tests {
         assert_eq!(p("file:///bad%zz%4").as_deref(), Some("/bad%zz%4"));
         if cfg!(windows) {
             assert_eq!(p("file://srv/share/x%20y"), None);
+            // A drive on another machine is not this machine's drive.
+            assert_eq!(p("file://srv/C:/x"), None);
+            assert_eq!(p("file://LOCALHOST/C:/x").as_deref(), Some("C:\\x"));
         }
         assert_eq!(p("http://x/y"), None);
         assert_eq!(p("file://host-only"), None);
