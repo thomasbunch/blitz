@@ -217,7 +217,8 @@ pub const SETTINGS: &[Setting] = &[
         key: "mascot",
         group: "Easter eggs",
         label: "Spark",
-        help: "A little critter at the foot of the sidebar that naps, runs                and waves along with your sessions.",
+        help: "A little critter at the foot of the sidebar that naps, runs \
+               and waves along with your sessions.",
         kind: Kind::Toggle,
         applies: NOW,
     },
@@ -225,7 +226,8 @@ pub const SETTINGS: &[Setting] = &[
         key: "game",
         group: "Easter eggs",
         label: "blitz run",
-        help: "A one-button runner for while agents work. Enter starts it,                Space jumps, Esc quits; it closes when a session needs you.",
+        help: "A one-button runner for while agents work. Enter starts it, \
+               Space jumps, Esc quits; it closes when a session needs you.",
         kind: Kind::Game,
         applies: NOW,
     },
@@ -498,6 +500,14 @@ mod tests {
         let v = c.get("shell");
         assert!(Config::default().set("shell", &v));
         assert_eq!(Config::parse(&format!("shell = {v}")).shell, c.shell);
+    }
+
+    #[test]
+    fn help_text_has_single_spaces() {
+        // The settings search matches the help as written.
+        for s in SETTINGS {
+            assert!(!s.help.contains("  "), "{}: {:?}", s.key, s.help);
+        }
     }
 
     #[test]
