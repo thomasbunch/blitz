@@ -363,11 +363,13 @@ impl Config {
     /// skipped; `None` when none were. It names the first one's key, not
     /// its value, which may be a token the screen must not show. Nor is
     /// what only looks like a key shown, such as a padded base64 secret
-    /// on a line of its own: keys are short, lowercase and snake_case.
+    /// on a line of its own: keys are short, lowercase and snake_case, or
+    /// kebab-case as other terminals spell them.
     pub fn ignored_notice(&self) -> Option<String> {
         let ((n, line), more) = self.ignored.split_first()?;
         let key = (line.split_once('=').map(|(k, _)| k.trim())).filter(|k| {
-            k.len() <= 32 && (k.bytes()).all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+            let word = |b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
+            k.len() <= 32 && k.bytes().all(word)
         });
         let key = key.map_or_else(String::new, |k| format!(" ({k})"));
         Some(match more.len() {
@@ -867,6 +869,9 @@ mod tests {
         let typo = Config::parse("evn = GITHUB_TOKEN=ghp_x\nghp_y\n");
         let notice = "config.toml line 1 (evn) and 1 more were skipped";
         assert_eq!(typo.ignored_notice().as_deref(), Some(notice));
+        let other = Config::parse("font-size = 14\n");
+        let notice = "config.toml line 1 (font-size) was skipped";
+        assert_eq!(other.ignored_notice().as_deref(), Some(notice));
         let secret = Config::parse(
             "env = API_KEY=
 dGhpcyBpcyBhIHNlY3JldA==
