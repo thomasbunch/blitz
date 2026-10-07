@@ -3990,7 +3990,7 @@ impl App {
             (crate::links::scan(&l.text).into_iter()).find(|(r, _)| r.contains(&here))?;
         let target = match found {
             Link::Url(u) => Target::Uri(u),
-            Link::Path(p) => Target::Path(crate::links::resolve(&p, &v.pane.cwd)?),
+            Link::Path(p, _) => Target::Path(crate::links::resolve(&p, &v.pane.cwd)?),
         };
         Some((target, l.span(range)))
     }

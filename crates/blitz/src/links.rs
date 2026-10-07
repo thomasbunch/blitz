@@ -22,9 +22,11 @@ pub enum Target {
 pub enum Link {
     /// An `http` or `https` URL.
     Url(String),
-    /// A word that looks like a file path, without the `:line:col` after
-    /// it. It is a link only if the file exists; see [`resolve`].
-    Path(String),
+    /// A word that looks like a file path, and the line and column after
+    /// it, as in `src/app.rs:12:5` or tsc's `src/app.ts(12,5)`; a line alone
+    /// is at column 1. It is a link only if the file exists; see
+    /// [`resolve`].
+    Path(String, Option<(u32, u32)>),
 }
 
 /// How blitz opens a link.
@@ -116,10 +118,12 @@ pub fn scan(text: &str) -> Vec<(Range<usize>, Link)> {
             i += n;
             continue;
         }
-        if before.is_none_or(|b| !path_char(b))
-            && let Some((path, end)) = path_at(&text[i..])
+        // Claude Code's tool headers, as in `Update(src/app.rs)`, Markdown
+        // links and `--flag=path` put a path right after a word.
+        if before.is_none_or(|b| !path_char(b) || matches!(b, '(' | '[' | '=' | '\''))
+            && let Some((path, end, at)) = path_at(&text[i..])
         {
-            let found = Link::Path(text[i + path.start..i + path.end].to_owned());
+            let found = Link::Path(text[i + path.start..i + path.end].to_owned(), at);
             out.push((i + path.start..i + end, found));
             i += end;
             continue;
@@ -149,41 +153,82 @@ fn path_char(c: char) -> bool {
         || c.is_ascii_graphic() && !matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | ':' | '`')
 }
 
-/// The path word at the start of `s`: where the path is in it, and where
-/// the word ends after any `:line` or `:line:col`. A path starts with a
-/// drive, or holds a `/` or `\` and ends in a name with an extension.
-fn path_at(s: &str) -> Option<(Range<usize>, usize)> {
+/// Where a path is in a word, where the word ends, and the line and
+/// column after the path.
+type PathWord = (Range<usize>, usize, Option<(u32, u32)>);
+
+/// The path word at the start of `s`: where the path is in it, where the
+/// word ends after any `:line`, `:line:col` or `(line,col)`, and that line
+/// and column. A path starts with a drive or `~`, holds a `/` or `\` and
+/// ends in a name with an extension, or is a bare `name.ext`.
+fn path_at(s: &str) -> Option<PathWord> {
     // A bracket or quote before a path is not part of it.
     let lead = s.len() - s.trim_start_matches(['(', '[', '\'']).len();
     let p = &s[lead..];
     let b = p.as_bytes();
     let drive =
         b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    let home = p.starts_with("~/") || p.starts_with("~\\");
     let from = if drive { 2 } else { 0 };
     let word = from + p[from..].find(|c| !path_char(c)).unwrap_or(p.len() - from);
-    let path = &p[..trim_end(&p[..word])];
+    // A Markdown link's text ends where its target starts.
+    let word = p[..word].find("](").unwrap_or(word);
+    let mut path = &p[..trim_end(&p[..word])];
+    // tsc and MSBuild put the place in brackets: `a.ts(12,5)`.
+    let mut at = None;
+    let mut end = lead + path.len();
+    if let Some(i) = path.rfind('(')
+        && let Some(place) = path[i + 1..].strip_suffix(')').and_then(bracketed)
+    {
+        (path, at) = (&path[..i], Some(place));
+    }
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    let named = name.rsplit_once('.').is_some_and(|(stem, ext)| {
-        !stem.is_empty() && !ext.is_empty() && ext.chars().all(char::is_alphanumeric)
+    let ext = name.rsplit_once('.').and_then(|(stem, ext)| {
+        let ok = !stem.is_empty() && !ext.is_empty() && ext.chars().all(char::is_alphanumeric);
+        ok.then_some(ext)
     });
+    let sep = path.contains(['/', '\\']);
     // A path from a separator would be read from the root of the drive, or
     // from another machine for two.
-    let relative = path.contains(['/', '\\']) && !path.starts_with(['/', '\\']) && named;
-    if !drive && !relative {
+    let relative = sep && !path.starts_with(['/', '\\']) && ext.is_some();
+    // A bare name is looked for in the pane's folder; `v1.2` is no file.
+    let bare = !sep && ext.is_some_and(|e| e.chars().any(|c| c.is_ascii_alphabetic()));
+    // In `--flag=path` the path starts after the `=`.
+    let flag = path
+        .split(['/', '\\'])
+        .next()
+        .is_some_and(|s| s.contains('='));
+    if !drive && !home && !relative && !bare || flag {
         return None;
     }
-    // ponytail: editor:line integration later
-    let mut end = lead + path.len();
-    for _ in 0..2 {
-        let digits = s[end..].strip_prefix(':').map_or(0, |r| {
-            r.len() - r.trim_start_matches(|c: char| c.is_ascii_digit()).len()
-        });
-        if digits == 0 {
-            break;
+    if at.is_none() {
+        let mut place = Vec::new();
+        while place.len() < 2
+            && let Some(r) = s[end..].strip_prefix(':')
+            && let digits = r.len() - r.trim_start_matches(|c: char| c.is_ascii_digit()).len()
+            && let Ok(n) = r[..digits].parse()
+        {
+            place.push(n);
+            end += 1 + digits;
         }
-        end += 1 + digits;
+        at = place
+            .first()
+            .map(|&line| (line, place.get(1).copied().unwrap_or(1)));
     }
-    Some((lead..lead + path.len(), end))
+    Some((lead..lead + path.len(), end, at))
+}
+
+/// The line and column in `12,5` or `12`, a line alone at column 1.
+fn bracketed(s: &str) -> Option<(u32, u32)> {
+    let num = |n: &str| {
+        n.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| n.parse().ok())?
+    };
+    match s.split_once(',') {
+        Some((line, col)) => Some((num(line)?, num(col)?)),
+        None => Some((num(s)?, 1)),
+    }
 }
 
 /// The length of `s` without the punctuation of a sentence around it, or
@@ -204,19 +249,24 @@ fn trim_end(mut s: &str) -> usize {
 }
 
 /// Where a path word from the text is: as it is when it starts with a
-/// drive, else in the pane's folder `cwd`. Only a path that exists counts,
-/// and one that would reach another machine is never looked at.
+/// drive, in the user's folder for `~`, else in the pane's folder `cwd`.
+/// Only a path that exists counts, and one that would reach another
+/// machine is never looked at.
 // ponytail: looks at the disk on the UI thread for each move over a path
 // while Ctrl is held; keep the last answer if a slow drive makes that lag.
 pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
-    let full = if vt::osc::local_dir(word) {
-        PathBuf::from(word)
-    } else if vt::osc::local_dir(cwd) {
-        Path::new(cwd).join(word)
-    } else {
-        return None;
+    let home = std::env::var("USERPROFILE").ok();
+    full_path(word, cwd, home.as_deref()).filter(|p| p.exists())
+}
+
+/// [`resolve`] without looking at the disk, `~` standing for `home`.
+fn full_path(word: &str, cwd: &str, home: Option<&str>) -> Option<PathBuf> {
+    let (base, rest) = match word.strip_prefix('~') {
+        Some(r) if r.starts_with(['/', '\\']) => (home?, &r[1..]),
+        _ if vt::osc::local_dir(word) => return Some(PathBuf::from(word)),
+        _ => (cwd, word),
     };
-    full.exists().then_some(full)
+    vt::osc::local_dir(base).then(|| Path::new(base).join(rest))
 }
 
 /// What opening an OSC 8 link's `uri` does. Only `http`, `https`,
@@ -333,7 +383,11 @@ mod tests {
     }
 
     fn path(s: &str) -> Link {
-        Link::Path(s.into())
+        Link::Path(s.into(), None)
+    }
+
+    fn path_at(s: &str, line: u32, col: u32) -> Link {
+        Link::Path(s.into(), Some((line, col)))
     }
 
     #[test]
@@ -369,7 +423,7 @@ mod tests {
     fn links_scan_paths() {
         assert_eq!(
             found("error in src/foo.rs:42 here"),
-            [("src/foo.rs:42", path("src/foo.rs"))]
+            [("src/foo.rs:42", path_at("src/foo.rs", 42, 1))]
         );
         assert_eq!(
             found(r"wrote C:\Users\x\file.txt."),
@@ -379,7 +433,7 @@ mod tests {
             found("C:/dev/blitz/src/app.rs:2066:9: error"),
             [(
                 "C:/dev/blitz/src/app.rs:2066:9",
-                path("C:/dev/blitz/src/app.rs")
+                path_at("C:/dev/blitz/src/app.rs", 2066, 9)
             )]
         );
         assert_eq!(
@@ -394,16 +448,81 @@ mod tests {
             [("../x/y.toml", path("../x/y.toml"))]
         );
         for none in [
-            "file.txt",
             "a/b",
             "1/2 done, v1.2/3",
             r"\\server\share\x.txt",
             "//host/x.txt",
             r"\Windows\notepad.exe",
             "a/.env",
+            "v1.2 and 3.14",
+            ".env",
+            "~ and ~x",
+            "a.b(x)",
         ] {
             assert_eq!(found(none), [], "{none}");
         }
+    }
+
+    #[test]
+    fn links_scan_tool_headers_markdown_places_and_names() {
+        // Claude Code's tool headers.
+        assert_eq!(
+            found("Update(src/app.rs)"),
+            [("src/app.rs", path("src/app.rs"))]
+        );
+        assert_eq!(found("Read(README.md)"), [("README.md", path("README.md"))]);
+        // A Markdown link's target.
+        assert_eq!(
+            found("[x](docs/x.md) and [a/y.md](y/z.md:3)."),
+            [
+                ("docs/x.md", path("docs/x.md")),
+                ("a/y.md", path("a/y.md")),
+                ("y/z.md:3", path_at("y/z.md", 3, 1))
+            ]
+        );
+        assert_eq!(
+            found("--manifest-path=crates/vt/Cargo.toml"),
+            [("crates/vt/Cargo.toml", path("crates/vt/Cargo.toml"))]
+        );
+        // tsc and MSBuild.
+        assert_eq!(
+            found("src/app.ts(12,5): error TS2322"),
+            [("src/app.ts(12,5)", path_at("src/app.ts", 12, 5))]
+        );
+        assert_eq!(
+            found("Program.cs(7): warning"),
+            [("Program.cs(7)", path_at("Program.cs", 7, 1))]
+        );
+        assert_eq!(
+            found("Update(src/app.ts(1,2))"),
+            [("src/app.ts(1,2)", path_at("src/app.ts", 1, 2))]
+        );
+        // The user's folder, and a bare name, if the file is there.
+        assert_eq!(
+            found(r"~/.claude/settings.json and ~\notes"),
+            [
+                ("~/.claude/settings.json", path("~/.claude/settings.json")),
+                (r"~\notes", path(r"~\notes"))
+            ]
+        );
+        assert_eq!(
+            found("edit file.txt:3:9, then go"),
+            [("file.txt:3:9", path_at("file.txt", 3, 9))]
+        );
+    }
+
+    #[test]
+    fn links_find_home_and_relative_paths() {
+        let home = Some(r"C:\Users\me");
+        let full = |w| full_path(w, r"D:\work", home);
+        let me = Path::new(r"C:\Users\me");
+        assert_eq!(full("~/x/y.rs"), Some(me.join("x/y.rs")));
+        assert_eq!(full(r"~\y.rs"), Some(me.join("y.rs")));
+        assert_eq!(full("a.rs"), Some(Path::new(r"D:\work").join("a.rs")));
+        assert_eq!(full(r"E:\b.rs"), Some(PathBuf::from(r"E:\b.rs")));
+        assert_eq!(full_path("~/x", r"D:\work", None), None, "no home");
+        assert_eq!(full_path("~/x", r"D:\work", Some(r"\\server\me")), None);
+        assert_eq!(full_path("a.rs", r"\\server\share", home), None);
     }
 
     #[test]
