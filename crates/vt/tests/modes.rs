@@ -110,23 +110,33 @@ fn ris_keeps_conpty_modes() {
     assert!(!t.input_modes().w32im);
 }
 
-/// The host starting a pane's screen over, as after a parser panic, is RIS:
-/// the size and ConPTY's modes stay, and old line numbers name nothing.
+/// The host starting a pane's screen over, as after a parser panic, is RIS
+/// but for the modes: the size, ConPTY's modes and the program's stay, and
+/// old line numbers name nothing.
 #[test]
-fn host_reset_is_ris() {
+fn host_reset_is_ris_but_keeps_the_modes() {
     let mut t = Terminal::new(Options {
         cols: 10,
         rows: 3,
         ..Options::default()
     });
-    t.feed(b"\x1b[?9001h\x1b[?1004h\x1b[?2004h\x1b[?1049hx");
-    let epoch = t.line_epoch();
+    t.feed(b"\x1b[?9001h\x1b[?1004h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1h");
+    t.feed(b"\x1b[?1049h\x1b[>1u\x1b[?2026hx");
+    let (before, epoch) = (t.input_modes(), t.line_epoch());
     t.reset();
     let m = t.input_modes();
-    assert!(m.w32im && m.focus);
-    assert!(!m.bracketed && !m.alt_screen);
+    assert_eq!(m, before);
+    assert!(m.bracketed && m.mouse_sgr && m.decckm && m.alt_screen);
+    assert_eq!((m.kitty, m.mouse), (1, MouseMode::Click));
+    // An update the panic left open would hold the screen back.
+    assert!(!t.sync_pending(Instant::now()));
     assert_eq!(t.screen_text(), "\n\n");
     assert_ne!(t.line_epoch(), epoch);
+    t.feed(b"\x1b[?1049l");
+    assert_eq!(
+        (t.input_modes().kitty, t.screen_text().as_str()),
+        (0, "\n\n")
+    );
     t.feed(b"0123456789ab");
     assert_eq!(t.screen_text(), "0123456789\nab\n");
 }

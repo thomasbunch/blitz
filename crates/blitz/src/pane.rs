@@ -651,10 +651,12 @@ mod tests {
             rows: 4,
             ..Default::default()
         });
-        term.feed(b"\x1b[31mone\r\ntwo\r\nC:\\>dir");
+        term.feed(b"\x1b[?2004h\x1b[31mone\r\ntwo\r\nC:\\>dir");
         start_over(&mut term, vt::Terminal::feed);
         assert_eq!(term.screen_text().trim_end(), "C:\\>dir");
         assert_eq!(term.cursor(), (7, 0, true));
+        // The program is not told its modes went.
+        assert!(term.input_modes().bracketed);
     }
 
     /// The line fed again may panic as it did the first time. The screen

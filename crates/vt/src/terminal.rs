@@ -511,9 +511,17 @@ impl Terminal {
 
     /// Starts over on blank screens of the same size, as RIS does, keeping
     /// what the host told it. For a host that cannot trust the state any
-    /// more, say once parsing panicked.
+    /// more, say once parsing panicked. The program's modes and screen
+    /// stay too: it is not told they went, and neither console host sends
+    /// them again.
     pub fn reset(&mut self) {
+        let (modes, alt) = (std::mem::take(&mut self.modes), self.alt);
         self.full_reset();
+        self.modes = Modes {
+            sync: None,
+            ..modes
+        };
+        self.switch_screen(alt);
     }
 
     /// The host's theme: whether it is dark, for `CSI ? 996 n`, and its
