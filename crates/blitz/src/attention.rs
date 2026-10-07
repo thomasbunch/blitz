@@ -181,11 +181,14 @@ impl Command {
 
 /// What closing a session would cut short, if anything: Claude Code
 /// working or waiting for the user, or a command its shell is running.
-pub fn busy(state: Attn, cmd: &Command) -> Option<&'static str> {
+/// Claude Code is not busy at its own prompt, where closing loses nothing
+/// a resume does not bring back: `claude` when the session runs it, and a
+/// hook that spoke says so too.
+pub fn busy(state: Attn, cmd: &Command, claude: bool) -> Option<&'static str> {
     match state {
         Attn::Working => Some("working"),
         Attn::NeedsYou => Some("waiting for you"),
-        _ if cmd.running.is_some() => Some("running a command"),
+        _ if cmd.running.is_some() && !cmd.hooked && !claude => Some("running a command"),
         _ => None,
     }
 }
@@ -1064,12 +1067,27 @@ mod tests {
             running: Some(Instant::now()),
             ..Command::default()
         };
-        assert_eq!(busy(Attn::Working, &idle), Some("working"));
-        assert_eq!(busy(Attn::NeedsYou, &running), Some("waiting for you"));
-        assert_eq!(busy(Attn::Idle, &running), Some("running a command"));
-        assert_eq!(busy(Attn::DoneUnseen, &running), Some("running a command"));
+        assert_eq!(busy(Attn::Working, &idle, true), Some("working"));
+        assert_eq!(
+            busy(Attn::NeedsYou, &running, true),
+            Some("waiting for you")
+        );
+        assert_eq!(busy(Attn::Idle, &running, false), Some("running a command"));
+        assert_eq!(
+            busy(Attn::DoneUnseen, &running, false),
+            Some("running a command")
+        );
         for state in [Attn::Idle, Attn::DoneUnseen, Attn::Error] {
-            assert_eq!(busy(state, &idle), None, "{state:?}");
+            assert_eq!(busy(state, &idle, false), None, "{state:?}");
+        }
+        // Claude Code at its prompt, resumed or after a turn.
+        let hooked = Command {
+            hooked: true,
+            ..running
+        };
+        for (cmd, claude) in [(&running, true), (&hooked, false)] {
+            assert_eq!(busy(Attn::Idle, cmd, claude), None);
+            assert_eq!(busy(Attn::DoneUnseen, cmd, claude), None);
         }
     }
 

@@ -766,7 +766,7 @@ impl View {
     fn busy(&self) -> Option<&'static str> {
         let p = &self.pane;
         (p.exit_code.is_none())
-            .then(|| crate::attention::busy(p.attn.state, &p.cmd))
+            .then(|| crate::attention::busy(p.attn.state, &p.cmd, p.claude.is_some()))
             .flatten()
     }
 }
