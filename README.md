@@ -54,10 +54,11 @@ hours. If there is a newer one, the foot of the sidebar says so, or a
 strip under the panes while the sidebar is collapsed or not shown.
 Ctrl+Shift+U downloads the installer, checks it against the release's
 `SHA256SUMS.txt` and restarts blitz on the new version. That ends every
-session, so blitz asks you to press it twice if one is busy. A copy run from the zip opens
-the release page instead. If the installer fails, blitz starts again on
-the old version and names the installer's log there. With nothing
-shown, Ctrl+Shift+U asks GitHub right away and says what it found.
+session, so blitz asks you to press it twice if one is busy. A copy run
+from the zip opens the release page instead. If the installer fails,
+blitz starts again on the old version and a strip under the panes names
+the installer's log. With nothing shown, Ctrl+Shift+U asks GitHub right
+away and says what it found.
 
 ## Build
 
