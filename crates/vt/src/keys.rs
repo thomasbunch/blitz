@@ -227,17 +227,16 @@ fn csi(
     out.push(fin);
 }
 
-/// The C0 byte xterm sends for Ctrl plus this character, if there is one.
+/// The C0 byte xterm sends for Ctrl plus this character, if there is one:
+/// Xlib's rule, which takes `@` to `~` to C0 and lets the digits 2 to 8
+/// stand for the characters above them, plus Windows' Ctrl+- and Ctrl+?.
 fn ctrl_byte(c: char) -> Option<u8> {
     Some(match c {
-        'a'..='z' | 'A'..='Z' => c as u8 & 0x1f,
-        ' ' | '2' | '@' => 0,
-        '[' | '3' => 0x1b,
-        '\\' | '4' => 0x1c,
-        ']' | '5' => 0x1d,
-        '^' | '6' => 0x1e,
-        '_' | '7' | '-' | '/' => 0x1f,
+        '@'..='~' => c as u8 & 0x1f,
+        ' ' | '2' => 0,
+        '3'..='7' => c as u8 - b'3' + 0x1b,
         '8' | '?' => 0x7f,
+        '-' | '/' => 0x1f,
         _ => return None,
     })
 }

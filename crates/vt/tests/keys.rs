@@ -107,6 +107,124 @@ fn legacy_keys() {
 }
 
 #[test]
+fn legacy_and_kitty_every_named_key() {
+    for (key, legacy, kkp) in [
+        (Key::Up, "\x1b[A", "\x1b[A"),
+        (Key::Down, "\x1b[B", "\x1b[B"),
+        (Key::Right, "\x1b[C", "\x1b[C"),
+        (Key::Left, "\x1b[D", "\x1b[D"),
+        (Key::Home, "\x1b[H", "\x1b[H"),
+        (Key::End, "\x1b[F", "\x1b[F"),
+        (Key::Insert, "\x1b[2~", "\x1b[2~"),
+        (Key::Delete, "\x1b[3~", "\x1b[3~"),
+        (Key::PageUp, "\x1b[5~", "\x1b[5~"),
+        (Key::PageDown, "\x1b[6~", "\x1b[6~"),
+        (Key::F(1), "\x1bOP", "\x1b[P"),
+        (Key::F(2), "\x1bOQ", "\x1b[Q"),
+        (Key::F(3), "\x1bOR", "\x1b[13~"),
+        (Key::F(4), "\x1bOS", "\x1b[S"),
+        (Key::F(5), "\x1b[15~", "\x1b[15~"),
+        (Key::F(6), "\x1b[17~", "\x1b[17~"),
+        (Key::F(7), "\x1b[18~", "\x1b[18~"),
+        (Key::F(8), "\x1b[19~", "\x1b[19~"),
+        (Key::F(9), "\x1b[20~", "\x1b[20~"),
+        (Key::F(10), "\x1b[21~", "\x1b[21~"),
+        (Key::F(11), "\x1b[23~", "\x1b[23~"),
+        (Key::F(12), "\x1b[24~", "\x1b[24~"),
+        (Key::F(13), "", "\x1b[57376u"),
+        (Key::F(24), "", "\x1b[57387u"),
+        (Key::F(35), "", "\x1b[57398u"),
+        (Key::F(36), "", ""),
+    ] {
+        assert_eq!(enc(&k("", key, ""), &LEGACY), legacy, "legacy {key:?}");
+        assert_eq!(enc(&k("", key, ""), &kitty(1)), kkp, "kitty {key:?}");
+    }
+    for (m, key, want) in [
+        ("csa", Key::Down, "\x1b[1;8B"),
+        ("s", Key::Right, "\x1b[1;2C"),
+        ("c", Key::Insert, "\x1b[2;5~"),
+        ("a", Key::PageDown, "\x1b[6;3~"),
+        ("a", Key::F(2), "\x1b[1;3Q"),
+        ("c", Key::F(4), "\x1b[1;5S"),
+        ("s", Key::F(6), "\x1b[17;2~"),
+        ("cs", Key::F(11), "\x1b[23;6~"),
+    ] {
+        assert_eq!(enc(&k(m, key, ""), &LEGACY), want, "{m} {key:?}");
+        assert_eq!(enc(&k(m, key, ""), &kitty(1)), want, "kitty {m} {key:?}");
+    }
+}
+
+/// Ctrl with a character follows Xlib, which xterm uses: `@` to `~` drop
+/// to C0, and the digits 2 to 8 stand in for the ones that need Shift.
+#[test]
+fn legacy_keys_ctrl_digits_and_punctuation() {
+    for (m, c, text, want) in [
+        ("c", '2', "2", "\0"),
+        ("c", '3', "3", "\x1b"),
+        ("c", '4', "4", "\x1c"),
+        ("c", '5', "5", "\x1d"),
+        ("c", '6', "6", "\x1e"),
+        ("c", '7', "7", "\x1f"),
+        ("c", '8', "8", "\x7f"),
+        ("c", '9', "9", "9"),
+        ("c", '0', "0", "0"),
+        ("c", '\\', "\\", "\x1c"),
+        ("c", ']', "]", "\x1d"),
+        ("c", '`', "`", "\0"),
+        ("cs", '`', "~", "\x1e"),
+        ("cs", '6', "^", "\x1e"),
+        ("cs", '2', "@", "\0"),
+        ("cs", '[', "{", "\x1b"),
+        ("cs", '\\', "|", "\x1c"),
+        ("cs", ']', "}", "\x1d"),
+        ("c", '=', "=", "="),
+        ("c", ';', ";", ";"),
+        ("c", '\'', "'", "'"),
+        ("c", ',', ",", ","),
+        ("c", '.', ".", "."),
+        ("ca", '\\', "\\", "\x1b\x1c"),
+    ] {
+        assert_eq!(enc(&k(m, Key::Char(c), text), &LEGACY), want, "{m}+{c}");
+    }
+}
+
+#[test]
+fn legacy_keys_modifier_combinations() {
+    for (m, key, text, want) in [
+        ("sa", Key::Char('a'), "A", "\x1bA"),
+        ("a", Key::Char('é'), "é", "\x1bé"),
+        ("csa", Key::Char('a'), "A", "\x1b\x01"),
+        ("w", Key::Char('a'), "a", "a"),
+        ("s", Key::Backspace, "", "\x7f"),
+        ("ca", Key::Backspace, "", "\x1b\x08"),
+        ("c", Key::Tab, "", "\t"),
+        ("a", Key::Tab, "", "\x1b\t"),
+        ("sa", Key::Tab, "", "\x1b\x1b[Z"),
+        ("s", Key::Escape, "", "\x1b"),
+        ("w", Key::Up, "", "\x1b[1;9A"),
+        ("cw", Key::Home, "", "\x1b[1;13H"),
+    ] {
+        assert_eq!(enc(&k(m, key, text), &LEGACY), want, "{m} {key:?}");
+    }
+}
+
+/// On a layout whose key has no C0 byte of its own, Ctrl falls back to
+/// the key in the same place on a US layout, as it does for Cyrillic.
+#[test]
+fn legacy_keys_ctrl_on_latin_layouts_uses_the_us_position() {
+    // AZERTY: the US 3 key types `"`, the US 2 key types `é`.
+    let mut quote = k("c", Key::Char('"'), "\"");
+    quote.us_base = Some('3');
+    assert_eq!(enc(&quote, &LEGACY), "\x1b");
+    let mut e = k("c", Key::Char('é'), "é");
+    e.us_base = Some('2');
+    assert_eq!(enc(&e, &LEGACY), "\0");
+    // A key with no US counterpart sends its text.
+    e.us_base = None;
+    assert_eq!(enc(&e, &LEGACY), "é");
+}
+
+#[test]
 fn legacy_keys_ignore_key_up() {
     let mut up = k("", Key::Char('a'), "a");
     up.down = false;
