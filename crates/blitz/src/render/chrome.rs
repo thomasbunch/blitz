@@ -231,7 +231,8 @@ pub fn sidebar_w(width: i32, scale: f32, tw: i32) -> i32 {
 
 /// The part of a `size` window that the active tab's panes share: all of
 /// it but the sidebar or rail, shown once there are two sessions, and the
-/// banner strip. `tw` is the width of a sidebar character.
+/// banner strip, which the expanded sidebar holds at its foot instead.
+/// `tw` is the width of a sidebar character.
 pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: bool, tw: i32) -> Rect {
     let s = |v: f32| (v * scale).round() as i32;
     let fleet = win.has_sidebar();
@@ -240,7 +241,8 @@ pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: bool, tw: i32) -
         (true, true) => sidebar_w(size.0, scale, tw),
         (true, false) => s(RAIL_W),
     };
-    let bh = if banner { s(BANNER_H) } else { 0 };
+    let strip = banner && !(fleet && win.sidebar_expanded);
+    let bh = if strip { s(BANNER_H) } else { 0 };
     Rect {
         x: side,
         y: 0,
@@ -278,7 +280,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let fleet = m.win.has_sidebar();
     let expanded = m.win.sidebar_expanded;
     let area = area(m.win, m.size, m.scale, m.banner.is_some(), tw);
-    let (side, bh) = (area.x, m.banner.map_or(0, |_| s(BANNER_H)));
+    let (side, bh) = (area.x, h - area.bottom());
     let session = |id: PaneId| m.sessions.iter().find(|x| x.id == id);
     // A tab's sessions in reading order, as its panes sit.
     let members =
@@ -460,6 +462,26 @@ pub fn build(m: &ChromeModel) -> Chrome {
             },
             c.border,
         ));
+        // The update cue sits at the foot, where it takes no row from
+        // every pane.
+        let lh = th + s(3.0);
+        let cue = m.banner.map(|msg| wrap(msg, side - s(32.0), tw, 3));
+        let bottom = h - cue.as_ref().map_or(0, |l| l.len() as i32 * lh + s(10.0));
+        if let Some(lines) = cue {
+            let foot = Rect {
+                x: 0,
+                y: bottom,
+                w: side - 1,
+                h: h - bottom,
+            };
+            out.banner = Some(foot);
+            p.push(Prim::Rect(foot, c.hdr_bg));
+            p.push(Prim::Rect(Rect { h: 1, ..foot }, c.hdr_line));
+            for (i, l) in lines.iter().enumerate() {
+                let ly = bottom + s(5.0) + i as i32 * lh + (lh - th) / 2;
+                text(p, s(16.0), ly, l, c.dim, false);
+            }
+        }
         let mut y = s(10.0);
         for (ti, t) in m.win.tabs.iter().enumerate() {
             let list = members(t);
@@ -613,7 +635,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 x: 0,
                 y,
                 w: side - 1,
-                h: h - y,
+                h: bottom - y,
             };
             let state = busiest.unwrap_or_default();
             crate::arcade::mascot::draw(p, free, state, t, m.scale, c, (tw, th));
@@ -685,7 +707,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let (cw, ch) = (m.term_cell.0 as i32, m.term_cell.1.max(1) as i32);
     let pane = |id: PaneId| out.panes.iter().find(|x| x.0 == id).map(|x| x.1);
     let mut extra = Vec::new();
-    if let Some(msg) = m.banner {
+    if let Some(msg) = m.banner.filter(|_| !(fleet && expanded)) {
         let strip = Rect {
             y: area.bottom(),
             h: bh,
@@ -1910,12 +1932,32 @@ mod tests {
         assert_eq!(c.panes[0].1.bottom(), strip.y, "panes end above it");
         assert!(texts(&c).contains(&"blitz 0.0.2 is available"));
 
-        let (win, sessions, now) = fleet(true);
+        // Beside the rail, the strip is under the panes.
+        let (win, sessions, now) = fleet(false);
         let mut m = model(&win, &sessions, now);
         m.banner = Some("x");
         let c = build(&m);
-        assert_eq!(c.banner.map(|r| (r.x, r.right())), Some((240, AREA.w)));
+        assert_eq!(c.banner.map(|r| (r.x, r.right())), Some((15, AREA.w)));
         assert!(c.panes.iter().all(|(_, r)| r.bottom() <= AREA.h - 22));
+    }
+
+    #[test]
+    fn the_expanded_sidebar_holds_the_banner_at_its_foot() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let msg = "blitz 0.0.2 is available \u{b7} Ctrl+Shift+U to update and restart";
+        m.banner = Some(msg);
+        let c = build(&m);
+        let foot = c.banner.expect("cue");
+        assert_eq!((foot.x, foot.right(), foot.bottom()), (0, 239, AREA.h));
+        // The panes keep their size.
+        let without = build(&model(&win, &sessions, now));
+        assert_eq!(c.panes, without.panes);
+        // Wrapped onto lines that fit the sidebar.
+        let t = texts(&c);
+        assert!(t.contains(&"blitz 0.0.2 is available \u{b7}"), "{t:?}");
+        assert!(t.contains(&"Ctrl+Shift+U to update and") && t.contains(&"restart"));
+        assert!(c.rows.iter().all(|(_, r)| r.bottom() <= foot.y));
     }
 
     #[test]
@@ -2200,11 +2242,13 @@ mod tests {
             m.banner = Some("u");
             let c = build(&m);
             let side = (SIDEBAR_W * scale).round() as i32;
-            let strip = c.banner.expect("banner");
+            // The banner goes at the sidebar's foot.
+            let foot = c.banner.expect("banner");
+            assert_eq!((foot.right(), foot.bottom()), (side - 1, AREA.h));
             let a = area(&win, m.size, scale, true, 7);
             assert_eq!(
                 (a.x, a.right(), a.bottom()),
-                (side, AREA.w, strip.y),
+                (side, AREA.w, AREA.h),
                 "{scale}"
             );
             // Each grid is its tile less the frame.
