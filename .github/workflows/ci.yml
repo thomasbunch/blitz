@@ -34,6 +34,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # A PR's commits, for the attribution check.
+          fetch-depth: 0
       - name: Only allowlisted files are tracked
         run: |
           bad="$(git ls-files -ci --exclude-standard)"
@@ -56,6 +58,18 @@ jobs:
             b="$(grep -E "^  $k: " .github/workflows/release.yml)"
             [ -n "$a" ] && [ "$a" = "$b" ] || { echo "::error::$k differs between ci.yml and release.yml"; exit 1; }
           done
+      - name: No AI attribution in the commits or the description
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if { git log --format=%B "$BASE..$HEAD"; printf '%s\n' "$BODY"; } |
+            grep -iE '^(Co-Authored-By|Claude-Session):|Generated with \[Claude Code\]'; then
+            echo "::error::AI attribution is not allowed in this repo"
+            exit 1
+          fi
       - run: rustup toolchain install
       - run: cargo fmt --all --check
 
