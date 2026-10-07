@@ -402,6 +402,8 @@ struct App {
     settings_hits: Option<chrome::SettingsHits>,
     /// blitz run while it is open, and when it last moved.
     game: Option<(Run, Instant)>,
+    /// When a session needing the user last closed blitz run.
+    game_ended: Option<Instant>,
     /// Windows shows animations; scenery and the spark keep still if not.
     motion: bool,
     scale: f64,
@@ -542,6 +544,7 @@ impl App {
             settings: None,
             settings_hits: None,
             game: None,
+            game_ended: None,
             motion: animations_on(),
             scale: 1.0,
             win: layout::Window::default(),
@@ -1482,7 +1485,7 @@ impl App {
                     self.eaten = Some(k.vk);
                     match k.vk {
                         VK_ESCAPE => self.close_game(),
-                        VK_SPACE | VK_UP | VK_W => g.jump(),
+                        vk if is_jump(vk) => g.jump(),
                         _ => {}
                     }
                     self.request_redraw();
@@ -1527,6 +1530,12 @@ impl App {
         // A key whose press was eaten is still held: its autorepeat must not
         // reach the pane either, as when a needs-you closes blitz run mid-jump.
         if k.down && self.eaten == Some(k.vk) {
+            return;
+        }
+        // Nor do jumps already on their way when it closed.
+        let since = self.game_ended.map(|t| t.elapsed());
+        if k.down && late_jump(k.vk, since) {
+            self.eaten = Some(k.vk);
             return;
         }
         let Some(v) = self.current() else {
@@ -1922,22 +1931,28 @@ impl App {
     /// it changes to something the user should see while looking away.
     /// Returns true when the state changed.
     fn attention(&mut self, id: PaneId, ev: Ev) -> bool {
-        // blitz run covers the panes, so the focused one is not in view.
+        // Back to work: blitz run ends when a session starts needing the
+        // user. It closes first, so the focused pane is in view again for
+        // the event, as if the game had never been open.
+        let now = Instant::now();
+        if self.game.is_some()
+            && self
+                .view(id)
+                .is_some_and(|v| ends_game(v.pane.attn, ev, now))
+        {
+            self.close_game();
+            self.game_ended = Some(now);
+        }
+        // While it is open, it covers the panes: the focused one is not in view.
         let attended = self.focused && self.game.is_none() && self.focus_id() == Some(id);
         let away = !self.focused && self.config.flash;
         let Some(v) = self.view_mut(id) else {
             return false;
         };
-        let now = Instant::now();
         let changed = v.pane.attn.apply(ev, attended, now);
-        let needs_you = changed && v.pane.attn.state == Attn::NeedsYou;
         let kind = (changed && away)
             .then(|| flash_kind(v.pane.attn.state, &mut v.flashed, now))
             .flatten();
-        // Back to work: the game ends when a session needs the user.
-        if needs_you {
-            self.close_game();
-        }
         // The sidebar shows the new state.
         self.request_redraw();
         if let (Some(kind), Some(w)) = (kind, &self.window) {
@@ -2533,6 +2548,28 @@ fn animations_on() -> bool {
         )
     };
     read.is_err() || on.as_bool()
+}
+
+/// How long after a session needing the user closes blitz run a jump key
+/// is still taken for the game, and kept from the pane.
+const LATE_JUMP: Duration = Duration::from_millis(400);
+
+/// The keys that jump in blitz run.
+fn is_jump(vk: u16) -> bool {
+    matches!(vk, VK_SPACE | VK_UP | VK_W)
+}
+
+/// Whether `ev` closes blitz run: it starts the session needing the user.
+/// A repeat of a needs-you already showing does not.
+fn ends_game(attn: crate::attention::PaneAttn, ev: Ev, now: Instant) -> bool {
+    let mut seen = attn;
+    seen.apply(ev, false, now) && seen.state == Attn::NeedsYou
+}
+
+/// Whether a press of `vk` is a jump meant for blitz run that arrived
+/// after a session closed it, `since` ago.
+fn late_jump(vk: u16, since: Option<Duration>) -> bool {
+    is_jump(vk) && since.is_some_and(|d| d < LATE_JUMP)
 }
 
 /// Whether a notification replaces the session's sidebar message. It is
@@ -3417,6 +3454,40 @@ mod tests {
         // the end of the session still clears the message.
         assert!(feed(Ev::Done, true));
         assert!(feed(Ev::Idle, true));
+    }
+
+    #[test]
+    fn a_session_starting_to_need_you_ends_the_game() {
+        let t0 = Instant::now();
+        let mut a = crate::attention::PaneAttn::new(t0);
+        a.apply(Ev::Working, true, t0);
+        assert!(ends_game(a, Ev::NeedsYou, t0));
+        assert!(!ends_game(a, Ev::Done, t0));
+        assert!(!ends_game(a, Ev::Error { sticky: false }, t0));
+        assert!(!ends_game(a, Ev::Attended, t0));
+        // Asking leaves the state as it was.
+        assert_eq!(a.state, Attn::Working);
+        a.apply(Ev::NeedsYou, false, t0);
+        assert!(!ends_game(a, Ev::NeedsYou, t0), "a repeat");
+        // Once closed, the focused pane is in view: the needs-you that
+        // closed the game is seen and does not relabel the session.
+        let mut b = crate::attention::PaneAttn::new(t0);
+        b.apply(Ev::Working, true, t0);
+        assert!(!relabels(Ev::NeedsYou, b.apply(Ev::NeedsYou, true, t0)));
+        assert_eq!(b.state, Attn::Working);
+    }
+
+    #[test]
+    fn jumps_just_after_the_game_closes_stay_out_of_the_pane() {
+        let ms = |n| Some(Duration::from_millis(n));
+        for vk in [VK_SPACE, VK_UP, VK_W] {
+            assert!(late_jump(vk, ms(0)));
+            assert!(late_jump(vk, ms(399)));
+            assert!(!late_jump(vk, ms(400)));
+            assert!(!late_jump(vk, None), "the game never closed itself");
+        }
+        assert!(!late_jump(VK_RETURN, ms(0)), "Enter answers the prompt");
+        assert!(!late_jump(VK_DOWN, ms(0)));
     }
 
     #[test]
