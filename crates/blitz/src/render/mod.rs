@@ -957,6 +957,7 @@ mod gpu {
         let mut model = ChromeModel {
             win: &win,
             sessions: &sessions,
+            hover: None,
             ui: theme.ui,
             size: (w as i32, h as i32),
             scale,

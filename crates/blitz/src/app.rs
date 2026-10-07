@@ -507,6 +507,8 @@ struct Mouse {
     divider: Option<(usize, (i32, i32))>,
     /// The pointer is over a divider along this axis and shows it.
     over_divider: Option<Axis>,
+    /// What in the sidebar the pointer is over.
+    over_side: Option<Side>,
     /// A left-button drag is making a selection.
     drag: Option<Drag>,
     /// When the drag next scrolls, while the pointer is outside its pane.
@@ -1654,6 +1656,10 @@ impl App {
         ChromeModel {
             win,
             sessions,
+            hover: match self.mouse.over_side {
+                Some(Side::Session(id)) => Some(id),
+                _ => None,
+            },
             ui: self.theme.ui,
             size: (size.width as i32, size.height as i32),
             scale: self.scale as f32,
@@ -3533,7 +3539,7 @@ impl App {
     fn link_under(&self, pos: PhysicalPosition<f64>) -> Option<(Target, (Pos, Pos))> {
         let v = self
             .current()
-            .filter(|v| self.hit(pos).0 == Some(v.pane.id))?;
+            .filter(|v| self.hit(pos) == (Some(v.pane.id), false))?;
         let (col, row) = self.cell_at(pos);
         let t = lock(&v.pane.term);
         let at = (t.view_top() + usize::from(row), col);
@@ -3583,6 +3589,25 @@ impl App {
         self.request_redraw();
     }
 
+    /// Notes what in the sidebar the pointer is over: the hand says a
+    /// click there does something, and a session's row lights up.
+    fn set_over_side(&mut self, over: Option<Side>) {
+        if over == self.mouse.over_side {
+            return;
+        }
+        if let Some(w) = &self.window
+            && over.is_some() != self.mouse.over_side.is_some()
+        {
+            w.set_cursor(if over.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            });
+        }
+        self.mouse.over_side = over;
+        self.request_redraw();
+    }
+
     /// Opens a link, or says in the pane why not.
     fn open_link(&mut self, target: &Target) {
         if let Err(e) = crate::links::open(target)
@@ -3625,6 +3650,10 @@ impl App {
         if self.game.is_some() {
             return;
         }
+        let (x, y) = (pos.x as i32, pos.y as i32);
+        let panel = self.commands.is_some() || self.settings.is_some();
+        let over = (x < self.tab_area().x && !panel).then(|| self.side.at(x, y));
+        self.set_over_side(over.flatten());
         self.update_hover();
         let mods = mods_now();
         // A drag goes where its press went, like the release will.
@@ -4951,6 +4980,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => self.on_mouse_move(position),
+            WindowEvent::CursorLeft { .. } => self.set_over_side(None),
             WindowEvent::MouseInput { state, button, .. } => {
                 self.on_mouse_button(el, state, button);
             }

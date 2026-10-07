@@ -64,6 +64,8 @@ pub struct ChromeModel<'a> {
     /// Tabs, the active tab and whether the sidebar is expanded.
     pub win: &'a Window,
     pub sessions: &'a [Session],
+    /// The session whose sidebar or rail row is under the pointer.
+    pub hover: Option<PaneId>,
     pub ui: Ui,
     /// Window client size in pixels.
     pub size: (i32, i32),
@@ -612,12 +614,18 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     h: rh,
                 };
                 out.side.rows.push((x.id, row));
-                if focused {
+                // The row under the pointer is lit, more faintly.
+                let tint = if focused {
+                    Some(c.row_focus)
+                } else {
+                    (m.hover == Some(x.id)).then(|| super::mix(c.side_bg, c.row_focus))
+                };
+                if let Some(color) = tint {
                     p.push(Prim::Shape {
                         r: row,
                         radius: 6.0 * m.scale,
                         stroke: 0.0,
-                        color: c.row_focus,
+                        color,
                     });
                 }
                 let (mx, my) = (row.x + s(12.0), y + top + s(5.0) + s(4.0));
@@ -756,6 +764,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             c.border,
         ));
         out.side.rail = Some(rail);
+        let mut tip = None;
         let mut y = s(12.0);
         for (ti, t) in m.win.tabs.iter().enumerate() {
             if ti > 0 {
@@ -772,6 +781,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 out.side.rows.push((x.id, row));
                 if ti == m.win.active && x.id == t.focus {
                     p.push(Prim::Rect(row, c.rail_focus));
+                }
+                if m.hover == Some(x.id) {
+                    tip = Some((x, row));
                 }
                 let (cx, cy) = (row.w / 2, y + row.h / 2);
                 match x.state {
@@ -802,6 +814,22 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 };
                 p.push(Prim::Rect(line, c.idle));
             }
+        }
+        // The dot under the pointer is named beside the rail.
+        if let Some((x, row)) = tip {
+            let (lx, pad, one) = (side + s(4.0), s(8.0), s(1.0).max(1));
+            let label = format!("{} \u{b7} {}", x.name, state_word(x, m.now));
+            let label = fit(&label, m.size.0 - lx - 2 * pad, tw);
+            let lh = th + s(8.0);
+            let r = Rect {
+                x: lx,
+                y: row.y + (row.h - lh) / 2,
+                w: text_w(&label, tw) + 2 * pad,
+                h: lh,
+            };
+            p.push(Prim::Rect(r, c.border));
+            p.push(Prim::Rect(inset(r, one), c.side_bg));
+            text(p, r.x + pad, r.y + (lh - th) / 2, &label, c.name, false);
         }
     }
 
@@ -1661,6 +1689,7 @@ mod tests {
         ChromeModel {
             win,
             sessions,
+            hover: None,
             ui: crate::theme::blitz(false).ui,
             size: (AREA.w, AREA.h),
             scale: 1.0,
@@ -1873,6 +1902,50 @@ mod tests {
         assert_eq!(c.side.at(5, row.1.y - 1), Some(Side::Rail));
         assert_eq!(c.side.at(5, AREA.h - 1), Some(Side::Rail));
         assert_eq!(c.side.at(15, AREA.h - 1), None);
+    }
+
+    #[test]
+    fn the_row_under_the_pointer_is_lit() {
+        let (win, sessions, now) = fleet(true);
+        let ui = crate::theme::blitz(false).ui;
+        let lit = |c: &Chrome, color| -> Vec<Rect> {
+            (c.prims.iter())
+                .filter_map(|p| match p {
+                    Prim::Shape { r, color: k, .. } if *k == color => Some(*r),
+                    _ => None,
+                })
+                .collect()
+        };
+        let faint = crate::render::mix(ui.side_bg, ui.row_focus);
+        let mut m = model(&win, &sessions, now);
+        assert!(lit(&build(&m), faint).is_empty());
+        m.hover = Some(PaneId(3));
+        let c = build(&m);
+        assert_eq!(lit(&c, faint), [c.side.rows[2].1]);
+        // The focused row keeps its own tint.
+        m.hover = Some(win.tabs[0].focus);
+        let c = build(&m);
+        assert!(lit(&c, faint).is_empty());
+        assert_eq!(lit(&c, ui.row_focus).len(), 1);
+
+        // On the rail, the dot under the pointer gets a label beside it.
+        let (win, sessions, now) = fleet(false);
+        let mut m = model(&win, &sessions, now);
+        m.hover = Some(PaneId(1));
+        let c = build(&m);
+        let (x, y) = (c.prims.iter())
+            .find_map(|p| match p {
+                Prim::Text { text, x, y, .. } if text == "api \u{b7} needs you" => Some((*x, *y)),
+                _ => None,
+            })
+            .expect("label");
+        let row = c.side.rows[0].1;
+        assert!(
+            x > 15 && y >= row.y - 4 && y + 15 <= row.bottom() + 4,
+            "{x} {y}"
+        );
+        m.hover = None;
+        assert_eq!(texts(&build(&m)), ["api", "web"]);
     }
 
     #[test]
