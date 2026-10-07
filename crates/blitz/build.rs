@@ -98,8 +98,10 @@ fn icons(res: &mut Vec<u8>, ico: &[u8]) {
 /// The VS_VERSIONINFO of exe `bin`, which Explorer's Details tab and
 /// Task Manager show: `version` as numbers and as text, in US English.
 fn version_info(bin: &str, about: &str, version: &str) -> Vec<u8> {
-    let n: Vec<u32> = (version.split(['.', '-']).take(3))
-        .map(|p| p.parse().expect("a numeric crate version"))
+    // A pre-release or build suffix is not a number; each number has 16
+    // bits of its own.
+    let n: Vec<u32> = (version.split(['.', '-', '+']).take(3))
+        .map(|p| u32::from(p.parse::<u16>().expect("a crate version part of 0..=65535")))
         .collect();
     let (ms, ls) = (n[0] << 16 | n[1], n[2] << 16);
     let fixed: Vec<u8> = [

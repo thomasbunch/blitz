@@ -277,7 +277,9 @@ fn exes_carry_version_information_and_a_manifest() {
         assert!(found.as_bool() && len >= 52, "{exe}: no fixed version");
         // SAFETY: VS_FIXEDFILEINFO is 13 aligned u32s inside `block`.
         let fixed = unsafe { std::slice::from_raw_parts(at.cast::<u32>(), 13) };
-        let n: Vec<u32> = version.split('.').map(|p| p.parse().unwrap()).collect();
+        let n: Vec<u32> = (version.split(['.', '-', '+']).take(3))
+            .map(|p| u32::from(p.parse::<u16>().unwrap()))
+            .collect();
         assert_eq!(fixed[0], 0xfeef_04bd, "signature");
         assert_eq!((fixed[2], fixed[3]), (n[0] << 16 | n[1], n[2] << 16));
 
