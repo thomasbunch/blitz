@@ -3215,6 +3215,13 @@ impl App {
         self.typed(out);
     }
 
+    /// The kind of shell pane `id` started, which pasted paths are quoted
+    /// for.
+    fn shell_of(&self, id: PaneId) -> crate::shell::Kind {
+        let name = self.view(id).map_or("", |v| v.pane.name.as_str());
+        crate::shell::kind(Path::new(name))
+    }
+
     /// A paste with only an image on the clipboard, such as a screenshot.
     /// Claude Code pastes one on Alt+V, so its pane gets that. False for
     /// any other pane, where the key goes on to the program.
@@ -3295,8 +3302,10 @@ impl App {
                     return false;
                 };
                 // Files copied in Explorer paste as their paths.
-                let text = (crate::clipboard::get_text().filter(|t| !t.is_empty()))
-                    .or_else(|| crate::clipboard::get_files().map(|f| quote_paths(&f)));
+                let text = (crate::clipboard::get_text().filter(|t| !t.is_empty())).or_else(|| {
+                    let shell = self.shell_of(id);
+                    crate::clipboard::get_files().map(|f| quote_paths(&f, shell))
+                });
                 // The answer to a question pastes what it asked about; a
                 // clipboard that changed since asks again.
                 let asked = (self.view_mut(id)).and_then(|v| {
@@ -4121,8 +4130,9 @@ impl App {
             return;
         };
         match dropped(paths, self.hit(pos)) {
-            Some(Dropped::Paste(id, text)) => {
+            Some(Dropped::Paste(id, paths)) => {
                 self.show(id);
+                let text = quote_paths(&paths, self.shell_of(id));
                 self.paste(id, &text, false, Ask::Drop);
             }
             Some(Dropped::Open(dirs)) if dirs.is_empty() => {
@@ -6306,17 +6316,31 @@ fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
     }
 }
 
-/// Paths as a paste types them: joined by spaces, each in quotes when it
-/// holds anything but letters, digits and `_.-:\/`, so no shell reads a
-/// name such as `a&calc.txt` as syntax. A `$` or backtick gets single
-/// quotes, which PowerShell does not expand; they mean nothing to cmd.
-fn quote_paths(paths: &[PathBuf]) -> String {
+/// Paths as a paste types them into a pane that runs `shell`: joined by
+/// spaces, each in double quotes when it holds anything but letters,
+/// digits and `_.-:\/`, so no shell reads a name such as `a&calc.txt` as
+/// syntax. In cmd only `"`, which no Windows name holds, ends them, and
+/// `%VAR%` still expands: its prompt has no way to quote that. A name
+/// PowerShell would expand or end inside them, with `$`, a backtick or a
+/// typographic double quote, gets single quotes in any other shell, with
+/// each of PowerShell's single quote marks doubled, typographic ones too.
+fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> String {
     let plain = |c: char| c.is_alphanumeric() || "_.-:\\/".contains(c);
+    let single = shell != crate::shell::Kind::Cmd;
     let quoted: Vec<String> = (paths.iter())
         .map(|p| match p.to_string_lossy() {
-            s if s.contains(['$', '`']) => format!("'{}'", s.replace('\'', "''")),
-            s if !s.chars().all(plain) => format!("\"{s}\""),
-            s => s.into_owned(),
+            s if s.chars().all(plain) => s.into_owned(),
+            s if single && s.contains(['$', '`', '\u{201c}', '\u{201d}', '\u{201e}']) => {
+                let mut q = String::from('\'');
+                for c in s.chars() {
+                    if "'\u{2018}\u{2019}\u{201a}\u{201b}".contains(c) {
+                        q.push(c);
+                    }
+                    q.push(c);
+                }
+                q + "'"
+            }
+            s => format!("\"{s}\""),
         })
         .collect();
     quoted.join(" ")
@@ -6327,7 +6351,7 @@ fn quote_paths(paths: &[PathBuf]) -> String {
 enum Dropped {
     /// Pasted into this pane as their paths, the way [`quote_paths`] types
     /// them.
-    Paste(PaneId, String),
+    Paste(PaneId, Vec<PathBuf>),
     /// The folders among them, dropped on the sidebar, each opened in a
     /// new tab.
     Open(Vec<PathBuf>),
@@ -6339,7 +6363,7 @@ fn dropped(paths: Vec<PathBuf>, hit: (Option<PaneId>, bool)) -> Option<Dropped> 
         (_, true) => Some(Dropped::Open(
             paths.into_iter().filter(|p| p.is_dir()).collect(),
         )),
-        (Some(id), false) => Some(Dropped::Paste(id, quote_paths(&paths))),
+        (Some(id), false) => Some(Dropped::Paste(id, paths)),
         (None, false) => None,
     }
 }
@@ -9388,16 +9412,36 @@ mod tests {
 
     #[test]
     fn app_files_paste_as_paths_quoted_only_when_a_shell_would_read_them() {
+        use crate::shell::Kind::{Cmd, Other, PowerShell};
         let paths = [r"C:\some dir\shot.png", r"D:\b.txt"].map(PathBuf::from);
-        assert_eq!(quote_paths(&paths), r#""C:\some dir\shot.png" D:\b.txt"#);
-        assert_eq!(quote_paths(&paths[1..]), r"D:\b.txt");
-        let one = |p: &str| quote_paths(&[PathBuf::from(p)]);
-        assert_eq!(one(r"C:\x&calc&.txt"), r#""C:\x&calc&.txt""#);
-        assert_eq!(one(r"C:\x(1);y.txt"), r#""C:\x(1);y.txt""#);
-        assert_eq!(one(r"C:\%PATH%^.txt"), r#""C:\%PATH%^.txt""#);
-        assert_eq!(one(r"C:\$(calc).txt"), r"'C:\$(calc).txt'");
-        assert_eq!(one(r"C:\it's $x.txt"), r"'C:\it''s $x.txt'");
-        assert_eq!(one(r"C:\café_1-2.txt"), r"C:\café_1-2.txt");
+        let both = r#""C:\some dir\shot.png" D:\b.txt"#;
+        assert_eq!(quote_paths(&paths, PowerShell), both);
+        assert_eq!(quote_paths(&paths[1..], Cmd), r"D:\b.txt");
+        let one = |p: &str, shell| quote_paths(&[PathBuf::from(p)], shell);
+        // Double quotes, which cmd and PowerShell alike read as one word.
+        for shell in [Cmd, PowerShell, Other] {
+            assert_eq!(one(r"C:\x&calc&.txt", shell), r#""C:\x&calc&.txt""#);
+            assert_eq!(one(r"C:\x(1);y.txt", shell), r#""C:\x(1);y.txt""#);
+            assert_eq!(one(r"C:\%PATH%^.txt", shell), r#""C:\%PATH%^.txt""#);
+            assert_eq!(one(r"C:\a‘;b’.txt", shell), r#""C:\a‘;b’.txt""#);
+            assert_eq!(one(r"C:\café_1-2.txt", shell), r"C:\café_1-2.txt");
+        }
+        // cmd reads `'` as text and nothing in these as syntax.
+        assert_eq!(one(r"\\srv\c$\a.txt", Cmd), r#""\\srv\c$\a.txt""#);
+        assert_eq!(one(r"C:\x$&calc&.txt", Cmd), r#""C:\x$&calc&.txt""#);
+        assert_eq!(one(r"C:\a”;calc;”.txt", Cmd), r#""C:\a”;calc;”.txt""#);
+        // PowerShell expands `$` and ends a string at a typographic quote
+        // inside double quotes, but nothing ends single ones but a single
+        // quote mark, doubled.
+        assert_eq!(one(r"\\srv\c$\a.txt", PowerShell), r"'\\srv\c$\a.txt'");
+        assert_eq!(one(r"C:\$(calc).txt", PowerShell), r"'C:\$(calc).txt'");
+        assert_eq!(one(r"C:\it's $x.txt", Other), r"'C:\it''s $x.txt'");
+        assert_eq!(one(r"C:\a”;calc;”.txt", PowerShell), r"'C:\a”;calc;”.txt'");
+        assert_eq!(
+            one(r"C:\x$’;calc;’.txt", PowerShell),
+            r"'C:\x$’’;calc;’’.txt'"
+        );
+        assert_eq!(one("C:\\a`b‚‛.txt", PowerShell), "'C:\\a`b‚‚‛‛.txt'");
     }
 
     #[test]
@@ -9411,8 +9455,10 @@ mod tests {
         let side = dropped(paths.clone(), (Some(PaneId(1)), true));
         let nowhere = dropped(paths, (None, false));
         let _ = std::fs::remove_dir_all(&dir);
-        let text = format!("\"{}\" \"{}\"", file.display(), dir.display());
-        assert_eq!(pane, Some(Dropped::Paste(PaneId(2), text)));
+        assert_eq!(
+            pane,
+            Some(Dropped::Paste(PaneId(2), vec![file, dir.clone()]))
+        );
         assert_eq!(side, Some(Dropped::Open(vec![dir])), "folders only");
         assert_eq!(nowhere, None);
     }
