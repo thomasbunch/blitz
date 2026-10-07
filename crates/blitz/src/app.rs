@@ -77,8 +77,9 @@ const SCENERY_FRAME: Duration = Duration::from_millis(66);
 /// one runs every few hours.
 const UPDATE_FIRST: Duration = Duration::from_secs(10);
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
-/// Why an update or a look for one stopped when its thread panicked.
-const INTERNAL: &str = "blitz stopped after an internal error";
+/// Why an update or a look for one stopped when its thread panicked; only
+/// that thread did.
+const INTERNAL: &str = "an internal error";
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
 /// How long a restored pane waits for its shell's first prompt before it
@@ -88,8 +89,9 @@ const RESUME_AFTER: Duration = Duration::from_secs(3);
 const SAVED_LINES: usize = 1000;
 /// Lines scrolled per wheel notch when the program takes no mouse input.
 const WHEEL_LINES: isize = 3;
-/// How long a changed layout waits before it is saved, so dragging a
-/// divider or holding a resize key writes the file once, not every step.
+/// How long a changed layout waits before it is saved, so holding a resize
+/// key writes the file at most once this often rather than every step. A
+/// divider drag writes it once, after the drag.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// How long to wait before building the renderer again after it failed.
 const GFX_RETRY: Duration = Duration::from_secs(1);
