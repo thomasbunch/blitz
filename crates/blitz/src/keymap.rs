@@ -332,12 +332,17 @@ pub fn repeats(k: &KeyInput, user: &[Binding], panel: bool) -> bool {
 }
 
 /// Whether blitz drops the auto-repeat of a held key: the press was blitz's
-/// (`taken`) or the key is a shortcut, and [`repeats`] says no. A shortcut
-/// counts even when blitz lost track of its press, as when focus left and
-/// came back while it was held, so a held key never answers its own "press
-/// again".
+/// (`taken`), and [`repeats`] says no. A shortcut that asks to be pressed
+/// again counts as taken even when blitz lost track of its press, as when
+/// focus left and came back while it was held, so a held key never answers
+/// its own "press again". Other shortcuts that passed their press on, as
+/// Ctrl+C with nothing selected, pass their repeats on too.
 pub fn drops_repeat(k: &KeyInput, user: &[Binding], taken: bool, panel: bool) -> bool {
-    (taken || action(k, user).is_some()) && !repeats(k, user, panel)
+    let confirms = matches!(
+        action(k, user),
+        Some(Action::Paste | Action::ClosePane | Action::Update)
+    );
+    (taken || confirms) && !repeats(k, user, panel)
 }
 
 /// Unshifted characters of a US layout by set-1 scan code, NUL where the
@@ -1157,10 +1162,17 @@ mod msg_to_key_tests {
             let k = msg_to_key(vk, again, &state(held, &[]), layout(US), &mut t);
             drops_repeat(&k, &[], taken, false)
         };
-        // A held shortcut is dropped even once blitz lost track of its
-        // press, as when focus left and came back while it was held.
-        for (vk, held) in [(0x56, &[0xa2][..]), (0x57, CS), (0x55, CS)] {
+        // A held shortcut that asks to be pressed again is dropped even once
+        // blitz lost track of its press, as when focus left and came back
+        // while it was held.
+        for (vk, held) in [(0x56, &[0xa2][..]), (0x57, CS), (0x55, CS), (0x2d, &[0xa1])] {
             assert!(drops(vk, held, false), "{vk:#x}");
+        }
+        // Copy with nothing selected passes its press on, so the program
+        // gets every ^C of a held Ctrl+C; taken, it copies once.
+        for (vk, held) in [(0x43, &[0xa2][..]), (0x2d, &[0xa2])] {
+            assert!(!drops(vk, held, false), "{vk:#x}");
+            assert!(drops(vk, held, true), "{vk:#x} taken");
         }
         assert!(drops(0x0d, &[], true), "Enter that closed an exited pane");
         // Typing, and moving that repeats, go on.

@@ -118,6 +118,23 @@ jobs:
           if (-not (Test-Path $iscc)) { throw "Inno Setup 6 is not on this runner image" }
           & $iscc "/DAppVersion=$env:VERSION" "/DSrcDir=$PWD\dist\blitz-$env:VERSION-windows-x64" "/DOutDir=$PWD\out" .github\blitz.iss
 
+      # The last published installer, for the smoke test to upgrade over,
+      # checked against its release's SHA256SUMS as the updater checks what
+      # it downloads. The token stays in this step, out of the installers'.
+      - name: Last published installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $d = "$env:RUNNER_TEMP\prev"
+          gh release download --repo $env:GITHUB_REPOSITORY --pattern '*-setup.exe' --pattern SHA256SUMS.txt --dir $d
+          if ($LASTEXITCODE) { throw "could not fetch the last published installer" }
+          $exe = Get-ChildItem "$d\*-setup.exe"
+          $line = Select-String -Path "$d\SHA256SUMS.txt" -SimpleMatch $exe.Name | Select-Object -First 1
+          $want = if ($line) { ($line.Line -split '\s+')[0] }
+          $got = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash
+          if (-not $want -or $got -ne $want) { throw "$($exe.Name) does not match its SHA256SUMS.txt" }
+
       # What users get, run before anything is uploaded: the zip as unpacked,
       # then the installer over the last published release, the installed
       # blitz, its Explorer menu and the uninstaller. A broken installer would
@@ -126,7 +143,6 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ steps.v.outputs.version }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           $t = $env:RUNNER_TEMP
           $name = "blitz-$env:VERSION-windows-x64"
@@ -162,8 +178,6 @@ jobs:
 
             $app = "$env:LOCALAPPDATA\Programs\blitz"
             $quiet = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
-            gh release download --repo $env:GITHUB_REPOSITORY --pattern '*-setup.exe' --dir "$t\prev"
-            if ($LASTEXITCODE) { throw "could not fetch the last published installer" }
             Run (Get-ChildItem "$t\prev\*-setup.exe").FullName @quiet "/LOG=$t\install-prev.log"
             if (-not (Test-Path "$app\blitz.exe")) { throw "the last release did not install to $app" }
             Run "$PWD\out\$name-setup.exe" @quiet "/LOG=$t\install.log"

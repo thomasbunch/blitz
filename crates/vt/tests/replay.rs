@@ -3,14 +3,17 @@
 //! The recordings are not in the repository. Point `VT_CORPUS_DIR` at a
 //! directory of `.log` recordings and run
 //! `cargo test -p vt --test replay -- --ignored`. Recordings with `claude`
-//! in their name are taken to be Claude Code sessions and checked as such.
+//! in their name are taken to be Claude Code sessions and checked as such,
+//! so each must hold a `resize-COLSxROWS` snap, a `cand-b` snap taken with
+//! `line1` and `line2` typed on two lines of the input box, and an end that
+//! quits Claude Code (Ctrl+C twice, or `/exit`). One missing fails.
 //!
 //! A recording has one event per line, `t_ms \t kind \t payload`. `out`
-//! payloads are the program's output with `\e`, `\r`, `\n`, `\\` and
-//! `\xNN` escapes. `note` lines mark resizes (`resize 90x30 hr=...`) and
-//! points where the screen was looked at (`snap LABEL: ...`); a snap
-//! labelled `resize-COLSxROWS` follows a resize. The first line is a `#`
-//! header carrying `size=COLSxROWS`.
+//! payloads are the program's output and `in` payloads what was typed,
+//! with `\e`, `\r`, `\n`, `\\` and `\xNN` escapes. `note` lines mark
+//! resizes (`resize 90x30 hr=...`) and points where the screen was looked
+//! at (`snap LABEL: ...`); a snap labelled `resize-COLSxROWS` follows a
+//! resize. The first line is a `#` header carrying `size=COLSxROWS`.
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +29,8 @@ struct Snap {
 struct Replay {
     t: Terminal,
     snaps: Vec<Snap>,
+    /// What was typed, one `in` event each.
+    typed: Vec<Vec<u8>>,
 }
 
 /// Undoes the payload escapes. A `\x` without two hex digits after it is
@@ -94,11 +99,12 @@ fn replay_log(log: &str, seed: Option<u64>) -> Replay {
         ..Options::default()
     });
     let mut rng = seed.map(|s| Rng(s | 1));
-    let mut snaps = Vec::new();
+    let (mut snaps, mut typed) = (Vec::new(), Vec::new());
     for line in lines {
         let mut f = line.splitn(3, '\t');
         let (_, kind, payload) = (f.next(), f.next(), f.next().unwrap_or_default());
         match kind {
+            Some("in") => typed.push(unescape(payload)),
             Some("out") => {
                 let bytes = unescape(payload);
                 match &mut rng {
@@ -128,7 +134,23 @@ fn replay_log(log: &str, seed: Option<u64>) -> Replay {
             _ => {}
         }
     }
-    Replay { t, snaps }
+    Replay { t, snaps, typed }
+}
+
+impl Replay {
+    /// The snap labelled `label`; a recording without it fails.
+    fn snap(&self, label: &str, log: &Path) -> &Snap {
+        (self.snaps.iter().find(|s| s.label == label))
+            .unwrap_or_else(|| panic!("{} has no snap {label}", log.display()))
+    }
+
+    /// Whether the last thing typed quit Claude Code: Ctrl+C twice, or
+    /// `/exit` and Enter.
+    fn quit(&self) -> bool {
+        let ctrl_c = [b"\x03".to_vec(), b"\x03".to_vec()];
+        let exit = |i: &[u8]| i.windows(5).any(|w| w == b"/exit");
+        self.typed.ends_with(&ctrl_c) || self.typed.iter().rev().take(3).any(|i| exit(i))
+    }
 }
 
 fn replay(path: &Path, seed: Option<u64>) -> Replay {
@@ -182,28 +204,32 @@ fn replay_captures() {
     assert!(!claude.is_empty(), "no recordings with claude in the name");
     for log in &claude {
         let r = replay(log, None);
-        for s in &r.snaps {
-            if let Some((cols, _)) = s.label.strip_prefix("resize-").and_then(size) {
-                claude_screen(s, cols.into());
-            }
+        let resized: Vec<_> = (r.snaps.iter())
+            .filter_map(|s| Some((s, s.label.strip_prefix("resize-").and_then(size)?)))
+            .collect();
+        assert!(!resized.is_empty(), "{} has no resize snap", log.display());
+        for (s, (cols, _)) in resized {
+            claude_screen(s, cols.into());
         }
         // Two lines typed into the input box stay one under the other.
         // Claude puts a no-break space after its `>` prompt.
-        if let Some(s) = r.snaps.iter().find(|s| s.label == "cand-b") {
-            let text = s.text.replace('\u{a0}', " ");
-            let ruled = |l: &str| !l.is_empty() && l.chars().all(|c| c == '─');
-            let found = rows(&text)
-                .windows(4)
-                .any(|w| ruled(w[0]) && w[1] == "> line1" && w[2] == "  line2" && ruled(w[3]));
-            check(found, "\"> line1\" over \"  line2\" between rules", s);
-        }
-        // After `/exit` the full-screen UI is gone and the resume hint is
-        // left on the main screen.
+        let s = r.snap("cand-b", log);
+        let text = s.text.replace('\u{a0}', " ");
+        let ruled = |l: &str| !l.is_empty() && l.chars().all(|c| c == '─');
+        let found = rows(&text)
+            .windows(4)
+            .any(|w| ruled(w[0]) && w[1] == "> line1" && w[2] == "  line2" && ruled(w[3]));
+        check(found, "\"> line1\" over \"  line2\" between rules", s);
+        // Once Claude Code quits, its full-screen UI is gone and the main
+        // screen is back without it.
+        assert!(r.quit(), "{} does not end by quitting", log.display());
         let text = r.t.screen_text();
-        if text.contains("Resume this session with:") {
-            assert!(!r.t.input_modes().alt_screen, "{}", log.display());
-            assert!(!text.contains("Claude Code v"), "{text}");
-        }
+        assert!(!r.t.input_modes().alt_screen, "{}:\n{text}", log.display());
+        assert!(
+            !text.contains("Claude Code v"),
+            "{}:\n{text}",
+            log.display()
+        );
     }
 }
 
@@ -253,9 +279,23 @@ fn replay_of_a_small_recording() {
         "3\tnote\tresize 6x2 hr=0\n",
         "4\tnote\tsnap resize-6x2: on the alternate screen\n",
         "5\tout\t\\e[?1049lbye\n",
-        "6\tin\tignored\n",
+        "6\tin\tnot fed\n",
     );
     let r = replay_log(log, None);
+    // What was typed is kept, not fed: it is what quit, or did not.
+    assert_eq!(r.typed, [b"not fed".to_vec()]);
+    assert!(!r.quit());
+    for (end, quit) in [
+        ("7\tin\t\\x03\n8\tin\t\\x03\n", true),
+        ("7\tin\t/exit\n8\tin\t\\r\n", true),
+        ("7\tin\t\\x03\n8\tin\ty\n", false),
+    ] {
+        assert_eq!(
+            replay_log(&format!("{log}{end}"), None).quit(),
+            quit,
+            "{end:?}"
+        );
+    }
     let labels: Vec<_> = r.snaps.iter().map(|s| s.label.as_str()).collect();
     assert_eq!(labels, ["first", "resize-6x2"]);
     assert_eq!(

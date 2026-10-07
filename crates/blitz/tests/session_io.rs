@@ -44,8 +44,26 @@ fn session_files_round_trip() {
     assert_eq!(session::load(), None);
     assert_eq!(session::load_output(A), None);
 
+    // Another window's temporary file is not this one's business while
+    // that window may be writing it, but one a crash left goes, on the
+    // first save of a run.
+    std::fs::create_dir_all(&dir).expect("state folder");
+    let (fresh, stale) = (
+        dir.join("session.json.4294967295.tmp"),
+        dir.join("session.json.4294967294.tmp"),
+    );
+    std::fs::write(&fresh, "{").expect("write");
+    std::fs::write(&stale, "{").expect("write");
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    (std::fs::File::options().write(true).open(&stale))
+        .and_then(|f| f.set_modified(hour_ago))
+        .expect("age it");
+
     let (one, two) = (state("one"), state("two"));
     session::save(&one).expect("save");
+    assert!(fresh.exists(), "a fresh one stays");
+    assert!(!stale.exists(), "a stale one goes");
+    std::fs::remove_file(&fresh).expect("remove");
     assert_eq!(session::load(), Some(one.clone()), "with the pane's key");
     // Over an existing file, leaving no temporary one behind.
     session::save(&two).expect("save again");
@@ -87,12 +105,29 @@ fn session_files_round_trip() {
     std::fs::write(&file, b"\xff\xfe{").expect("write");
     assert_eq!(session::load(), None, "not UTF-8");
 
-    // Another window's temporary file is not this one's business.
-    let other = dir.join("session.json.4294967295.tmp");
-    std::fs::write(&other, "{").expect("write");
+    // The next save puts a good one back.
     session::save(&two).expect("save");
     assert_eq!(session::load(), Some(two.clone()));
-    std::fs::remove_file(&other).expect("remove");
+
+    // A session saved before panes had keys filed their output by tab and
+    // leaf, which the first start after an update still reads.
+    let before_keys = "{\"v\":1,\"window\":{\"x\":0,\"y\":0,\"w\":800,\"h\":600,\
+        \"maximized\":false},\"sidebar_expanded\":true,\"active\":0,\"tabs\":[{\"name\":\"t\",\
+        \"focus\":0,\"zoom\":null,\"root\":{\"pane\":{\"cwd\":\"old\",\"claude\":null}}}]}";
+    std::fs::write(&file, before_keys).expect("write");
+    let scrollback = dir.join("scrollback");
+    std::fs::create_dir_all(&scrollback).expect("folder");
+    std::fs::write(scrollback.join("0-0.txt"), "from before").expect("write");
+    let old = session::load().expect("an old session reads");
+    assert!(old.layout(1).1.iter().all(|(_, p)| p.key.is_empty()));
+    assert_eq!(
+        session::load_legacy_output(0, 0).as_deref(),
+        Some("from before")
+    );
+    assert_eq!(session::load_legacy_output(0, 1), None);
+    // The next save of output files it by key, so it is read only once.
+    out(&[(A, "now")]);
+    assert_eq!(session::load_legacy_output(0, 0), None);
 
     session::clear();
     assert_eq!(session::load(), None);
