@@ -3598,10 +3598,18 @@ impl App {
     }
 
     /// Pastes `text` into pane `id`, the focused one, or asks first as
-    /// [`vt::keys::needs_paste_confirm`] says, as `ask` makes the question;
+    /// [`vt::keys::needs_paste_confirm`] says, or for file `names` that
+    /// [`quote_paths`] would ask about, as `ask` makes the question;
     /// `confirmed` when this is the answer. A single line goes without its
     /// line break, so it is not run.
-    fn paste(&mut self, id: PaneId, text: &str, confirmed: bool, ask: fn(String) -> Ask) {
+    fn paste(
+        &mut self,
+        id: PaneId,
+        text: &str,
+        confirmed: bool,
+        names: bool,
+        ask: fn(String) -> Ask,
+    ) {
         let text = trim_paste(text);
         let Some(v) = self.view(id).filter(|_| !text.is_empty()) else {
             return;
@@ -3618,8 +3626,8 @@ impl App {
             term.confirm_paste();
         }
         drop(term);
-        if !confirmed && vt::keys::needs_paste_confirm(text, bracketed, trusted) {
-            self.ask_paste(id, text, ask);
+        if !confirmed && asks_first(text, names, bracketed, trusted) {
+            self.ask_paste(id, text, names, ask);
             return;
         }
         let mut out = Vec::new();
@@ -3628,9 +3636,9 @@ impl App {
     }
 
     /// Asks before pasting `text` into pane `id`; the paste key confirms.
-    fn ask_paste(&mut self, id: PaneId, text: &str, ask: fn(String) -> Ask) {
+    fn ask_paste(&mut self, id: PaneId, text: &str, names: bool, ask: fn(String) -> Ask) {
         let key = keymap::keys_for(Action::Paste, &self.config.keys);
-        let asked = paste_question(text, key.as_deref());
+        let asked = paste_question(text, names, key.as_deref());
         self.ask(id, asked, ask(text.to_owned()));
     }
 
@@ -3738,12 +3746,11 @@ impl App {
                 }
                 let now = text.as_ref().map(|t| t.0.as_str());
                 if let Some(answer) = asked.and_then(|n| answers(n.ask, now)) {
-                    self.paste(id, &answer, true, Ask::Paste);
+                    self.paste(id, &answer, true, false, Ask::Paste);
                     return true;
                 }
                 match text {
-                    Some((text, true)) => self.ask_paste(id, &text, Ask::Paste),
-                    Some((text, false)) => self.paste(id, &text, false, Ask::Paste),
+                    Some((text, names)) => self.paste(id, &text, false, names, Ask::Paste),
                     None => return self.paste_image(id),
                 }
             }
@@ -4788,10 +4795,8 @@ impl App {
         match dropped(paths, self.hit(pos)) {
             Some(Dropped::Paste(id, paths)) => {
                 self.show(id);
-                match quote_paths(&paths, self.shell_of(id)) {
-                    (text, true) => self.ask_paste(id, &text, Ask::Drop),
-                    (text, false) => self.paste(id, &text, false, Ask::Drop),
-                }
+                let (text, names) = quote_paths(&paths, self.shell_of(id));
+                self.paste(id, &text, false, names, Ask::Drop);
             }
             Some(Dropped::Open(dirs)) if dirs.is_empty() => {
                 if let Some(id) = self.focus_id() {
@@ -7357,15 +7362,17 @@ fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
 /// by spaces, and whether to ask before pasting them. A name with anything
 /// but letters, digits and `_.-:\/` is quoted, so no shell reads one such
 /// as `a&calc.txt` as syntax. cmd gets double quotes, which only `"` ends
-/// and no Windows name holds; `%VAR%` still expands, as its prompt has no
+/// and no name Windows makes holds, so one that does asks first, as does
+/// one with `<>|` or a control; `%VAR%` still expands, as its prompt has no
 /// way to quote that. PowerShell expands `$` and a backtick inside them
 /// and ends them at a typographic double quote, so there such a name gets
 /// single quotes, with each of its single quote marks doubled. The shell
 /// reading the line may be one started inside the pane, cmd in PowerShell
-/// or the reverse, so cmd gets single quotes too for a name PowerShell
-/// would run inside double ones, and a name that also holds `&`, which cmd
-/// runs inside single ones, asks first. Any other shell is taken for bash,
-/// where `\` needs quoting too and only `'` ends single quotes.
+/// or the reverse, so a name quoted for the pane's shell that the other
+/// would read as syntax asks first: in cmd one PowerShell would run or
+/// end inside double quotes, in PowerShell one that also holds `&`, which
+/// cmd runs inside single ones. Any other shell is taken for bash, where
+/// `\` needs quoting too and only `'` ends single quotes.
 fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, bool) {
     use crate::shell::Kind::{Cmd, Other, PowerShell};
     let plain =
@@ -7377,14 +7384,19 @@ fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, bool) {
             if s.chars().all(plain) {
                 return s.into_owned();
             }
-            // What PowerShell runs, or ends at, inside double quotes.
-            let runs = s.contains("$(") || s.contains(['\u{201c}', '\u{201d}', '\u{201e}']);
+            // What PowerShell runs, or ends at, inside double quotes; a
+            // backtick last escapes the closing one.
+            let runs = s.contains("$(") || s.contains(['`', '\u{201c}', '\u{201d}', '\u{201e}']);
             let single = match shell {
-                Cmd => runs && !s.contains('&'),
-                PowerShell => runs || s.contains(['$', '`']),
+                Cmd => false,
+                PowerShell => runs || s.contains('$'),
                 Other => true,
             };
-            asks |= shell != Other && s.contains('&') && (single || runs);
+            // Win32 forbids these in a name, but NTFS written from Linux
+            // holds them, and no quoting keeps them in.
+            let odd = s.contains(['"', '<', '>', '|']) || s.chars().any(char::is_control);
+            asks |= shell == Cmd && (runs || odd)
+                || shell == PowerShell && (odd || single && s.contains('&'));
             if !single {
                 return format!("\"{s}\"");
             }
@@ -7492,9 +7504,18 @@ fn trim_paste(text: &str) -> &str {
     }
 }
 
+/// Whether a paste of `text` asks first: as
+/// [`vt::keys::needs_paste_confirm`] says, or for file `names` that
+/// [`quote_paths`] would ask about, unless the program that turned
+/// bracketed paste on is trusted with pastes, as Claude Code is once its
+/// hooks have reported.
+fn asks_first(text: &str, names: bool, bracketed: bool, trusted: bool) -> bool {
+    names && !trusted || vt::keys::needs_paste_confirm(text, bracketed, trusted)
+}
+
 /// What a paste that needs confirming asks: how many lines, how they
-/// start, and the paste `key`, when one is bound.
-fn paste_question(text: &str, key: Option<&str>) -> String {
+/// start, or why file `names` ask, and the paste `key`, when one is bound.
+fn paste_question(text: &str, names: bool, key: Option<&str>) -> String {
     // A lone CR is Enter too, and the preview leaves out what would hide
     // or reorder the text.
     let first = (text.trim_start().split(['\r', '\n']).next()).unwrap_or_default();
@@ -7513,6 +7534,10 @@ fn paste_question(text: &str, key: Option<&str>) -> String {
         Some(k) => format!("Press {k} again"),
         None => "Paste again".into(),
     };
+    if names && lines == 1 {
+        // Quoted already, as only a quoted name asks.
+        return format!("Paste {start}? A shell may run part of a file name. {again}");
+    }
     format!("Paste {lines} line{s} starting \"{start}\"? {again}")
 }
 
@@ -11152,10 +11177,20 @@ mod tests {
         assert_eq!(one(r"\\srv\c$\a.txt", Cmd), r#""\\srv\c$\a.txt""#);
         assert_eq!(one(r"C:\x$&calc&.txt", Cmd), r#""C:\x$&calc&.txt""#);
         assert!(!asks(r"C:\x$&calc&.txt", Cmd));
-        // What PowerShell would run inside double quotes gets single ones,
-        // which cmd reads as text too.
-        assert_eq!(one(r"C:\$(calc).txt", Cmd), r"'C:\$(calc).txt'");
-        assert_eq!(one(r"C:\a”;calc;”.txt", Cmd), r"'C:\a”;calc;”.txt'");
+        // cmd reads `'` as text, so it keeps double quotes, and asks for
+        // what PowerShell started inside it would run, end or escape in
+        // them.
+        for name in [
+            r"C:\$(calc).txt",
+            r"C:\a”;calc;”.txt",
+            r"C:\Report “final” v2.docx",
+            r"C:\it's $(x).txt",
+            r"C:\d\a`",
+        ] {
+            assert_eq!(one(name, Cmd), format!("\"{name}\""));
+            assert!(asks(name, Cmd), "{name}");
+        }
+        assert!(asks(r"C:\a`&b.txt", Cmd));
         // PowerShell expands `$` and ends a string at a typographic quote
         // inside double quotes, but nothing ends single ones but a single
         // quote mark, doubled.
@@ -11167,7 +11202,6 @@ mod tests {
             r"'C:\x$’’;calc;’’.txt'"
         );
         assert_eq!(one("C:\\a`b‚‛.txt", PowerShell), "'C:\\a`b‚‚‛‛.txt'");
-        assert_eq!(one(r"C:\it's $(x).txt", Cmd), r"'C:\it''s $(x).txt'");
         // No quoting suits both cmd and PowerShell: asked first, quoted for
         // the shell the pane started.
         assert_eq!(one(r"C:\x$&calc&.txt", PowerShell), r"'C:\x$&calc&.txt'");
@@ -11175,6 +11209,12 @@ mod tests {
         assert_eq!(one(r"C:\a”&calc&”.txt", Cmd), r#""C:\a”&calc&”.txt""#);
         assert!(asks(r"C:\a”&calc&”.txt", Cmd));
         assert!(asks(r"C:\$(calc)&.txt", Cmd));
+        // Linux can write what Windows forbids in a name, and no quoting
+        // keeps those in; bash's single quotes do.
+        for name in [r#"C:\x"&calc&".txt"#, r"C:\a|b.txt", "C:\\a\nb.txt"] {
+            assert!(asks(name, Cmd) && asks(name, PowerShell), "{name}");
+            assert!(!asks(name, Other), "{name}");
+        }
         // bash: only `'` ends single quotes, and `'\''` puts one in.
         assert_eq!(one(r"C:\it's $x.txt", Other), r"'C:\it'\''s $x.txt'");
         assert_eq!(one(r"C:\a b\x!y.txt", Other), r"'C:\a b\x!y.txt'");
@@ -11232,32 +11272,54 @@ mod tests {
     #[test]
     fn app_paste_question_says_what_and_which_key() {
         assert_eq!(
-            paste_question("\r\ngit status\r\ngit diff\r\n", Some("Ctrl+V")),
+            paste_question("\r\ngit status\r\ngit diff\r\n", false, Some("Ctrl+V")),
             "Paste 3 lines starting \"git status\"? Press Ctrl+V again"
         );
         // The first 40 characters, without tabs or other controls.
         let long = format!("{}\tyz", "x".repeat(39));
         assert_eq!(
-            paste_question(&long, Some("Shift+Insert")),
+            paste_question(&long, false, Some("Shift+Insert")),
             format!(
                 "Paste 1 line starting \"{}y\u{2026}\"? Press Shift+Insert again",
                 "x".repeat(39)
             )
         );
         assert_eq!(
-            paste_question("a\nb", None),
+            paste_question("a\nb", false, None),
             "Paste 2 lines starting \"a\"? Paste again"
         );
         // A lone CR runs a line too.
         assert_eq!(
-            paste_question("echo hi\rcalc\r", None),
+            paste_question("echo hi\rcalc\r", false, None),
             "Paste 2 lines starting \"echo hi\"? Paste again"
         );
         // Nothing invisible or reordering in the preview.
         assert_eq!(
-            paste_question("\u{202e}\u{200b}ab\nc", None),
+            paste_question("\u{202e}\u{200b}ab\nc", false, None),
             "Paste 2 lines starting \"ab\"? Paste again"
         );
+        // File names say why they ask.
+        assert_eq!(
+            paste_question(r#""C:\a”;calc;”.txt""#, true, Some("Ctrl+V")),
+            "Paste \"C:\\a”;calc;”.txt\"? A shell may run part of a file name. \
+             Press Ctrl+V again"
+        );
+    }
+
+    #[test]
+    fn app_file_names_ask_unless_the_program_is_trusted_with_pastes() {
+        let ask = |t: &vt::Terminal, text, names| {
+            let trusted = t.paste_trusted();
+            asks_first(text, names, t.input_modes().bracketed, trusted)
+        };
+        let mut t = fed(20, 2, "\x1b[?2004h");
+        assert!(ask(&t, "'C:\\x$&calc&.txt'", true));
+        assert!(!ask(&t, "'C:\\x$.txt'", false));
+        assert!(ask(&t, "a\nb", false));
+        // Claude Code's hooks reported: it reads the name as text.
+        t.vouch_paste(true);
+        assert!(!ask(&t, "'C:\\x$&calc&.txt'", true));
+        assert!(!ask(&t, "a\nb", false));
     }
 
     #[test]

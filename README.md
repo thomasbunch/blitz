@@ -397,11 +397,13 @@ Nothing is pasted into a pane whose program has exited.
 Files copied in Explorer paste as their paths, in quotes when they hold
 a space or anything else a shell would read, and so do files dropped on
 a pane. As either shell may run inside the other, a name no quoting
-keeps safe in both cmd and PowerShell waits for a second Ctrl+V. A folder dropped on the sidebar opens in a new tab. Windows
-does not let you drop from Explorer onto blitz running as
-administrator. With an image on the clipboard and no text, such as a
-screenshot, Ctrl+V in a Claude Code pane whose hooks have reported
-sends Alt+V, which pastes the image; other programs get Ctrl+V.
+keeps safe in both cmd and PowerShell waits for a second Ctrl+V. A Git
+Bash pane gets single quotes, which keep any name, and never asks about
+one. A folder dropped on the sidebar opens in a new tab. Windows does
+not let you drop from Explorer onto blitz running as administrator.
+With an image on the clipboard and no text, such as a screenshot,
+Ctrl+V in a Claude Code pane whose hooks have reported sends Alt+V,
+which pastes the image; other programs get Ctrl+V.
 
 In the find bar, the command palette, the theme picker and the settings
 panel, a paste adds the first line of the clipboard and Ctrl+Backspace

@@ -58,13 +58,17 @@ const OPENS: &[&str] = &[
 pub fn scan(text: &str) -> Vec<(Range<usize>, Link)> {
     let mut out = Vec::new();
     let mut i = 0;
+    // The char before `i`, or the one the marks and joiners after it build
+    // on: no word starts inside a character, so a run of letters that each
+    // carry a mark is walked once, not once per letter.
+    let mut before = None;
     while let Some(c) = text[i..].chars().next() {
-        let before = text[..i].chars().next_back();
-        if before.is_none_or(|b| !b.is_alphanumeric())
+        if before.is_none_or(|b: char| !b.is_alphanumeric())
             && let Some(n) = url_len(&text[i..])
         {
             out.push((i..i + n, Link::Url(text[i..i + n].to_owned())));
             i += n;
+            before = text[..i].chars().next_back();
             continue;
         }
         // Claude Code's tool headers, as in `Update(src/app.rs)`, Markdown
@@ -75,7 +79,11 @@ pub fn scan(text: &str) -> Vec<(Range<usize>, Link)> {
             let found = Link::Path(text[i + path.start..i + path.end].to_owned(), at);
             out.push((i + path.start..i + end, found));
             i += end;
+            before = text[..i].chars().next_back();
             continue;
+        }
+        if !text[..i].chars().next_back().is_some_and(|p| joins(p, c)) {
+            before = Some(c);
         }
         i += c.len_utf8();
     }
@@ -103,19 +111,24 @@ fn url_len(s: &str) -> Option<usize> {
 /// and a joiner left at the end joins nothing.
 fn word_len(s: &str, ok: impl Fn(char) -> bool) -> usize {
     let mut prev = None;
-    // Marks and joiners are never ASCII or space. A Prepend letter such as
-    // U+0D4E joins whatever follows it, so only those can join after one.
     let n = s
         .find(|c: char| {
-            let joined = prev.is_some_and(|p| vt::width::joins(p, p, 1, c))
-                && !c.is_ascii()
-                && !c.is_whitespace()
-                && (!vt::width::is_ignorable(c) || matches!(c, '\u{200C}' | '\u{200D}'));
+            let joined = prev.is_some_and(|p| joins(p, c));
             prev = Some(c);
             !ok(c) && !joined
         })
         .unwrap_or(s.len());
     s[..n].trim_end_matches(['\u{200C}', '\u{200D}']).len()
+}
+
+/// Whether `c` is a mark or joiner that builds one character with `p`.
+/// Marks and joiners take no columns: a Prepend letter such as U+0D4E
+/// joins whatever follows it, so anything with a width must be a word
+/// char on its own.
+fn joins(p: char, c: char) -> bool {
+    vt::width::joins(p, p, 1, c)
+        && vt::width::char_width(c) == 0
+        && (!vt::width::is_ignorable(c) || matches!(c, '\u{200C}' | '\u{200D}'))
 }
 
 /// What a path word is made of: anything a Windows file name can hold
@@ -596,6 +609,14 @@ mod tests {
         one("https://x.com/a\u{D4E}\"q", "https://x.com/a\u{D4E}");
         one("https://x.com/\u{111C2}<b>", "https://x.com/\u{111C2}");
         one("https://x.com/a\u{200C} next", "https://x.com/a");
+        // Nor any punctuation that takes a column.
+        one("https://x.com/a\u{D4E}\u{201C}x", "https://x.com/a\u{D4E}");
+        one("https://x.com/a\u{D4E}\u{3002}x", "https://x.com/a\u{D4E}");
+        one("https://x.com/a\u{D4E}\u{FF02}x", "https://x.com/a\u{D4E}");
+        one(
+            "https://x.com/\u{111C2}\u{300C}y\u{300D}",
+            "https://x.com/\u{111C2}",
+        );
         one(
             "https://example.com/a/b.html",
             "https://example.com/a/b.html",
@@ -617,7 +638,12 @@ mod tests {
             let text = format!("{word}{}", ")]".repeat(50_000));
             assert_eq!(found(&text).len(), 1, "{word}");
         }
-        // One pass takes milliseconds and the old quadratic trim took over
+        // Every letter carries a mark or joiner, so none starts a word.
+        for mark in ['\u{300}', '\u{200D}'] {
+            let text = format!("a{mark}").repeat(100_000);
+            assert_eq!(found(&text), [], "{mark:?}");
+        }
+        // One pass takes milliseconds and the old quadratic walks took over
         // half a minute, so a slow, busy runner still has room.
         assert!(t0.elapsed().as_secs() < 5, "{:?}", t0.elapsed());
     }
