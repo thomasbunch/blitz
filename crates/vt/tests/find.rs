@@ -155,6 +155,14 @@ fn session() -> Terminal {
     t
 }
 
+#[test]
+fn lines_say_where_blitz_prompts_start() {
+    let t = session();
+    let prompts: Vec<usize> = t.lines().filter(|&n| t.starts_prompt(n)).collect();
+    assert_eq!(prompts, [0, 5, 10, 15, 20]);
+    assert!(!t.starts_prompt(99), "no such line");
+}
+
 /// The text of the top row of the view.
 fn top_row(t: &mut Terminal) -> String {
     let s = shot(t);

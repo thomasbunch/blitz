@@ -625,6 +625,11 @@ impl Terminal {
         self.line(n).is_some_and(|r| r.flags & rf::WRAPPED != 0)
     }
 
+    /// Whether one of blitz's own prompts starts on line `n`.
+    pub fn starts_prompt(&self, n: usize) -> bool {
+        self.line(n).is_some_and(|r| r.flags & rf::PROMPT != 0)
+    }
+
     /// The OSC 8 hyperlink in column `col` of line `n`: its URI, and the
     /// first and last cell it covers, following soft wraps.
     pub fn link_at(&self, n: usize, col: u16) -> Option<(&str, LineCol, LineCol)> {
