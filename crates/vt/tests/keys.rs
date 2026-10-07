@@ -1094,8 +1094,10 @@ fn bracketed_paste_is_trusted_once_confirmed() {
     assert!(!t.paste_trusted(), "set by output after a command started");
     t.confirm_paste();
     assert!(t.paste_trusted());
-    t.feed(b"\x1b[?2004h");
-    assert!(!t.paste_trusted(), "set again");
+    // Claude Code sets it again on every redraw; only turning it on anew
+    // asks again.
+    t.feed(b"\x1b[?2004h\x1b[?2004h");
+    assert!(t.paste_trusted(), "set again while on");
     for reset in ["\x1b]133;A;blitz=1\x07", "\x1bc", "\x1b[?2004l"] {
         t.confirm_paste();
         t.feed(reset.as_bytes());

@@ -107,8 +107,8 @@ pub struct Modes {
     /// When the open synchronized update began.
     pub sync: Option<Instant>,
     /// The user confirmed a multi-line paste since bracketed paste was last
-    /// set. Any program's output can set it, so until then it does not show
-    /// that a program reading pastes safely is listening.
+    /// turned on. Any program's output can turn it on, so until then it does
+    /// not show that a program reading pastes safely is listening.
     pub paste_confirmed: bool,
     /// Mode 2031: report dark/light changes unasked, as `CSI ? 997 ; n n`.
     pub theme_reports: bool,
@@ -134,9 +134,13 @@ impl Modes {
             }
             1004 => i.focus = on,
             1006 => i.mouse_sgr = on,
+            // Programs such as Claude Code set it again on every redraw;
+            // only turning it on anew can mean another program reads keys.
             2004 => {
+                if on && !i.bracketed {
+                    self.paste_confirmed = false;
+                }
                 i.bracketed = on;
-                self.paste_confirmed = false;
             }
             // A repeated begin keeps the first start time, so a program
             // that never ends its update is still shown every timeout.
