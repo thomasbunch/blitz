@@ -198,13 +198,15 @@ pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
 }
 
 /// Whether each folder and file `path` names after its first `from`
-/// bytes is there and is no symbolic link or junction. Each is looked at
-/// without following it: a link can lead to another machine, and looking
-/// at a file there makes Windows sign in to it.
+/// bytes is there and is no symbolic link or junction, and whether `path`
+/// is there when it is no more than those bytes, as `Z:\` is. Each is
+/// looked at without following it: a link can lead to another machine,
+/// and looking at a file there makes Windows sign in to it.
 fn plain(path: &Path, from: usize) -> bool {
     (path.ancestors())
         .take_while(|a| a.as_os_str().len() > from)
         .all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| !m.file_type().is_symlink()))
+        && std::fs::symlink_metadata(path).is_ok()
 }
 
 /// What opening an OSC 8 link's `uri` does. Only `http`, `https` and
@@ -542,6 +544,11 @@ mod tests {
         assert!(matches!(notes_plan, Some(Open::File(p)) if p.ends_with(r"sub\notes.txt")));
         assert!(matches!(tool_plan, Some(Open::Reveal(p)) if p.ends_with("tool.cmd")));
         assert_eq!((gone, far), (None, None));
+        // A bare drive root counts only when the drive is there.
+        let root = |l: char| format!(r"{l}:\");
+        let missing = ('A'..='Z').rev().map(root).find(|r| !Path::new(r).exists());
+        assert_eq!(resolve(&missing.expect("a free drive letter"), ""), None);
+        assert!(resolve(&root('C'), "").is_some());
     }
 
     #[test]
