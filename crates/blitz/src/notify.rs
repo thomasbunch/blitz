@@ -1,5 +1,6 @@
 //! Bringing the user back to a session while blitz is in the background:
-//! the taskbar button's flash and badge, and Windows notifications.
+//! the taskbar button's flash and badge, Windows notifications, and a key
+//! that works from any program.
 
 use std::ffi::c_void;
 use std::sync::Once;
@@ -9,10 +10,13 @@ use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateIcon, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, HICON,
-    MSGFLT_ALLOW, RegisterWindowMessageW,
+    MSGFLT_ALLOW, RegisterWindowMessageW, WM_HOTKEY,
 };
 use windows::core::{HSTRING, w};
 use winit::event_loop::EventLoopProxy;
@@ -30,14 +34,23 @@ struct Hook {
     button: u32,
 }
 
-/// The event for window message `msg`, if blitz wants it. `button` is the
-/// number of TaskbarButtonCreated, 0 when it could not be had.
-fn event(msg: u32, button: u32) -> Option<UserEvent> {
-    (button != 0 && msg == button).then_some(UserEvent::TaskbarButton)
+/// The id of the hot key [`global_jump`] takes.
+const JUMP: i32 = 1;
+
+/// The event for window message `msg` with `wparam`, if blitz wants it.
+/// `button` is the number of TaskbarButtonCreated, 0 when it could not be
+/// had.
+fn event(msg: u32, wparam: usize, button: u32) -> Option<UserEvent> {
+    match msg {
+        WM_HOTKEY if wparam == JUMP as usize => Some(UserEvent::GlobalJump),
+        _ if button != 0 && msg == button => Some(UserEvent::TaskbarButton),
+        _ => None,
+    }
 }
 
 /// Makes `hwnd` hear when Explorer makes its taskbar button again, as it
-/// does after a restart, so the progress and badge can go back on.
+/// does after a restart, so the progress and badge can go back on; and
+/// when the key [`global_jump`] takes is pressed.
 pub fn install(hwnd: isize, proxy: EventLoopProxy<UserEvent>) {
     let hwnd = HWND(hwnd as *mut c_void);
     // SAFETY: a NUL-terminated name.
@@ -51,7 +64,7 @@ pub fn install(hwnd: isize, proxy: EventLoopProxy<UserEvent>) {
     // reads `hook`, which is never freed.
     let ok = unsafe { SetWindowSubclass(hwnd, Some(proc), SUBCLASS, hook as usize) };
     if !ok.as_bool() {
-        eprintln!("blitz: cannot tell when the taskbar button is made again");
+        eprintln!("blitz: cannot hear from the taskbar or Ctrl+Alt+J");
     }
 }
 
@@ -65,7 +78,7 @@ unsafe extern "system" fn proc(
 ) -> LRESULT {
     // SAFETY: `install` leaked this hook for the window's lifetime.
     let hook = unsafe { &*(hook as *const Hook) };
-    if let Some(e) = event(msg, hook.button) {
+    if let Some(e) = event(msg, wparam.0, hook.button) {
         let _ = hook.proxy.send_event(e);
     }
     // SAFETY: passes the message on unchanged.
@@ -122,6 +135,23 @@ pub fn badge_icon(size: u32, fg: u32, bg: u32, ring: bool) -> Option<HICON> {
     // SAFETY: both buffers hold at least `size` rows of `size` pixels in
     // the depths given, and outlive the call, which copies them.
     unsafe { CreateIcon(None, n, n, 1, 32, mask.as_ptr(), px.as_ptr().cast()) }.ok()
+}
+
+/// Takes Ctrl+Alt+J from every program for `hwnd`, which then hears of
+/// each press, or with `on` false gives it back. False when another
+/// program has it.
+pub fn global_jump(hwnd: isize, on: bool) -> bool {
+    let hwnd = Some(HWND(hwnd as *mut c_void));
+    // SAFETY: a window this thread owns.
+    unsafe {
+        if on {
+            let mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+            RegisterHotKey(hwnd, JUMP, mods, u32::from(b'J')).is_ok()
+        } else {
+            let _ = UnregisterHotKey(hwnd, JUMP);
+            true
+        }
+    }
 }
 
 /// The app id notifications show under. blitz gives it a name and icon
@@ -255,15 +285,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_new_taskbar_button_is_the_only_message_taken() {
+    fn only_a_new_taskbar_button_and_the_jump_key_are_taken() {
         let button = 0xc0de;
         assert!(matches!(
-            event(button, button),
+            event(button, 0, button),
             Some(UserEvent::TaskbarButton)
         ));
-        assert!(event(0x0010, button).is_none(), "WM_CLOSE");
+        assert!(event(0x0010, 0, button).is_none(), "WM_CLOSE");
         // Without the registered number, no message is it, not even WM_NULL.
-        assert!(event(0, 0).is_none());
+        assert!(event(0, 0, 0).is_none());
+        assert!(matches!(
+            event(WM_HOTKEY, JUMP as usize, button),
+            Some(UserEvent::GlobalJump)
+        ));
+        // Ids below 0 are Windows' own, such as IDHOT_SNAPWINDOW.
+        assert!(event(WM_HOTKEY, -1isize as usize, button).is_none());
     }
 
     #[test]

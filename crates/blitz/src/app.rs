@@ -156,6 +156,8 @@ pub enum UserEvent {
     TaskbarButton,
     /// The user clicked the notification about this session.
     ShowPane(PaneId),
+    /// The user pressed the key that brings them to blitz from anywhere.
+    GlobalJump,
 }
 
 /// Command-line options of the GUI.
@@ -1067,6 +1069,8 @@ struct App {
     hooks_hinted: bool,
     /// The state whose dot badges the taskbar button.
     badge_shows: Option<Attn>,
+    /// Ctrl+Alt+J comes to this window from every program.
+    jump_key: bool,
     counters: Counters,
     code: i32,
 }
@@ -1478,7 +1482,7 @@ impl App {
             plugin: None,
             hooks_hinted: false,
             badge_shows: None,
-
+            jump_key: false,
             counters: Counters::default(),
             code: 0,
         }
@@ -1572,6 +1576,8 @@ impl App {
         if self.persist && !cfg!(debug_assertions) {
             restart_after_reboot();
         }
+        // Once there is a pane to say it failed in.
+        self.global_jump();
         if let Some(script) = self.args.selftest.clone() {
             self.start_selftest(script);
         }
@@ -2344,7 +2350,11 @@ impl App {
         if c.font_size != self.config.font_size {
             self.font_zoom = 0.0;
         }
+        let jump = c.global_jump != self.config.global_jump;
         self.config = c;
+        if jump {
+            self.global_jump();
+        }
         if font {
             self.reload_font();
         }
@@ -3445,23 +3455,7 @@ impl App {
                 }
                 self.request_redraw();
             }
-            // The focused session is skipped: the user is already looking
-            // at it, and a session that exited stays red until closed.
-            Action::JumpToAttention => {
-                let waiting = (self.views.iter())
-                    .filter(|v| Some(v.pane.id) != before)
-                    .map(|v| (v.pane.id, v.pane.attn));
-                let target = crate::attention::jump_target(waiting);
-                match jump(before, target, &mut self.jumped).filter(|&id| self.view(id).is_some()) {
-                    Some(id) => self.show(id),
-                    None => {
-                        if let Some(id) = before {
-                            let until = Some(Instant::now() + NOTHING);
-                            self.set_notice(id, "Nothing needs you", until, true);
-                        }
-                    }
-                }
-            }
+            Action::JumpToAttention => self.jump(),
             Action::Update => {
                 let Some(id) = before else {
                     return false;
@@ -3996,6 +3990,40 @@ impl App {
                 }
             }
             Err(e) => eprintln!("blitz: notification: {e}"),
+        }
+    }
+
+    /// Shows the session that most wants the user; see [`jump_to`]. With
+    /// none, goes back to where the jumps started, or says nothing needs
+    /// the user.
+    fn jump(&mut self) {
+        let before = self.focus_id();
+        let waiting = (self.views.iter()).map(|v| (v.pane.id, v.pane.attn));
+        let target = jump_to(waiting, before, self.focused);
+        match jump(before, target, &mut self.jumped).filter(|&id| self.view(id).is_some()) {
+            Some(id) => self.show(id),
+            None => {
+                if let Some(id) = before {
+                    let until = Some(Instant::now() + NOTHING);
+                    self.set_notice(id, "Nothing needs you", until, true);
+                }
+            }
+        }
+    }
+
+    /// Takes Ctrl+Alt+J from every program while `global_jump` is on, in
+    /// the main window only, or gives it back. Says so in the focused pane
+    /// when another program has it.
+    fn global_jump(&mut self) {
+        let on = self.config.global_jump && self.persist;
+        if on == self.jump_key {
+            return;
+        }
+        let ok = crate::notify::global_jump(self.hwnd, on);
+        self.jump_key = on && ok;
+        if !ok && let Some(id) = self.focus_id() {
+            let text = "Another program has Ctrl+Alt+J, so it cannot bring you to blitz";
+            self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
         }
     }
 
@@ -5624,6 +5652,19 @@ fn alert(state: Attn, c: &Config, last: &mut Option<Instant>, now: Instant) -> O
     Some(a)
 }
 
+/// The session a jump goes to: the one waiting longest among those that
+/// most want the user. The focused one counts only while blitz is in the
+/// background (`front` false): in front, the user is already looking at
+/// it. A session that exited stays red until closed.
+fn jump_to(
+    sessions: impl Iterator<Item = (PaneId, crate::attention::PaneAttn)>,
+    focus: Option<PaneId>,
+    front: bool,
+) -> Option<PaneId> {
+    let skip = focus.filter(|_| front);
+    crate::attention::jump_target(sessions.filter(|s| Some(s.0) != skip))
+}
+
 /// Whether a session's notification comes down: the user is looking at
 /// the session, or it no longer wants them.
 fn untoasts(attended: bool, state: Attn) -> bool {
@@ -6633,10 +6674,14 @@ impl ApplicationHandler<UserEvent> for App {
                     self.add(Some(dir), new_tab);
                 }
             }
-            // So does a click on a notification.
+            // So does a click on a notification, and the jump key.
             UserEvent::ShowPane(id) => {
                 self.to_front();
                 self.show(id);
+            }
+            UserEvent::GlobalJump => {
+                self.jump();
+                self.to_front();
             }
         }
     }
@@ -8428,6 +8473,29 @@ mod tests {
         };
         let a = super::alert(Attn::Error, &c, &mut None, now);
         assert!(a.is_some_and(|a| a.beep && a.flashes == 0));
+    }
+
+    #[test]
+    fn app_jumps_skip_the_focused_session_only_while_blitz_is_in_front() {
+        let t0 = Instant::now();
+        let (a, b) = (PaneId(1), PaneId(2));
+        let attn = |state, since| {
+            let mut p = crate::attention::PaneAttn::new(t0);
+            (p.state, p.since) = (state, since);
+            p
+        };
+        let sessions = || {
+            [
+                (a, attn(Attn::NeedsYou, t0)),
+                (b, attn(Attn::NeedsYou, t0 + Duration::from_secs(1))),
+            ]
+            .into_iter()
+        };
+        assert_eq!(jump_to(sessions(), Some(a), true), Some(b));
+        assert_eq!(jump_to(sessions(), Some(a), false), Some(a));
+        assert_eq!(jump_to(sessions(), None, true), Some(a));
+        let idle = [(a, attn(Attn::Idle, t0))].into_iter();
+        assert_eq!(jump_to(idle, Some(a), false), None, "nothing waits");
     }
 
     #[test]

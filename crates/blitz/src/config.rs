@@ -26,6 +26,9 @@ pub struct Config {
     pub toasts: String,
     /// Make a sound when a session needs attention.
     pub sound: bool,
+    /// Ctrl+Alt+J brings the user to the session that needs them, from
+    /// any program.
+    pub global_jump: bool,
     /// Whether BEL, or a notification without the pane's token, in an
     /// unfocused pane asks for attention.
     pub bell_attention: bool,
@@ -70,6 +73,7 @@ impl Default for Config {
             flash: true,
             toasts: "needs-you".into(),
             sound: false,
+            global_jump: false,
             bell_attention: true,
             check_updates: true,
             restore_session: true,
@@ -255,6 +259,16 @@ pub const SETTINGS: &[Setting] = &[
         applies: NOW,
     },
     Setting {
+        key: "global_jump",
+        group: "Notifications",
+        label: "Jump from anywhere",
+        help: "Ctrl+Alt+J brings blitz to the front from any program, on the \
+               session that needs you. The main window takes it; others leave \
+               it alone.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
         key: "bell_attention",
         group: "Notifications",
         label: "Bell needs you",
@@ -334,6 +348,7 @@ impl Config {
             "flash" => flag(self.flash),
             "toasts" => quote(&self.toasts),
             "sound" => flag(self.sound),
+            "global_jump" => flag(self.global_jump),
             "bell_attention" => flag(self.bell_attention),
             "check_updates" => flag(self.check_updates),
             "scenery" => quote(&self.scenery),
@@ -412,6 +427,7 @@ impl Config {
             "restore_scrollback" => &mut self.restore_scrollback,
             "flash" => &mut self.flash,
             "sound" => &mut self.sound,
+            "global_jump" => &mut self.global_jump,
             "bell_attention" => &mut self.bell_attention,
             "check_updates" => &mut self.check_updates,
             "mascot" => &mut self.mascot,
@@ -887,6 +903,7 @@ scenery = stars
             ("flash", "false"),
             ("toasts", "\"all\""),
             ("sound", "true"),
+            ("global_jump", "true"),
             ("bell_attention", "false"),
             ("check_updates", "false"),
             ("scenery", "\"snow\""),
