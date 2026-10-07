@@ -303,12 +303,19 @@ fn installer_name(v: &str) -> String {
     format!("blitz-{v}-windows-x64-setup.exe")
 }
 
+/// An installer [`fetch`] saved, and the SHA-256 it was checked against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Installer {
+    pub path: PathBuf,
+    pub sum: String,
+}
+
 /// Downloads the installer for version `v` (from `newer`), checks it
 /// against the release's SHA256SUMS.txt, and returns where it saved it.
 // ponytail: the checksum comes from the same release, so it catches a bad
 // download, not a bad release. Check an Authenticode signer once releases
 // are signed.
-pub fn fetch(v: &str) -> Result<PathBuf, String> {
+pub fn fetch(v: &str) -> Result<Installer, String> {
     let base = format!("https://github.com/{REPO}/releases/download/v{v}");
     let name = installer_name(v);
     let sums_url = format!("{base}/SHA256SUMS.txt");
@@ -322,8 +329,6 @@ pub fn fetch(v: &str) -> Result<PathBuf, String> {
     if !sha256_hex(&exe).is_some_and(|got| got.eq_ignore_ascii_case(want)) {
         return Err("the download does not match its checksum".into());
     }
-    // %TEMP% is the user's own, so nobody else can swap the file between
-    // the check and the start.
     let dir = std::env::temp_dir().join(format!("blitz-update-{v}"));
     let path = dir.join(&name);
     // The error names no path: it can end up in an issue report.
@@ -334,28 +339,51 @@ pub fn fetch(v: &str) -> Result<PathBuf, String> {
     if saved.is_err() {
         let _ = std::fs::remove_dir_all(&dir);
     }
-    saved.map(|()| path)
+    saved.map(|()| Installer {
+        path,
+        sum: want.to_ascii_lowercase(),
+    })
 }
 
 /// Starts the `installer` that `fetch` saved. It closes what is left of
-/// blitz and installs, and with `relaunch` starts blitz again.
-pub fn run(installer: &Path, relaunch: bool) -> Result<(), String> {
+/// blitz and installs, and with `relaunch` starts blitz again. One left
+/// for when blitz closes may wait hours, so the file is checked again,
+/// held open so nothing can change it until the installer has started.
+pub fn run(installer: &Installer, relaunch: bool) -> Result<(), String> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let path = &installer.path;
     // blitz is gone by the time the installer could fail, so the log is
     // what `failed` finds on the next start.
-    let log = installer.with_file_name("setup.log");
-    let started = Command::new(installer)
-        .args(installer_args(&log, relaunch))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(drop)
-        .map_err(|e| format!("could not start the installer: {e}"));
+    let log = path.with_file_name("setup.log");
+    let mut data = Vec::new();
+    let started = (std::fs::OpenOptions::new().read(true))
+        .share_mode(FILE_SHARE_READ.0)
+        .open(path)
+        .and_then(|mut held| held.read_to_end(&mut data).map(|_| held))
+        .map_err(|e| format!("could not read the installer: {e}"))
+        .and_then(|held| {
+            if sha256_hex(&data).as_deref() != Some(&installer.sum) {
+                return Err("the installer changed since it was checked".to_string());
+            }
+            let child = Command::new(path)
+                .args(installer_args(&log, relaunch))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            drop(held);
+            child
+                .map(drop)
+                .map_err(|e| format!("could not start the installer: {e}"))
+        });
     // An installer that never ran leaves nothing to report, nor a folder
     // that holds only it.
     if started.is_err() {
-        let _ = std::fs::remove_file(installer);
-        if let Some(dir) = installer.parent() {
+        let _ = std::fs::remove_file(path);
+        if let Some(dir) = path.parent() {
             let _ = std::fs::remove_dir(dir);
         }
     }
@@ -977,6 +1005,47 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc").as_deref(),
             Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    /// An installer left for when blitz closes is checked again before it
+    /// starts: hours may have passed since the download.
+    #[test]
+    fn an_installer_changed_since_its_check_does_not_start() {
+        let dir = std::env::temp_dir().join(format!("blitz-recheck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("setup.exe");
+        std::fs::write(&path, b"abc").unwrap();
+        let installer = Installer {
+            path: path.clone(),
+            sum: sha256_hex(b"abc").unwrap(),
+        };
+        // As checked: it passes, and only then fails to start, being no
+        // program at all.
+        let same = run(&installer, false);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"abd").unwrap();
+        let swapped = run(&installer, false);
+        // A real program starts while blitz holds it.
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("whoami.exe");
+        let system = crate::shell::system_root(|k| std::env::var_os(k)).join("System32");
+        std::fs::copy(system.join("whoami.exe"), &exe).unwrap();
+        let real = Installer {
+            sum: sha256_hex(&std::fs::read(&exe).unwrap()).unwrap(),
+            path: exe,
+        };
+        let started = run(&real, false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(started, Ok(()));
+        assert!(
+            same.as_ref()
+                .is_err_and(|e| e.starts_with("could not start")),
+            "{same:?}"
+        );
+        assert_eq!(
+            swapped,
+            Err("the installer changed since it was checked".into())
         );
     }
 }

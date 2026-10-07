@@ -157,7 +157,7 @@ pub enum UserEvent {
     Installed(Result<(), String>),
     /// The installer of this release, downloaded to run when blitz
     /// closes, or why it could not be.
-    Fetched(String, Result<PathBuf, String>),
+    Fetched(String, Result<crate::update::Installer, String>),
     /// Another launch asks the window to come to the front, and maybe to
     /// open a tab in its folder.
     Handoff(crate::handoff::Ask),
@@ -2997,7 +2997,7 @@ impl App {
 
     /// Updates to release `v` now, downloading its installer unless
     /// `installer` is it. blitz exits once the installer starts.
-    fn update_now(&self, v: String, installer: Option<PathBuf>) {
+    fn update_now(&self, v: String, installer: Option<crate::update::Installer>) {
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             let done = std::panic::catch_unwind(move || {
@@ -3015,7 +3015,7 @@ impl App {
     /// The installer of release `v`, to run when blitz closes, finished
     /// downloading or failed to. If Ctrl+Shift+U asked to update now in
     /// the meantime, it runs now.
-    fn fetched(&mut self, v: String, got: Result<PathBuf, String>) {
+    fn fetched(&mut self, v: String, got: Result<crate::update::Installer, String>) {
         // Dropped in the meantime.
         if self.at_close.as_ref().is_none_or(|a| a.0 != v) {
             return;
@@ -6531,7 +6531,7 @@ fn first_hint(user: &[keymap::Binding]) -> String {
 
 /// An update left for when blitz closes: its release, and its installer
 /// once downloaded.
-type AtClose = (String, Option<PathBuf>);
+type AtClose = (String, Option<crate::update::Installer>);
 
 /// Whether Ctrl+Shift+U, leaving release `v` for when blitz closes, starts
 /// its download: not when `at_close` already holds it, but when it holds an
@@ -9603,7 +9603,11 @@ mod tests {
 
     #[test]
     fn an_update_left_for_close_follows_the_banner() {
-        let left = |v: &str, got: bool| (v.to_string(), got.then(|| PathBuf::from("setup.exe")));
+        let setup = || crate::update::Installer {
+            path: "setup.exe".into(),
+            sum: String::new(),
+        };
+        let left = |v: &str, got: bool| (v.to_string(), got.then(setup));
         // Pressed again for the same release, nothing downloads twice; for
         // a newer one that took the banner, it does.
         assert!(arms(None, "0.0.5"));
