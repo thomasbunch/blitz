@@ -61,6 +61,9 @@ pub struct Font {
     pub gamma: f32,
     pub contrast: f32,
     fallbacks: HashMap<(char, u8), Option<IDWriteFontFace>>,
+    /// The installed Nerd Font for icons, looked for at the first icon
+    /// the font lacks.
+    nerd: Option<Option<IDWriteFontFamily>>,
     /// Fallback lookups [`Font::raster`] may still make before it fails
     /// with `E_PENDING`. Each new character takes about a tenth of a
     /// millisecond, so a renderer allows a few per frame.
@@ -99,22 +102,71 @@ pub fn monospace_families() -> Vec<String> {
             if !mono || font.IsSymbolFont().as_bool() {
                 continue;
             }
-            let names = fam.GetFamilyNames()?;
-            let (mut index, mut exists) = (0u32, BOOL(0));
-            names.FindLocaleName(w!("en-us"), &mut index, &mut exists)?;
-            if !exists.as_bool() {
-                index = 0;
-            }
-            let mut name = vec![0u16; names.GetStringLength(index)? as usize + 1];
-            names.GetString(index, &mut name)?;
-            name.pop();
-            out.push(String::from_utf16_lossy(&name));
+            out.push(family_name(&fam)?);
         }
         out.sort_by_key(|n| n.to_lowercase());
         out.dedup();
         Result::Ok(out)
     };
     list().unwrap_or_default()
+}
+
+/// The English name of `fam`, or its first.
+fn family_name(fam: &IDWriteFontFamily) -> Result<String> {
+    // SAFETY: COM calls with valid out-pointers and a buffer of the length
+    // asked for.
+    unsafe {
+        let names = fam.GetFamilyNames()?;
+        let (mut index, mut exists) = (0u32, BOOL(0));
+        names.FindLocaleName(w!("en-us"), &mut index, &mut exists)?;
+        if !exists.as_bool() {
+            index = 0;
+        }
+        let mut name = vec![0u16; names.GetStringLength(index)? as usize + 1];
+        names.GetString(index, &mut name)?;
+        name.pop();
+        Ok(String::from_utf16_lossy(&name))
+    }
+}
+
+/// Whether `c` is in a private use area, where Nerd Fonts keep their
+/// icons.
+fn is_private(c: char) -> bool {
+    matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..)
+}
+
+/// How well a family named `name` suits as the font for icons: 0 for a
+/// Nerd Font with icons one cell wide, as "JetBrainsMono Nerd Font Mono"
+/// or "CaskaydiaCove NFM", 1 for one with wider icons, as "Hack Nerd
+/// Font" or "Cascadia Code NF", and `None` for any other font.
+fn nerd_rank(name: &str) -> Option<u8> {
+    if name.ends_with(" Nerd Font Mono") || name.ends_with(" NFM") {
+        Some(0)
+    } else if name.ends_with(" Nerd Font") || name.ends_with(" NF") {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// The installed Nerd Font that suits best for icons.
+fn nerd_family(collection: &IDWriteFontCollection) -> Option<IDWriteFontFamily> {
+    let mut best: Option<(u8, IDWriteFontFamily)> = None;
+    // SAFETY: a plain query on a live collection.
+    let count = unsafe { collection.GetFontFamilyCount() };
+    for i in 0..count {
+        // SAFETY: an index below the collection's count.
+        let Ok(fam) = (unsafe { collection.GetFontFamily(i) }) else {
+            continue;
+        };
+        let rank = family_name(&fam).ok().as_deref().and_then(nerd_rank);
+        if let Some(rank) = rank
+            && best.as_ref().is_none_or(|b| rank < b.0)
+        {
+            best = Some((rank, fam));
+        }
+    }
+    best.map(|b| b.1)
 }
 
 /// The row strikethrough starts on, `up` pixels above the baseline, kept
@@ -232,6 +284,7 @@ impl Font {
                 gamma,
                 contrast,
                 fallbacks: HashMap::new(),
+                nerd: None,
                 lookups: u32::MAX,
             })
         }
@@ -350,9 +403,11 @@ impl Font {
         }
     }
 
-    /// The system's fallback font face for `c`, cached. Emoji are drawn
-    /// in one colour, so where the system picks its emoji font, Segoe UI
-    /// Symbol's text form of the symbol comes first.
+    /// The font face for `c` when the font lacks it, cached: an installed
+    /// Nerd Font for an icon, which Windows has no font for, or else the
+    /// system's fallback. Emoji are drawn in one colour, so where the
+    /// system picks its emoji font, Segoe UI Symbol's text form of the
+    /// symbol comes first.
     fn fallback_face(&mut self, c: char, style: u8) -> Result<Option<IDWriteFontFace>> {
         if let Some(f) = self.fallbacks.get(&(c, style)) {
             return Ok(f.clone());
@@ -361,6 +416,16 @@ impl Font {
             return Err(E_PENDING.into());
         }
         self.lookups -= 1;
+        if is_private(c) {
+            let nerd = self
+                .nerd
+                .get_or_insert_with(|| nerd_family(&self.collection));
+            let face = (nerd.as_ref()).and_then(|f| face_of(f, style).ok());
+            if let Some(f) = face.filter(|f| glyph_index(f, c) != 0) {
+                self.fallbacks.insert((c, style), Some(f.clone()));
+                return Ok(Some(f));
+            }
+        }
         let mut text = [0u16; 2];
         let len = c.encode_utf16(&mut text).len() as u32;
         let source = Source {
@@ -632,6 +697,34 @@ mod tests {
             a.alpha != i.alpha || a.dx != i.dx || a.w != i.w,
             "italic differs"
         );
+    }
+
+    #[test]
+    fn icons_come_from_a_nerd_font() {
+        for (name, rank) in [
+            ("JetBrainsMono Nerd Font Mono", Some(0)),
+            ("CaskaydiaCove NFM", Some(0)),
+            ("Hack Nerd Font", Some(1)),
+            ("Cascadia Code NF", Some(1)),
+            ("Cascadia Code", None),
+            ("Symbols Nerd Font Propo", None),
+            ("SNF", None),
+        ] {
+            assert_eq!(nerd_rank(name), rank, "{name}");
+        }
+        assert!(is_private('\u{E0A0}') && is_private('\u{F0001}'));
+        assert!(!is_private('\u{D7FF}') && !is_private('\u{F900}'));
+        // Without one installed, an icon is no error.
+        let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        let gear = font.raster("\u{F013}", 0, 1);
+        assert!(gear.is_ok());
+        assert!(font.nerd.is_some(), "looked for once");
+        // With one, it draws the icon.
+        if let Some(Some(fam)) = &font.nerd {
+            let name = family_name(fam).expect("name");
+            let r = gear.expect("raster").expect(&name);
+            assert!(ink(&r) > 0, "{name}");
+        }
     }
 
     #[test]
