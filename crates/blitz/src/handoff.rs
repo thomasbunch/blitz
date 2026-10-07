@@ -42,8 +42,11 @@ pub fn encode(dir: &Path) -> Vec<u16> {
     dir.as_os_str().encode_wide().collect()
 }
 
-/// The folder in a payload, or `None` when it is not one blitz sent: blitz
-/// only sends absolute paths.
+/// The folder in a payload, or `None` when it is not one blitz sent or not
+/// a local drive folder. Any program on the desktop can send one, and the
+/// window procedure looks at it, so a network or device path would make
+/// Windows sign in to that host or open that device for the sender. A
+/// blitz refused one opens a window of its own there instead.
 pub fn decode(data: usize, bytes: &[u8]) -> Option<PathBuf> {
     if data != MAGIC
         || bytes.is_empty()
@@ -56,7 +59,8 @@ pub fn decode(data: usize, bytes: &[u8]) -> Option<PathBuf> {
         .map(|&b| u16::from_le_bytes(b))
         .collect();
     let text = String::from_utf16(&units).ok()?;
-    (!text.contains('\0') && Path::new(&text).is_absolute()).then(|| PathBuf::from(text))
+    // The same rule as a folder a program reports with OSC 7.
+    vt::osc::local_dir(&text).then(|| PathBuf::from(text))
 }
 
 /// Sends `dir` to the running blitz. True only when it took it; on false
@@ -182,31 +186,35 @@ mod tests {
         );
         let long = bytes(&vec![u16::from(b'a'); MAX_BYTES / 2 + 1]);
         assert_eq!(decode(MAGIC, &long), None, "too long");
-        let most: Vec<u16> = "C:\\"
-            .encode_utf16()
-            .chain(std::iter::repeat(u16::from(b'a')))
-            .take(MAX_BYTES / 2)
-            .collect();
-        assert!(
-            decode(MAGIC, &bytes(&most)).is_some(),
-            "the longest allowed"
-        );
+        // A folder is held to OSC 7's 4096 bytes; the sender opens a
+        // window of its own for a longer one.
+        let path = |n: usize| bytes(&encode(Path::new(&format!(r"C:\{}", "a".repeat(n - 3)))));
+        assert!(decode(MAGIC, &path(4096)).is_some(), "the longest allowed");
+        assert_eq!(decode(MAGIC, &path(4097)), None, "one byte more");
     }
 
     /// blitz sends absolute paths. A relative one would be read against
     /// the receiver's directory, which is not the sender's.
     #[test]
-    fn handoff_takes_only_absolute_folders() {
+    fn handoff_takes_only_local_drive_folders() {
         let take = |p: &str| decode(MAGIC, &bytes(&encode(Path::new(p)))).is_some();
-        for ok in [
-            r"C:\x",
-            r"\\server\share\x",
-            r"\\?\C:\x",
-            r"\\?\UNC\server\share",
-        ] {
+        for ok in [r"C:\x", r"z:\", "C:/x"] {
             assert!(take(ok), "{ok}");
         }
-        for bad in [r"x", r"x\y", r"..\x", r"C:x", r"\x"] {
+        for bad in [
+            r"x",
+            r"x\y",
+            r"..\x",
+            r"C:x",
+            r"\x",
+            // Looking at these signs in to a host or opens a device.
+            r"\\server\share\x",
+            r"\\?\UNC\server\share",
+            r"\\?\C:\x",
+            r"\\.\pipe\x",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1",
+            "C:\\x\ny",
+        ] {
             assert!(!take(bad), "{bad}");
         }
     }
