@@ -1255,7 +1255,6 @@ mod msg_to_key_tests {
         // Only two hex digits make a byte.
         assert_eq!(unesc(r"\x+f\x4"), br"\x+f\x4");
         assert_eq!(text_binding("ctrl+e=text:"), None, "nothing to type");
-
         assert_eq!(text_binding("ctrl+bogus+e=text:x"), None);
         assert_eq!(text_binding("ctrl+e=split_right"), None);
         assert_eq!(binding(r"ctrl+e=text:x"), None, "not an action");

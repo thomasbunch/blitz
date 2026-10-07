@@ -725,7 +725,6 @@ fn interrupt_keys_stay_console_records() {
     cs_break.extended = true;
     assert_eq!(enc(&cs_break, &both), "\x1b[3;70;3;1;280;1_");
     // Without win32-input-mode there is no console record to keep.
-
     assert_eq!(enc(&ctrl_c, &kitty(1)), "\x1b[99;5u");
 }
 

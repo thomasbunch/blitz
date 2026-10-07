@@ -2642,7 +2642,6 @@ impl App {
         if search || f.stale {
             f.search(&term, v.grid.1);
         }
-
         if search {
             self.find_last.clone_from(&f.query);
         }
@@ -4094,7 +4093,6 @@ impl App {
                     self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
                 }
             }
-
             Some(Dropped::Open(dirs)) => {
                 for dir in dirs {
                     self.add(Some(dir), new_tab);
@@ -4714,7 +4712,6 @@ impl App {
         // What is under a still pointer can change too, as when a program
         // takes the mouse or a panel opens from the keyboard.
         self.update_pointer();
-
         self.ensure_gfx();
         let Some(g) = &self.gfx else {
             return;
@@ -4825,7 +4822,6 @@ impl App {
             if let Some(q) = self.quick.as_ref().filter(|q| q.pane == id) {
                 v.snap.highlight(&q.found, None);
             }
-
             // Only the focused pane has a link under the pointer.
             let hover = (self.hover)
                 .filter(|h| Some(id) == focus && h.0 == term.line_epoch())
@@ -6255,7 +6251,6 @@ fn hides_lasting(old: Option<&Notice>, until: Option<Instant>, dim: bool) -> boo
 }
 
 /// What pasting answers paste question `ask` with, the clipboard holding
-
 /// `now`: the text it asked about, while the clipboard still holds it.
 /// Dropped files are answered whatever the clipboard holds.
 fn answers(ask: Ask, now: Option<&str>) -> Option<String> {
@@ -7509,7 +7504,6 @@ mod tests {
         // Pagers such as less never ask.
         let pager = fed(10, 2, "\x1b[?1049h").input_modes();
         assert_eq!(does(&pager, false, false), Wheel::Arrows, "less");
-
         assert_eq!(does(&asked, false, true), Wheel::Nothing, "Claude Code");
         assert_eq!(does(&mouse, false, true), Wheel::Report);
         assert_eq!(
@@ -8053,7 +8047,6 @@ mod tests {
             let s = selection_of(t, &pal, (a, 0), (b, u16::MAX));
             selection_text(t, &pal, &s, 0)
         };
-
         let text = format!(
             "{PROMPT}ls\r\none\r\n{PROMPT}cargo build --release\r\n\
              Compiling x\r\nFinished\r\n\r\n{PROMPT}"
@@ -8087,7 +8080,6 @@ mod tests {
         // One prompt has no command before it.
         let t = fed(12, 4, &format!("hello\r\n{PROMPT}"));
         assert_eq!(last_output(&t, &pal), None);
-
         let t = fed(12, 4, "");
         assert_eq!(all_text(&t, &pal), None, "nothing to select");
     }

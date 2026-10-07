@@ -598,7 +598,6 @@ impl Grid {
             tails.sort_unstable_by_key(|g| g.0);
             let mut tails = tails.into_iter().peekable();
             prompt |= row.flags & rf::MARKS;
-
             for (x, c) in row.cells.iter().enumerate() {
                 if i == cy && x == usize::from(cur.0) {
                     cursor = Some(line.len());
