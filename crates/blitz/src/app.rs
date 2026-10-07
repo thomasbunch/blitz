@@ -551,8 +551,9 @@ struct Mouse {
     hidden: bool,
     /// A left-button drag is making a selection.
     drag: Option<Drag>,
-    /// The drag's pane showed the bottom of its text when it began.
-    drag_bottom: bool,
+    /// The pane the drag began in, and whether it showed the bottom of its
+    /// text then.
+    drag_in: Option<(PaneId, bool)>,
     /// When the drag next scrolls, while the pointer is outside its pane.
     scroll_at: Option<Instant>,
     /// The last press that went to selection: when, on which cell, and
@@ -728,6 +729,28 @@ fn let_go(term: &mut vt::Terminal, bottom: bool, selected: bool) {
     term.hold(false);
     if bottom && !selected {
         term.scroll_viewport(isize::MIN);
+    }
+}
+
+/// What a drag does to pane `id`'s `term`: its view holds still while the
+/// drag goes on in it, `held`, and when the drag has `ended`, the pane it
+/// began in lets go, wherever focus went meanwhile. True when it let go.
+fn drag_holds(
+    term: &mut vt::Terminal,
+    id: PaneId,
+    held: Option<PaneId>,
+    ended: Option<(PaneId, bool)>,
+    selected: bool,
+) -> bool {
+    match ended {
+        Some((began, bottom)) if began == id => {
+            let_go(term, bottom, selected);
+            true
+        }
+        _ => {
+            term.hold(held == Some(id));
+            false
+        }
     }
 }
 
@@ -2828,17 +2851,20 @@ impl App {
         let (now, was) = (drag.is_some(), self.mouse.drag.is_some());
         self.mouse.drag = drag;
         let focus = self.focus_id();
+        if now && !was {
+            let v = focus.and_then(|id| self.view(id));
+            self.mouse.drag_in = v.map(|v| (v.pane.id, lock(&v.pane.term).viewport() == 0));
+        }
+        let ended = if was && !now {
+            self.mouse.drag_in.take()
+        } else {
+            None
+        };
+        let held = focus.filter(|_| now);
         for v in &self.views {
             let mut term = lock(&v.pane.term);
-            let here = Some(v.pane.id) == focus;
-            if here && now && !was {
-                self.mouse.drag_bottom = term.viewport() == 0;
-            }
-            if here && was && !now {
-                let_go(&mut term, self.mouse.drag_bottom, v.selection.is_some());
+            if drag_holds(&mut term, v.pane.id, held, ended, v.selection.is_some()) {
                 self.request_redraw();
-            } else {
-                term.hold(now && here);
             }
         }
     }
@@ -9399,6 +9425,19 @@ mod tests {
         assert!(held(true, false), "a click");
         assert!(!held(true, true), "a selection keeps its text in view");
         assert!(!held(false, false), "scrolled back before the click");
+        // Focus moved to another pane before the button came up: the pane
+        // the drag began in lets go, the other keeps its place.
+        let (a, b) = (PaneId(1), PaneId(2));
+        let mut began = fed(10, 2, "a\r\nb");
+        began.hold(true);
+        began.feed(b"\r\nc\r\nd");
+        let mut other = fed(10, 2, "a\r\nb\r\nc\r\nd");
+        other.scroll_viewport(1);
+        let top = other.view_top();
+        assert!(drag_holds(&mut began, a, None, Some((a, true)), false));
+        assert!(!drag_holds(&mut other, b, None, Some((a, true)), false));
+        assert_eq!(began.view_top(), began.screen_top());
+        assert_eq!(other.view_top(), top, "scrolled back");
     }
 
     #[test]
