@@ -27,6 +27,8 @@ pub enum Ev {
     /// The user sent Claude Code a prompt, which starts a turn.
     Working,
     /// Claude Code's title shows it working: on with the turn it is in.
+    /// A question stays, as with [`Ev::Quiet`]: only an answer or a hook
+    /// ends one.
     Busy,
     Done,
     /// Claude Code's title stopped showing work. That ends a turn, but a
@@ -307,6 +309,12 @@ impl PaneAttn {
                 self.bell = ev == Ev::Bell;
                 NeedsYou
             }
+            // The title cannot answer a question: any program can print
+            // one. The answer finds Claude Code at work.
+            Ev::Busy if self.state == NeedsYou => {
+                self.prev = Working;
+                return false;
+            }
             Ev::Working | Ev::Busy => Working,
             Ev::Done if attended => Idle,
             Ev::Done => DoneUnseen,
@@ -514,14 +522,17 @@ mod tests {
         assert_eq!(p.state, Attn::Idle);
     }
 
-    /// Working again after a question means it was answered; going quiet
-    /// does not end the question, but answering it then finds the turn
-    /// over rather than back at work.
+    /// A title, which any program can print, never ends a question: the
+    /// answer then finds Claude Code at work, or, after the title went
+    /// quiet, the turn over.
     #[test]
     fn title_marks_around_a_question() {
         let mut p = pane(Attn::Working);
         p.apply(Ev::NeedsYou, AWAY, Instant::now());
-        assert!(p.apply(Ev::Busy, AWAY, Instant::now()));
+        p.apply(Ev::Quiet, AWAY, Instant::now());
+        assert!(!p.apply(Ev::Busy, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::NeedsYou);
+        assert!(p.apply(Ev::Answered, HERE, Instant::now()));
         assert_eq!(p.state, Attn::Working);
 
         let mut p = pane(Attn::Working);

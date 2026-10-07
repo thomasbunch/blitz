@@ -2875,7 +2875,6 @@ impl App {
                 }
                 let silent = hooks_silent(v.claude_working, v.hooks_seen, Instant::now());
                 let (was, now) = (v.pane.claude_title, claude_title(&t).map(|c| c.0));
-                let asked = v.pane.attn.state == Attn::NeedsYou;
                 v.pane.claude_title = now;
                 v.pane.title = t;
                 if focus {
@@ -2885,14 +2884,8 @@ impl App {
                 // This needs no hooks, and it sees a turn the user
                 // interrupted end, which runs no hook at all.
                 match (was, now) {
-                    // Back at work: a question it showed was answered.
                     (w, Some(true)) if w != Some(true) => {
-                        if self.attention(id, Ev::Busy)
-                            && asked
-                            && let Some(v) = self.view_mut(id)
-                        {
-                            v.pane.msg.clear();
-                        }
+                        self.attention(id, Ev::Busy);
                     }
                     (Some(true), Some(false)) => {
                         self.attention(id, Ev::Quiet);
