@@ -156,9 +156,16 @@ fn build<'a>(n: &'a NodeState, first: u32, panes: &mut Vec<(PaneId, &'a PaneMeta
     }
 }
 
-/// `%LOCALAPPDATA%\blitz`. It is created on the first save.
+/// `%LOCALAPPDATA%\blitz`. It is created on the first save. Debug builds
+/// use their own, so `cargo run` never restores, resumes or deletes the
+/// installed blitz's sessions.
 pub fn dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("blitz"))
+    let name = if cfg!(debug_assertions) {
+        "blitz.dev"
+    } else {
+        "blitz"
+    };
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(name))
 }
 
 fn file() -> Option<PathBuf> {
@@ -523,6 +530,16 @@ mod tests {
             ..sample()
         };
         assert_eq!(from_json(&to_json(&empty)), None);
+    }
+
+    /// `cargo run` must never restore, resume or delete the sessions of the
+    /// installed blitz.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn debug_builds_keep_their_own_state() {
+        if let Some(d) = dir() {
+            assert_eq!(d.file_name().and_then(|n| n.to_str()), Some("blitz.dev"));
+        }
     }
 
     #[test]
