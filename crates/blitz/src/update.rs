@@ -349,6 +349,26 @@ mod tests {
         assert!(INSTALLER_ARGS.contains(&"/VERYSILENT") && iss.contains("WizardSilent"));
     }
 
+    /// Setup offers to start blitz at sign-in, for this user, never ticked
+    /// for them, and takes it away when unticked or uninstalled.
+    #[test]
+    fn setup_can_start_blitz_at_sign_in() {
+        let iss = include_str!("../../../.github/blitz.iss");
+        let task = (iss.lines())
+            .find(|l| l.starts_with("Name: startup;"))
+            .expect("the task");
+        assert!(task.ends_with("Flags: unchecked"), "{task}");
+        let run = r#"Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; "#;
+        let lines: Vec<&str> = iss.lines().filter_map(|l| l.strip_prefix(run)).collect();
+        assert_eq!(
+            lines,
+            [
+                r#"ValueType: string; ValueName: "blitz"; ValueData: """{app}\blitz.exe"""; Flags: uninsdeletevalue; Tasks: startup"#,
+                r#"ValueType: none; ValueName: "blitz"; Flags: deletevalue dontcreatekey; Check: not WizardIsTaskSelected('startup')"#,
+            ]
+        );
+    }
+
     #[test]
     fn the_banner_offers_a_release_and_keeps_a_failure_in_view() {
         let log = Path::new(r"C:\Users\someone\AppData\Local\Temp\blitz-update-0.0.5\setup.log");

@@ -179,6 +179,13 @@ jobs:
             }
             $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\blitz.lnk"
             if (-not (Test-Path $lnk)) { throw "no Start menu shortcut" }
+            # Starting at sign-in only when asked for, and the uninstaller
+            # removes it.
+            $startup = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+            if ((Get-ItemProperty $startup).blitz) { throw "setup made blitz start at sign-in unasked" }
+            Run "$PWD\out\$name-setup.exe" @quiet /MERGETASKS=startup "/LOG=$t\install-startup.log"
+            $got = (Get-ItemProperty $startup).blitz
+            if ($got -ne "`"$app\blitz.exe`"") { throw "sign-in starts $got" }
 
             # The uninstaller hands over to a copy of itself and returns.
             $entry = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{1DA65EB8-E92D-465A-9531-C4B72BB72597}_is1'
@@ -187,6 +194,7 @@ jobs:
             while ((Test-Path $app) -and (Get-Date) -lt $deadline) { Start-Sleep 1 }
             $left = @($app, $lnk, $entry) + $menu | Where-Object { Test-Path $_ }
             if ($left) { throw "the uninstaller left $($left -join ', ')" }
+            if ((Get-ItemProperty $startup).blitz) { throw "the uninstaller left blitz starting at sign-in" }
           } finally {
             Get-ChildItem "$t\*.log" | ForEach-Object { "::group::$($_.Name)"; Get-Content $_; '::endgroup::' }
           }
