@@ -2318,7 +2318,8 @@ impl App {
     fn offer_update(&mut self, v: String, log: Option<PathBuf>) {
         let installed = crate::update::installed();
         let shown = self.update.as_ref();
-        if let Some(text) = crate::update::banner(shown, &v, log.as_deref(), installed) {
+        let keys = keymap::press_for(Action::Update, &self.config.keys);
+        if let Some(text) = crate::update::banner(shown, &v, log.as_deref(), installed, &keys) {
             self.update = Some((v, text));
             self.request_redraw();
         }

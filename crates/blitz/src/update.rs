@@ -60,7 +60,8 @@ fn version(s: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// The banner text for release `v`, or for the update to it that failed
-/// and wrote `log`; `installed` when blitz can update itself. `None` keeps
+/// and wrote `log`; `installed` when blitz can update itself, and `keys`
+/// what to press to update. `None` keeps
 /// the banner shown now, `shown`: a later look finding the same release
 /// keeps a failure in view. The action comes before the log's long path,
 /// so a narrow window that cuts the text keeps it.
@@ -69,13 +70,14 @@ pub fn banner(
     v: &str,
     log: Option<&Path>,
     installed: bool,
+    keys: &str,
 ) -> Option<String> {
     if log.is_none() && shown.is_some_and(|u| u.0 == v) {
         return None;
     }
     Some(match log {
         Some(log) => format!(
-            "Updating to blitz {v} failed \u{b7} Ctrl+Shift+U to try again \u{b7} log: {}",
+            "Updating to blitz {v} failed \u{b7} {keys} to try again \u{b7} log: {}",
             log.display()
         ),
         None => {
@@ -84,7 +86,7 @@ pub fn banner(
             } else {
                 "open the download page"
             };
-            format!("blitz {v} is available \u{b7} Ctrl+Shift+U to {how}")
+            format!("blitz {v} is available \u{b7} {keys} to {how}")
         }
     })
 }
@@ -350,17 +352,18 @@ mod tests {
     #[test]
     fn the_banner_offers_a_release_and_keeps_a_failure_in_view() {
         let log = Path::new(r"C:\Users\someone\AppData\Local\Temp\blitz-update-0.0.5\setup.log");
-        let offer = banner(None, "0.0.5", None, true).expect("a banner");
+        const U: &str = "Ctrl+Shift+U";
+        let offer = banner(None, "0.0.5", None, true, U).expect("a banner");
         assert_eq!(
             offer,
             "blitz 0.0.5 is available \u{b7} Ctrl+Shift+U to update and restart"
         );
-        let zip = banner(None, "0.0.5", None, false).expect("a banner");
+        let zip = banner(None, "0.0.5", None, false, U).expect("a banner");
         assert!(
             zip.ends_with("Ctrl+Shift+U to open the download page"),
             "{zip}"
         );
-        let failed = banner(None, "0.0.5", Some(log), true).expect("a banner");
+        let failed = banner(None, "0.0.5", Some(log), true, U).expect("a banner");
         let action = failed
             .find("Ctrl+Shift+U to try again")
             .expect("the action");
@@ -371,12 +374,18 @@ mod tests {
         // A later look at the same release keeps the failure; a newer one
         // replaces it, and a failure replaces an offer.
         let shown = ("0.0.5".to_string(), failed.clone());
-        assert_eq!(banner(Some(&shown), "0.0.5", None, true), None);
-        assert!(banner(Some(&shown), "0.0.6", None, true).is_some());
+        assert_eq!(banner(Some(&shown), "0.0.5", None, true, U), None);
+        assert!(banner(Some(&shown), "0.0.6", None, true, U).is_some());
         let offered = ("0.0.5".to_string(), offer);
         assert_eq!(
-            banner(Some(&offered), "0.0.5", Some(log), true),
+            banner(Some(&offered), "0.0.5", Some(log), true, U),
             Some(failed)
+        );
+        // The keys are the user's.
+        let rebound = banner(None, "0.0.5", None, true, "Alt+F12").expect("a banner");
+        assert!(
+            rebound.ends_with("Alt+F12 to update and restart"),
+            "{rebound}"
         );
     }
 

@@ -316,6 +316,15 @@ pub fn keys_for(a: Action, user: &[Binding]) -> Option<String> {
         .map(|(m, vk, _)| chord_label(m, vk))
 }
 
+/// What a notice tells the user to press for `a`: its first chord, or
+/// with none its name in the command palette.
+pub fn press_for(a: Action, user: &[Binding]) -> String {
+    keys_for(a, user).unwrap_or_else(|| {
+        let label = ACTIONS.iter().find(|x| x.0 == a).map_or("", |x| x.2);
+        format!("\"{label}\"")
+    })
+}
+
 /// The shortcut a key press triggers, if any, with the `user` bindings
 /// from `config.toml` over the defaults. Modifiers must match exactly, so
 /// AltGr (Ctrl+Alt) and Win never trigger Ctrl shortcuts.
@@ -1108,6 +1117,10 @@ mod msg_to_key_tests {
         assert_eq!(keys(Action::SplitRight), None);
         assert_eq!(keys(Action::ClosePane), None);
         assert_eq!(keys_for(Action::Copy, &[]).as_deref(), Some("Ctrl+C"));
+        // A notice names the user's keys, or the palette's name.
+        assert_eq!(press_for(Action::NewTab, &user), "Ctrl+Shift+R");
+        assert_eq!(press_for(Action::ClosePane, &user), "\"Close pane\"");
+        assert_eq!(press_for(Action::Paste, &[]), "Ctrl+V");
     }
 
     #[test]
