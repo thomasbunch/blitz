@@ -56,10 +56,7 @@ pub fn fresh_path(
 /// variables in it expanded.
 #[cfg(windows)]
 fn registry_path(machine: bool) -> Option<String> {
-    use windows::Win32::Foundation::ERROR_MORE_DATA;
-    use windows::Win32::System::Registry::{
-        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
-    };
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
     use windows::core::w;
 
     let (key, sub) = if machine {
@@ -68,6 +65,19 @@ fn registry_path(machine: bool) -> Option<String> {
     } else {
         (HKEY_CURRENT_USER, w!("Environment"))
     };
+    registry_string(key, sub, w!("Path"))
+}
+
+/// A string value in the registry, with the variables in it expanded.
+#[cfg(windows)]
+fn registry_string(
+    key: windows::Win32::System::Registry::HKEY,
+    sub: windows::core::PCWSTR,
+    value: windows::core::PCWSTR,
+) -> Option<String> {
+    use windows::Win32::Foundation::ERROR_MORE_DATA;
+    use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
+
     let mut buf = vec![0u16; 2048];
     // The value can grow between the size query and the read.
     for _ in 0..4 {
@@ -78,7 +88,7 @@ fn registry_path(machine: bool) -> Option<String> {
             RegGetValueW(
                 key,
                 sub,
-                w!("Path"),
+                value,
                 RRF_RT_REG_SZ,
                 None,
                 Some(buf.as_mut_ptr().cast()),
@@ -103,6 +113,67 @@ fn registry_path(machine: bool) -> Option<String> {
 #[cfg(not(windows))]
 fn registry_path(_machine: bool) -> Option<String> {
     None
+}
+
+/// The names of the WSL distributions installed for this user.
+#[cfg(windows)]
+fn wsl_distros() -> Vec<String> {
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+    use windows::core::w;
+
+    let lxss = w!(r"Software\Microsoft\Windows\CurrentVersion\Lxss");
+    subkey_strings(HKEY_CURRENT_USER, lxss, w!("DistributionName"))
+}
+
+/// The string `value` of each key under `path` that has one.
+#[cfg(windows)]
+fn subkey_strings(
+    root: windows::Win32::System::Registry::HKEY,
+    path: windows::core::PCWSTR,
+    value: windows::core::PCWSTR,
+) -> Vec<String> {
+    use windows::Win32::System::Registry::{
+        HKEY, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let mut key = HKEY::default();
+    // SAFETY: a valid out pointer; the key is closed below.
+    if unsafe { RegOpenKeyExW(root, path, None, KEY_READ, &mut key) }.is_err() {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    // Key names are at most 255 characters.
+    let mut sub = [0u16; 256];
+    for i in 0.. {
+        let mut len = sub.len() as u32;
+        // SAFETY: `sub` holds `len` characters, and the name comes back
+        // ended with a NUL.
+        let r = unsafe {
+            RegEnumKeyExW(
+                key,
+                i,
+                Some(PWSTR(sub.as_mut_ptr())),
+                &mut len,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if r.is_err() {
+            break;
+        }
+        names.extend(registry_string(key, PCWSTR(sub.as_ptr()), value));
+    }
+    // SAFETY: opened above and not used after.
+    let _ = unsafe { RegCloseKey(key) };
+    names
+}
+
+#[cfg(not(windows))]
+fn wsl_distros() -> Vec<String> {
+    Vec::new()
 }
 
 /// [`detect`] with the environment supplied by the caller.
@@ -164,10 +235,10 @@ fn pwsh(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         .map(|(_, exe)| exe)
 }
 
-/// The shells the settings panel offers, as (name, path): first the
-/// automatic choice, whose path is empty, then each one installed.
+/// The shells the settings panel offers, as (name, `shell` setting): first
+/// the automatic choice, whose setting is empty, then each one installed.
 pub fn choices() -> Vec<(String, String)> {
-    let found = installed_with(pane_var);
+    let found = installed_with(pane_var, wsl_distros());
     let auto = detect();
     let name = (found.iter())
         .find(|(_, p)| Path::new(p) == auto)
@@ -177,25 +248,67 @@ pub fn choices() -> Vec<(String, String)> {
     out
 }
 
-/// Shells found with the environment supplied by the caller, as (name,
-/// path).
-fn installed_with(var: impl Fn(&str) -> Option<OsString>) -> Vec<(String, String)> {
+/// Shells found with the environment supplied by the caller, and one for
+/// each of the WSL distributions `distros`, as (name, `shell` setting).
+/// Docker and Rancher Desktop's own distributions are no shells, and
+/// Windows Terminal leaves them out too.
+fn installed_with(
+    var: impl Fn(&str) -> Option<OsString>,
+    mut distros: Vec<String>,
+) -> Vec<(String, String)> {
     let root = system_root(&var);
     let sys = root.join("System32");
-    let git = var("ProgramFiles").map(|pf| Path::new(&pf).join("Git").join("bin").join("bash.exe"));
-    [
+    let found = |exe: Option<PathBuf>| {
+        let exe = exe.filter(|e| e.is_file())?;
+        Some(exe.to_string_lossy().into_owned())
+    };
+    let mut out: Vec<(String, String)> = [
         ("PowerShell 7", pwsh(&var)),
         ("Windows PowerShell", Some(windows_powershell(&root))),
         ("Command Prompt", Some(sys.join("cmd.exe"))),
-        ("WSL", Some(sys.join("wsl.exe"))),
-        ("Git Bash", git),
     ]
     .into_iter()
-    .filter_map(|(name, exe)| {
-        let exe = exe.filter(|e| e.is_file())?;
-        Some((name.to_string(), exe.to_string_lossy().into_owned()))
-    })
-    .collect()
+    .filter_map(|(name, exe)| Some((name.to_string(), found(exe)?)))
+    .collect();
+    // A login shell reads /etc/profile, which sets up Git's tools and prompt.
+    if let Some(bash) = found(git_bash(&var)) {
+        out.push(("Git Bash".into(), quote(&bash) + " --login -i"));
+    }
+    if let Some(wsl) = found(Some(sys.join("wsl.exe"))) {
+        let theirs = |d: &str| {
+            ["docker-desktop", "rancher-desktop"]
+                .iter()
+                .any(|t| d.starts_with(t))
+        };
+        distros.retain(|d| !d.is_empty() && !theirs(&d.to_ascii_lowercase()));
+        distros.sort_by_key(|d| d.to_lowercase());
+        for d in distros {
+            let shell = format!("{} -d {}", quote(&wsl), quote(&d));
+            out.push((d, shell));
+        }
+    }
+    out
+}
+
+/// Git's `bin\bash.exe`: of the Git whose `git.exe` is on PATH, as one
+/// installed for this user only is, else of `%ProgramFiles%\Git`.
+fn git_bash(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let path = var("PATH").unwrap_or_default();
+    // Git puts its `cmd` folder on PATH, and may put `mingw64\bin`.
+    let on_path: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|d| d.is_absolute() && d.join("git.exe").is_file())
+        .flat_map(|d| {
+            d.ancestors()
+                .skip(1)
+                .take(2)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let pf = var("ProgramFiles").map(|pf| Path::new(&pf).join("Git"));
+    (on_path.into_iter().chain(pf))
+        .map(|git| git.join("bin").join("bash.exe"))
+        .find(|bash| bash.is_file())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,6 +665,25 @@ mod tests {
         );
     }
 
+    /// As WSL's distributions are read: a value from each key under one.
+    /// Every Windows has services, and many run in svchost.
+    #[test]
+    #[cfg(windows)]
+    fn values_are_read_from_each_key_under_one() {
+        use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+        use windows::core::w;
+        let services = w!(r"SYSTEM\CurrentControlSet\Services");
+        let paths = subkey_strings(HKEY_LOCAL_MACHINE, services, w!("ImagePath"));
+        assert!(paths.len() > 10, "{paths:?}");
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.to_lowercase().contains("svchost.exe"))
+        );
+        let none = w!(r"Software\blitz-no-such-key-4b1d");
+        assert!(subkey_strings(HKEY_CURRENT_USER, none, w!("x")).is_empty());
+    }
+
     /// The setting once took only a path, written without quotes.
     #[test]
     fn a_path_with_spaces_is_one_program() {
@@ -629,7 +761,7 @@ mod tests {
         assert!(
             c[1..]
                 .iter()
-                .all(|(n, p)| !n.is_empty() && Path::new(p).is_file()),
+                .all(|(n, p)| !n.is_empty() && Path::new(parts(p).0).is_file()),
             "{c:?}"
         );
     }
@@ -731,12 +863,65 @@ mod tests {
 
         // The settings panel lists only shells that are there.
         touch(pf.join("Git").join("bin").join("bash.exe"));
-        let found = installed_with(env);
+        let found = installed_with(env, vec!["Ubuntu".into()]);
         let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["PowerShell 7", "Windows PowerShell", "Git Bash"]);
         assert_eq!(found[0].1, on_path.join("pwsh.exe").to_string_lossy());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_bash_logs_in_and_each_wsl_distribution_is_a_shell() {
+        let root = std::env::temp_dir().join(format!("blitz-shells-{}", std::process::id()));
+        let touch = |p: &Path| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"").unwrap();
+        };
+        let (pf, sys) = (root.join("pf"), root.join("win"));
+        // Git for this user only, as its installer can put it.
+        let mine = root.join("Programs").join("Git");
+        let wsl = sys.join("System32").join("wsl.exe");
+        for f in [
+            &pf.join("Git").join("bin").join("bash.exe"),
+            &mine.join("cmd").join("git.exe"),
+            &mine.join("bin").join("bash.exe"),
+            &wsl,
+        ] {
+            touch(f);
+        }
+        let env = |path: &Path| {
+            let path = std::env::join_paths([path]).unwrap();
+            let (pf, sys) = (pf.clone(), sys.clone());
+            move |k: &str| match k {
+                "PATH" => Some(path.clone()),
+                "ProgramFiles" => Some(pf.clone().into_os_string()),
+                "SystemRoot" => Some(sys.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let distros = [
+            "Ubuntu",
+            "docker-desktop-data",
+            "debian",
+            "Rancher-Desktop",
+            "",
+        ];
+        let found = installed_with(env(&mine.join("cmd")), distros.map(Into::into).to_vec());
+        let elsewhere = installed_with(env(&root), Vec::new());
+        let _ = std::fs::remove_dir_all(&root);
+
+        let bash = |git: &Path| quote(&git.join("bin").join("bash.exe").to_string_lossy());
+        let wsl = quote(&wsl.to_string_lossy());
+        let want = [
+            ("Git Bash", bash(&mine) + " --login -i"),
+            ("debian", format!("{wsl} -d debian")),
+            ("Ubuntu", format!("{wsl} -d Ubuntu")),
+        ]
+        .map(|(n, s)| (n.to_string(), s));
+        assert_eq!(found, want);
+        let git = (elsewhere.iter()).find(|s| s.0 == "Git Bash").map(|s| &s.1);
+        assert_eq!(git, Some(&(bash(&pf.join("Git")) + " --login -i")));
     }
 
     /// Folders are listed in name order, which puts `7-preview` after `7`.
