@@ -1,16 +1,21 @@
 //! Finding a newer release on GitHub and installing it.
 //!
 //! Only full releases count: GitHub's latest release skips drafts and
-//! prereleases. HTTP goes through Windows' own curl.exe.
+//! prereleases. HTTP goes through Windows' own curl.exe, by way of the
+//! proxy Windows is set to use.
 
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
+use windows::Win32::Networking::WinHttp::{
+    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG, WinHttpGetIEProxyConfigForCurrentUser,
+};
 use windows::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, PWSTR, w};
 
 const REPO: &str = "thomasbunch/blitz";
 /// The latest release's page.
@@ -273,14 +278,16 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
 /// Runs curl.exe over HTTPS only, redirects included, and returns what it
 /// downloaded. A bare name finds System32's copy: Rust searches blitz's
 /// own folder, then System32, before PATH, and never the current directory.
-// ponytail: curl ignores the system proxy; WinHTTP if that bites.
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let ua = concat!("blitz/", env!("CARGO_PKG_VERSION"));
+    // curl does not read Windows' proxy setting itself.
+    let proxy = system_proxy().map(|p| vec!["--proxy".to_string(), p]);
     // A slow line still finishes the download; one that stalls gives up.
     let out = Command::new("curl.exe")
         .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https"])
         .args(["--connect-timeout", "20", "--speed-limit", "1000"])
         .args(["--speed-time", "30", "-A", ua])
+        .args(proxy.unwrap_or_default())
         .args(args)
         .stdin(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
@@ -290,6 +297,52 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
         return Err(curl_error(&out.stderr, out.status.code()));
     }
     Ok(out.stdout)
+}
+
+/// The proxy for HTTPS that Windows' proxy settings name, if any.
+// ponytail: a fixed proxy only; a setup script or automatic detection
+// needs WinHttpGetProxyForUrl, and the bypass list is not read.
+fn system_proxy() -> Option<String> {
+    let mut ie = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
+    // SAFETY: a struct for the call to fill.
+    unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut ie) }.ok()?;
+    let take = |s: PWSTR| {
+        if s.is_null() {
+            return None;
+        }
+        // SAFETY: a NUL-terminated string WinHTTP allocated, read once,
+        // then freed with GlobalFree as its documentation says.
+        unsafe {
+            let text = s.to_string().ok();
+            let _ = GlobalFree(Some(HGLOBAL(s.0.cast())));
+            text
+        }
+    };
+    // Every string is freed, used or not.
+    let (list, _, _) = (
+        take(ie.lpszProxy),
+        take(ie.lpszProxyBypass),
+        take(ie.lpszAutoConfigUrl),
+    );
+    https_proxy(&list?)
+}
+
+/// The proxy for HTTPS in a WinHTTP proxy list: `host:port` for every
+/// scheme, or entries such as `http=a:80;https=b:443`.
+fn https_proxy(list: &str) -> Option<String> {
+    let mut all = None;
+    for e in list.split([';', ' ']).filter(|e| !e.is_empty()) {
+        match e.split_once('=') {
+            Some((scheme, p)) if scheme.eq_ignore_ascii_case("https") && !p.is_empty() => {
+                return Some(p.into());
+            }
+            Some(_) => {}
+            None => {
+                all.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    all
 }
 
 /// Why curl failed: what it printed, or its exit code when it printed
@@ -500,6 +553,27 @@ mod tests {
         );
         assert_eq!(curl_error(b"", Some(28)), "curl stopped with code 28");
         assert_eq!(curl_error(b" \r\n", None), "curl stopped");
+    }
+
+    #[test]
+    fn the_proxy_for_https_comes_from_the_windows_list() {
+        assert_eq!(https_proxy("proxy:8080").as_deref(), Some("proxy:8080"));
+        assert_eq!(
+            https_proxy("http://proxy.corp:3128").as_deref(),
+            Some("http://proxy.corp:3128")
+        );
+        let split = "http=a:80;https=b:443;ftp=c:21";
+        assert_eq!(https_proxy(split).as_deref(), Some("b:443"));
+        assert_eq!(
+            https_proxy("HTTPS=b:443 http=a:80").as_deref(),
+            Some("b:443")
+        );
+        // A proxy for other schemes only leaves HTTPS direct.
+        for list in ["", ";", "http=a:80", "socks=s:1080;ftp=c:21", "https="] {
+            assert_eq!(https_proxy(list), None, "{list:?}");
+        }
+        // Reads, and frees, this machine's own setting.
+        let _ = system_proxy();
     }
 
     #[test]
