@@ -250,16 +250,15 @@ impl Font {
                 .filter(|&g| g != 0),
         );
         let n = glyphs.len();
-        let mut gm = vec![DWRITE_GLYPH_METRICS::default(); n];
+        let mut g = DWRITE_GLYPH_METRICS::default();
         let mut fm = DWRITE_FONT_METRICS::default();
-        // SAFETY: `gm` has room for `n` metrics.
+        // SAFETY: one glyph's metrics into `g`.
         unsafe {
-            face.GetDesignGlyphMetrics(glyphs.as_ptr(), n as u32, gm.as_mut_ptr(), false)?;
+            face.GetDesignGlyphMetrics(glyphs.as_ptr(), 1, &mut g, false)?;
             face.GetMetrics(&mut fm);
         }
         let upem = f32::from(fm.designUnitsPerEm.max(1));
         let to_px = self.px / upem;
-        let g = &gm[0];
         // Fallback fonts (Segoe UI Symbol and friends) have wide
         // advances around small ink, so fitting by advance shrinks symbols
         // like U+273B to a dot. Fit and centre the ink box instead; the
@@ -277,10 +276,11 @@ impl Font {
             let left = g.leftSideBearing as f32 * to_px * k;
             (self.px * k, ((cells - ink_w * k) / 2.0 - left).round())
         };
-        let advances: Vec<f32> = gm
-            .iter()
-            .map(|g| g.advanceWidth as f32 * em / upem)
-            .collect();
+        // Every glyph starts where its cluster does. Fixed-width fonts
+        // draw a combining mark over the character before it from there
+        // (Cascadia Mono's have no advance, Consolas' reach back), so the
+        // base's advance would push the mark into the next cell.
+        let advances = vec![0f32; n];
         let run = DWRITE_GLYPH_RUN {
             fontFace: ManuallyDrop::new(Some(face)),
             fontEmSize: em,

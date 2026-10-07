@@ -1993,6 +1993,40 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn render_warp_combining_marks_stay_on_their_character() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        // Ink in the first and second cell of `text` on a 2x1 screen.
+        let mut ink = |text: &str| {
+            let mut t = vt::Terminal::new(vt::Options {
+                cols: 2,
+                rows: 1,
+                ..vt::Options::default()
+            });
+            t.feed(format!("{text}\x1b[?25l").as_bytes());
+            let mut snap = Snapshot::default();
+            t.snapshot(&mut snap, &p);
+            let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+            let cw = w / 2;
+            let count = |x0: u32| {
+                (0..h)
+                    .flat_map(|y| (x0..x0 + cw).map(move |x| (x, y)))
+                    .filter(|&(x, y)| pixel(&px, w, x, y) != p.bg)
+                    .count()
+            };
+            (count(0), count(cw))
+        };
+        let (plain, _) = ink("e");
+        for marked in ["e\u{301}", "a\u{308}", "o\u{303}"] {
+            let (first, second) = ink(marked);
+            assert_eq!(second, 0, "{marked:?} reaches the next cell");
+            assert!(first > plain / 2, "{marked:?} lost its character");
+        }
+        assert!(ink("e\u{301}").0 > plain, "the accent is drawn");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn render_warp_spreads_font_lookups_over_frames() {
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
