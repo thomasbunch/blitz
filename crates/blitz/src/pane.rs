@@ -346,8 +346,11 @@ mod tests {
         std::fs::write(&head, format!("ref: refs/heads/{}", "x".repeat(10_000))).expect("head");
         assert!(git_branch(&sub).is_some_and(|b| b.len() < 4096));
 
+        // Gone with its repository. A folder above the temp folder may be in
+        // a repository of its own, so that is what is found now.
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(git_branch(&root), None);
+        assert_eq!(git_branch(&sub), git_branch(&std::env::temp_dir()));
+        assert_ne!(git_branch(&sub).as_deref(), Some("feature/x"));
     }
 
     /// A pane parses its child's output on the reader thread, answers
