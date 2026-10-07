@@ -390,19 +390,25 @@ impl Grid {
         self.pool.extend(self.rows.drain(..excess));
     }
 
-    /// Changes the size without rewrapping. When rows shrink, blank space
-    /// below the cursor goes first, then rows from the top move into
-    /// scrollback. Returns the cursor's new row.
+    /// Changes the size without rewrapping. When rows shrink, blank rows
+    /// below the cursor go first, then rows from the top move into
+    /// scrollback; only once the cursor is on top do rows below it go.
+    /// Returns the cursor's new row.
     pub fn resize(&mut self, cols: u16, lines: u16, cursor_y: u16) -> u16 {
         let mut y = cursor_y.min(self.lines - 1);
         if lines < self.lines {
-            let drop = (self.lines - lines).min(self.lines - 1 - y);
-            for _ in 0..drop {
+            let need = self.lines - lines;
+            let blank = (y + 1..self.lines)
+                .rev()
+                .take_while(|&r| self.row(r).cells.iter().all(|c| c.cp == 0 && c.flags == 0))
+                .count() as u16;
+            let up = (need - need.min(blank)).min(y);
+            for _ in 0..need - up {
                 if let Some(r) = self.rows.pop_back() {
                     self.pool.push(r);
                 }
             }
-            y -= self.lines - drop - lines;
+            y -= up;
         } else {
             for _ in self.lines..lines {
                 let row = self.fresh(Cell::default());
@@ -634,6 +640,25 @@ mod tests {
         assert_eq!(text(&g), ["a", "b", ""]);
         assert_eq!(g.resize(2, 2, 2), 1);
         assert_eq!(text(&g), ["a", "b", ""]);
+        assert_eq!(g.scrollback_len(), 1);
+    }
+
+    #[test]
+    fn shrinking_moves_the_top_to_scrollback_before_dropping_text() {
+        // Text below the cursor stays; the rows above it make room.
+        let mut g = grid_with(&["a", "b", "c", "d"]);
+        assert_eq!(g.resize(4, 3, 1), 0);
+        assert_eq!(text(&g), ["a", "b", "c", "d"]);
+        assert_eq!(g.scrollback_len(), 1);
+        // Only when the cursor is already on top does text below it go,
+        // so the cursor stays on screen.
+        let mut g = grid_with(&["a", "b", "c", "d"]);
+        assert_eq!(g.resize(4, 2, 0), 0);
+        assert_eq!(text(&g), ["a", "b"]);
+        // Blank rows at the bottom go first.
+        let mut g = grid_with(&["a", "b", "c", ""]);
+        assert_eq!(g.resize(4, 2, 1), 0);
+        assert_eq!(text(&g), ["a", "b", "c"]);
         assert_eq!(g.scrollback_len(), 1);
     }
 
