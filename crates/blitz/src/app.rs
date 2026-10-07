@@ -240,13 +240,16 @@ impl Args {
     }
 }
 
-/// A folder from the command line. Explorer passes a drive root as "C:\",
-/// and argv parsing reads the \" as an escaped quote, so it arrives as C:".
+/// A folder from the command line, made absolute, as the tab it opens is
+/// named after it and the session keeps it. Explorer passes a drive root
+/// as "C:\", and argv parsing reads the \" as an escaped quote, so it
+/// arrives as C:".
 fn folder(arg: &str) -> PathBuf {
-    match arg.strip_suffix('"') {
+    let dir: PathBuf = match arg.strip_suffix('"') {
         Some(root) => format!("{root}\\").into(),
         None => arg.into(),
-    }
+    };
+    std::path::absolute(&dir).unwrap_or(dir)
 }
 
 /// Runs the GUI until the window closes. Returns the process exit code, or
@@ -9101,6 +9104,10 @@ mod tests {
         assert_eq!(a.cwd, Some(r"C:\".into()));
         let bad = Args::parse(&["stup".into()]).err();
         assert_eq!(bad.as_deref(), Some("no such folder: stup"));
+        // A relative one is the folder it names now, not later.
+        let here = std::env::current_dir().expect("a current folder");
+        assert_eq!(parse(&["."]).cwd.as_ref(), Some(&here));
+        assert_eq!(parse(&["--cwd", "."]).cwd, Some(here));
     }
 
     /// A launch that a running blitz did not take must not open a second
