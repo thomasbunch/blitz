@@ -154,13 +154,15 @@ impl Pane {
                 }));
                 if r.is_err() {
                     dead = gives_up(&mut panics, Instant::now());
-                    replies.clear();
                     // The panic may have left the screen half updated, and
                     // the UI thread reads it every frame. A fresh one the
                     // program can draw on again takes its place; once the
                     // pane gives up, a blank one, 1x1 until the next resize
                     // so it never draws past the pane.
                     let mut term = lock(&t);
+                    // Answers to queries parsed before the panic go out
+                    // now: a program may wait on one before it prints more.
+                    term.take_replies(&mut replies);
                     if dead {
                         *term = vt::Terminal::new(vt::Options {
                             cols: 1,
@@ -171,6 +173,9 @@ impl Pane {
                         term.reset();
                     }
                     drop(term);
+                    if !replies.is_empty() {
+                        w.reply(std::mem::take(&mut replies));
+                    }
                     // The panic may have come before the UI heard of the
                     // output, which would then never be drawn.
                     d.store(false, Ordering::Release);
@@ -228,6 +233,16 @@ impl Pane {
         let kept = lock(&self.term).resize_keeping(cols, rows, marks);
         self.pty.resize(cols, rows);
         kept
+    }
+
+    /// Has the console host send the whole `cols` by `rows` screen again,
+    /// as it does after a resize: it otherwise sends only what changes, so
+    /// a screen that started over would stay blank where the program does
+    /// not draw again.
+    pub fn repaint(&self, cols: u16, rows: u16) {
+        let other = if rows > 1 { rows - 1 } else { rows + 1 };
+        self.pty.resize(cols, other);
+        self.pty.resize(cols, rows);
     }
 
     pub fn send(&self, bytes: impl Into<Vec<u8>>) {
@@ -500,6 +515,53 @@ mod tests {
         assert_eq!(notes.last(), Some(&Note::Exit(0)));
         let text = lock(&pane.term).screen_text();
         assert!(text.contains("pane-two"), "screen: {text:?}");
+    }
+
+    /// A screen that started over gets what the console host shows back
+    /// once asked, not only what the program prints after.
+    #[test]
+    fn pane_gets_its_screen_again_after_starting_over() {
+        let (tx, rx) = mpsc::channel();
+        let pane = Pane::spawn(
+            PaneId(9),
+            &Spawn {
+                cmdline: "cmd.exe /d /k echo pane-one",
+                env: &[],
+                cwd: None,
+                cols: 40,
+                rows: 5,
+                scrollback: 100,
+                dark: true,
+                pal: crate::theme::dark(),
+                parent: None,
+                token: "t",
+                restored: &[],
+            },
+            move |_, n| {
+                let _ = tx.send(n);
+            },
+        )
+        .expect("spawn");
+        let shows = |what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                if lock(&pane.term).screen_text().contains(what) {
+                    return true;
+                }
+                if let Ok(Note::Dirty) = rx.recv_timeout(Duration::from_millis(100)) {
+                    pane.dirty.store(false, Ordering::Release);
+                }
+            }
+            false
+        };
+        assert!(shows("pane-one"));
+        // As the reader does after a panic.
+        lock(&pane.term).reset();
+        pane.repaint(40, 5);
+        let again = shows("pane-one");
+        let text = lock(&pane.term).screen_text();
+        pane.send("exit\r");
+        assert!(again, "screen: {text:?}");
     }
 
     /// Output that keeps panicking stops being parsed, but the exit still
