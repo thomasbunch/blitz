@@ -8,6 +8,8 @@ use crate::render::chrome::SettingRow;
 const FONT_SIZES: &[f32] = &[
     8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0,
 ];
+/// Line heights offered, as multiples of the font's own.
+const LINE_HEIGHTS: &[f32] = &[0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8, 2.0];
 /// Scrollback lengths offered.
 const SCROLLBACK: &[usize] = &[1000, 5000, 10_000, 20_000, 50_000, 100_000];
 
@@ -70,6 +72,9 @@ impl Panel {
             "font_family" => (self.fonts.iter()).map(|f| (f.clone(), quote(f))).collect(),
             "font_size" => (FONT_SIZES.iter())
                 .map(|n| (format!("{n} pt"), n.to_string()))
+                .collect(),
+            "line_height" => (LINE_HEIGHTS.iter())
+                .map(|n| (format!("{n:.1}"), n.to_string()))
                 .collect(),
             "scrollback_lines" => (SCROLLBACK.iter())
                 .map(|&n| (format!("{} lines", thousands(n)), n.to_string()))
@@ -218,7 +223,7 @@ mod tests {
         assert_eq!(p.matches().len(), SETTINGS.len());
         p.filter = "FONT".into();
         let keys: Vec<_> = p.matches().iter().map(|s| s.key).collect();
-        assert_eq!(keys, ["font_family", "font_size"]);
+        assert_eq!(keys, ["font_family", "font_size", "line_height"]);
         // Help text counts: the scrollback warning mentions secrets.
         p.filter = "secrets".into();
         assert_eq!(p.selected().map(|s| s.key), Some("restore_scrollback"));
@@ -261,6 +266,21 @@ mod tests {
         assert_eq!(p.shown(size, &c), "11.5 pt");
         assert_eq!(p.step(size, &c, 1, false).as_deref(), Some("12"));
         assert_eq!(p.step(size, &c, -1, false).as_deref(), Some("11"));
+    }
+
+    #[test]
+    fn line_heights_step_through_their_presets() {
+        let (p, mut c) = (panel(), Config::default());
+        let lh = setting("line_height");
+        assert_eq!(p.shown(lh, &c), "1.0");
+        assert_eq!(p.step(lh, &c, 1, false).as_deref(), Some("1.1"));
+        assert_eq!(p.step(lh, &c, -1, false).as_deref(), Some("0.9"));
+        c.line_height = 2.0;
+        assert_eq!(p.step(lh, &c, 1, false), None);
+        // A height set by hand shows as written.
+        c.line_height = 1.25;
+        assert_eq!(p.shown(lh, &c), "1.25");
+        assert_eq!(p.step(lh, &c, 1, false).as_deref(), Some("1.3"));
     }
 
     #[test]
@@ -314,7 +334,7 @@ mod tests {
         p.filter = "font".into();
         assert_eq!(p.selected(), None, "past the end of the matches");
         p.move_by(-1);
-        assert_eq!(p.selected().map(|s| s.key), Some("font_size"));
+        assert_eq!(p.selected().map(|s| s.key), Some("line_height"));
         p.filter = "zzz".into();
         p.move_by(1);
         assert_eq!((p.sel, p.selected()), (0, None));

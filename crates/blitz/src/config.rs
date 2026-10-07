@@ -10,6 +10,8 @@ pub struct Config {
     pub font_family: String,
     /// Points; pixels = pt * dpi / 72.
     pub font_size: f32,
+    /// Space between the panes' lines, as a multiple of the font's own.
+    pub line_height: f32,
     /// A theme name, or `light:NAME,dark:NAME` to follow the Windows app
     /// theme; see [`crate::theme::choose`].
     pub theme: String,
@@ -46,6 +48,7 @@ impl Default for Config {
         Self {
             font_family: "Cascadia Mono".into(),
             font_size: 11.0,
+            line_height: 1.0,
             theme: crate::theme::DEFAULT.into(),
             shell: String::new(),
             shell_integration: true,
@@ -116,6 +119,15 @@ pub const SETTINGS: &[Setting] = &[
         group: "Appearance",
         label: "Font size",
         help: "In points. Windows display scaling applies on top.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
+        key: "line_height",
+        group: "Appearance",
+        label: "Line height",
+        help: "Space between the lines in the panes, from 0.8 to 2 times the \
+               font's own. The sidebar keeps its spacing.",
         kind: Kind::Choice,
         applies: NOW,
     },
@@ -250,6 +262,7 @@ impl Config {
             "theme" => quote(&self.theme),
             "font_family" => quote(&self.font_family),
             "font_size" => self.font_size.to_string(),
+            "line_height" => self.line_height.to_string(),
             "shell" => quote(&self.shell),
             "shell_integration" => flag(self.shell_integration),
             "scrollback_lines" => self.scrollback_lines.to_string(),
@@ -292,6 +305,10 @@ impl Config {
             },
             "font_size" => match num.filter(|n| (4.0..=72.0).contains(n)) {
                 Some(n) => self.font_size = n as f32,
+                None => return false,
+            },
+            "line_height" => match num.filter(|n| (0.8..=2.0).contains(n)) {
+                Some(n) => self.line_height = n as f32,
                 None => return false,
             },
             "scrollback_lines" => match num.filter(|n| (0.0..=100_000.0).contains(n)) {
@@ -752,6 +769,7 @@ scenery = stars
             ("theme", "\"Rose Pine\""),
             ("font_family", "\"Consolas\""),
             ("font_size", "13.5"),
+            ("line_height", "1.2"),
             ("shell", r"'C:\x\sh.exe'"),
             ("shell_integration", "false"),
             ("scrollback_lines", "0"),
@@ -848,6 +866,12 @@ scenery = stars
         }
         for v in ["-1", "100001", "1e400", "0.5", "inf", "NaN"] {
             assert!(!ok("scrollback_lines", v), "scrollback_lines = {v}");
+        }
+        for v in ["0.8", "1", "1.25", "2"] {
+            assert!(ok("line_height", v), "line_height = {v}");
+        }
+        for v in ["0.79", "2.01", "0", "-1", "NaN", "\"1.2\""] {
+            assert!(!ok("line_height", v), "line_height = {v}");
         }
         let c = Config::parse("font_size = 1_2\nscrollback_lines = 20_000");
         assert_eq!((c.font_size, c.scrollback_lines), (12.0, 20_000));

@@ -2013,8 +2013,9 @@ impl App {
     /// Takes new settings and shows the font and theme they pick. The
     /// rest are read where they are used.
     fn apply_config(&mut self, c: Config) {
-        let font =
-            (&c.font_family, c.font_size) != (&self.config.font_family, self.config.font_size);
+        let old = &self.config;
+        let font = (&c.font_family, c.font_size, c.line_height)
+            != (&old.font_family, old.font_size, old.line_height);
         if c.font_size != self.config.font_size {
             self.font_zoom = 0.0;
         }
@@ -2034,8 +2035,8 @@ impl App {
     fn reload_font(&mut self) {
         let (px, base) = self.font_px();
         if let Some(g) = &mut self.gfx {
-            let scale = self.scale as f32;
-            if let Err(e) = g.r.set_font(&self.config.font_family, px, base, scale) {
+            let (scale, c) = (self.scale as f32, &self.config);
+            if let Err(e) = g.r.set_font(&c.font_family, px, base, scale, c.line_height) {
                 eprintln!("blitz: font: {e}");
             }
             g.r.set_scale(scale);
@@ -2262,13 +2263,12 @@ impl App {
         };
         let size = window.inner_size();
         let early = self.gpu.take().and_then(|h| h.join().ok()?.ok());
-        let (family, (px, base), scale) =
-            (&self.config.font_family, self.font_px(), self.scale as f32);
+        let (c, (px, base), scale) = (&self.config, self.font_px(), self.scale as f32);
         let built = match early {
             Some(gpu) => Ok(gpu),
             None => Gpu::new(false),
         }
-        .and_then(|gpu| Renderer::with_gpu(gpu, family, px, base, scale));
+        .and_then(|gpu| Renderer::with_gpu(gpu, &c.font_family, px, base, scale, c.line_height));
         let built = built.and_then(|mut r| {
             r.set_scale(scale);
             let hwnd = HWND(self.hwnd as *mut c_void);

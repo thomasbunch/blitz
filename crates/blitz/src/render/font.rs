@@ -290,6 +290,19 @@ impl Font {
         }
     }
 
+    /// Spaces lines `k` times as far apart as the font does, with the text
+    /// centred in its taller or shorter cell.
+    pub fn set_line_height(&mut self, k: f32) {
+        let h = ((self.cell_h as f32 * k).round() as i32).max(2);
+        let shift = (h - self.cell_h as i32) / 2;
+        self.cell_h = h as u32;
+        self.baseline = (self.baseline + shift).min(h - 1).max(1);
+        self.underline_y = (self.underline_y + shift)
+            .min(h - self.underline_h as i32)
+            .max(0);
+        self.strike_y = (self.strike_y + shift).min(self.baseline - 1).max(0);
+    }
+
     /// Rasterizes one grapheme cluster spanning `width` cells. Returns
     /// `None` when it has no ink. Characters missing from the font come
     /// from the system fallback font, with their ink shrunk to fit their
@@ -646,6 +659,25 @@ mod tests {
         assert!(font.raster(" ", 0, 1).expect("raster").is_none());
         let bold = font.raster("A", BOLD, 1).expect("raster").expect("ink");
         assert!(ink(&bold) > ink(&a));
+    }
+
+    #[test]
+    fn line_height_spaces_lines_and_keeps_text_centred() {
+        let mut base = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        for k in [0.8, 1.0, 1.3, 2.0] {
+            let mut f = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+            f.set_line_height(k);
+            let h = (base.cell_h as f32 * k).round() as i32;
+            assert_eq!((f.cell_w, f.cell_h as i32), (base.cell_w, h), "{k}");
+            let shift = (h - base.cell_h as i32) / 2;
+            assert_eq!(f.baseline, base.baseline + shift, "{k}");
+            assert!(f.underline_y + f.underline_h as i32 <= h, "{k}");
+            assert!(f.strike_y > 0 && f.strike_y < f.baseline, "{k}");
+            // Glyphs sit on the new baseline.
+            let a = f.raster("A", 0, 1).expect("raster").expect("ink");
+            let b = base.raster("A", 0, 1).expect("raster").expect("ink");
+            assert_eq!(a.dy, b.dy + shift, "{k}");
+        }
     }
 
     #[test]

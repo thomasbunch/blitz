@@ -201,33 +201,40 @@ mod gpu {
     /// The terminal font at `px` and the chrome font, sized from `base`,
     /// the terminal font's size before any zoom, so the sidebar keeps its
     /// text while the terminal zooms: `family`, or the first of the
-    /// defaults installed, at DPI `scale`.
-    fn fonts(family: &str, px: f32, base: f32, scale: f32) -> Result<(Font, Font)> {
+    /// defaults installed, at DPI `scale`. Only the terminal's lines are
+    /// `line_height` times the font's own.
+    fn fonts(
+        family: &str,
+        px: f32,
+        base: f32,
+        scale: f32,
+        line_height: f32,
+    ) -> Result<(Font, Font)> {
         let families: Vec<&str> = (std::iter::once(family).filter(|f| !f.is_empty()))
             .chain(DEFAULT_FAMILIES.iter().copied())
             .collect();
-        Ok((
-            Font::new(&families, px)?,
-            Font::new(&families, super::chrome_px(base, scale))?,
-        ))
+        let mut font = Font::new(&families, px)?;
+        font.set_line_height(line_height);
+        Ok((font, Font::new(&families, super::chrome_px(base, scale))?))
     }
 
     impl Renderer {
         pub fn new(warp: bool, px: f32) -> Result<Self> {
-            Self::with_gpu(Gpu::new(warp)?, "", px, px, px / DEFAULT_PX)
+            Self::with_gpu(Gpu::new(warp)?, "", px, px, px / DEFAULT_PX, 1.0)
         }
 
-        /// [`Self::new`] on a device made elsewhere, in font `family`, at
-        /// DPI `scale`, with the chrome sized from `base` as
-        /// [`Self::set_font`] does.
+        /// [`Self::new`] on a device made elsewhere, in font `family` with
+        /// lines `line_height` times its own apart, at DPI `scale`, with the
+        /// chrome sized from `base` as [`Self::set_font`] does.
         pub fn with_gpu(
             mut gpu: Gpu,
             family: &str,
             px: f32,
             base: f32,
             scale: f32,
+            line_height: f32,
         ) -> Result<Self> {
-            let (font, small) = fonts(family, px, base, scale)?;
+            let (font, small) = fonts(family, px, base, scale, line_height)?;
             gpu.set_text_params(font.gamma, font.contrast);
             let mut r = Self {
                 gpu,
@@ -254,9 +261,16 @@ mod gpu {
 
         /// Loads another font, or the same at a new size after a DPI change
         /// or a zoom. The chrome font follows `base`, the size before any
-        /// zoom.
-        pub fn set_font(&mut self, family: &str, px: f32, base: f32, scale: f32) -> Result<()> {
-            (self.font, self.small) = fonts(family, px, base, scale)?;
+        /// zoom; only the terminal's lines are `line_height` apart.
+        pub fn set_font(
+            &mut self,
+            family: &str,
+            px: f32,
+            base: f32,
+            scale: f32,
+            line_height: f32,
+        ) -> Result<()> {
+            (self.font, self.small) = fonts(family, px, base, scale, line_height)?;
             self.atlas.clear();
             Ok(())
         }
@@ -1454,7 +1468,7 @@ mod tests {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         render_offscreen(&mut r, &snap, &p).expect("render");
         let (small, chrome) = (r.cell(), r.small_cell());
-        r.set_font("", 24.0, 16.0, 1.0).expect("font");
+        r.set_font("", 24.0, 16.0, 1.0, 1.0).expect("font");
         assert!(r.cell().1 > small.1, "{:?} after {small:?}", r.cell());
         assert_eq!(r.small_cell(), chrome, "a zoom leaves the chrome be");
         let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
@@ -1464,9 +1478,19 @@ mod tests {
         assert_eq!(pixel(&px, w, w - 1, h - 1), p.fg, "bottom right");
         assert_eq!(pixel(&px, w, 0, 0), p.fg, "top left");
         // A family that is not installed falls back to the defaults.
-        r.set_font("No Such Font 4b1d", 16.0, 16.0, 1.0)
+        r.set_font("No Such Font 4b1d", 16.0, 16.0, 1.0, 1.0)
             .expect("fallback font");
         assert_eq!(r.cell(), small);
+        // Taller lines for the terminal only; blocks still fill them.
+        let chrome = r.small_cell();
+        r.set_font("", 16.0, 16.0, 1.0, 1.5).expect("font");
+        assert_eq!(r.cell(), (small.0, (small.1 as f32 * 1.5).round() as u32));
+        assert_eq!(r.small_cell(), chrome);
+        let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert_eq!(
+            (pixel(&px, w, 0, 0), pixel(&px, w, w - 1, h - 1)),
+            (p.fg, p.fg)
+        );
     }
 
     #[test]
