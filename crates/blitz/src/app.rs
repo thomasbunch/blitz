@@ -3979,13 +3979,10 @@ fn ends_game(attn: crate::attention::PaneAttn, ev: Ev, now: Instant) -> bool {
     seen.apply(ev, false, now) && seen.state == Attn::NeedsYou
 }
 
-/// Whether a pane title shows Claude Code working: it puts a half-filled
-/// circle in front, which turns as it works.
+/// Whether a pane title shows Claude Code working, as the sidebar reads
+/// it too.
 fn claude_working_title(title: &str) -> bool {
-    title
-        .chars()
-        .next()
-        .is_some_and(|c| ('\u{25d0}'..='\u{25d3}').contains(&c))
+    claude_title(title).is_some_and(|(working, _)| working)
 }
 
 /// The hint about Claude Code's hooks, `older` than this blitz or not
@@ -5721,10 +5718,17 @@ mod tests {
 
     #[test]
     fn app_titles_that_show_claude_working() {
-        for t in ["\u{25d0} Fix the tests", "\u{25d1} x", "\u{25d3}"] {
+        for t in ["\u{25d0} Fix the tests", "\u{25d1} x"] {
             assert!(claude_working_title(t), "{t}");
         }
-        for t in ["\u{2733} Fix the tests", "", "pwsh", "x \u{25d0}"] {
+        // Not Claude Code's marks, so the sidebar would not see it work.
+        for t in [
+            "\u{2733} Fix the tests",
+            "",
+            "pwsh",
+            "x \u{25d0}",
+            "\u{25d3} x",
+        ] {
             assert!(!claude_working_title(t), "{t}");
         }
     }
