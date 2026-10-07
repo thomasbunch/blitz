@@ -612,6 +612,20 @@ pub fn dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("blitz"))
 }
 
+/// `config.toml`, for the user to open in an editor: an empty one is
+/// made first when there is none, so the editor does not ask.
+pub fn file() -> std::io::Result<PathBuf> {
+    file_in(&dir().ok_or_else(|| std::io::Error::other("no APPDATA"))?)
+}
+
+fn file_in(dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(FILE);
+    // Appending never changes one that is there.
+    (std::fs::OpenOptions::new().append(true).create(true)).open(&path)?;
+    Ok(path)
+}
+
 /// Sets `key = value` in `config.toml`, keeping the rest of the file; with
 /// no value, removes `key` so its default applies. Writes a new file and
 /// moves it over the old one, so a failed save never leaves half a file.
@@ -1180,6 +1194,18 @@ scenery = stars
         let c = Config::read(&dir.join(FILE));
         assert!(!c.flash);
         assert_eq!(c.theme, "B");
+    }
+
+    #[test]
+    fn opening_the_file_makes_one_and_keeps_one_that_is_there() {
+        let t = Temp::new("open");
+        let dir = t.0.join("new");
+        let path = file_in(&dir).unwrap();
+        assert_eq!(path, dir.join(FILE));
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        std::fs::write(&path, "flash = false\n").unwrap();
+        file_in(&dir).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"flash = false\n");
     }
 
     #[test]

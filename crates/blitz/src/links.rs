@@ -432,6 +432,59 @@ pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
             )
         }
     };
+    shell_open(&file, &args).ok_or("Windows could not open the link")
+}
+
+/// What opens the text file `path` for editing, as (file, arguments) for
+/// `ShellExecuteW`: the file itself when Windows has a program for its
+/// type (`associated`), else Notepad from Windows folder `root`, as for
+/// `.toml` until a program claims it.
+pub fn edit_plan(path: &Path, associated: bool, root: &Path) -> (String, String) {
+    let path = path.display().to_string();
+    if associated {
+        return (path, String::new());
+    }
+    let notepad = root.join("System32").join("notepad.exe");
+    (notepad.display().to_string(), crate::shell::quote(&path))
+}
+
+/// Opens the text file `path` for editing, as [`edit_plan`] says.
+pub fn edit(path: &Path) -> Result<(), &'static str> {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let (file, args) = edit_plan(path, opens(path), Path::new(&root));
+    shell_open(&file, &args).ok_or("Windows could not open the file")
+}
+
+/// Whether Windows has a program that opens files of `path`'s type. The
+/// "Unknown" type, which offers the Open with dialog, is none.
+fn opens(path: &Path) -> bool {
+    use windows::Win32::UI::Shell::{
+        ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_COMMAND, AssocQueryStringW,
+    };
+    let ext = path.extension().unwrap_or_default().to_string_lossy();
+    let mut n = 0;
+    // SAFETY: NUL-terminated strings that outlive the call; with no buffer
+    // only the length comes back.
+    unsafe {
+        AssocQueryStringW(
+            ASSOCF_INIT_IGNOREUNKNOWN,
+            ASSOCSTR_COMMAND,
+            &HSTRING::from(format!(".{ext}")),
+            w!("open"),
+            None,
+            &mut n,
+        )
+    }
+    .is_ok()
+}
+
+/// Shows the folder `dir` in Explorer.
+pub fn show_folder(dir: &Path) -> Result<(), &'static str> {
+    shell_open(&dir.display().to_string(), "").ok_or("Windows could not open the folder")
+}
+
+/// `ShellExecuteW`'s open of `file` with `args`; `None` if it failed.
+fn shell_open(file: &str, args: &str) -> Option<()> {
     // SAFETY: NUL-terminated strings that outlive the call, and no window.
     let done = unsafe {
         ShellExecuteW(
@@ -444,11 +497,7 @@ pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
         )
     };
     // Values above 32 mean it started.
-    if done.0 as usize > 32 {
-        Ok(())
-    } else {
-        Err("Windows could not open the link")
-    }
+    (done.0 as usize > 32).then_some(())
 }
 
 #[cfg(test)]
@@ -469,6 +518,33 @@ mod tests {
 
     fn path_at(s: &str, line: u32, col: u32) -> Link {
         Link::Path(s.into(), Some((line, col)))
+    }
+
+    #[test]
+    fn a_file_with_no_program_for_its_type_opens_in_notepad() {
+        let (cfg, win) = (
+            Path::new(r"C:\Users\me\blitz\config.toml"),
+            Path::new(r"C:\W"),
+        );
+        assert_eq!(
+            edit_plan(cfg, true, win),
+            (cfg.display().to_string(), String::new())
+        );
+        assert_eq!(
+            edit_plan(cfg, false, win),
+            (
+                r"C:\W\System32\notepad.exe".into(),
+                cfg.display().to_string()
+            )
+        );
+        let spaced = Path::new(r"C:\Users\Jo Ann\blitz\config.toml");
+        assert_eq!(
+            edit_plan(spaced, false, win).1,
+            format!("\"{}\"", spaced.display())
+        );
+        // Notepad has text files; nothing has a type no one made up.
+        assert!(opens(Path::new("a.txt")));
+        assert!(!opens(Path::new("a.blitz-no-such-type-4b1d")));
     }
 
     #[test]

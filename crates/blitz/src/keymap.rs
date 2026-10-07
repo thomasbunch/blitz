@@ -67,6 +67,10 @@ pub enum Action {
     ThemePicker,
     /// Open or close the settings panel.
     Settings,
+    /// Open `config.toml` in an editor.
+    OpenConfig,
+    /// Open the themes folder in Explorer.
+    OpenThemes,
     /// Show only the focused pane, filling the tab, or every pane again.
     Zoom,
     /// Give the tab's panes equal space.
@@ -144,6 +148,8 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Update, "update", "Update blitz"),
     (Action::ThemePicker, "theme_picker", "Pick a theme"),
     (Action::Settings, "settings", "Settings"),
+    (Action::OpenConfig, "open_config", "Open config.toml"),
+    (Action::OpenThemes, "open_themes", "Open themes folder"),
     (Action::Zoom, "zoom", "Zoom the pane, or show every pane"),
     (Action::Resize(Dir::Left), "resize_left", "Move the divider left"),
     (Action::Resize(Dir::Right), "resize_right", "Move the divider right"),

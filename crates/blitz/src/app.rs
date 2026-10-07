@@ -3614,6 +3614,21 @@ impl App {
                 });
                 self.request_redraw();
             }
+            Action::OpenConfig => {
+                let opened = (crate::config::file())
+                    .map_err(|e| format!("Cannot make config.toml: {e}"))
+                    .and_then(|p| crate::links::edit(&p).map_err(String::from));
+                self.tell(opened);
+            }
+            Action::OpenThemes => {
+                let opened = match crate::theme::dir() {
+                    Some(d) => (std::fs::create_dir_all(&d))
+                        .map_err(|e| format!("Cannot make the themes folder: {e}"))
+                        .and_then(|()| crate::links::show_folder(&d).map_err(String::from)),
+                    None => Err("Cannot find the themes folder: APPDATA is not set".into()),
+                };
+                self.tell(opened);
+            }
             Action::Palette => {
                 // Update without a release would only look for one.
                 let hidden = match self.update {
@@ -4893,7 +4908,12 @@ impl App {
 
     /// Opens a link, or says in the pane why not.
     fn open_link(&mut self, target: &Target) {
-        if let Err(e) = crate::links::open(target, &self.config.editor_uri)
+        self.tell(crate::links::open(target, &self.config.editor_uri).map_err(String::from));
+    }
+
+    /// Says in the focused pane why something did not open.
+    fn tell(&mut self, opened: Result<(), String>) {
+        if let Err(e) = opened
             && let Some(id) = self.focus_id()
         {
             self.error(id, e);
