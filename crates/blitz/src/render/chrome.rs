@@ -988,6 +988,8 @@ pub fn build(m: &ChromeModel) -> Chrome {
         out.field = out.field.or(to_commands.then_some(at));
     }
     if let (Some((_, _, t)), Some(f)) = (m.preedit, out.field) {
+        // Over the hint an empty field shows.
+        extra.push(Prim::Rect(f, c.side_bg));
         composition(&mut extra, t, f, tw, false, (c.side_bg, c.msg), s(1.0));
     }
     out.prims.extend(extra);
@@ -2652,6 +2654,8 @@ mod tests {
         let field = c.field.expect("the palette's field");
         assert!(field.y < find.y || field.x != find.x);
         assert_eq!(composed(&c), Some((field.x, field.y, false)));
+        let hint = Prim::Rect(field, crate::theme::blitz(false).ui.side_bg);
+        assert!(c.prims.contains(&hint), "covers \"type to filter\"");
         // With nothing open there is no field.
         let mut m = model(&win, &sessions, now);
         m.preedit = Some((2, 1, "\u{4e2d}"));
