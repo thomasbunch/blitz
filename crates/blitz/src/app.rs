@@ -1104,6 +1104,8 @@ struct App {
     saved: Option<session::State>,
     /// When a changed layout is saved, unless it changes back first.
     save_after: Option<Instant>,
+    /// Writes of the session in a row that failed.
+    save_fails: u32,
     /// No renderer could be built; the next try is not before this.
     gfx_retry: Option<Instant>,
     /// Where the window last was while not minimized, maximized or full
@@ -1565,6 +1567,7 @@ impl App {
             hidden_until: None,
             saved: None,
             save_after: None,
+            save_fails: 0,
             gfx_retry: None,
             placed: Geometry::default(),
             watched: None,
@@ -5445,12 +5448,21 @@ impl App {
         // Output, which changes all the time, is saved only at exit, and
         // only once the layout holding the keys it is filed by was written.
         match session::save(&s) {
-            Ok(()) if force => self.save_output(),
-            Ok(()) => {}
-            Err(e) => eprintln!("blitz: saving the session: {e}"),
+            Ok(()) => {
+                if force {
+                    self.save_output();
+                }
+                self.saved = Some(s);
+                self.save_fails = 0;
+            }
+            // Not saved, so tried again, later each time it fails: a busy
+            // or full drive is not written to every turn.
+            Err(e) => {
+                eprintln!("blitz: saving the session: {e}");
+                self.save_after = Some(Instant::now() + save_retry(self.save_fails));
+                self.save_fails = self.save_fails.saturating_add(1);
+            }
         }
-        // Kept even when the write failed, so it is not retried every turn.
-        self.saved = Some(s);
     }
 
     /// Saves each pane's recent output when `restore_scrollback` is on, and
@@ -5535,6 +5547,12 @@ impl App {
         .flatten()
         .min()
     }
+}
+
+/// How long a session that `fails` writes in a row could not save waits
+/// before the next try: twice as long each time, up to about a minute.
+fn save_retry(fails: u32) -> Duration {
+    SAVE_DELAY * 2u32.pow(fails.min(7))
 }
 
 /// Whether a layout that `changed` since the last save is written now. A
@@ -8186,6 +8204,26 @@ mod tests {
         assert_eq!(due, None);
         assert!(!save_now(true, false, at(700), &mut due));
         assert!(save_now(true, false, at(1200), &mut due));
+    }
+
+    /// A session that could not be written is tried again, later after
+    /// each failure in a row, rather than taken as saved.
+    #[test]
+    fn app_failed_session_saves_back_off() {
+        let waits: Vec<u128> = (0..10).map(|n| save_retry(n).as_millis()).collect();
+        assert_eq!(
+            waits,
+            [
+                500, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 64000, 64000
+            ]
+        );
+        assert_eq!(save_retry(u32::MAX), save_retry(7));
+        // The next try waits out its delay as any change does.
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut due = Some(t0 + save_retry(3));
+        assert!(!save_now(true, false, at(3999), &mut due));
+        assert!(save_now(true, false, at(4000), &mut due));
     }
 
     fn input(vk: u16, down: bool, key: vt::Key, text: &'static str) -> KeyInput<'static> {
