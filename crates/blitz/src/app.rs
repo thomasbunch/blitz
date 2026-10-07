@@ -2915,12 +2915,14 @@ impl App {
                         }
                     }
                 }
-                // A long command that ended while the user looked away.
-                if let Some((ev, msg)) = ended
+                // A long command that ended while the user looked away. Its
+                // time, not that of a Claude Code turn before it, shows.
+                if let Some((ev, msg, took)) = ended
                     && self.attention(id, ev)
                     && let Some(v) = self.view_mut(id)
                 {
                     v.pane.msg = msg;
+                    v.pane.attn.took = Some(took);
                 }
             }
             Event::Notify { title, body } => match Ev::from_notify(&title, &v.pane.token) {

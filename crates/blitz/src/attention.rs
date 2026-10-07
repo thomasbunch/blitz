@@ -141,10 +141,10 @@ pub struct Command {
 
 impl Command {
     /// Feeds a prompt mark. At blitz's own prompt, which program output
-    /// cannot fake, gives the event and message for a command that ran at
-    /// least [`LONG_COMMAND`] and reported its code: done when it worked or
-    /// was stopped with Ctrl+C, else an error.
-    pub fn mark(&mut self, m: PromptMark, now: Instant) -> Option<(Ev, String)> {
+    /// cannot fake, gives the event, message and time for a command that
+    /// ran at least [`LONG_COMMAND`] and reported its code: done when it
+    /// worked or was stopped with Ctrl+C, else an error.
+    pub fn mark(&mut self, m: PromptMark, now: Instant) -> Option<(Ev, String, Duration)> {
         match m {
             PromptMark::C if self.prompt => {
                 *self = Command {
@@ -165,7 +165,7 @@ impl Command {
                     _ => Ev::Error { sticky: false },
                 };
                 let msg = format!("{} \u{b7} {}", exit_text(code), elapsed(took));
-                return Some((ev, msg));
+                return Some((ev, msg, took));
             }
             _ => {}
         }
@@ -1002,6 +1002,10 @@ mod tests {
             PromptMark::A { blitz: true },
             t0 + Duration::from_secs(secs),
         );
+        let end = end.map(|(ev, msg, took)| {
+            assert_eq!(took, Duration::from_secs(secs));
+            (ev, msg)
+        });
         (c, end)
     }
 
@@ -1065,7 +1069,8 @@ mod tests {
         // The shell's own end mark comes last and is the one that counts.
         c.mark(PromptMark::D(Some(0)), later);
         let end = c.mark(PromptMark::A { blitz: true }, later);
-        assert_eq!(end, Some((Ev::Done, "exit 0 \u{b7} 30s".into())));
+        let took = Duration::from_secs(30);
+        assert_eq!(end, Some((Ev::Done, "exit 0 \u{b7} 30s".into(), took)));
         // A prompt with no command before it.
         assert_eq!(c.mark(PromptMark::A { blitz: true }, later), None);
     }
