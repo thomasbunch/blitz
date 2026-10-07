@@ -642,6 +642,22 @@ impl Selection {
         let top = term.screen_top();
         self.seen = (top, selection_text(term, pal, self, top));
     }
+
+    /// The text it held at the last look, once output rewrote it. Lines
+    /// above the screen were scrollback then, which output leaves alone;
+    /// `None` when some of them are gone.
+    fn last_text(&self, term: &vt::Terminal, pal: &Palette) -> Option<String> {
+        let (top, shown) = &self.seen;
+        if self.start.0 >= *top {
+            return Some(shown.clone());
+        }
+        if !self.kept(term) {
+            return None;
+        }
+        let all = selection_text(term, pal, self, 0);
+        let now = selection_text(term, pal, self, *top);
+        Some(all.strip_suffix(now.as_str())?.to_owned() + shown)
+    }
 }
 
 /// The cells from `start` to `end`, or the block they are the corners
@@ -870,6 +886,9 @@ struct App {
     focused: bool,
     /// A selection in the focused pane.
     selection: Option<Selection>,
+    /// The text of a selection that output rewrote, which Copy still
+    /// takes until the user does something else.
+    orphan: Option<String>,
     /// The link under the pointer while Ctrl is held, drawn underlined:
     /// the line epoch and its first and last cell.
     hover: Option<(u32, Pos, Pos)>,
@@ -1147,6 +1166,7 @@ impl App {
             next_num: 1,
             focused: false,
             selection: None,
+            orphan: None,
             hover: None,
             mouse: Mouse::default(),
             preedit: String::new(),
@@ -1588,6 +1608,7 @@ impl App {
             return;
         }
         self.selection = None;
+        self.orphan = None;
         self.find = None;
         self.mouse.drag = None;
         // A drag belongs to the tab it started in.
@@ -2579,6 +2600,7 @@ impl App {
         if self.selection.take().is_some() {
             self.request_redraw();
         }
+        self.orphan = None;
         if let Some(v) = self.current() {
             lock(&v.pane.term).scroll_viewport(isize::MIN);
             v.pane.send(bytes);
@@ -2658,26 +2680,31 @@ impl App {
         Some(in_view(s.start, s.end, s.drag.block, top, v.grid).is_some())
     }
 
-    /// Copies the selection in the focused pane. False when there is none,
-    /// so the key goes on to the program. When another program holds the
-    /// clipboard the selection stays, to copy again.
+    /// Copies the selection in the focused pane, or else the text of one
+    /// that output just rewrote. False when there is neither, so the key
+    /// goes on to the program. When another program holds the clipboard
+    /// the selection stays, to copy again.
     fn copy(&mut self) -> bool {
         let Some(v) = self.current() else {
             return false;
         };
         let id = v.pane.id;
         let term = lock(&v.pane.term);
-        let Some(sel) = self.selection.as_ref().filter(|s| s.kept(&term)) else {
-            return false;
+        let (text, rewritten) = match self.selection.as_ref().filter(|s| s.kept(&term)) {
+            Some(sel) => (selection_text(&term, &self.theme.pal, sel, 0), false),
+            None => match &self.orphan {
+                Some(t) => (t.clone(), true),
+                None => return false,
+            },
         };
-        let text = selection_text(&term, &self.theme.pal, sel, 0);
         drop(term);
         let owner = Some(HWND(self.hwnd as *mut c_void));
         let copied = crate::clipboard::set_text(owner, &text);
         if copied {
             self.selection = None;
+            self.orphan = None;
         }
-        self.notice_copy(id, copy_notice(&text, copied), copied);
+        self.notice_copy(id, copy_notice(&text, copied, rewritten), copied);
         true
     }
 
@@ -3634,6 +3661,7 @@ impl App {
         let Some((epoch, here)) = self.line_cell(self.mouse.pos) else {
             return;
         };
+        self.orphan = None;
         let held = self.selection.as_ref().map(|s| s.drag);
         if let Some(drag) = held.filter(|d| extend && d.epoch == epoch) {
             self.mouse.drag = Some(drag);
@@ -3978,7 +4006,8 @@ impl App {
             let mut term = lock(&v.pane.term);
             v.sync_until = term.sync_deadline();
             if !refresh(&mut term, &mut v.snap, &self.theme.pal, sel) {
-                self.selection = None;
+                let lost = self.selection.take();
+                self.orphan = lost.and_then(|s| s.last_text(&term, &self.theme.pal));
             }
             v.snap.highlights.clear();
             if let Some(f) = find {
@@ -4952,15 +4981,21 @@ fn label(
     (name.to_owned(), msg.to_owned())
 }
 
-/// What a copy of `text` says: how many lines went to the clipboard, or
-/// that another program held it.
-fn copy_notice(text: &str, copied: bool) -> String {
+/// What a copy of `text` says: how many lines went to the clipboard, and
+/// whether they were the selection output then rewrote, or that another
+/// program held the clipboard.
+fn copy_notice(text: &str, copied: bool, rewritten: bool) -> String {
     if !copied {
         return "Clipboard busy; nothing was copied".into();
     }
     let lines = text.split('\n').count();
     let s = if lines == 1 { "" } else { "s" };
-    format!("Copied {lines} line{s}")
+    let old = if rewritten {
+        ", as selected before the output changed"
+    } else {
+        ""
+    };
+    format!("Copied {lines} line{s}{old}")
 }
 
 /// Whether copy key `k` copies a selection that `shown` says is in view or
@@ -6966,13 +7001,48 @@ mod tests {
 
     #[test]
     fn app_a_copy_says_what_it_did() {
-        assert_eq!(copy_notice("ls", true), "Copied 1 line");
-        assert_eq!(copy_notice("", true), "Copied 1 line", "a blank line");
-        assert_eq!(copy_notice("a\r\nb\r\n", true), "Copied 3 lines");
+        assert_eq!(copy_notice("ls", true, false), "Copied 1 line");
         assert_eq!(
-            copy_notice("a\r\nb", false),
+            copy_notice("", true, false),
+            "Copied 1 line",
+            "a blank line"
+        );
+        assert_eq!(copy_notice("a\r\nb\r\n", true, false), "Copied 3 lines");
+        assert_eq!(
+            copy_notice("a\r\nb", true, true),
+            "Copied 2 lines, as selected before the output changed"
+        );
+        assert_eq!(
+            copy_notice("a\r\nb", false, true),
             "Clipboard busy; nothing was copied"
         );
+    }
+
+    #[test]
+    fn app_copy_takes_the_selected_text_that_output_rewrote() {
+        let pal = crate::theme::dark();
+        let mut s = Snapshot::default();
+        // "one" is in scrollback, line 0; the screen holds lines 1 and 2.
+        let mut t = fed(10, 2, "one\r\ntwo\r\nthree");
+        assert!(refresh(&mut t, &mut s, &pal, None));
+        let mut sel = select(&t, (0, 0), (2, 9));
+        t.feed(b"\x1b[2;1HTHREE");
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)));
+        assert_eq!(
+            sel.last_text(&t, &pal).as_deref(),
+            Some("one\r\ntwo\r\nthree")
+        );
+        // On the screen only: kept even once the lines are gone.
+        let mut sel = select(&t, (1, 0), (1, 9));
+        t.feed(b"\x1b[?1049h");
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)));
+        assert_eq!(sel.last_text(&t, &pal).as_deref(), Some("two"));
+        t.feed(b"\x1b[?1049l");
+        // Partly in scrollback that is gone: nothing to take.
+        let mut sel = select(&t, (0, 0), (2, 9));
+        t.resize(8, 2);
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)));
+        assert_eq!(sel.last_text(&t, &pal), None);
     }
 
     #[test]

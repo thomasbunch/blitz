@@ -8,7 +8,8 @@ use crate::layout::Dir;
 /// What a shortcut does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Copy the selection. Without one the key goes to the program.
+    /// Copy the selection, or one that output just rewrote. Without one
+    /// the key goes to the program.
     Copy,
     /// Paste clipboard text. Without text the key goes to the program.
     Paste,
