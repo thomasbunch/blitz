@@ -3,6 +3,7 @@
 // One process hosts every session, so a failed HRESULT must never panic.
 #![deny(clippy::unwrap_used)]
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -483,11 +484,14 @@ enum Ask {
 impl Ask {
     /// Whether a key that runs `a`, if any, takes the notice away. `here`
     /// when the key goes to the notice's pane. Opening the palette does
-    /// not, since an action run from it confirms too.
+    /// not, since an action run from it confirms too. A question about its
+    /// own pane goes at any key aimed at another, so the same action there
+    /// cannot answer it later.
     fn gone(&self, a: Option<Action>, here: bool) -> bool {
         let by = match self {
             Ask::Nothing => return false,
             Ask::Key => return here,
+            Ask::Paste(_) | Ask::ClosePane | Ask::CloseTab if !here => return true,
             Ask::Paste(_) => Action::Paste,
             Ask::ClosePane => Action::ClosePane,
             Ask::CloseTab => Action::CloseTab,
@@ -495,6 +499,12 @@ impl Ask {
             Ask::Quit => return true,
         };
         a != Some(by) && a != Some(Action::Palette)
+    }
+
+    /// Whether the question is about its own pane, so focus leaving that
+    /// pane takes it away.
+    fn of_pane(&self) -> bool {
+        matches!(self, Ask::Paste(_) | Ask::ClosePane | Ask::CloseTab)
     }
 }
 
@@ -876,11 +886,17 @@ struct App {
     /// The number the next new session shows after its name.
     next_num: u32,
     focused: bool,
+    /// A session changed while the user was away from the screen; the
+    /// focused pane counts as seen once they are back.
+    away: bool,
     /// A selection in the focused pane.
     selection: Option<Selection>,
     /// The link under the pointer while Ctrl is held, drawn underlined:
     /// the line epoch and its first and last cell.
     hover: Option<(u32, Pos, Pos)>,
+    /// The last path word looked for while Ctrl is held, the pane's folder
+    /// and what was found; see [`Self::resolve`].
+    resolved: RefCell<Option<(String, String, Option<PathBuf>)>>,
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
@@ -1059,6 +1075,7 @@ impl Find {
     /// Searches `term` again. The current match stays on the one that
     /// starts where it did, or else the nearest one above it; with none
     /// yet, it is the nearest one above the bottom of the `rows` high view.
+    /// With nothing above, it is the first one below.
     fn search(&mut self, term: &vt::Terminal, rows: u16) {
         let anchor = match self.cur.and_then(|i| self.found.get(i)) {
             Some(m) => m.start,
@@ -1151,8 +1168,10 @@ impl App {
             next_id: 1,
             next_num: 1,
             focused: false,
+            away: false,
             selection: None,
             hover: None,
+            resolved: RefCell::new(None),
             mouse: Mouse::default(),
             preedit: String::new(),
             update: None,
@@ -1410,7 +1429,8 @@ impl App {
     }
 
     /// Starts the program of pane `id`, which exited, again in its place:
-    /// in its folder, resuming its Claude Code session. The new session
+    /// in its folder, by the name the user gave it, resuming its Claude
+    /// Code session. The new session
     /// gets a new id, so nothing still on its way from the old one lands
     /// in it.
     fn restart(&mut self, id: PaneId) {
@@ -1428,7 +1448,10 @@ impl App {
             return;
         }
         // The new session takes the old one's row in the sidebar.
-        self.views.swap_remove(i);
+        let named = self.views.swap_remove(i).pane.named;
+        if let Some(v) = self.view_mut(new) {
+            v.pane.named = named;
+        }
         self.resume(new, claude);
         self.install(win);
     }
@@ -1614,6 +1637,9 @@ impl App {
         }
         self.selection = None;
         self.find = None;
+        if let Some(v) = before.and_then(|id| self.view_mut(id)) {
+            v.notice.take_if(|n| n.ask.of_pane());
+        }
         self.mouse.drag = None;
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
@@ -2193,6 +2219,8 @@ impl App {
     /// came since the last search, moves `by` matches, and scrolls the
     /// current one into view.
     fn find_go(&mut self, search: bool, by: isize) {
+        let text_h = self.gfx.as_ref().map_or(12, |g| g.r.small_cell().1);
+        let covered = bar_rows(text_h, self.scale, self.cell().1);
         let Some(f) = &mut self.find else {
             return;
         };
@@ -2206,7 +2234,7 @@ impl App {
         f.step(by);
         let shown = f.cur.map(|i| f.found[i]);
         if let Some(m) = shown {
-            reveal(&mut term, m, v.grid.1);
+            reveal(&mut term, m, v.grid.1, covered);
         }
         drop(term);
         self.request_redraw();
@@ -2253,7 +2281,7 @@ impl App {
         let mut list: Vec<chrome::Session> = (self.views.iter())
             .map(|v| {
                 let p = &v.pane;
-                let claude = p.claude_title.is_some();
+                let claude = titled_by_claude(p.claude_title, p.hooked, p.claude.as_deref());
                 let (name, msg) = label(p.named.as_deref(), &p.name, &p.title, claude, &p.msg);
                 chrome::Session {
                     id: p.id,
@@ -2377,7 +2405,9 @@ impl App {
         until: Option<Instant>,
         dim: bool,
     ) {
-        if let Some(v) = self.view_mut(id) {
+        if let Some(v) = self.view_mut(id)
+            && (!dim || hint_fits(v.notice.as_ref()))
+        {
             v.notice = Some(Notice {
                 text: text.into(),
                 until,
@@ -2442,6 +2472,8 @@ impl App {
             match input {
                 Input::Text(t) => {
                     if !self.filter_text(&t) {
+                        // As any other key, it takes questions away.
+                        self.dismiss(None);
                         self.typed(t.into_bytes());
                     }
                 }
@@ -2545,7 +2577,7 @@ impl App {
             vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
         );
         let a = keymap::action(k, &self.config.keys);
-        if k.down && !modifier {
+        if k.down && !modifier && !lock_key(k.vk) {
             self.dismiss(a);
         }
         if let Some(a) = a
@@ -3019,12 +3051,8 @@ impl App {
                     self.close(el, id);
                     return;
                 }
-                self.set_notice(
-                    id,
-                    format!("{} \u{b7} Enter restart \u{b7} Esc close", exit_text(code)),
-                    None,
-                    false,
-                );
+                // `notice_line` says so from now on.
+                self.request_redraw();
             }
             Note::Dead => {
                 self.attention(id, Ev::Error { sticky: true });
@@ -3054,20 +3082,13 @@ impl App {
                 }
                 let silent = hooks_silent(v.claude_working, v.hooks_seen, Instant::now());
                 let (was, now) = (v.pane.claude_title, claude_title(&t).map(|c| c.0));
-                let asked = v.pane.attn.state == Attn::NeedsYou;
                 v.pane.claude_title = now;
                 v.pane.title = t;
                 // This needs no hooks, and it sees a turn the user
                 // interrupted end, which runs no hook at all.
                 match (was, now) {
-                    // Back at work: a question it showed was answered.
                     (w, Some(true)) if w != Some(true) => {
-                        if self.attention(id, Ev::Busy)
-                            && asked
-                            && let Some(v) = self.view_mut(id)
-                        {
-                            v.pane.msg.clear();
-                        }
+                        self.attention(id, Ev::Busy);
                     }
                     (Some(true), Some(false)) => {
                         self.attention(id, Ev::Quiet);
@@ -3097,12 +3118,14 @@ impl App {
                         }
                     }
                 }
-                // A long command that ended while the user looked away.
-                if let Some((ev, msg)) = ended
+                // A long command that ended while the user looked away. Its
+                // time, not that of a Claude Code turn before it, shows.
+                if let Some((ev, msg, took)) = ended
                     && self.attention(id, ev)
                     && let Some(v) = self.view_mut(id)
                 {
                     v.pane.msg = msg;
+                    v.pane.attn.took = Some(took);
                 }
             }
             Event::Notify { title, body } => match Ev::from_notify(&title, &v.pane.token) {
@@ -3234,6 +3257,7 @@ impl App {
         // While it is open, it covers the panes: the focused one is not in
         // view. Nor is anything while the user is away from the screen.
         let here = present(self.focused, idle_for());
+        self.away |= !here;
         let attended = here && self.game.is_none() && self.focus_id() == Some(id);
         let away = !here && self.config.flash;
         let Some(v) = self.view_mut(id) else {
@@ -3632,14 +3656,25 @@ impl App {
             return Some((Target::Uri(uri.to_owned()), (a, b)));
         }
         let l = Logical::new(&t, &self.theme.pal, at.0);
+        // Output goes on while the line is scanned and the disk looked at.
+        drop(t);
         let here = l.cells[l.index(at)?].0;
         let (range, found) =
             (crate::links::scan(&l.text).into_iter()).find(|(r, _)| r.contains(&here))?;
         let target = match found {
             Link::Url(u) => Target::Uri(u),
-            Link::Path(p) => Target::Path(crate::links::resolve(&p, &v.pane.cwd)?),
+            Link::Path(p) => Target::Path(self.resolve(&p, &v.pane.cwd)?),
         };
         Some((target, l.span(range)))
+    }
+
+    /// [`crate::links::resolve`], answered again without looking at the
+    /// disk while Ctrl stays held over one path: each move of the pointer
+    /// and each repeat of a held key asks, and a slow drive would make
+    /// every one of them wait.
+    fn resolve(&self, word: &str, cwd: &str) -> Option<PathBuf> {
+        let last = &mut self.resolved.borrow_mut();
+        resolve_again(last, word, cwd, crate::links::resolve)
     }
 
     /// Underlines the link under the pointer, and shows the hand, while
@@ -3647,6 +3682,10 @@ impl App {
     fn update_hover(&mut self) {
         let mods = mods_now();
         let ctrl = (mods.lctrl || mods.rctrl) && self.mouse_to_program(&mods).is_none();
+        // A file made since Ctrl was last held counts.
+        if !ctrl {
+            *self.resolved.get_mut() = None;
+        }
         let hover = (ctrl && self.mouse.drag.is_none())
             .then(|| self.link_under(self.mouse.pos))
             .flatten()
@@ -3949,8 +3988,8 @@ impl App {
                     let rows = v.grid.1.min((at.h / ch as i32) as u16);
                     g.r.clipped(at, |r| {
                         r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
-                        if let Some(n) = &v.notice {
-                            draw_notice(r, &pal, at, (v.grid.0, rows), n);
+                        if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code) {
+                            draw_notice(r, &pal, at, (v.grid.0, rows), &text, dim);
                         }
                     });
                 }
@@ -4288,13 +4327,10 @@ fn ends_game(attn: crate::attention::PaneAttn, ev: Ev, now: Instant) -> bool {
     seen.apply(ev, false, now) && seen.state == Attn::NeedsYou
 }
 
-/// Whether a pane title shows Claude Code working: it puts a half-filled
-/// circle in front, which turns as it works.
+/// Whether a pane title shows Claude Code working, as the sidebar reads
+/// it too.
 fn claude_working_title(title: &str) -> bool {
-    title
-        .chars()
-        .next()
-        .is_some_and(|c| ('\u{25d0}'..='\u{25d3}').contains(&c))
+    claude_title(title).is_some_and(|(working, _)| working)
 }
 
 /// The hint about Claude Code's hooks, `older` than this blitz or not
@@ -4373,12 +4409,12 @@ fn prompt_back(prompted: &mut bool, resume: &mut Option<(String, Instant)>) -> P
 fn tell_focus(v: &View, focused: bool) {
     let mut out = Vec::new();
     // Under one lock, so a program turning reports on meanwhile is told
-    // either way.
+    // either way, and its reports reach it in the order they were made.
     let mut term = lock(&v.pane.term);
     term.set_focused(focused);
     vt::encode_focus(focused, &term.input_modes(), &mut out);
-    drop(term);
     v.pane.send(out);
+    drop(term);
 }
 
 /// Whether the user is at the window: it is in front, and they touched a
@@ -4437,6 +4473,12 @@ fn alt_f4_passes(down: bool, lparam: isize) -> bool {
     !down || !keymap::held_before(lparam)
 }
 
+/// Caps Lock, Num Lock and Scroll Lock, which like a modifier change how
+/// keys type and answer no question.
+fn lock_key(vk: u16) -> bool {
+    matches!(vk, 0x14 | 0x90 | 0x91)
+}
+
 /// How to confirm action `a`: its first key again, or with none, the
 /// palette.
 fn again(a: Action, keys: &[keymap::Binding]) -> String {
@@ -4490,11 +4532,38 @@ fn flash_kind(state: Attn, last: &mut Option<Instant>, now: Instant) -> Option<U
     Some(kind)
 }
 
+/// How many rows of `cell_h` pixels the find bar covers at the top of a
+/// pane, as the chrome draws it: a line of `text_h` pixel text, with 5
+/// pixels at `scale` above and below.
+fn bar_rows(text_h: u32, scale: f64, cell_h: u32) -> u16 {
+    let bar = f64::from(text_h) + (10.0 * scale).round();
+    (bar / f64::from(cell_h.max(1))).ceil() as u16
+}
+
+/// `look` at path `word` in folder `cwd`, unless `last` was the same
+/// question; then its answer.
+fn resolve_again(
+    last: &mut Option<(String, String, Option<PathBuf>)>,
+    word: &str,
+    cwd: &str,
+    look: impl FnOnce(&str, &str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some((w, c, found)) = last
+        && (w.as_str(), c.as_str()) == (word, cwd)
+    {
+        return found.clone();
+    }
+    let found = look(word, cwd);
+    *last = Some((word.to_owned(), cwd.to_owned(), found.clone()));
+    found
+}
+
 /// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
-/// unless it shows already. Returns whether the view moved.
-fn reveal(term: &mut vt::Terminal, m: Found, rows: u16) -> bool {
+/// unless it shows already below the `covered` rows at its top, which the
+/// find bar hides. Returns whether the view moved.
+fn reveal(term: &mut vt::Terminal, m: Found, rows: u16, covered: u16) -> bool {
     let (top, rows) = (term.view_top(), usize::from(rows));
-    if (top..top + rows).contains(&m.start.0) {
+    if (top + usize::from(covered)..top + rows).contains(&m.start.0) {
         return false;
     }
     term.scroll_to(m.start.0.saturating_sub(rows / 2));
@@ -4531,13 +4600,33 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
 }
 
 /// Draws a notice over the bottom row of the pane whose grid is at `at`.
-fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &Notice) {
+/// A passing hint shows only where no question or error waits, which
+/// it would take the place of.
+fn hint_fits(n: Option<&Notice>) -> bool {
+    n.is_none_or(|n| n.ask == Ask::Nothing)
+}
+
+/// The bottom row of a pane, and whether it is dim: its notice, else for
+/// a program that exited, how and what Enter and Esc do, which comes
+/// back when a notice over it goes.
+fn notice_line(n: Option<&Notice>, exit: Option<u32>) -> Option<(Cow<'_, str>, bool)> {
+    match (n, exit) {
+        (Some(n), _) => Some((Cow::Borrowed(n.text.as_str()), n.dim)),
+        (None, Some(code)) => {
+            let text = format!("{} \u{b7} Enter restart \u{b7} Esc close", exit_text(code));
+            Some((Cow::Owned(text), false))
+        }
+        (None, None) => None,
+    }
+}
+
+fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text: &str, dim: bool) {
     let (_, ch) = r.cell();
-    let mut s = text_snapshot(&format!(" {}", n.text), grid.0, 1, pal);
-    let bg = if n.dim { pal.bg } else { pal.selection_bg };
+    let mut s = text_snapshot(&format!(" {text}"), grid.0, 1, pal);
+    let bg = if dim { pal.bg } else { pal.selection_bg };
     for c in &mut s.cells {
         c.bg = bg;
-        if n.dim {
+        if dim {
             c.attrs |= vt::snapshot::attr::DIM;
         }
     }
@@ -4870,6 +4959,14 @@ fn new_tab(win: &mut layout::Window, id: PaneId) -> bool {
     true
 }
 
+/// Whether a pane's title names its session: it has Claude Code's mark,
+/// and Claude Code is known to run there, as its hooks with the pane's
+/// token or blitz's resume say. Any program can print the mark, and
+/// would then go by a name it picked, perhaps one like another session's.
+fn titled_by_claude(mark: Option<bool>, hooked: bool, session: Option<&str>) -> bool {
+    mark.is_some() && (hooked || session.is_some())
+}
+
 /// What the sidebar calls a session, and the message under its name: the
 /// name the user gave it, else for Claude Code the task its title names,
 /// which Claude's /rename changes too (`claude` says the title has its
@@ -5135,6 +5232,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // that could run or escape anything.
                 text.retain(|c| !c.is_control());
                 if !self.filter_text(&text) {
+                    self.dismiss(None);
                     self.typed(text.into_bytes());
                 }
             }
@@ -5222,6 +5320,14 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.drain_keys(el);
+        // Back at the screen, with a key or the mouse: the focused pane
+        // is in view again.
+        if self.away && self.game.is_none() && present(self.focused, idle_for()) {
+            self.away = false;
+            if let Some(id) = self.focus_id() {
+                self.attention(id, Ev::Attended);
+            }
+        }
         self.save_session(false);
         // Here, after every batch of events, rather than at each change:
         // a minimized window is not drawn.
@@ -5794,6 +5900,22 @@ mod tests {
     }
 
     #[test]
+    fn app_a_held_ctrl_looks_at_a_path_once() {
+        let mut looks = 0;
+        let mut last = None;
+        for word in ["a.txt", "a.txt", "b.txt"] {
+            resolve_again(&mut last, word, "C:/x", |w, _| {
+                looks += 1;
+                Some(PathBuf::from(w))
+            });
+        }
+        assert_eq!(looks, 2);
+        let again = resolve_again(&mut last, "b.txt", "C:/x", |_, _| None);
+        assert_eq!(again, Some(PathBuf::from("b.txt")));
+        assert_eq!(resolve_again(&mut last, "b.txt", "C:/y", |_, _| None), None);
+    }
+
+    #[test]
     fn app_links_map_back_to_their_cells() {
         let t = fed(10, 3, "go https://e.com/abc now");
         let l = Logical::new(&t, &crate::theme::dark(), 1);
@@ -6080,6 +6202,17 @@ mod tests {
     }
 
     #[test]
+    fn app_find_starts_below_the_view_when_nothing_above_matches() {
+        let mut t = fed(10, 2, "a\r\nb\r\nc\r\nmatch\r\nmatch");
+        t.scroll_viewport(9);
+        assert_eq!(t.view_top(), 0);
+        let mut f = Find::new(PaneId(1));
+        f.query = "match".into();
+        f.search(&t, 2);
+        assert_eq!((f.found.len(), f.cur), (2, Some(0)));
+    }
+
+    #[test]
     fn app_find_keeps_its_place_as_output_goes_on() {
         let mut t = vt::Terminal::new(vt::Options {
             cols: 20,
@@ -6107,9 +6240,14 @@ mod tests {
         f.step(-1);
         assert_eq!(f.cur, Some(11));
         // A match out of view comes into the middle of it.
-        assert!(reveal(&mut t, f.found[2], 3));
+        assert!(reveal(&mut t, f.found[2], 3, 0));
         assert_eq!(t.view_top(), 1);
-        assert!(!reveal(&mut t, f.found[2], 3), "already in view");
+        assert!(!reveal(&mut t, f.found[2], 3, 1), "already in view");
+        // Not under the find bar, which covers the top row.
+        assert!(reveal(&mut t, f.found[1], 3, 1));
+        assert_eq!(t.view_top(), 0);
+        assert_eq!(bar_rows(17, 1.0, 20), 2);
+        assert_eq!(bar_rows(17, 1.0, 27), 1);
 
         f.query = "zzz".into();
         f.search(&t, 3);
@@ -6131,6 +6269,15 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         assert_eq!(got, home);
         assert_eq!(start_dir(""), home);
+    }
+
+    #[test]
+    fn app_only_claude_code_names_a_session_by_its_title() {
+        let id = Some("3f2a0c1e-0000-4000-8000-00000000abcd");
+        assert!(titled_by_claude(Some(true), true, None));
+        assert!(titled_by_claude(Some(false), false, id));
+        assert!(!titled_by_claude(Some(false), false, None), "any program");
+        assert!(!titled_by_claude(None, true, id), "no mark");
     }
 
     #[test]
@@ -6569,10 +6716,17 @@ mod tests {
 
     #[test]
     fn app_titles_that_show_claude_working() {
-        for t in ["\u{25d0} Fix the tests", "\u{25d1} x", "\u{25d3}"] {
+        for t in ["\u{25d0} Fix the tests", "\u{25d1} x"] {
             assert!(claude_working_title(t), "{t}");
         }
-        for t in ["\u{2733} Fix the tests", "", "pwsh", "x \u{25d0}"] {
+        // Not Claude Code's marks, so the sidebar would not see it work.
+        for t in [
+            "\u{2733} Fix the tests",
+            "",
+            "pwsh",
+            "x \u{25d0}",
+            "\u{25d3} x",
+        ] {
             assert!(!claude_working_title(t), "{t}");
         }
     }
@@ -6736,34 +6890,81 @@ mod tests {
 
     /// A question stays until it is answered or another key is pressed,
     /// which then does what it always does; an error goes at the next key
-    /// in its pane; other notices stay.
+    /// in its pane; other notices stay. A question about its own pane goes
+    /// at any key aimed at another pane, its own action too.
     #[test]
     fn notices_go_at_the_next_key_that_does_not_answer_them() {
         let close = Some(Action::ClosePane);
+        for ask in [Ask::ClosePane, Ask::CloseTab, Ask::Paste("a\nb".into())] {
+            assert!(ask.of_pane());
+            for a in [close, Some(Action::CloseTab), Some(Action::Paste)] {
+                assert!(ask.gone(a, false), "{ask:?} at {a:?} elsewhere");
+            }
+            assert!(ask.gone(Some(Action::Palette), false));
+        }
+        assert!(!Ask::Update.of_pane() && !Ask::Quit.of_pane() && !Ask::Key.of_pane());
+        let paste = Ask::Paste("a\nb".into());
+        assert!(!paste.gone(Some(Action::Paste), true));
+        assert!(paste.gone(close, true));
+        assert!(!Ask::ClosePane.gone(close, true), "answered");
+        assert!(
+            !Ask::ClosePane.gone(Some(Action::Palette), true),
+            "answered from the palette"
+        );
+        assert!(!Ask::CloseTab.gone(Some(Action::CloseTab), true));
         for here in [true, false] {
             let ask = Ask::ClosePane;
-            assert!(!ask.gone(close, here), "answered");
-            assert!(
-                !ask.gone(Some(Action::Palette), here),
-                "answered from the palette"
-            );
             assert!(ask.gone(None, here), "typing");
             assert!(ask.gone(Some(Action::Update), here), "another shortcut");
-            let paste = Ask::Paste("a\nb".into());
-            assert!(!paste.gone(Some(Action::Paste), here));
-            assert!(paste.gone(close, here));
             assert!(!Ask::Update.gone(Some(Action::Update), here));
             assert!(Ask::Update.gone(Some(Action::Copy), here));
             assert_eq!(Ask::Key.gone(None, here), here, "an error, read");
             assert_eq!(Ask::Key.gone(close, here), here);
             assert!(!Ask::Nothing.gone(None, here));
-            assert!(!Ask::CloseTab.gone(Some(Action::CloseTab), here));
             assert!(Ask::CloseTab.gone(close, here), "not the whole tab");
             assert!(
                 Ask::Quit.gone(None, here),
                 "closing the window, then typing"
             );
             assert!(Ask::Quit.gone(Some(Action::Palette), here));
+        }
+    }
+
+    /// A passing hint leaves a question or an error where it is, and an
+    /// exited program's line comes back once a notice over it goes.
+    #[test]
+    fn notices_over_questions_and_exits() {
+        let notice = |ask, dim| Notice {
+            text: "n".into(),
+            until: None,
+            dim,
+            ask,
+        };
+        assert!(hint_fits(None));
+        assert!(hint_fits(Some(&notice(Ask::Nothing, true))));
+        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit] {
+            assert!(!hint_fits(Some(&notice(ask, false))));
+        }
+        let exited = notice_line(None, Some(2)).expect("a line");
+        assert_eq!(
+            exited,
+            ("exit 2 \u{b7} Enter restart \u{b7} Esc close".into(), false)
+        );
+        let error = notice(Ask::Key, false);
+        assert_eq!(
+            notice_line(Some(&error), Some(2)),
+            Some(("n".into(), false))
+        );
+        assert_eq!(notice_line(None, None), None);
+    }
+
+    #[test]
+    fn lock_keys_leave_questions() {
+        for vk in [0x14, 0x90, 0x91] {
+            assert!(lock_key(vk), "{vk:#x}");
+        }
+        for vk in [0x41, VK_RETURN, VK_ESCAPE, 0x10] {
+            assert!(!lock_key(vk), "{vk:#x}");
         }
     }
 

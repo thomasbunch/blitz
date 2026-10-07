@@ -38,68 +38,14 @@ pub enum Open {
     Reveal(PathBuf),
 }
 
-/// File types that run when opened, besides those in `%PATHEXT%`.
-const RUNS: &[&str] = &[
-    "exe",
-    "com",
-    "bat",
-    "cmd",
-    "pif",
-    "lnk",
-    "url",
-    "scf",
-    "hta",
-    "msi",
-    "msc",
-    "ps1",
-    "vbs",
-    "vbe",
-    "js",
-    "jse",
-    "wsf",
-    "wsh",
-    "reg",
-    "scr",
-    "cpl",
-    "jar",
-    "appref-ms",
-    "application",
-    "settingcontent-ms",
-    // Run by an interpreter when one is installed.
-    "py",
-    "pyw",
-    "pyz",
-    "pyzw",
-    "pyc",
-    "rb",
-    "rbw",
-    "pl",
-    "tcl",
-    "ahk",
-    "au3",
-    // Run code or change settings when opened, without being programs.
-    "ws",
-    "wsc",
-    "sct",
-    "chm",
-    "diagcab",
-    "theme",
-    "themepack",
-    "desktopthemepackfile",
-    "library-ms",
-    "searchconnector-ms",
-    "website",
-    "xbap",
-    "gadget",
-    "msp",
-    "mst",
-    "msix",
-    "msixbundle",
-    "appx",
-    "appxbundle",
-    "appinstaller",
-    "xll",
-    "iqy",
+/// File types that open with their program: text, source code, images
+/// and PDFs, which a program shows rather than runs. Any other type is
+/// shown in Explorer: Windows and the programs on it keep adding types
+/// that run or install when opened, so no list of those is ever complete.
+const OPENS: &[&str] = &[
+    "txt", "md", "markdown", "log", "json", "jsonc", "jsonl", "toml", "yaml", "yml", "ini", "sql",
+    "rs", "c", "h", "cc", "cpp", "cxx", "hpp", "cs", "go", "java", "kt", "swift", "ts", "tsx",
+    "css", "scss", "html", "htm", "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "svg", "pdf",
 ];
 
 /// Every URL and path-like word in `text`, the logical line under the
@@ -134,8 +80,11 @@ fn url_len(s: &str) -> Option<usize> {
     let scheme = ["https://", "http://"]
         .into_iter()
         .find(|p| s.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)))?;
+    // Letters and digits of any script, as in `https://bücher.de`, but not
+    // the quotes and punctuation of the text around it.
     let url_char = |c: char| {
         c.is_ascii_graphic() && !matches!(c, '<' | '>' | '"' | '`' | '{' | '}' | '|' | '\\' | '^')
+            || !c.is_ascii() && c.is_alphanumeric()
     };
     let n = trim_end(&s[..s.find(|c| !url_char(c)).unwrap_or(s.len())]);
     (n > scheme.len()).then_some(n)
@@ -187,42 +136,68 @@ fn path_at(s: &str) -> Option<(Range<usize>, usize)> {
 }
 
 /// The length of `s` without the punctuation of a sentence around it, or
-/// a closing bracket it does not open.
-fn trim_end(mut s: &str) -> usize {
-    loop {
-        let unopened =
-            |open, close| s.ends_with(close) && s.matches(open).count() < s.matches(close).count();
-        if s.ends_with(['.', ',', ';', ':', '!', '?', '\'', '"'])
-            || unopened('(', ')')
-            || unopened('[', ']')
-        {
-            s = &s[..s.len() - 1];
-        } else {
-            return s.len();
+/// a closing bracket it does not open. The brackets are counted once, so
+/// a long run of them costs no more than the rest of the text.
+fn trim_end(s: &str) -> usize {
+    // Round and square brackets, opening and closing.
+    let (mut opens, mut closes) = ([0usize; 2], [0usize; 2]);
+    for c in s.chars() {
+        match c {
+            '(' => opens[0] += 1,
+            '[' => opens[1] += 1,
+            ')' => closes[0] += 1,
+            ']' => closes[1] += 1,
+            _ => {}
         }
+    }
+    let mut n = s.len();
+    loop {
+        let k = match s[..n].chars().next_back() {
+            Some('.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"') => None,
+            Some(')') => Some(0),
+            Some(']') => Some(1),
+            _ => return n,
+        };
+        if let Some(k) = k {
+            if opens[k] >= closes[k] {
+                return n;
+            }
+            closes[k] -= 1;
+        }
+        n -= 1;
     }
 }
 
 /// Where a path word from the text is: as it is when it starts with a
 /// drive, else in the pane's folder `cwd`. Only a path that exists counts,
-/// and one that would reach another machine is never looked at.
-// ponytail: looks at the disk on the UI thread for each move over a path
-// while Ctrl is held; keep the last answer if a slow drive makes that lag.
+/// and one that would reach another machine is never looked at, nor is
+/// one through a link; see [`plain`].
 pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
-    let full = if vt::osc::local_dir(word) {
-        PathBuf::from(word)
+    let (full, from) = if vt::osc::local_dir(word) {
+        (PathBuf::from(word), 3)
     } else if vt::osc::local_dir(cwd) {
-        Path::new(cwd).join(word)
+        (Path::new(cwd).join(word), cwd.len())
     } else {
         return None;
     };
-    full.exists().then_some(full)
+    plain(&full, from).then_some(full)
 }
 
-/// What opening an OSC 8 link's `uri` does. Only `http`, `https`,
-/// `mailto` and local `file` URIs open: any other scheme starts whatever
-/// program registered it, and some (`ms-msdt:`, `search-ms:`) have been
-/// used to attack Windows.
+/// Whether each folder and file `path` names after its first `from`
+/// bytes is there and is no symbolic link or junction. Each is looked at
+/// without following it: a link can lead to another machine, and looking
+/// at a file there makes Windows sign in to it.
+fn plain(path: &Path, from: usize) -> bool {
+    (path.ancestors())
+        .take_while(|a| a.as_os_str().len() > from)
+        .all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| !m.file_type().is_symlink()))
+}
+
+/// What opening an OSC 8 link's `uri` does. Only `http`, `https` and
+/// local `file` URIs open: any other scheme starts whatever program
+/// registered it, and some (`ms-msdt:`, `search-ms:`) have been used to
+/// attack Windows. Even `mailto:` hands a message the program wrote,
+/// attachments included in some mail programs, to the one registered.
 pub fn plan_uri(uri: &str, pathext: &str) -> Option<Open> {
     // A space or quote could split the command line that starts the
     // program.
@@ -234,14 +209,15 @@ pub fn plan_uri(uri: &str, pathext: &str) -> Option<Open> {
     }
     let (scheme, _) = uri.split_once(':')?;
     match scheme.to_ascii_lowercase().as_str() {
-        "http" | "https" | "mailto" => Some(Open::Uri(uri.to_owned())),
+        "http" | "https" => Some(Open::Uri(uri.to_owned())),
         "file" => plan_path(Path::new(&vt::osc::file_url_path(uri)?), pathext),
         _ => None,
     }
 }
 
 /// What opening the file or folder `path` does. It must be a plain drive
-/// path. Never runs it: a type in `pathext` or [`RUNS`] is shown in
+/// path. Never runs it: only a folder, a file with no type and the types
+/// in [`OPENS`] open; anything else, or a type `pathext` runs, is shown in
 /// Explorer instead.
 pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
     let s = path.to_str()?;
@@ -254,9 +230,8 @@ pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
         .unwrap_or_default()
         .trim_end_matches(['.', ' ']);
     let runs = name.rsplit_once('.').is_some_and(|(_, ext)| {
-        let mut types =
-            (RUNS.iter().copied()).chain(pathext.split(';').map(|t| t.trim_start_matches('.')));
-        types.any(|t| !t.is_empty() && t.eq_ignore_ascii_case(ext))
+        let is = |t: &str| !t.is_empty() && t.eq_ignore_ascii_case(ext);
+        !OPENS.iter().any(|t| is(t)) || pathext.split(';').any(|t| is(t.trim_start_matches('.')))
     });
     Some(if runs {
         Open::Reveal(path.into())
@@ -275,6 +250,10 @@ pub fn plan(t: &Target, pathext: &str) -> Option<Open> {
     match p {
         Open::Uri(_) => Some(p),
         Open::File(p) | Open::Reveal(p) => {
+            // A path from the text passed [`resolve`] already.
+            if matches!(t, Target::Uri(_)) && !plain(&p, 3) {
+                return None;
+            }
             let real = std::fs::canonicalize(p).ok()?;
             let real = real.to_str()?;
             plan_path(
@@ -300,7 +279,7 @@ pub fn open(t: &Target) -> Result<(), &'static str> {
                 format!("/select,\"{}\"", p.display()),
             )
         }
-        None => return Err("blitz opens only web and mail links and files on this computer"),
+        None => return Err("blitz opens only web links and files on this computer"),
     };
     // SAFETY: NUL-terminated strings that outlive the call, and no window.
     let done = unsafe {
@@ -352,6 +331,9 @@ mod tests {
         one("<https://x.com/>", "https://x.com/");
         one("'http://x.com/a#top'!", "http://x.com/a#top");
         one("HTTPS://X.COM/A", "HTTPS://X.COM/A");
+        one("see https://bücher.de/x.", "https://bücher.de/x");
+        one("“https://example.com/café”", "https://example.com/café");
+        one("https://例え.jp/パス。", "https://例え.jp/パス");
         one(
             "https://example.com/a/b.html",
             "https://example.com/a/b.html",
@@ -364,6 +346,16 @@ mod tests {
         ] {
             assert_eq!(found(none), [], "{none}");
         }
+    }
+
+    #[test]
+    fn links_scan_a_long_run_of_brackets_quickly() {
+        let t0 = std::time::Instant::now();
+        for word in ["https://x.com/", "a/b.c"] {
+            let text = format!("{word}{}", ")]".repeat(50_000));
+            assert_eq!(found(&text).len(), 1, "{word}");
+        }
+        assert!(t0.elapsed().as_millis() < 500, "{:?}", t0.elapsed());
     }
 
     #[test]
@@ -417,7 +409,6 @@ mod tests {
             uri("https://example.com/a?b")
         );
         assert_eq!(plan("HTTP://x.com"), uri("HTTP://x.com"));
-        assert_eq!(plan("mailto:a@b.c"), uri("mailto:a@b.c"));
         for bad in [
             "ms-msdt:/id PCWDiagnostic",
             "ms-msdt:-id",
@@ -425,6 +416,7 @@ mod tests {
             "javascript:alert(1)",
             "vbscript:x",
             "ms-settings:",
+            "mailto:a@b.c?attach=C:/x/secret.txt",
             r"\\server\share\x.txt",
             "file://server/share/x.txt",
             "file:///C:/x/a%0a.txt",
@@ -440,6 +432,7 @@ mod tests {
         let file = |p: &str| Some(Open::File(p.into()));
         let reveal = |p: &str| Some(Open::Reveal(p.into()));
         assert_eq!(plan("file:///C:/docs/a%20b.txt"), file(r"C:\docs\a b.txt"));
+        assert_eq!(plan("FILE:///C:/docs/a%20b.txt"), file(r"C:\docs\a b.txt"));
         assert_eq!(plan("file:///C:/docs/"), file(r"C:\docs\"));
         assert_eq!(plan("file:///C:/x/setup.EXE"), reveal(r"C:\x\setup.EXE"));
         assert_eq!(
@@ -474,10 +467,32 @@ mod tests {
             "chm",
             "diagcab",
             "themepack",
+            // Types a list of what runs did not have, until each was found.
+            "deskthemepack",
+            "wsb",
+            "rdp",
+            "msu",
+            "psc1",
+            "jnlp",
+            "diagcfg",
+            "search-ms",
+            "vhdx",
+            "iso",
+            "docm",
+            "xlsm",
+            "one",
+            "accde",
+            "made-up",
         ] {
             let p = format!(r"C:\x\a.{t}");
             assert_eq!(plan_path(Path::new(&p), ""), reveal(&p), "{t}");
         }
+        for t in ["a.txt", "a.MD", "a.rs", "a.png", "a.pdf", "README", "dir"] {
+            let p = format!(r"C:\x\{t}");
+            assert_eq!(plan_path(Path::new(&p), ""), file(&p), "{t}");
+        }
+        let toml = r"C:\x\a.toml";
+        assert_eq!(plan_path(Path::new(toml), ".TOML"), reveal(toml), "PATHEXT");
         assert_eq!(plan_path(Path::new(r"\\?\C:\x.txt"), pathext), None);
         assert_eq!(plan_path(Path::new("x.txt"), pathext), None);
     }
@@ -500,5 +515,29 @@ mod tests {
         assert!(matches!(notes_plan, Some(Open::File(p)) if p.ends_with(r"sub\notes.txt")));
         assert!(matches!(tool_plan, Some(Open::Reveal(p)) if p.ends_with("tool.cmd")));
         assert_eq!((gone, far), (None, None));
+    }
+
+    #[test]
+    fn links_never_look_through_a_link() {
+        let dir = std::env::temp_dir().join(format!("blitz-links-j-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real")).expect("dir");
+        std::fs::write(dir.join("real").join("a.txt"), "x").expect("write");
+        // A junction needs no rights to make, unlike a symbolic link.
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(dir.join("j"))
+            .arg(dir.join("real"))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let cwd = dir.display().to_string();
+        let real = resolve("real/a.txt", &cwd);
+        let through = resolve("j/a.txt", &cwd);
+        let link = resolve("j", &cwd);
+        let uri = format!("file:///{}", dir.join("j").join("a.txt").display());
+        let opened = plan(&Target::Uri(uri.replace('\\', "/")), "");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(made, "mklink");
+        assert!(real.is_some());
+        assert_eq!((through, link, opened), (None, None, None));
     }
 }

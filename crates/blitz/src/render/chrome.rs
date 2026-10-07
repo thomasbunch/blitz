@@ -1046,7 +1046,7 @@ struct List<'a> {
     /// The names that match it, and the highlighted one.
     names: Vec<&'a str>,
     sel: usize,
-    /// Shown when nothing matches.
+    /// Shown when nothing matches; for a name, what leaving it empty does.
     empty: &'a str,
     hint: &'a str,
     /// Shown in place of an empty filter.
@@ -1219,7 +1219,11 @@ fn commands(
             filter: cm.filter,
             names: Vec::new(),
             sel: 0,
-            empty: "With no name, blitz picks one again",
+            // What an empty name does, while it is empty.
+            empty: match cm.filter {
+                "" => "With no name, blitz picks one again",
+                _ => "",
+            },
             hint: "Enter rename  \u{b7}  Esc cancel",
             prompt: "type a name",
             width: 460.0,
@@ -2830,6 +2834,8 @@ mod tests {
         });
         let t: Vec<String> = texts(&build(&m)).iter().map(|t| t.to_string()).collect();
         assert!(t.contains(&"Rename tab".into()) && t.contains(&"type a name".into()));
+        let unnamed = "With no name, blitz picks one again";
+        assert!(t.contains(&unnamed.into()));
         m.commands = Some(Commands {
             filter: "shop api",
             items: Vec::new(),
@@ -2838,6 +2844,7 @@ mod tests {
         });
         let c = build(&m);
         assert!(texts(&c).contains(&"shop api"));
+        assert!(!texts(&c).contains(&unnamed), "a name is typed");
         assert!(c.commands.expect("palette").1.is_empty(), "no rows to pick");
     }
 
