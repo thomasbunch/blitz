@@ -3,6 +3,7 @@
 // One process hosts every session, so a failed HRESULT must never panic.
 #![deny(clippy::unwrap_used)]
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ops::Range;
@@ -52,7 +53,7 @@ use winit::platform::windows::{
     EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorIcon, Fullscreen, Icon, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Icon, Window, WindowAttributes, WindowId};
 
 use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev, claude_title, exit_text};
@@ -190,6 +191,8 @@ struct Args {
     exit_after: Option<Duration>,
     /// Open a window of its own, even if blitz is already running.
     new_window: bool,
+    /// blitz runs as administrator, and its title says so.
+    admin: bool,
 }
 
 impl Args {
@@ -235,6 +238,21 @@ impl Args {
             || self.capture.is_some()
     }
 
+    /// A window of its own, which takes no launches. Run as administrator,
+    /// blitz is one too: it would otherwise take launches from programs
+    /// that are not, and resume the saved session's Claude Code sessions
+    /// elevated.
+    fn separate(&self) -> bool {
+        self.new_window || self.admin
+    }
+
+    /// The main window: this launch goes to a blitz already running first,
+    /// and the window restores and saves the session. Scripted and test
+    /// runs never are.
+    fn main(&self) -> bool {
+        !self.separate() && !self.scripted()
+    }
+
     /// Takes what the blitz already running made of this launch, `None`
     /// when none runs. True when it took the launch, which is then done.
     /// One that runs but did not take it (it hung, or refused the folder)
@@ -263,15 +281,10 @@ fn folder(arg: &str) -> PathBuf {
 /// what is wrong with the arguments.
 pub fn run(args: &[String]) -> Result<i32, String> {
     let mut args = Args::parse(args)?;
-    // Run as administrator, blitz is a window of its own: it takes no
-    // launches, gives none away, and leaves the saved session to the
-    // normal one, whose Claude Code sessions it would resume elevated.
-    let admin = elevated();
-    args.new_window |= admin;
+    args.admin = elevated();
     // A launch brings the blitz already running to the front, and a folder
-    // opens as a tab there. Scripted and test launches always get a window
-    // of their own.
-    if !args.new_window && !args.scripted() {
+    // opens as a tab there.
+    if args.main() {
         let sent = crate::handoff::send(args.cwd.as_deref());
         if args.handed_off(sent) {
             return Ok(0);
@@ -301,7 +314,6 @@ pub fn run(args: &[String]) -> Result<i32, String> {
     };
     let mut app = App::new(args, keys, event_loop.create_proxy());
     app.gpu = Some(gpu);
-    app.admin = admin;
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("blitz: {e}");
         return Ok(1);
@@ -533,8 +545,12 @@ enum Ask {
     /// An error: the next key in its pane takes it away, read by then.
     Key,
     /// The action that showed it, run again in its pane, confirms. Any
-    /// other key takes it away and goes on to do what it does.
+    /// other key takes it away and goes on to do what it does. Pasting
+    /// confirms only while the clipboard still holds this text.
     Paste(String),
+    /// Files dropped on the pane, as their paths: pasting confirms them,
+    /// whatever the clipboard holds.
+    Drop(String),
     ClosePane,
     CloseTab,
     Update,
@@ -545,18 +561,30 @@ enum Ask {
 impl Ask {
     /// Whether a key that runs `a`, if any, takes the notice away. `here`
     /// when the key goes to the notice's pane. Opening the palette does
-    /// not, since an action run from it confirms too.
+    /// not, since an action run from it confirms too. A question about its
+    /// own pane goes at any key aimed at another, so the same action there
+    /// cannot answer it later.
     fn gone(&self, a: Option<Action>, here: bool) -> bool {
         let by = match self {
             Ask::Nothing => return false,
             Ask::Key => return here,
-            Ask::Paste(_) => Action::Paste,
+            Ask::Paste(_) | Ask::Drop(_) | Ask::ClosePane | Ask::CloseTab if !here => return true,
+            Ask::Paste(_) | Ask::Drop(_) => Action::Paste,
             Ask::ClosePane => Action::ClosePane,
             Ask::CloseTab => Action::CloseTab,
             Ask::Update => Action::Update,
             Ask::Quit => return true,
         };
         a != Some(by) && a != Some(Action::Palette)
+    }
+
+    /// Whether the question is about its own pane, so focus leaving that
+    /// pane takes it away.
+    fn of_pane(&self) -> bool {
+        matches!(
+            self,
+            Ask::Paste(_) | Ask::Drop(_) | Ask::ClosePane | Ask::CloseTab
+        )
     }
 }
 
@@ -573,7 +601,6 @@ struct Mouse {
     /// For the left, middle and right button, the pane whose program was
     /// sent its press.
     reported: [Option<PaneId>; 3],
-    tracker: vt::keys::MouseTracker,
     /// Wheel movement not yet turned into whole steps.
     wheel: f64,
     /// When Ctrl and the wheel last changed the font size.
@@ -589,6 +616,8 @@ struct Mouse {
     hidden: bool,
     /// A left-button drag is making a selection.
     drag: Option<Drag>,
+    /// The drag's pane showed the bottom of its text when it began.
+    drag_bottom: bool,
     /// When the drag next scrolls, while the pointer is outside its pane.
     scroll_at: Option<Instant>,
     /// The last press that went to selection: when, on which cell, and
@@ -757,6 +786,16 @@ impl Selection {
     }
 }
 
+/// Ends a drag in `term`, whose view it held. A click that selected
+/// nothing puts a view that showed the bottom (`bottom`) back there, which
+/// output that came meanwhile moved it off.
+fn let_go(term: &mut vt::Terminal, bottom: bool, selected: bool) {
+    term.hold(false);
+    if bottom && !selected {
+        term.scroll_viewport(isize::MIN);
+    }
+}
+
 /// A selection of the cells from `start` to `end`, as made in code.
 fn selection_of(term: &vt::Terminal, pal: &Palette, start: Pos, end: Pos) -> Selection {
     let drag = Drag {
@@ -777,16 +816,21 @@ fn all_text(term: &vt::Terminal, pal: &Palette) -> Option<(usize, usize)> {
 
 /// The first and last line of the last command's output: the lines from
 /// the end of the command at blitz's next to last prompt down to its last
-/// prompt, none blank at the end.
+/// prompt, none blank at the end. The output starts where the shell marked
+/// it, below a prompt or command of more than one line; a shell that does
+/// not mark it, such as cmd, gets the line after the command's last row.
 fn last_output(term: &vt::Terminal, pal: &Palette) -> Option<(usize, usize)> {
     let mut prompts = term.lines().rev().filter(|&n| term.starts_prompt(n));
     let (now, before) = (prompts.next()?, prompts.next()?);
-    let mut first = before;
-    while first < now && term.wraps(first) {
-        first += 1;
-    }
-    let last = (first + 1..now).rev().find(|&n| !blank(term, pal, n))?;
-    Some((first + 1, last))
+    let first = (before..now).find(|&n| term.starts_output(n)).or_else(|| {
+        let mut end = before;
+        while end < now && term.wraps(end) {
+            end += 1;
+        }
+        Some(end + 1)
+    })?;
+    let last = (first..now).rev().find(|&n| !blank(term, pal, n))?;
+    Some((first, last))
 }
 
 /// Whether line `n` holds no text.
@@ -950,6 +994,8 @@ fn line_at(term: &vt::Terminal, at: Pos) -> (Pos, Pos) {
 struct View {
     pane: Pane,
     snap: Snapshot,
+    /// Mouse reports to its program, one per cell crossed.
+    tracker: vt::keys::MouseTracker,
     /// The terminal's size in cells.
     grid: (u16, u16),
     /// When the terminal last took a new size, and when its pane's new
@@ -1062,9 +1108,15 @@ struct App {
     /// The text of a selection in the focused pane that output rewrote,
     /// which Copy still takes until the user does something else.
     orphan: Option<String>,
+    /// A session changed while the user was away from the screen; the
+    /// focused pane counts as seen once they are back.
+    away: bool,
     /// The link under the pointer while Ctrl is held, drawn underlined:
     /// the line epoch and its first and last cell.
     hover: Option<(u32, Pos, Pos)>,
+    /// The last path word looked for while Ctrl is held, the pane's folder
+    /// and what was found; see [`Self::resolve`].
+    resolved: RefCell<Option<(String, String, Option<PathBuf>)>>,
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
@@ -1116,10 +1168,10 @@ struct App {
     /// This is the main window, whose layout is saved for the next start.
     /// Separate windows and scripted runs leave the saved one alone.
     persist: bool,
-    /// blitz runs as administrator, and its title says so.
-    admin: bool,
     /// The window is hidden until its first frame, or until this time.
     hidden_until: Option<Instant>,
+    /// The window shows maximized, as the saved session left it.
+    maximize: bool,
     /// The session as last saved.
     saved: Option<session::State>,
     /// When a changed layout is saved, unless it changes back first.
@@ -1318,6 +1370,9 @@ struct Find {
     /// The query was put there when the bar opened and is drawn selected:
     /// typing replaces it.
     fresh: bool,
+    /// The view's top line when the bar opened, and whether it showed the
+    /// bottom, until the bar searches or moves to another match.
+    back: Option<(usize, bool)>,
 }
 
 impl Find {
@@ -1330,7 +1385,25 @@ impl Find {
             stale: false,
             searched: None,
             fresh: false,
+            back: None,
         }
+    }
+
+    /// What closing the bar with Esc leaves selected in `term`, whose view
+    /// is `rows` high: the current match, or nothing when the bar did
+    /// nothing since it opened, which puts the view back where it was.
+    fn close(&mut self, term: &mut vt::Terminal, rows: u16) -> Option<Found> {
+        if let Some((top, bottom)) = self.back {
+            match bottom {
+                true => term.scroll_viewport(isize::MIN),
+                false => term.scroll_to(top),
+            }
+            return None;
+        }
+        if self.stale {
+            self.search(term, rows);
+        }
+        self.cur.map(|i| self.found[i])
     }
 
     /// Types `t` into the query, in place of a fresh one.
@@ -1360,6 +1433,7 @@ impl Find {
     /// Searches `term` again. The current match stays on the one that
     /// starts where it did, or else the nearest one above it; with none
     /// yet, it is the nearest one above the bottom of the `rows` high view.
+    /// With nothing above, it is the first one below.
     fn search(&mut self, term: &vt::Terminal, rows: u16) {
         let anchor = match self.cur.and_then(|i| self.found.get(i)) {
             Some(m) => m.start,
@@ -1399,6 +1473,8 @@ struct Quick {
     /// their cells, their text, and what opening them does. A hash opens
     /// nothing.
     items: Vec<QuickItem>,
+    /// Their cells in order, as each frame highlights them.
+    found: Vec<Found>,
 }
 
 type QuickItem = (Found, String, Option<Target>);
@@ -1533,7 +1609,7 @@ impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
         let config = Config::load();
         let theme = crate::theme::current(&config.theme);
-        let persist = !args.new_window && !args.scripted();
+        let persist = args.main();
         App {
             args,
             config,
@@ -1565,7 +1641,9 @@ impl App {
             next_num: 1,
             focused: false,
             orphan: None,
+            away: false,
             hover: None,
+            resolved: RefCell::new(None),
             mouse: Mouse::default(),
             preedit: String::new(),
             dropped: Vec::new(),
@@ -1588,8 +1666,8 @@ impl App {
             hooked: false,
             capture_then_exit: false,
             persist,
-            admin: false,
             hidden_until: None,
+            maximize: false,
             saved: None,
             save_after: None,
             save_fails: 0,
@@ -1626,14 +1704,14 @@ impl App {
         // flash of white or black.
         self.hidden_until = Some(Instant::now() + FIRST_FRAME);
         let mut attrs = Window::default_attributes()
-            .with_title(window_title(0, "", self.admin))
+            .with_title(window_title(0, "", self.args.admin))
             .with_visible(false)
             .with_inner_size(LogicalSize::new(980.0, 620.0))
             // Icon group 1, which build.rs links in.
             .with_window_icon(Icon::from_resource(1, Some(small_icon_size())).ok())
             .with_taskbar_icon(Icon::from_resource(1, None).ok())
             // Only the main window takes folders from other launches.
-            .with_class_name(crate::handoff::class(self.args.new_window));
+            .with_class_name(crate::handoff::class(self.args.separate()));
         let saved = (self.persist && self.config.restore_session)
             .then(session::load)
             .flatten();
@@ -1644,10 +1722,8 @@ impl App {
         {
             let g = on_screen(el, g);
             self.placed = g;
-            attrs = attrs
-                .with_position(PhysicalPosition::new(g.x, g.y))
-                .with_inner_size(PhysicalSize::new(g.w, g.h))
-                .with_maximized(g.maximized);
+            self.maximize = g.maximized;
+            attrs = placed_at(attrs, g);
         }
         let window = el.create_window(attrs).map_err(|e| e.to_string())?;
         window.set_ime_allowed(true);
@@ -1657,7 +1733,7 @@ impl App {
         {
             self.hwnd = h.hwnd.get();
         }
-        crate::handoff::install(self.hwnd, self.proxy.clone(), !self.args.new_window);
+        crate::handoff::install(self.hwnd, self.proxy.clone(), !self.args.separate());
         crate::notify::install(self.hwnd, self.proxy.clone());
         watch_settings(self.proxy.clone());
         self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
@@ -1872,7 +1948,8 @@ impl App {
     }
 
     /// Starts the program of pane `id`, which exited, again in its place:
-    /// in its folder, resuming its Claude Code session. The new session
+    /// in its folder, by the name the user gave it, resuming its Claude
+    /// Code session. The new session
     /// gets a new id, so nothing still on its way from the old one lands
     /// in it.
     fn restart(&mut self, id: PaneId) {
@@ -1890,7 +1967,10 @@ impl App {
             return;
         }
         // The new session takes the old one's row in the sidebar.
-        self.views.swap_remove(i);
+        let named = self.views.swap_remove(i).pane.named;
+        if let Some(v) = self.view_mut(new) {
+            v.pane.named = named;
+        }
         self.resume(new, claude);
         self.install(win);
     }
@@ -2012,6 +2092,7 @@ impl App {
         lock(&pane.term).set_cell_px(cw as u16, ch as u16);
         pane.name = program_name(&launch.cmdline);
         self.views.push(View {
+            tracker: Default::default(),
             pane,
             snap: Snapshot::default(),
             grid,
@@ -2119,6 +2200,9 @@ impl App {
         self.orphan = None;
         self.find = None;
         self.quick = None;
+        if let Some(v) = before.and_then(|id| self.view_mut(id)) {
+            v.notice.take_if(|n| n.ask.of_pane());
+        }
         self.set_drag(None);
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
@@ -2146,7 +2230,7 @@ impl App {
             .filter(|v| v.pane.attn.state == Attn::NeedsYou)
             .count();
         let pane = self.current().map_or("", |v| v.pane.title.as_str());
-        let title = window_title(waiting, pane, self.admin);
+        let title = window_title(waiting, pane, self.args.admin);
         if title != self.title
             && let Some(w) = &self.window
         {
@@ -2236,10 +2320,7 @@ impl App {
             text_cell: self.text_cell(),
             term_cell: self.cell(),
             now: Instant::now(),
-            banner: banner_text(
-                self.update.as_ref(),
-                self.banner_note.as_ref().map(|n| n.0.as_str()),
-            ),
+            banner: self.banner(),
             preedit,
             picker: self.picker.as_ref().map(|p| chrome::Picker {
                 filter: &p.filter,
@@ -2493,7 +2574,7 @@ impl App {
     /// highlights it, and one outside the panel closes it.
     fn settings_click(&mut self) {
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let Some(h) = &self.settings_hits else {
             return;
         };
@@ -2681,7 +2762,7 @@ impl App {
     /// runs it, and one outside the palette closes it.
     fn commands_click(&mut self, el: &ActiveEventLoop) {
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let Some((panel, rows)) = &self.commands_hits else {
             return;
         };
@@ -2774,11 +2855,8 @@ impl App {
                 if let Some(mut f) = self.find.take()
                     && let Some(v) = self.views.iter_mut().find(|v| v.pane.id == f.pane)
                 {
-                    let term = lock(&v.pane.term);
-                    if f.stale {
-                        f.search(&term, v.grid.1);
-                    }
-                    let found = f.cur.map(|i| f.found[i]);
+                    let mut term = lock(&v.pane.term);
+                    let found = f.close(&mut term, v.grid.1);
                     let sel = found.map(|m| selection_of(&term, &pal, m.start, m.end));
                     drop(term);
                     v.selection = sel.or(v.selection.take());
@@ -2812,7 +2890,9 @@ impl App {
         self.find = Some(f);
         let v = self.views.iter().find(|v| v.pane.id == id);
         if let (Some(f), Some(v)) = (&mut self.find, v) {
-            f.search(&lock(&v.pane.term), v.grid.1);
+            let term = lock(&v.pane.term);
+            f.back = Some((term.view_top(), term.viewport() == 0));
+            f.search(&term, v.grid.1);
             let picked = f.found.iter().position(|m| Some(m.start) == at);
             f.cur = picked.or(f.cur);
         }
@@ -2823,6 +2903,8 @@ impl App {
     /// came since the last search, moves `by` matches, and scrolls the
     /// current one into view.
     fn find_go(&mut self, search: bool, by: isize) {
+        let text_h = self.gfx.as_ref().map_or(12, |g| g.r.small_cell().1);
+        let covered = bar_rows(text_h, self.scale, self.cell().1);
         let Some(f) = &mut self.find else {
             return;
         };
@@ -2830,6 +2912,9 @@ impl App {
             return;
         };
         let mut term = lock(&v.pane.term);
+        if search || by != 0 {
+            f.back = None;
+        }
         if search || f.stale {
             f.search(&term, v.grid.1);
         }
@@ -2839,7 +2924,7 @@ impl App {
         f.step(by);
         let shown = f.cur.map(|i| f.found[i]);
         if let Some(m) = shown {
-            reveal(&mut term, m, v.grid.1);
+            reveal(&mut term, m, v.grid.1, covered);
         }
         drop(term);
         self.request_redraw();
@@ -2889,7 +2974,7 @@ impl App {
         let mut list: Vec<chrome::Session> = (self.views.iter())
             .map(|v| {
                 let p = &v.pane;
-                let claude = p.claude_title.is_some();
+                let claude = titled_by_claude(p.claude_title, p.hooked, p.claude.as_deref());
                 let (name, msg) = label(p.named.as_deref(), &p.name, &p.title, claude, &p.msg);
                 chrome::Session {
                     id: p.id,
@@ -2977,10 +3062,21 @@ impl App {
     /// whose view holds still meanwhile, so output does not slide the text
     /// out from under the pointer.
     fn set_drag(&mut self, drag: Option<Drag>) {
+        let (now, was) = (drag.is_some(), self.mouse.drag.is_some());
         self.mouse.drag = drag;
         let focus = self.focus_id();
         for v in &self.views {
-            lock(&v.pane.term).hold(drag.is_some() && Some(v.pane.id) == focus);
+            let mut term = lock(&v.pane.term);
+            let here = Some(v.pane.id) == focus;
+            if here && now && !was {
+                self.mouse.drag_bottom = term.viewport() == 0;
+            }
+            if here && was && !now {
+                let_go(&mut term, self.mouse.drag_bottom, v.selection.is_some());
+                self.request_redraw();
+            } else {
+                term.hold(now && here);
+            }
         }
     }
 
@@ -3117,6 +3213,9 @@ impl App {
         self.set_notice(id, text, Some(Instant::now() + HINT), true);
     }
 
+    /// Shows `text` in pane `id` until `until`, or else until something
+    /// replaces it, unless it would hide one ([`hides_lasting`]), or it is
+    /// a hint over a question or error ([`hint_fits`]).
     fn set_notice(
         &mut self,
         id: PaneId,
@@ -3124,7 +3223,10 @@ impl App {
         until: Option<Instant>,
         dim: bool,
     ) {
-        if let Some(v) = self.view_mut(id) {
+        if let Some(v) = self.view_mut(id)
+            && !hides_lasting(v.notice.as_ref(), until, dim)
+            && (!dim || hint_fits(v.notice.as_ref()))
+        {
             v.notice = Some(Notice {
                 text: text.into(),
                 until,
@@ -3196,6 +3298,8 @@ impl App {
             match input {
                 Input::Text(t) => {
                     if !self.filter_text(&t) {
+                        // As any other key, it takes questions away.
+                        self.dismiss(None);
                         self.hide_pointer(true);
                         self.typed(t.into_bytes());
                     }
@@ -3336,9 +3440,11 @@ impl App {
         );
         let action = keymap::action(k, &self.config.keys);
         // A copy key with no selection in view goes to the program.
-        let hidden = action == Some(Action::Copy) && !copy_key_copies(k, self.selection_shown());
+        let shown = self.selection_shown();
+        let hidden =
+            action == Some(Action::Copy) && !copy_key_copies(k, shown, self.orphan.is_some());
         let action = action.filter(|_| !hidden);
-        if k.down && !modifier {
+        if k.down && !modifier && !lock_key(k.vk) {
             self.dismiss(action);
         }
         if let Some(a) = action
@@ -3424,22 +3530,22 @@ impl App {
     }
 
     /// Pastes `text` into pane `id`, the focused one, or asks first as
-    /// [`vt::keys::needs_paste_confirm`] says; `confirmed` when this is the
-    /// answer. A single line goes without its line break, so it is not run.
-    fn paste(&mut self, id: PaneId, text: &str, confirmed: bool) {
+    /// [`vt::keys::needs_paste_confirm`] says, as `ask` makes the question;
+    /// `confirmed` when this is the answer. A single line goes without its
+    /// line break, so it is not run.
+    fn paste(&mut self, id: PaneId, text: &str, confirmed: bool, ask: fn(String) -> Ask) {
         let text = trim_paste(text);
         let Some(v) = self.view(id).filter(|_| !text.is_empty()) else {
             return;
         };
-        let label = format!("{} {}", v.pane.name, id.0);
+        let label = format!("{} {}", v.pane.name, v.num);
         if let Some(refused) = paste_refused(&label, v.pane.exit_code) {
             self.set_notice(id, refused, None, false);
             return;
         }
-        let claude = v.pane.claude.is_some();
         let mut term = lock(&v.pane.term);
         let bracketed = term.input_modes().bracketed;
-        let trusted = paste_trusted(&term, claude);
+        let trusted = term.paste_trusted();
         if confirmed {
             term.confirm_paste();
         }
@@ -3447,7 +3553,7 @@ impl App {
         if !confirmed && vt::keys::needs_paste_confirm(text, bracketed, trusted) {
             let key = keymap::keys_for(Action::Paste, &self.config.keys);
             let asked = paste_question(text, key.as_deref());
-            self.ask(id, asked, Ask::Paste(text.to_owned()));
+            self.ask(id, asked, ask(text.to_owned()));
             return;
         }
         let mut out = Vec::new();
@@ -3517,12 +3623,8 @@ impl App {
     }
 
     /// Says in pane `id` what a copy did: briefly and dimly when it
-    /// worked, a while longer when it did not. A brief notice never hides
-    /// one that stays up, such as how to close a pane that exited.
+    /// worked, a while longer when it did not.
     fn notice_copy(&mut self, id: PaneId, text: String, worked: bool) {
-        if worked && self.holds_notice(id) {
-            return;
-        }
         let shown = if worked { BRIEF } else { NOTICE };
         self.set_notice(id, text, Some(Instant::now() + shown), worked);
     }
@@ -3538,27 +3640,26 @@ impl App {
                 let Some(id) = before else {
                     return false;
                 };
-                // The answer to a question pastes what it asked about.
-                let asked = (self.view_mut(id))
-                    .and_then(|v| v.notice.take_if(|n| matches!(n.ask, Ask::Paste(_))));
-                if let Some(Notice {
-                    ask: Ask::Paste(text),
-                    ..
-                }) = asked
-                {
+                // Files copied in Explorer paste as their paths.
+                let text = (crate::clipboard::get_text().filter(|t| !t.is_empty()))
+                    .or_else(|| crate::clipboard::get_files().map(|f| quote_paths(&f)));
+                // The answer to a question pastes what it asked about; a
+                // clipboard that changed since asks again.
+                let asked = (self.view_mut(id)).and_then(|v| {
+                    v.notice
+                        .take_if(|n| matches!(n.ask, Ask::Paste(_) | Ask::Drop(_)))
+                });
+                if asked.is_some() {
                     self.request_redraw();
-                    self.paste(id, &text, true);
+                }
+                if let Some(answer) = asked.and_then(|n| answers(n.ask, text.as_deref())) {
+                    self.paste(id, &answer, true, Ask::Paste);
                     return true;
                 }
-                let text = match crate::clipboard::get_text().filter(|t| !t.is_empty()) {
-                    Some(t) => t,
-                    // Files copied in Explorer paste as their paths.
-                    None => match crate::clipboard::get_files() {
-                        Some(files) => quote_paths(&files),
-                        None => return self.paste_image(id),
-                    },
+                let Some(text) = text else {
+                    return self.paste_image(id);
                 };
-                self.paste(id, &text, false);
+                self.paste(id, &text, false, Ask::Paste);
             }
             Action::QuickSelect => {
                 let Some(v) = self.current() else {
@@ -3576,10 +3677,13 @@ impl App {
                     return true;
                 }
                 self.find = None;
+                let mut found: Vec<Found> = items.iter().map(|i| i.0).collect();
+                found.sort();
                 self.quick = Some(Quick {
                     pane: id,
                     epoch,
                     items,
+                    found,
                 });
                 self.request_redraw();
             }
@@ -3602,7 +3706,7 @@ impl App {
                         start: (first, 0),
                         end: (last, 0),
                     };
-                    reveal(&mut term, m, v.grid.1);
+                    reveal(&mut term, m, v.grid.1, 0);
                 }
                 drop(term);
                 v.selection = Some(sel);
@@ -3636,9 +3740,14 @@ impl App {
                 };
                 lock(&v.pane.term).clear_scrollback();
                 // The console host draws the screen again after this.
-                v.pane.pty.clear();
+                let screen = v.pane.pty.clear();
+                let id = v.pane.id;
                 if let Some(f) = self.find.as_mut() {
                     f.stale = true;
+                }
+                if !screen {
+                    let text = "Cleared the scrollback; this console host cannot clear the screen";
+                    self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
                 }
                 self.request_redraw();
             }
@@ -3851,7 +3960,7 @@ impl App {
                 let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
                 let asked = self.banner_note.take_if(|n| n.1 == Ask::Update);
                 let again = again(a, &self.config.keys);
-                let (others, main) = (crate::handoff::others(), !self.args.new_window);
+                let (others, main) = (crate::handoff::others(), !self.args.separate());
                 let ask = crate::update::confirm(&v, busy, others, main, &again);
                 let asks = asks(asked.is_some(), self.at_close.as_ref(), &v);
                 if let Some((text, later)) = ask.filter(|_| asks) {
@@ -4076,12 +4185,8 @@ impl App {
                     self.close(el, id);
                     return;
                 }
-                self.set_notice(
-                    id,
-                    format!("{} \u{b7} Enter restart \u{b7} Esc close", exit_text(code)),
-                    None,
-                    false,
-                );
+                // `notice_line` says so from now on.
+                self.request_redraw();
             }
             // The selection and link under the pointer end with the line
             // numbers they used; matches are found again.
@@ -4124,20 +4229,13 @@ impl App {
                 }
                 let silent = hooks_silent(v.claude_working, v.hooks_seen, Instant::now());
                 let (was, now) = (v.pane.claude_title, claude_title(&t).map(|c| c.0));
-                let asked = v.pane.attn.state == Attn::NeedsYou;
                 v.pane.claude_title = now;
                 v.pane.title = t;
                 // This needs no hooks, and it sees a turn the user
                 // interrupted end, which runs no hook at all.
                 match (was, now) {
-                    // Back at work: a question it showed was answered.
                     (w, Some(true)) if w != Some(true) => {
-                        if self.attention(id, Ev::Busy)
-                            && asked
-                            && let Some(v) = self.view_mut(id)
-                        {
-                            v.pane.msg.clear();
-                        }
+                        self.attention(id, Ev::Busy);
                     }
                     (Some(true), Some(false)) => {
                         self.attention(id, Ev::Quiet);
@@ -4167,12 +4265,14 @@ impl App {
                         }
                     }
                 }
-                // A long command that ended while the user looked away.
-                if let Some((ev, msg)) = ended
+                // A long command that ended while the user looked away. Its
+                // time, not that of a Claude Code turn before it, shows.
+                if let Some((ev, msg, took)) = ended
                     && self.attention(id, ev)
                     && let Some(v) = self.view_mut(id)
                 {
                     v.pane.msg = msg;
+                    v.pane.attn.took = Some(took);
                 }
             }
             Event::Notify { title, body } => match Ev::from_notify(&title, &v.pane.token) {
@@ -4180,6 +4280,7 @@ impl App {
                     v.hooks_seen = true;
                     v.pane.cmd.hooked = true;
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
+                    hook_confirms_paste(&mut lock(&v.pane.term), ev);
                     v.pane.hooked = ev != Ev::Idle;
                     self.hooked = true;
                     if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
@@ -4209,10 +4310,13 @@ impl App {
                 self.attention(id, Ev::Bell);
             }
             // OSC 52. The pane says so, as any program can write there.
+            // Only the pane the user is in, with blitz in front, copies:
+            // output in another cannot swap the clipboard under them.
             Event::Clipboard(text) => {
+                let here = Some(id) == self.focus_id() && self.focused;
                 let owner = Some(HWND(self.hwnd as *mut c_void));
-                let copied = crate::clipboard::set_text(owner, &text);
-                self.notice_copy(id, program_copy_notice(&text, copied), copied);
+                let copied = here && crate::clipboard::set_text(owner, &text);
+                self.notice_copy(id, program_copy_notice(&text, here, copied), copied);
             }
             _ => {}
         }
@@ -4394,6 +4498,7 @@ impl App {
         // While it is open, it covers the panes: the focused one is not in
         // view. Nor is anything while the user is away from the screen.
         let here = present(self.focused, idle_for());
+        self.away |= !here;
         let attended = here && self.game.is_none() && self.focus_id() == Some(id);
         let away = !here;
         let Some(v) = self.views.iter_mut().find(|v| v.pane.id == id) else {
@@ -4487,7 +4592,7 @@ impl App {
     fn global_jump(&mut self) {
         // Not `persist`, which a session that failed to come back turns
         // off while the window still takes launches.
-        let on = self.config.global_jump && !self.args.new_window && !self.args.scripted();
+        let on = self.config.global_jump && self.args.main();
         if on == self.jump_key {
             return;
         }
@@ -4547,12 +4652,15 @@ impl App {
             .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
         let size = (size.width as i32, size.height as i32);
         let tw = self.text_cell().0 as i32;
-        chrome::area(
-            &self.win,
-            size,
-            self.scale as f32,
-            self.update.as_ref().map(|u| u.1.as_str()),
-            tw,
+        chrome::area(&self.win, size, self.scale as f32, self.banner(), tw)
+    }
+
+    /// The text of the update strip or cue, which also decides whether
+    /// the strip takes room under the panes.
+    fn banner(&self) -> Option<&str> {
+        banner_text(
+            self.update.as_ref(),
+            self.banner_note.as_ref().map(|n| n.0.as_str()),
         )
     }
 
@@ -4560,7 +4668,7 @@ impl App {
     /// or a row of the sidebar. The second value is true for the sidebar.
     fn hit(&self, pos: PhysicalPosition<f64>) -> (Option<PaneId>, bool) {
         let (x, y) = (pos.x as i32, pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let area = self.tab_area();
         let (rects, side) = match self.win.tabs.get(self.win.active) {
             Some(_) if x < area.x => (self.side.rows.clone(), true),
@@ -4600,7 +4708,13 @@ impl App {
         match dropped(paths, self.hit(pos)) {
             Some(Dropped::Paste(id, text)) => {
                 self.show(id);
-                self.paste(id, &text, false);
+                self.paste(id, &text, false, Ask::Drop);
+            }
+            Some(Dropped::Open(dirs)) if dirs.is_empty() => {
+                if let Some(id) = self.focus_id() {
+                    let text = "Only folders open from the sidebar; drop files on a pane";
+                    self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                }
             }
             Some(Dropped::Open(dirs)) => {
                 for dir in dirs {
@@ -4672,7 +4786,7 @@ impl App {
     /// own mouse mode.
     fn mouse_report(&mut self, id: PaneId, kind: MouseKind, button: u8, mods: Mods) {
         let (col, row) = self.cell_in(id, self.mouse.pos);
-        let Some(v) = self.views.iter().find(|v| v.pane.id == id) else {
+        let Some(v) = self.views.iter_mut().find(|v| v.pane.id == id) else {
             return;
         };
         let m = lock(&v.pane.term).input_modes();
@@ -4684,7 +4798,7 @@ impl App {
             mods,
         };
         let mut out = Vec::new();
-        if self.mouse.tracker.encode(ev, &m, &mut out) {
+        if v.tracker.encode(ev, &m, &mut out) {
             v.pane.send(out);
         }
     }
@@ -4740,8 +4854,7 @@ impl App {
             }
             return;
         }
-        let chip = (self.below.iter())
-            .find(|(_, r)| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        let chip = (self.below.iter()).find(|(_, r)| r.contains(x, y));
         if pressed
             && b == 0
             && let Some(&(id, _)) = chip
@@ -4753,8 +4866,7 @@ impl App {
             return;
         }
         // A click on the find bar keeps it, where one below it closes it.
-        let on_find = (self.find_bar)
-            .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        let on_find = (self.find_bar).is_some_and(|r| r.contains(x, y));
         if pressed && on_find && self.find.is_some() {
             return;
         }
@@ -4787,6 +4899,7 @@ impl App {
                 Some(Side::More(ids)) => self.show_hidden(&ids),
                 Some(Side::Rail) => {
                     self.win.toggle_sidebar();
+                    self.fit_min_size();
                     self.request_redraw();
                 }
                 None => {}
@@ -4807,7 +4920,7 @@ impl App {
             }
             let on_grid = (self.current())
                 .and_then(|v| v.rect)
-                .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+                .is_some_and(|r| r.contains(x, y));
             if !on_grid {
                 return;
             }
@@ -4984,14 +5097,25 @@ impl App {
             return Some((Target::Uri(uri.to_owned()), (a, b)));
         }
         let l = Logical::new(&t, &self.theme.pal, at.0);
+        // Output goes on while the line is scanned and the disk looked at.
+        drop(t);
         let here = l.cells[l.index(at)?].0;
         let (range, found) =
             (crate::links::scan(&l.text).into_iter()).find(|(r, _)| r.contains(&here))?;
         let target = match found {
             Link::Url(u) => Target::Uri(u),
-            Link::Path(p, at) => Target::Path(crate::links::resolve(&p, &v.pane.cwd)?, at),
+            Link::Path(p, at) => Target::Path(self.resolve(&p, &v.pane.cwd)?, at),
         };
         Some((target, l.span(range)))
+    }
+
+    /// [`crate::links::resolve`], answered again without looking at the
+    /// disk while Ctrl stays held over one path: each move of the pointer
+    /// and each repeat of a held key asks, and a slow drive would make
+    /// every one of them wait.
+    fn resolve(&self, word: &str, cwd: &str) -> Option<PathBuf> {
+        let last = &mut self.resolved.borrow_mut();
+        resolve_again(last, word, cwd, crate::links::resolve)
     }
 
     /// The link under the pointer that a click with `mods` held opens,
@@ -5010,7 +5134,12 @@ impl App {
     /// Underlines the link under the pointer, and shows the hand, while a
     /// click would open it; see [`Self::ctrl_link`].
     fn update_hover(&mut self) {
-        let hover = (self.ctrl_link(&mods_now())).and_then(|(_, (a, b))| {
+        let mods = mods_now();
+        // A file made since Ctrl was last held counts.
+        if !(mods.lctrl || mods.rctrl) {
+            *self.resolved.get_mut() = None;
+        }
+        let hover = (self.ctrl_link(&mods)).and_then(|(_, (a, b))| {
             let epoch = lock(&self.current()?.pane.term).line_epoch();
             Some((epoch, a, b))
         });
@@ -5041,7 +5170,7 @@ impl App {
     fn update_pointer(&mut self) {
         let pos = self.mouse.pos;
         let (x, y) = (pos.x as i32, pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let panel = self.commands.is_some()
             || self.settings.is_some()
             || self.picker.is_some()
@@ -5183,24 +5312,11 @@ impl App {
         if self.game.is_some() {
             return;
         }
-        // Ctrl and the wheel change the font size, unless the program takes
-        // the mouse.
-        let mods = mods_now();
-        if (mods.lctrl || mods.rctrl) && self.modes().mouse == MouseMode::Off {
-            let now = Instant::now();
-            if let Some(by) = wheel_font(steps, self.mouse.font_at, now) {
-                self.mouse.font_at = Some(now);
-                self.font_size(by);
-            }
-            return;
-        }
         // The pane under the pointer takes the wheel without taking focus:
         // its history scrolls, or a full-screen program there gets the
         // reports at its own cell. Outside the panes it is the focused one's.
+        let mods = mods_now();
         let (under, side) = self.hit(self.mouse.pos);
-        if side {
-            return;
-        }
         let Some(v) = under.or(self.focus_id()).and_then(|id| self.view(id)) else {
             return;
         };
@@ -5208,8 +5324,16 @@ impl App {
         let focused = Some(id) == self.focus_id();
         let m = lock(&v.pane.term).input_modes();
         let lines = steps as isize * wheel_lines(scroll_lines(), v.grid.1);
-        let shift = mods.lshift || mods.rshift;
-        match wheel_does(&m, shift, v.pane.claude.is_some(), focused) {
+        let cells = self.grid_cell(id, self.mouse.pos).is_some();
+        match wheel_does(&m, &mods, v.pane.claude.is_some(), focused, cells) {
+            Wheel::Font => {
+                let now = Instant::now();
+                if let Some(by) = wheel_font(steps, self.mouse.font_at, now) {
+                    self.mouse.font_at = Some(now);
+                    self.font_size(by);
+                }
+            }
+            _ if side => {}
             Wheel::Report => {
                 let kind = if steps > 0.0 {
                     MouseKind::WheelUp
@@ -5241,7 +5365,12 @@ impl App {
             return;
         }
         // A narrow window has no room for the sidebar.
-        self.win.fit_width(size.width as f32 / self.scale as f32);
+        if self.win.fit_width(size.width as f32 / self.scale as f32) {
+            self.fit_min_size();
+        }
+        // What is under a still pointer can change too, as when a program
+        // takes the mouse or a panel opens from the keyboard.
+        self.update_pointer();
         self.ensure_gfx();
         let Some(g) = &self.gfx else {
             return;
@@ -5349,9 +5478,7 @@ impl App {
                 v.snap.highlight(&f.found, f.cur);
             }
             if let Some(q) = self.quick.as_ref().filter(|q| q.pane == id) {
-                let mut found: Vec<Found> = q.items.iter().map(|i| i.0).collect();
-                found.sort();
-                v.snap.highlight(&found, None);
+                v.snap.highlight(&q.found, None);
             }
             // Only the focused pane has a link under the pointer.
             let hover = (self.hover)
@@ -5435,8 +5562,9 @@ impl App {
                     let rows = v.grid.1.min((at.h / ch as i32) as u16);
                     g.r.clipped(at, |r| {
                         r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
-                        if let Some(n) = &v.notice {
-                            draw_notice(r, &pal, at, (v.grid.0, rows), n);
+                        if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code)
+                        {
+                            draw_notice(r, &pal, at, (v.grid.0, rows), &text, dim);
                         }
                     });
                 }
@@ -5520,12 +5648,17 @@ impl App {
         self.request_redraw();
     }
 
-    /// Shows the hidden window when [`shows`] says so.
+    /// Shows the hidden window when [`shows`] says so. One restored
+    /// maximized shows its first frame, then maximizes; the frame at the
+    /// new size follows.
     fn reveal(&mut self, presented: bool) {
         if shows(self.hidden_until, presented, Instant::now()) {
             self.hidden_until = None;
             if let Some(w) = &self.window {
                 w.set_visible(true);
+                if self.maximize {
+                    w.set_maximized(true);
+                }
             }
         }
     }
@@ -5946,13 +6079,10 @@ fn ends_game(attn: crate::attention::PaneAttn, ev: Ev, now: Instant) -> bool {
     seen.apply(ev, false, now) && seen.state == Attn::NeedsYou
 }
 
-/// Whether a pane title shows Claude Code working: it puts a half-filled
-/// circle in front, which turns as it works.
+/// Whether a pane title shows Claude Code working, as the sidebar reads
+/// it too.
 fn claude_working_title(title: &str) -> bool {
-    title
-        .chars()
-        .next()
-        .is_some_and(|c| ('\u{25d0}'..='\u{25d3}').contains(&c))
+    claude_title(title).is_some_and(|(working, _)| working)
 }
 
 /// The hint about Claude Code's hooks, `older` than this blitz or not
@@ -6031,12 +6161,12 @@ fn prompt_back(prompted: &mut bool, resume: &mut Option<(String, Instant)>) -> P
 fn tell_focus(v: &View, focused: bool) {
     let mut out = Vec::new();
     // Under one lock, so a program turning reports on meanwhile is told
-    // either way.
+    // either way, and its reports reach it in the order they were made.
     let mut term = lock(&v.pane.term);
     term.set_focused(focused);
     vt::encode_focus(focused, &term.input_modes(), &mut out);
-    drop(term);
     v.pane.send(out);
+    drop(term);
 }
 
 /// Whether the user is at the window: it is in front, and they touched a
@@ -6093,6 +6223,12 @@ fn busy_text(busy: &[&str], place: &str) -> String {
 /// cannot answer the question a busy session asks.
 fn alt_f4_passes(down: bool, lparam: isize) -> bool {
     !down || !keymap::held_before(lparam)
+}
+
+/// Caps Lock, Num Lock and Scroll Lock, which like a modifier change how
+/// keys type and answer no question.
+fn lock_key(vk: u16) -> bool {
+    matches!(vk, 0x14 | 0x90 | 0x91)
 }
 
 /// How to confirm action `a`: its first key again, or with none, the
@@ -6249,11 +6385,38 @@ fn toast_text(s: &chrome::Session) -> [String; 3] {
     ]
 }
 
+/// How many rows of `cell_h` pixels the find bar covers at the top of a
+/// pane, as the chrome draws it: a line of `text_h` pixel text, with 5
+/// pixels at `scale` above and below.
+fn bar_rows(text_h: u32, scale: f64, cell_h: u32) -> u16 {
+    let bar = f64::from(text_h) + (10.0 * scale).round();
+    (bar / f64::from(cell_h.max(1))).ceil() as u16
+}
+
+/// `look` at path `word` in folder `cwd`, unless `last` was the same
+/// question; then its answer.
+fn resolve_again(
+    last: &mut Option<(String, String, Option<PathBuf>)>,
+    word: &str,
+    cwd: &str,
+    look: impl FnOnce(&str, &str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some((w, c, found)) = last
+        && (w.as_str(), c.as_str()) == (word, cwd)
+    {
+        return found.clone();
+    }
+    let found = look(word, cwd);
+    *last = Some((word.to_owned(), cwd.to_owned(), found.clone()));
+    found
+}
+
 /// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
-/// unless it shows already. Returns whether the view moved.
-fn reveal(term: &mut vt::Terminal, m: Found, rows: u16) -> bool {
+/// unless it shows already below the `covered` rows at its top, which the
+/// find bar hides. Returns whether the view moved.
+fn reveal(term: &mut vt::Terminal, m: Found, rows: u16, covered: u16) -> bool {
     let (top, rows) = (term.view_top(), usize::from(rows));
-    if (top..top + rows).contains(&m.start.0) {
+    if (top + usize::from(covered)..top + rows).contains(&m.start.0) {
         return false;
     }
     term.scroll_to(m.start.0.saturating_sub(rows / 2));
@@ -6263,6 +6426,8 @@ fn reveal(term: &mut vt::Terminal, m: Found, rows: u16) -> bool {
 /// What the wheel does over a pane whose program is in modes `m`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Wheel {
+    /// The font size, with Ctrl.
+    Font,
     /// Wheel reports to the program, which takes the mouse.
     Report,
     /// Arrow keys, as in xterm's alternateScroll (mode 1007): pagers have
@@ -6273,14 +6438,19 @@ enum Wheel {
     Nothing,
 }
 
-/// What the wheel does over a pane in modes `m`; `shift` keeps it from a
-/// program that takes the mouse. Arrows go only to a program that asked
-/// for them in the `focused` pane, where the user types, and never to
+/// What the wheel does over a pane in modes `m`, with modifiers `mods`.
+/// Ctrl changes the font size, unless the program takes the mouse; Shift
+/// keeps it from such a program, which hears of it only over its own
+/// `cells`. Arrows go only to a full-screen program that did not turn
+/// them off, in the `focused` pane, where the user types, and never to
 /// Claude Code (`claude`), where they walk its prompt history and replace
 /// what was typed.
-fn wheel_does(m: &InputModes, shift: bool, claude: bool, focused: bool) -> Wheel {
-    if m.mouse != MouseMode::Off && !shift {
-        Wheel::Report
+fn wheel_does(m: &InputModes, mods: &Mods, claude: bool, focused: bool, cells: bool) -> Wheel {
+    let program = m.mouse != MouseMode::Off;
+    if (mods.lctrl || mods.rctrl) && !program {
+        Wheel::Font
+    } else if program && !(mods.lshift || mods.rshift) {
+        if cells { Wheel::Report } else { Wheel::Nothing }
     } else if !m.alt_screen {
         Wheel::Scroll
     } else if m.alt_scroll && !claude && focused {
@@ -6356,16 +6526,36 @@ fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
     lines.into_iter().map(|l| format!(" {l}")).collect()
 }
 
+/// A passing hint shows only where no question or error waits, which
+/// it would take the place of.
+fn hint_fits(n: Option<&Notice>) -> bool {
+    n.is_none_or(|n| n.ask == Ask::Nothing)
+}
+
+/// The notice of a pane, and whether it is dim: its own, else for
+/// a program that exited, how and what Enter and Esc do, which comes
+/// back when a notice over it goes.
+fn notice_line(n: Option<&Notice>, exit: Option<u32>) -> Option<(Cow<'_, str>, bool)> {
+    match (n, exit) {
+        (Some(n), _) => Some((Cow::Borrowed(n.text.as_str()), n.dim)),
+        (None, Some(code)) => {
+            let text = format!("{} \u{b7} Enter restart \u{b7} Esc close", exit_text(code));
+            Some((Cow::Owned(text), false))
+        }
+        (None, None) => None,
+    }
+}
+
 /// Draws a notice over the bottom rows of the pane whose grid is at `at`.
-fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &Notice) {
+fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text: &str, dim: bool) {
     let (_, ch) = r.cell();
-    let lines = notice_rows(&n.text, grid);
+    let lines = notice_rows(text, grid);
     let rows = (lines.len() as u16).clamp(1, grid.1.max(1));
     let mut s = text_snapshot(&lines.join("\n"), grid.0, rows, pal);
-    let bg = if n.dim { pal.bg } else { pal.selection_bg };
+    let bg = if dim { pal.bg } else { pal.selection_bg };
     for c in &mut s.cells {
         c.bg = bg;
-        if n.dim {
+        if dim {
             c.attrs |= vt::snapshot::attr::DIM;
         }
     }
@@ -6485,13 +6675,16 @@ fn shows(until: Option<Instant>, presented: bool, now: Instant) -> bool {
 
 /// Asks Windows to start blitz again, with its saved session, after it
 /// restarts for an update or the user signs back in with "restart apps"
-/// on. Not after a crash or a hang, which could happen again at once.
+/// on. Not after a crash or a hang, which could happen again at once,
+/// nor after an installer closes it: blitz's own starts it again itself,
+/// and one run as administrator would start it elevated.
 fn restart_after_reboot() {
     use windows::Win32::System::Recovery::{
-        RESTART_NO_CRASH, RESTART_NO_HANG, RegisterApplicationRestart,
+        RESTART_NO_CRASH, RESTART_NO_HANG, RESTART_NO_PATCH, RegisterApplicationRestart,
     };
+    let flags = RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_PATCH;
     // SAFETY: no command line, so blitz starts with none.
-    let _ = unsafe { RegisterApplicationRestart(None, RESTART_NO_CRASH | RESTART_NO_HANG) };
+    let _ = unsafe { RegisterApplicationRestart(None, flags) };
 }
 
 /// Whether setup made blitz start when the user signs in.
@@ -6532,9 +6725,12 @@ fn placement(was: Geometry, now: Geometry, minimized: bool, fullscreen: bool) ->
     if !now.maximized {
         return now;
     }
-    let (cx, cy) = (was.x + was.w as i32 / 2, was.y + was.h as i32 / 2);
-    let there =
-        (now.x..now.x + now.w as i32).contains(&cx) && (now.y..now.y + now.h as i32).contains(&cy);
+    // In i64: `was` can come from the session file, at any size.
+    let inside = |at: i32, size: u32, room_at: i32, room: u32| {
+        let (room_at, mid) = (i64::from(room_at), i64::from(at) + i64::from(size) / 2);
+        (room_at..room_at + i64::from(room)).contains(&mid)
+    };
+    let there = inside(was.x, was.w, now.x, now.w) && inside(was.y, was.h, now.y, now.h);
     let was = Geometry {
         maximized: true,
         ..was
@@ -6542,12 +6738,23 @@ fn placement(was: Geometry, now: Geometry, minimized: bool, fullscreen: bool) ->
     if there {
         return was;
     }
-    let mid = |at: i32, room: u32, size: u32| at + (room as i32 - size as i32).max(0) / 2;
+    let mid = |at: i32, room: u32, size: u32| {
+        at.saturating_add(((i64::from(room) - i64::from(size)).max(0) / 2) as i32)
+    };
     Geometry {
         x: mid(now.x, now.w, was.w),
         y: mid(now.y, now.h, was.h),
         ..was
     }
+}
+
+/// `attrs` for a window at `g`, the place it is restored to. Not
+/// maximized yet: winit shows a window as it maximizes it, which would be
+/// before its first frame, so [`App::reveal`] does.
+fn placed_at(attrs: WindowAttributes, g: Geometry) -> WindowAttributes {
+    attrs
+        .with_position(PhysicalPosition::new(g.x, g.y))
+        .with_inner_size(PhysicalSize::new(g.w, g.h))
 }
 
 /// `g`, moved onto the primary monitor when no monitor shows enough of it.
@@ -6823,6 +7030,14 @@ fn new_tab(win: &mut layout::Window, id: PaneId) -> bool {
     true
 }
 
+/// Whether a pane's title names its session: it has Claude Code's mark,
+/// and Claude Code is known to run there, as its hooks with the pane's
+/// token or blitz's resume say. Any program can print the mark, and
+/// would then go by a name it picked, perhaps one like another session's.
+fn titled_by_claude(mark: Option<bool>, hooked: bool, session: Option<&str>) -> bool {
+    mark.is_some() && (hooked || session.is_some())
+}
+
 /// What the sidebar calls a session, and the message under its name: the
 /// name the user gave it, else for Claude Code the task its title names,
 /// which Claude's /rename changes too (`claude` says the title has its
@@ -6877,8 +7092,12 @@ fn without_indent(text: &str) -> String {
     lines.join("\r\n")
 }
 
-/// What a pane says when its program copied `text` with OSC 52.
-fn program_copy_notice(text: &str, copied: bool) -> String {
+/// What a pane says when its program copied `text` with OSC 52, `here`
+/// when the pane had the user's focus.
+fn program_copy_notice(text: &str, here: bool, copied: bool) -> String {
+    if !here {
+        return "A program here tried to copy while you were elsewhere; nothing was copied".into();
+    }
     if !copied {
         return copy_notice(text, false, false);
     }
@@ -6941,10 +7160,11 @@ fn first_line(text: &str) -> String {
 }
 
 /// Whether copy key `k` copies a selection that `shown` says is in view or
-/// not, when there is one. Plain Ctrl+C is the interrupt too, so it copies
-/// only what the user can see; the other copy keys always copy.
-fn copy_key_copies(k: &KeyInput, shown: Option<bool>) -> bool {
-    shown != Some(false) || !vt::keys::is_interrupt(k)
+/// not, when there is one, or else the text of one output rewrote
+/// (`orphan`), which shows nowhere. Plain Ctrl+C is the interrupt too, so
+/// it copies only what the user can see; the other copy keys always copy.
+fn copy_key_copies(k: &KeyInput, shown: Option<bool>, orphan: bool) -> bool {
+    shown.or(orphan.then_some(false)) != Some(false) || !vt::keys::is_interrupt(k)
 }
 
 /// Whether a copy key that found nothing to copy is kept from the program.
@@ -6954,20 +7174,27 @@ fn eats_copy_key(k: &KeyInput, m: &InputModes) -> bool {
     !vt::keys::is_interrupt(k) && vt::keys::interrupts(k, m)
 }
 
-/// Whether a paste into `term` goes in without asking; see
-/// [`vt::keys::needs_paste_confirm`]. Claude Code, known by its hook
-/// notifications (`claude`), reads every paste under bracketed paste as
-/// text, so there it needs no confirmed paste first.
-fn paste_trusted(term: &vt::Terminal, claude: bool) -> bool {
-    term.paste_trusted() || claude && term.input_modes().bracketed
+/// What a hook notification `ev` from Claude Code does to pastes into
+/// `term`: Claude Code reads every paste under bracketed paste as text, so
+/// one confirms bracketed paste as the user would. Like theirs, it lasts
+/// until bracketed paste is turned on anew, as by a shell left behind
+/// when Claude Code dies without saying so.
+fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
+    if ev != Ev::Idle {
+        term.confirm_paste();
+    }
 }
 
 /// Paths as a paste types them: joined by spaces, each in quotes when it
-/// holds a space, as Windows Terminal does.
+/// holds anything but letters, digits and `_.-:\/`, so no shell reads a
+/// name such as `a&calc.txt` as syntax. A `$` or backtick gets single
+/// quotes, which PowerShell does not expand; they mean nothing to cmd.
 fn quote_paths(paths: &[PathBuf]) -> String {
+    let plain = |c: char| c.is_alphanumeric() || "_.-:\\/".contains(c);
     let quoted: Vec<String> = (paths.iter())
         .map(|p| match p.to_string_lossy() {
-            s if s.contains(' ') => format!("\"{s}\""),
+            s if s.contains(['$', '`']) => format!("'{}'", s.replace('\'', "''")),
+            s if !s.chars().all(plain) => format!("\"{s}\""),
             s => s.into_owned(),
         })
         .collect();
@@ -7024,13 +7251,31 @@ fn alt_v(m: &InputModes) -> Vec<u8> {
 }
 
 /// Why nothing is pasted into the pane `label` names, when its program
-/// exited with `code`. The notice it replaces said how to close the pane,
-/// so this one does too.
+/// exited with `code`. The notice it replaces said how to restart or
+/// close the pane, so this one does too.
 fn paste_refused(label: &str, code: Option<u32>) -> Option<String> {
-    let code = code?;
     Some(format!(
-        "{label} exited with code {code}, so nothing was pasted \u{b7} Enter close"
+        "{label} exited ({}), so nothing was pasted \u{b7} Enter restart \u{b7} Esc close",
+        exit_text(code?)
     ))
+}
+
+/// Whether a dim notice that goes away at `until` would hide `old`, one
+/// that stays up, such as why nothing was pasted into a pane that exited
+/// or a question waiting for its answer. News never does.
+fn hides_lasting(old: Option<&Notice>, until: Option<Instant>, dim: bool) -> bool {
+    dim && until.is_some() && old.is_some_and(|n| n.until.is_none())
+}
+
+/// What pasting answers paste question `ask` with, the clipboard holding
+/// `now`: the text it asked about, while the clipboard still holds it.
+/// Dropped files are answered whatever the clipboard holds.
+fn answers(ask: Ask, now: Option<&str>) -> Option<String> {
+    match ask {
+        Ask::Drop(text) => Some(text),
+        Ask::Paste(text) if now.map(trim_paste) == Some(text.as_str()) => Some(text),
+        _ => None,
+    }
 }
 
 /// `text` without the line break at its end when that is its only one: a
@@ -7048,13 +7293,19 @@ fn trim_paste(text: &str) -> &str {
 /// What a paste that needs confirming asks: how many lines, how they
 /// start, and the paste `key`, when one is bound.
 fn paste_question(text: &str, key: Option<&str>) -> String {
-    let first = text.trim_start().lines().next().unwrap_or_default();
-    let mut chars = first.chars().filter(|c| !c.is_control());
-    let mut start: String = chars.by_ref().take(40).collect();
-    if chars.next().is_some() {
+    // A lone CR is Enter too, and the preview leaves out what would hide
+    // or reorder the text.
+    let first = (text.trim_start().split(['\r', '\n']).next()).unwrap_or_default();
+    let mut start = vt::osc::clean(first, 41);
+    if start.chars().count() > 40 {
+        start.pop();
         start.push('\u{2026}');
     }
-    let lines = text.lines().count();
+    let lines = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .count();
     let s = if lines == 1 { "" } else { "s" };
     let again = match key {
         Some(k) => format!("Press {k} again"),
@@ -7333,6 +7584,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // that could run or escape anything.
                 text.retain(|c| !c.is_control());
                 if !self.filter_text(&text) {
+                    self.dismiss(None);
                     self.hide_pointer(true);
                     self.typed(text.into_bytes());
                 }
@@ -7455,6 +7707,14 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.drain_keys(el);
         self.on_drop();
+        // Back at the screen, with a key or the mouse: the focused pane
+        // is in view again.
+        if self.away && self.game.is_none() && present(self.focused, idle_for()) {
+            self.away = false;
+            if let Some(id) = self.focus_id() {
+                self.attention(id, Ev::Attended);
+            }
+        }
         self.save_session(false);
         // Here, after every batch of events, rather than at each change:
         // a minimized window is not drawn.
@@ -8104,6 +8364,22 @@ mod tests {
     }
 
     #[test]
+    fn app_a_held_ctrl_looks_at_a_path_once() {
+        let mut looks = 0;
+        let mut last = None;
+        for word in ["a.txt", "a.txt", "b.txt"] {
+            resolve_again(&mut last, word, "C:/x", |w, _| {
+                looks += 1;
+                Some(PathBuf::from(w))
+            });
+        }
+        assert_eq!(looks, 2);
+        let again = resolve_again(&mut last, "b.txt", "C:/x", |_, _| None);
+        assert_eq!(again, Some(PathBuf::from("b.txt")));
+        assert_eq!(resolve_again(&mut last, "b.txt", "C:/y", |_, _| None), None);
+    }
+
+    #[test]
     fn app_links_map_back_to_their_cells() {
         let t = fed(10, 3, "go https://e.com/abc now");
         let l = Logical::new(&t, &crate::theme::dark(), 1);
@@ -8309,11 +8585,10 @@ mod tests {
         assert_eq!(wheel_lines(u32::MAX, 40), 39, "a page");
         assert_eq!(wheel_lines(u32::MAX, 1), 1);
         assert_eq!(wheel_lines(5000, 40), 100);
-        assert!(scroll_lines() <= 100 || scroll_lines() == u32::MAX);
     }
 
     #[test]
-    fn app_wheel_sends_arrows_only_when_asked_and_never_to_claude() {
+    fn app_wheel_sends_arrows_unless_turned_off_and_never_to_claude() {
         let alt = InputModes {
             alt_screen: true,
             ..InputModes::default()
@@ -8326,10 +8601,13 @@ mod tests {
             mouse: MouseMode::Click,
             ..asked
         };
-        let does = |m: &InputModes, shift, claude| wheel_does(m, shift, claude, true);
+        let does = |m: &InputModes, shift, claude| wheel_does(m, &held(shift), claude, true, true);
         assert_eq!(does(&InputModes::default(), false, false), Wheel::Scroll);
-        assert_eq!(does(&alt, false, false), Wheel::Nothing, "not asked");
+        assert_eq!(does(&alt, false, false), Wheel::Nothing, "turned off");
         assert_eq!(does(&asked, false, false), Wheel::Arrows);
+        // Pagers such as less never ask.
+        let pager = fed(10, 2, "\x1b[?1049h").input_modes();
+        assert_eq!(does(&pager, false, false), Wheel::Arrows, "less");
         assert_eq!(does(&asked, false, true), Wheel::Nothing, "Claude Code");
         assert_eq!(does(&mouse, false, true), Wheel::Report);
         assert_eq!(
@@ -8356,11 +8634,41 @@ mod tests {
             mouse: MouseMode::Drag,
             ..asked
         };
-        assert_eq!(wheel_does(&mouse, false, true, false), Wheel::Report);
-        assert_eq!(wheel_does(&asked, false, false, false), Wheel::Nothing);
-        assert_eq!(wheel_does(&mouse, true, false, false), Wheel::Nothing);
+        let does = |m: &InputModes, shift, claude| wheel_does(m, &held(shift), claude, false, true);
+        assert_eq!(does(&mouse, false, true), Wheel::Report);
+        assert_eq!(does(&asked, false, false), Wheel::Nothing);
+        assert_eq!(does(&mouse, true, false), Wheel::Nothing);
         let main = InputModes::default();
-        assert_eq!(wheel_does(&main, false, false, false), Wheel::Scroll);
+        assert_eq!(does(&main, false, false), Wheel::Scroll);
+        // Not over its header or padding.
+        let none = Mods::default();
+        assert_eq!(
+            wheel_does(&mouse, &none, false, false, false),
+            Wheel::Nothing
+        );
+    }
+
+    /// Shift held, or nothing.
+    fn held(shift: bool) -> Mods {
+        Mods {
+            lshift: shift,
+            ..Mods::default()
+        }
+    }
+
+    #[test]
+    fn app_ctrl_and_the_wheel_size_the_font_unless_the_pane_under_it_takes_the_mouse() {
+        let ctrl = Mods {
+            lctrl: true,
+            ..Mods::default()
+        };
+        let mouse = InputModes {
+            mouse: MouseMode::Click,
+            ..InputModes::default()
+        };
+        let does = |m: &InputModes| wheel_does(m, &ctrl, false, false, true);
+        assert_eq!(does(&InputModes::default()), Wheel::Font);
+        assert_eq!(does(&mouse), Wheel::Report);
     }
 
     #[test]
@@ -8734,6 +9042,42 @@ mod tests {
     }
 
     #[test]
+    fn app_find_closed_before_doing_anything_selects_nothing_and_goes_back() {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 20,
+            rows: 3,
+            scrollback_lines: 100,
+            ..vt::Options::default()
+        });
+        t.feed(b"error\r\n");
+        for i in 0..10 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let bottom = t.view_top();
+        let mut f = Find::new(PaneId(1));
+        f.query = "error".into();
+        f.back = Some((bottom, true));
+        f.search(&t, 3);
+        assert!(reveal(&mut t, f.found[0], 3, 0));
+        assert_eq!(f.close(&mut t, 3), None, "the last query, untouched");
+        assert_eq!(t.view_top(), bottom);
+        // Once it moves or searches, Esc leaves the match selected.
+        f.back = None;
+        assert_eq!(f.close(&mut t, 3), Some(f.found[0]));
+    }
+
+    #[test]
+    fn app_find_starts_below_the_view_when_nothing_above_matches() {
+        let mut t = fed(10, 2, "a\r\nb\r\nc\r\nmatch\r\nmatch");
+        t.scroll_viewport(9);
+        assert_eq!(t.view_top(), 0);
+        let mut f = Find::new(PaneId(1));
+        f.query = "match".into();
+        f.search(&t, 2);
+        assert_eq!((f.found.len(), f.cur), (2, Some(0)));
+    }
+
+    #[test]
     fn app_find_keeps_its_place_as_output_goes_on() {
         let mut t = vt::Terminal::new(vt::Options {
             cols: 20,
@@ -8761,9 +9105,14 @@ mod tests {
         f.step(-1);
         assert_eq!(f.cur, Some(11));
         // A match out of view comes into the middle of it.
-        assert!(reveal(&mut t, f.found[2], 3));
+        assert!(reveal(&mut t, f.found[2], 3, 0));
         assert_eq!(t.view_top(), 1);
-        assert!(!reveal(&mut t, f.found[2], 3), "already in view");
+        assert!(!reveal(&mut t, f.found[2], 3, 1), "already in view");
+        // Not under the find bar, which covers the top row.
+        assert!(reveal(&mut t, f.found[1], 3, 1));
+        assert_eq!(t.view_top(), 0);
+        assert_eq!(bar_rows(17, 1.0, 20), 2);
+        assert_eq!(bar_rows(17, 1.0, 27), 1);
 
         f.query = "zzz".into();
         f.search(&t, 3);
@@ -8900,6 +9249,10 @@ mod tests {
     fn app_selects_all_text_or_the_last_command_output() {
         let pal = crate::theme::dark();
         const PROMPT: &str = "\x1b]133;A;blitz=1\x07$ ";
+        let text_of = |t: &vt::Terminal, (a, b): (usize, usize)| {
+            let s = selection_of(t, &pal, (a, 0), (b, u16::MAX));
+            selection_text(t, &pal, &s, 0)
+        };
         let text = format!(
             "{PROMPT}ls\r\none\r\n{PROMPT}cargo build --release\r\n\
              Compiling x\r\nFinished\r\n\r\n{PROMPT}"
@@ -8918,6 +9271,18 @@ mod tests {
         let all = all_text(&t, &pal).expect("text");
         assert!(text(all).starts_with("$ ls\r\none\r\n$ cargo build"));
         assert!(text(all).ends_with("Finished\r\n\r\n$"));
+        // A prompt of two lines, and a command of two, where the shell
+        // marks the output's start.
+        let text = format!(
+            "{PROMPT}~/repo\r\n$ git commit\r\n>> -m x\r\n\x1b]133;C\x07\
+             [main 1a2b3c4] x\r\n{PROMPT}"
+        );
+        let t = fed(20, 4, &text);
+        let out = last_output(&t, &pal).expect("output");
+        assert_eq!(text_of(&t, out), "[main 1a2b3c4] x");
+        // A command with no output.
+        let t = fed(20, 4, &format!("{PROMPT}cd x\r\n\x1b]133;C\x07{PROMPT}"));
+        assert_eq!(last_output(&t, &pal), None);
         // One prompt has no command before it.
         let t = fed(12, 4, &format!("hello\r\n{PROMPT}"));
         assert_eq!(last_output(&t, &pal), None);
@@ -8956,6 +9321,15 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         assert_eq!(got, home);
         assert_eq!(start_dir(""), home);
+    }
+
+    #[test]
+    fn app_only_claude_code_names_a_session_by_its_title() {
+        let id = Some("3f2a0c1e-0000-4000-8000-00000000abcd");
+        assert!(titled_by_claude(Some(true), true, None));
+        assert!(titled_by_claude(Some(false), false, id));
+        assert!(!titled_by_claude(Some(false), false, None), "any program");
+        assert!(!titled_by_claude(None, true, id), "no mark");
     }
 
     #[test]
@@ -9102,7 +9476,7 @@ mod tests {
     #[test]
     fn app_a_restart_for_an_update_finds_the_window_where_it_was() {
         use windows::Win32::System::Recovery::{
-            GetApplicationRestartSettings, RESTART_NO_CRASH, RESTART_NO_HANG,
+            GetApplicationRestartSettings, RESTART_NO_CRASH, RESTART_NO_HANG, RESTART_NO_PATCH,
         };
         use windows::Win32::System::Threading::GetCurrentProcess;
         let win = layout::Window {
@@ -9129,7 +9503,10 @@ mod tests {
             )
         }
         .expect("registered");
-        assert_eq!(flags, (RESTART_NO_CRASH | RESTART_NO_HANG).0);
+        assert_eq!(
+            flags,
+            (RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_PATCH).0
+        );
     }
 
     /// A window moved to another monitor and maximized there opens
@@ -9162,6 +9539,41 @@ mod tests {
         assert_eq!(left, at(560, 220, 800, 600, true));
         let again = placement(left, at(-8, -8, 1936, 1056, true), false, false);
         assert_eq!(again, left, "already there");
+        // A size from a damaged session file goes to the monitor too,
+        // without overflowing.
+        let huge = at(0, 0, 1 << 31, 600, true);
+        let now = at(2400, -8, 2576, 1416, true);
+        assert_eq!(
+            placement(huge, now, false, false),
+            at(2400, 400, 1 << 31, 600, true)
+        );
+        let far = at(-2_147_483_000, 0, 4_000_000_000, 600, true);
+        let now = at(-8, -8, 1936, 1056, true);
+        assert_eq!(
+            placement(far, now, false, false),
+            at(-8, 220, 4_000_000_000, 600, true)
+        );
+        let wide = at(i32::MAX, i32::MAX, u32::MAX, u32::MAX, true);
+        assert_eq!(
+            placement(wide, now, false, false),
+            at(-8, -8, u32::MAX, u32::MAX, true)
+        );
+    }
+
+    /// A window restored maximized is made at its restored place and
+    /// size, hidden, and is maximized only as it shows.
+    #[test]
+    fn app_a_maximized_window_is_not_made_maximized() {
+        let g = Geometry {
+            x: 10,
+            y: 20,
+            w: 800,
+            h: 600,
+            maximized: true,
+        };
+        let attrs = placed_at(Window::default_attributes().with_visible(false), g);
+        assert!(!attrs.maximized && !attrs.visible);
+        assert_eq!(attrs.inner_size, Some(PhysicalSize::new(800, 600).into()));
     }
 
     /// The smallest window still has room for the rail or the sidebar and
@@ -9569,10 +9981,17 @@ mod tests {
 
     #[test]
     fn app_titles_that_show_claude_working() {
-        for t in ["\u{25d0} Fix the tests", "\u{25d1} x", "\u{25d3}"] {
+        for t in ["\u{25d0} Fix the tests", "\u{25d1} x"] {
             assert!(claude_working_title(t), "{t}");
         }
-        for t in ["\u{2733} Fix the tests", "", "pwsh", "x \u{25d0}"] {
+        // Not Claude Code's marks, so the sidebar would not see it work.
+        for t in [
+            "\u{2733} Fix the tests",
+            "",
+            "pwsh",
+            "x \u{25d0}",
+            "\u{25d3} x",
+        ] {
             assert!(!claude_working_title(t), "{t}");
         }
     }
@@ -9694,7 +10113,20 @@ mod tests {
         assert!(!a.new_window, "the main window");
         assert!(a.handed_off(Some(true)), "taken");
         assert!(!a.handed_off(Some(false)), "hung or refused");
-        assert!(a.new_window, "a window of its own");
+        assert!(a.separate() && !a.main(), "a window of its own");
+    }
+
+    /// Run as administrator, blitz hands nothing off, takes no launches
+    /// and leaves the saved session alone.
+    #[test]
+    fn an_elevated_blitz_is_a_window_of_its_own() {
+        let a = Args::default();
+        assert!(a.main() && !a.separate());
+        let a = Args {
+            admin: true,
+            ..Args::default()
+        };
+        assert!(!a.main() && a.separate());
     }
 
     #[test]
@@ -9863,34 +10295,87 @@ mod tests {
 
     /// A question stays until it is answered or another key is pressed,
     /// which then does what it always does; an error goes at the next key
-    /// in its pane; other notices stay.
+    /// in its pane; other notices stay. A question about its own pane goes
+    /// at any key aimed at another pane, its own action too.
     #[test]
     fn notices_go_at_the_next_key_that_does_not_answer_them() {
         let close = Some(Action::ClosePane);
+        let asks = [
+            Ask::ClosePane,
+            Ask::CloseTab,
+            Ask::Paste("a\nb".into()),
+            Ask::Drop("C:\\a.txt".into()),
+        ];
+        for ask in asks {
+            assert!(ask.of_pane());
+            for a in [close, Some(Action::CloseTab), Some(Action::Paste)] {
+                assert!(ask.gone(a, false), "{ask:?} at {a:?} elsewhere");
+            }
+            assert!(ask.gone(Some(Action::Palette), false));
+        }
+        assert!(!Ask::Update.of_pane() && !Ask::Quit.of_pane() && !Ask::Key.of_pane());
+        let paste = Ask::Paste("a\nb".into());
+        assert!(!paste.gone(Some(Action::Paste), true));
+        assert!(paste.gone(close, true));
+        assert!(!Ask::ClosePane.gone(close, true), "answered");
+        assert!(
+            !Ask::ClosePane.gone(Some(Action::Palette), true),
+            "answered from the palette"
+        );
+        assert!(!Ask::CloseTab.gone(Some(Action::CloseTab), true));
         for here in [true, false] {
             let ask = Ask::ClosePane;
-            assert!(!ask.gone(close, here), "answered");
-            assert!(
-                !ask.gone(Some(Action::Palette), here),
-                "answered from the palette"
-            );
             assert!(ask.gone(None, here), "typing");
             assert!(ask.gone(Some(Action::Update), here), "another shortcut");
-            let paste = Ask::Paste("a\nb".into());
-            assert!(!paste.gone(Some(Action::Paste), here));
-            assert!(paste.gone(close, here));
             assert!(!Ask::Update.gone(Some(Action::Update), here));
             assert!(Ask::Update.gone(Some(Action::Copy), here));
             assert_eq!(Ask::Key.gone(None, here), here, "an error, read");
             assert_eq!(Ask::Key.gone(close, here), here);
             assert!(!Ask::Nothing.gone(None, here));
-            assert!(!Ask::CloseTab.gone(Some(Action::CloseTab), here));
             assert!(Ask::CloseTab.gone(close, here), "not the whole tab");
             assert!(
                 Ask::Quit.gone(None, here),
                 "closing the window, then typing"
             );
             assert!(Ask::Quit.gone(Some(Action::Palette), here));
+        }
+    }
+
+    /// A passing hint leaves a question or an error where it is, and an
+    /// exited program's line comes back once a notice over it goes.
+    #[test]
+    fn notices_over_questions_and_exits() {
+        let notice = |ask, dim| Notice {
+            text: "n".into(),
+            until: None,
+            dim,
+            ask,
+        };
+        assert!(hint_fits(None));
+        assert!(hint_fits(Some(&notice(Ask::Nothing, true))));
+        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit] {
+            assert!(!hint_fits(Some(&notice(ask, false))));
+        }
+        let exited = notice_line(None, Some(2)).expect("a line");
+        assert_eq!(
+            exited,
+            ("exit 2 \u{b7} Enter restart \u{b7} Esc close".into(), false)
+        );
+        let error = notice(Ask::Key, false);
+        assert_eq!(
+            notice_line(Some(&error), Some(2)),
+            Some(("n".into(), false))
+        );
+        assert_eq!(notice_line(None, None), None);
+    }
+
+    #[test]
+    fn lock_keys_leave_questions() {
+        for vk in [0x14, 0x90, 0x91] {
+            assert!(lock_key(vk), "{vk:#x}");
+        }
+        for vk in [0x41, VK_RETURN, VK_ESCAPE, 0x10] {
+            assert!(!lock_key(vk), "{vk:#x}");
         }
     }
 
@@ -10101,14 +10586,16 @@ mod tests {
 
     #[test]
     fn app_a_program_copy_says_so() {
-        assert_eq!(program_copy_notice("é", true), "Program copied 1 character");
+        let notice = |t| program_copy_notice(t, true, true);
+        assert_eq!(notice("é"), "Program copied 1 character");
+        assert_eq!(notice("ls -la"), "Program copied 6 characters");
         assert_eq!(
-            program_copy_notice("ls -la", true),
-            "Program copied 6 characters"
+            program_copy_notice("ls", true, false),
+            "Clipboard busy; nothing was copied"
         );
         assert_eq!(
-            program_copy_notice("ls", false),
-            "Clipboard busy; nothing was copied"
+            program_copy_notice("ls", false, false),
+            "A program here tried to copy while you were elsewhere; nothing was copied"
         );
     }
 
@@ -10185,23 +10672,76 @@ mod tests {
         }
         // Ctrl+C copies only a selection in view; scrolled out of view it
         // interrupts, and the other copy keys still copy it.
-        assert!(copy_key_copies(&ctrl_c, Some(true)));
-        assert!(!copy_key_copies(&ctrl_c, Some(false)));
-        assert!(copy_key_copies(&ctrl_c, None), "nothing selected");
+        assert!(copy_key_copies(&ctrl_c, Some(true), false));
+        assert!(!copy_key_copies(&ctrl_c, Some(false), false));
+        assert!(copy_key_copies(&ctrl_c, None, false), "nothing selected");
+        // Nor what output rewrote, which shows nowhere.
+        assert!(!copy_key_copies(&ctrl_c, None, true));
         for k in [ctrl_shift_c, ctrl_insert] {
-            assert!(copy_key_copies(&k, Some(false)));
+            assert!(copy_key_copies(&k, Some(false), false));
+            assert!(copy_key_copies(&k, None, true));
         }
     }
 
     #[test]
     fn app_claude_code_takes_bracketed_pastes_without_asking() {
         let mut t = fed(10, 2, "");
-        assert!(!paste_trusted(&t, true), "no bracketed paste");
+        hook_confirms_paste(&mut t, Ev::Ready);
+        assert!(!t.paste_trusted(), "no bracketed paste");
         t.feed(b"\x1b[?2004h");
-        assert!(paste_trusted(&t, true));
-        assert!(!paste_trusted(&t, false), "a shell asks once first");
-        t.confirm_paste();
-        assert!(paste_trusted(&t, false));
+        assert!(!t.paste_trusted(), "a shell asks once first");
+        hook_confirms_paste(&mut t, Ev::Busy);
+        assert!(t.paste_trusted());
+        // Claude Code died; a file printed turns bracketed paste on again.
+        t.feed(b"\x1b[?2004l\x1b[?2004h");
+        assert!(!t.paste_trusted(), "asks again");
+        hook_confirms_paste(&mut t, Ev::Idle);
+        assert!(!t.paste_trusted(), "Claude Code quit");
+    }
+
+    #[test]
+    fn app_news_never_hides_a_notice_that_stays_up() {
+        let notice = |until| Notice {
+            text: "exit 1 \u{b7} Enter restart \u{b7} Esc close".into(),
+            until,
+            dim: false,
+            ask: Ask::Nothing,
+        };
+        let (now, brief) = (Instant::now(), Some(Instant::now() + BRIEF));
+        assert!(hides_lasting(Some(&notice(None)), brief, true));
+        assert!(
+            !hides_lasting(Some(&notice(None)), brief, false),
+            "an error"
+        );
+        assert!(!hides_lasting(Some(&notice(None)), None, true));
+        assert!(!hides_lasting(Some(&notice(Some(now))), brief, true));
+        assert!(!hides_lasting(None, brief, true));
+    }
+
+    #[test]
+    fn app_a_click_while_output_streams_leaves_the_view_following_it() {
+        let held = |bottom, selected| {
+            let mut t = fed(10, 2, "a\r\nb");
+            t.hold(true);
+            t.feed(b"\r\nc\r\nd");
+            let_go(&mut t, bottom, selected);
+            t.feed(b"\r\ne");
+            t.view_top() == t.screen_top()
+        };
+        assert!(held(true, false), "a click");
+        assert!(!held(true, true), "a selection keeps its text in view");
+        assert!(!held(false, false), "scrolled back before the click");
+    }
+
+    #[test]
+    fn app_a_paste_question_is_answered_only_while_the_clipboard_holds_its_text() {
+        let asked = || Ask::Paste("a\nb".into());
+        assert_eq!(answers(asked(), Some("a\nb")), Some("a\nb".into()));
+        assert_eq!(answers(asked(), Some("x\ny")), None, "copied since");
+        assert_eq!(answers(asked(), None), None, "an image since");
+        let dropped = Ask::Drop("C:\\a.txt".into());
+        assert_eq!(answers(dropped, Some("x")), Some("C:\\a.txt".into()));
+        assert_eq!(answers(Ask::ClosePane, Some("a\nb")), None);
     }
 
     #[test]
@@ -10227,10 +10767,17 @@ mod tests {
     }
 
     #[test]
-    fn app_files_paste_as_paths_quoted_only_with_spaces() {
+    fn app_files_paste_as_paths_quoted_only_when_a_shell_would_read_them() {
         let paths = [r"C:\some dir\shot.png", r"D:\b.txt"].map(PathBuf::from);
         assert_eq!(quote_paths(&paths), r#""C:\some dir\shot.png" D:\b.txt"#);
         assert_eq!(quote_paths(&paths[1..]), r"D:\b.txt");
+        let one = |p: &str| quote_paths(&[PathBuf::from(p)]);
+        assert_eq!(one(r"C:\x&calc&.txt"), r#""C:\x&calc&.txt""#);
+        assert_eq!(one(r"C:\x(1);y.txt"), r#""C:\x(1);y.txt""#);
+        assert_eq!(one(r"C:\%PATH%^.txt"), r#""C:\%PATH%^.txt""#);
+        assert_eq!(one(r"C:\$(calc).txt"), r"'C:\$(calc).txt'");
+        assert_eq!(one(r"C:\it's $x.txt"), r"'C:\it''s $x.txt'");
+        assert_eq!(one(r"C:\café_1-2.txt"), r"C:\café_1-2.txt");
     }
 
     #[test]
@@ -10268,8 +10815,11 @@ mod tests {
         assert_eq!(paste_refused("pwsh 3", None), None);
         assert_eq!(
             paste_refused("pwsh 3", Some(1)).as_deref(),
-            Some("pwsh 3 exited with code 1, so nothing was pasted \u{b7} Enter close")
+            Some(
+                "pwsh 3 exited (exit 1), so nothing was pasted \u{b7} Enter restart \u{b7} Esc close"
+            )
         );
+        assert!(paste_refused("cmd 1", Some(0xC000_013A)).is_some_and(|t| t.contains("(Ctrl+C)")));
     }
 
     #[test]
@@ -10290,6 +10840,16 @@ mod tests {
         assert_eq!(
             paste_question("a\nb", None),
             "Paste 2 lines starting \"a\"? Paste again"
+        );
+        // A lone CR runs a line too.
+        assert_eq!(
+            paste_question("echo hi\rcalc\r", None),
+            "Paste 2 lines starting \"echo hi\"? Paste again"
+        );
+        // Nothing invisible or reordering in the preview.
+        assert_eq!(
+            paste_question("\u{202e}\u{200b}ab\nc", None),
+            "Paste 2 lines starting \"ab\"? Paste again"
         );
     }
 

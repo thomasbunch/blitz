@@ -10,9 +10,15 @@ fn term(s: &str) -> Terminal {
     t
 }
 
+/// All but wheel arrows, which pagers such as less never ask for.
 #[test]
 fn modes_start_off() {
-    assert_eq!(term("").input_modes(), InputModes::default());
+    let wheel = InputModes {
+        alt_scroll: true,
+        ..InputModes::default()
+    };
+    assert_eq!(term("").input_modes(), wheel);
+    assert_eq!(term("\x1b[?1007l").input_modes(), InputModes::default());
 }
 
 #[test]

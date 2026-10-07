@@ -44,7 +44,6 @@ Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 [Registry]
 ; So "blitz" starts it from Win+R, and from "start blitz" in a shell.
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\blitz.exe"; ValueType: string; ValueData: "{app}\blitz.exe"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\blitz.exe"; ValueType: string; ValueName: "Path"; ValueData: "{app}"
 ; Right-click menu entries. HKA is HKCU on a per-user install and HKLM on an
 ; all-users one. Windows 11 shows them under "Show more options". The second
 ; verb is Extended: it only shows on Shift+right-click.

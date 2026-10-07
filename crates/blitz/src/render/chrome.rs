@@ -262,7 +262,7 @@ pub enum Side {
 impl SideHits {
     /// What is at (`x`, `y`).
     pub fn at(&self, x: i32, y: i32) -> Option<Side> {
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         if let Some(&(id, _)) = self.rows.iter().find(|r| inside(&r.1)) {
             return Some(Side::Session(id));
         }
@@ -812,8 +812,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
             }
         }
         if !hidden.is_empty() {
-            // Accent when a session out of sight needs you.
-            let urgent = (hidden.iter()).any(|x| matches!(x.state, Attn::NeedsYou | Attn::Error));
+            // Accent when a session out of sight needs you, dark or light
+            // enough to read as text.
+            let urgent = (hidden.iter()).any(|x| x.state == Attn::NeedsYou);
             let r = Rect {
                 x: s(8.0),
                 y,
@@ -821,7 +822,10 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 h: more_h,
             };
             let label = format!("+{} more", hidden.len());
-            let color = if urgent { c.accent } else { c.dim };
+            let color = match urgent {
+                true => crate::theme::readable(c.accent, c.side_bg, 4.5),
+                false => c.dim,
+            };
             text(
                 p,
                 r.x + s(24.0),
@@ -1018,12 +1022,25 @@ pub fn build(m: &ChromeModel) -> Chrome {
         out.field = out.field.or(to_commands.then_some(at));
     }
     if let (Some((_, _, t)), Some(f)) = (m.preedit, out.field) {
+        let f = ime_rect(f, text_w(t, tw));
         // Over the hint an empty field shows.
         extra.push(Prim::Rect(f, c.side_bg));
         composition(&mut extra, t, f, tw, false, (c.side_bg, c.msg), s(1.0));
     }
     out.prims.extend(extra);
     out
+}
+
+/// Where a composition `w` wide goes in a field whose typed text goes
+/// next at `f`: there, or over the right end of the typed text when that
+/// leaves too little room.
+fn ime_rect(f: Rect, w: i32) -> Rect {
+    let x = f.x.min(f.right() - w).max(0);
+    Rect {
+        x,
+        w: f.right() - x,
+        ..f
+    }
 }
 
 /// IME composition `t`, underlined, from the top left of `r` and cut at
@@ -1140,7 +1157,7 @@ struct List<'a> {
     /// The names that match it, and the highlighted one.
     names: Vec<&'a str>,
     sel: usize,
-    /// Shown when nothing matches.
+    /// Shown when nothing matches; for a name, what leaving it empty does.
     empty: &'a str,
     hint: &'a str,
     /// Shown in place of an empty filter.
@@ -1317,7 +1334,11 @@ fn commands(
             filter: cm.filter,
             names: Vec::new(),
             sel: 0,
-            empty: "With no name, blitz picks one again",
+            // What an empty name does, while it is empty.
+            empty: match cm.filter {
+                "" => "With no name, blitz picks one again",
+                _ => "",
+            },
             hint: "Enter rename  \u{b7}  Esc cancel",
             prompt: "type a name",
             width: 460.0,
@@ -2323,14 +2344,23 @@ mod tests {
         assert_eq!(c.side.at(row.1.x, row.1.y), Some(Side::Session(row.0)));
         assert_eq!(c.side.at(foot.x + 1, foot.bottom()), None);
         let label = format!("+{} more", hidden.len());
-        let ui = crate::theme::blitz(false).ui;
-        assert!(
-            c.prims.iter().any(
-                |p| matches!(p, Prim::Text { text, color, .. } if *text == label && *color == ui.accent)
-            ),
-            "{:?}",
-            texts(&c)
-        );
+        let color = |c: &Chrome| {
+            (c.prims.iter()).find_map(|p| match p {
+                Prim::Text { text, color, .. } if *text == label => Some(*color),
+                _ => None,
+            })
+        };
+        assert_eq!(color(&c), Some(m.ui.accent), "{:?}", texts(&c));
+        // Readable on a light theme too, where amber is faint.
+        m.ui = crate::theme::blitz(true).ui;
+        let amber = color(&build(&m)).expect("footer");
+        assert!(crate::theme::contrast(amber, m.ui.side_bg) >= 4.5);
+        // A hidden error does not need you.
+        let mut sessions = sessions.clone();
+        sessions[11].state = Attn::Error;
+        let mut m = model(&win, &sessions, now);
+        m.scale = 1.5;
+        assert_eq!(color(&build(&m)), Some(m.ui.dim));
     }
 
     #[test]
@@ -2830,6 +2860,31 @@ mod tests {
     }
 
     #[test]
+    fn a_composition_shows_in_a_full_field() {
+        let room = Rect {
+            x: 100,
+            y: 5,
+            w: 40,
+            h: 16,
+        };
+        assert_eq!(ime_rect(room, 24), room, "after the typed text");
+        let full = Rect {
+            x: 139,
+            w: 1,
+            ..room
+        };
+        assert_eq!(
+            ime_rect(full, 24),
+            Rect {
+                x: 116,
+                w: 24,
+                ..room
+            }
+        );
+        assert_eq!(ime_rect(full, 500).x, 0);
+    }
+
+    #[test]
     fn a_caret_shows_where_typing_goes() {
         let (win, sessions, now) = fleet(true);
         let mut m = model(&win, &sessions, now);
@@ -3092,6 +3147,8 @@ mod tests {
         });
         let t: Vec<String> = texts(&build(&m)).iter().map(|t| t.to_string()).collect();
         assert!(t.contains(&"Rename tab".into()) && t.contains(&"type a name".into()));
+        let unnamed = "With no name, blitz picks one again";
+        assert!(t.contains(&unnamed.into()));
         m.commands = Some(Commands {
             filter: "shop api",
             items: Vec::new(),
@@ -3101,6 +3158,7 @@ mod tests {
         });
         let c = build(&m);
         assert!(texts(&c).contains(&"shop api"));
+        assert!(!texts(&c).contains(&unnamed), "a name is typed");
         assert!(c.commands.expect("palette").1.is_empty(), "no rows to pick");
     }
 

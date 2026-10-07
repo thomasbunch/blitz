@@ -27,6 +27,8 @@ pub enum Ev {
     /// The user sent Claude Code a prompt, which starts a turn.
     Working,
     /// Claude Code's title shows it working: on with the turn it is in.
+    /// A question stays, as with [`Ev::Quiet`]: only an answer or a hook
+    /// ends one.
     Busy,
     Done,
     /// Claude Code's title stopped showing work. That ends a turn, but a
@@ -139,10 +141,10 @@ pub struct Command {
 
 impl Command {
     /// Feeds a prompt mark. At blitz's own prompt, which program output
-    /// cannot fake, gives the event and message for a command that ran at
-    /// least [`LONG_COMMAND`] and reported its code: done when it worked or
-    /// was stopped with Ctrl+C, else an error.
-    pub fn mark(&mut self, m: PromptMark, now: Instant) -> Option<(Ev, String)> {
+    /// cannot fake, gives the event, message and time for a command that
+    /// ran at least [`LONG_COMMAND`] and reported its code: done when it
+    /// worked or was stopped with Ctrl+C, else an error.
+    pub fn mark(&mut self, m: PromptMark, now: Instant) -> Option<(Ev, String, Duration)> {
         match m {
             PromptMark::C if self.prompt => {
                 *self = Command {
@@ -163,7 +165,7 @@ impl Command {
                     _ => Ev::Error { sticky: false },
                 };
                 let msg = format!("{} \u{b7} {}", exit_text(code), elapsed(took));
-                return Some((ev, msg));
+                return Some((ev, msg, took));
             }
             _ => {}
         }
@@ -307,6 +309,12 @@ impl PaneAttn {
                 self.bell = ev == Ev::Bell;
                 NeedsYou
             }
+            // The title cannot answer a question: any program can print
+            // one. The answer finds Claude Code at work.
+            Ev::Busy if self.state == NeedsYou => {
+                self.prev = Working;
+                return false;
+            }
             Ev::Working | Ev::Busy => Working,
             Ev::Done if attended => Idle,
             Ev::Done => DoneUnseen,
@@ -330,6 +338,14 @@ impl PaneAttn {
             Ev::Exited => match self.state {
                 Working => Idle,
                 NeedsYou if !self.bell => Idle,
+                // A bell stays, but looking at it must not bring back a
+                // Claude Code at work that has gone.
+                NeedsYou => {
+                    if self.prev == Working {
+                        self.prev = Idle;
+                    }
+                    return false;
+                }
                 s => s,
             },
         };
@@ -514,14 +530,17 @@ mod tests {
         assert_eq!(p.state, Attn::Idle);
     }
 
-    /// Working again after a question means it was answered; going quiet
-    /// does not end the question, but answering it then finds the turn
-    /// over rather than back at work.
+    /// A title, which any program can print, never ends a question: the
+    /// answer then finds Claude Code at work, or, after the title went
+    /// quiet, the turn over.
     #[test]
     fn title_marks_around_a_question() {
         let mut p = pane(Attn::Working);
         p.apply(Ev::NeedsYou, AWAY, Instant::now());
-        assert!(p.apply(Ev::Busy, AWAY, Instant::now()));
+        p.apply(Ev::Quiet, AWAY, Instant::now());
+        assert!(!p.apply(Ev::Busy, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::NeedsYou);
+        assert!(p.apply(Ev::Answered, HERE, Instant::now()));
         assert_eq!(p.state, Attn::Working);
 
         let mut p = pane(Attn::Working);
@@ -558,6 +577,12 @@ mod tests {
         p.apply(Ev::Bell, AWAY, Instant::now());
         assert!(!p.apply(Ev::Exited, AWAY, Instant::now()));
         assert_eq!(p.state, Attn::NeedsYou);
+        // Looking at one rung while Claude Code worked finds it gone.
+        let mut p = pane(Attn::Working);
+        p.apply(Ev::Bell, AWAY, Instant::now());
+        assert!(!p.apply(Ev::Exited, AWAY, Instant::now()));
+        assert!(p.apply(Ev::Attended, HERE, Instant::now()));
+        assert_eq!(p.state, Attn::Idle);
     }
 
     /// A turn runs from the prompt to the result, questions and all.
@@ -977,6 +1002,10 @@ mod tests {
             PromptMark::A { blitz: true },
             t0 + Duration::from_secs(secs),
         );
+        let end = end.map(|(ev, msg, took)| {
+            assert_eq!(took, Duration::from_secs(secs));
+            (ev, msg)
+        });
         (c, end)
     }
 
@@ -1040,7 +1069,8 @@ mod tests {
         // The shell's own end mark comes last and is the one that counts.
         c.mark(PromptMark::D(Some(0)), later);
         let end = c.mark(PromptMark::A { blitz: true }, later);
-        assert_eq!(end, Some((Ev::Done, "exit 0 \u{b7} 30s".into())));
+        let took = Duration::from_secs(30);
+        assert_eq!(end, Some((Ev::Done, "exit 0 \u{b7} 30s".into(), took)));
         // A prompt with no command before it.
         assert_eq!(c.mark(PromptMark::A { blitz: true }, later), None);
     }

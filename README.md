@@ -20,9 +20,9 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   blitz is in the background, a Windows notification says so and takes
   you there when clicked, and the taskbar button flashes and shows the
   session's dot.
-- In PowerShell, a command that runs for 10 seconds or more and ends in
-  a pane you are not looking at marks it *done*, or *error* with its exit
-  code.
+- In PowerShell with PSReadLine (its default), a command that runs for 10
+  seconds or more and ends in a pane you are not looking at marks it
+  *done*, or *error* with its exit code.
 - Progress a program reports (OSC 9;4) shows in the sidebar and on the
   taskbar button.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
@@ -98,10 +98,12 @@ drops some features such as synchronized output.
 
 Claude Code 2.1.280 or later reports to blitz with nothing to set up.
 blitz keeps a small Claude Code plugin in
-`%LOCALAPPDATA%\blitz\claude-plugin`, whose hooks run the
-`blitz-hook.exe` next to `blitz.exe`, and every pane loads it through
-`CLAUDE_CODE_PLUGIN_DIRS`. blitz never edits Claude Code's settings. If
-Claude Code works for a while and no hook reports, blitz says so once.
+`%LOCALAPPDATA%\blitz\claude-plugin-…`, one for each copy of blitz, whose
+hooks run the `blitz-hook.exe` next to `blitz.exe`, and every pane
+loads it through `CLAUDE_CODE_PLUGIN_DIRS`. blitz never edits Claude
+Code's settings, and writes no plugin where other users could replace
+`blitz-hook.exe`. If Claude Code works for a while and no hook reports,
+blitz says so once.
 
 An older Claude Code, or managed settings that turn off plugin folders,
 needs the hooks in `~/.claude/settings.json`. **Claude Code setup** in
@@ -127,10 +129,11 @@ at marks it as needing you until you look. Claude Code rings one when
 it waits for you if its settings have
 `"preferredNotifChannel": "terminal_bell"`. The hooks add what the title
 cannot show: a question waiting for you, the prompt and the reply under
-the session's name, and the conversation to resume. Only they, and a
-session that ends in an error, raise a Windows notification, and only
-they keep the PC awake: any program can ring a bell or set a title, so
-a bell alone flashes the taskbar button and no more.
+the session's name, the conversation to resume, and that the pane runs
+Claude Code at all, which names the session after its task. Only they,
+and a session that ends in an error, raise a Windows notification, and
+only they keep the PC awake: any program can ring a bell or set a
+title, so a bell alone flashes the taskbar button and no more.
 
 ### Session marks
 
@@ -350,21 +353,24 @@ Ctrl+C copies the selection while it is in view; scrolled out of view,
 Ctrl+C goes to the program as usual. Ctrl+Shift+C and Ctrl+Insert copy
 it either way, and with nothing selected Ctrl+Shift+C never reaches the
 program as Ctrl+C. When output rewrites a selection, the next copy
-still takes the text as it was, and says so; anything else you do drops
-it. A dim line says how many lines were copied; if another program is
-holding the clipboard, the selection stays so you can copy again.
-**Copy without indent** in the command palette leaves out the marks
-Claude Code puts before replies and tool output, and the indent the
-lines share.
+still takes the text as it was, and says so, though plain Ctrl+C goes
+to the program, as nothing shows; anything else you do drops it. A dim
+line says how many lines were copied; if another program is holding
+the clipboard, the selection stays so you can copy again. **Copy
+without indent** in the command palette leaves out the marks Claude
+Code puts before replies and tool output, and the indent the lines
+share.
 
 Holding Ctrl underlines the link under the pointer: a hyperlink a
 program printed, a web address, or the path of a file that exists,
 relative ones from the pane's folder and `~` from your user folder. A
 path counts in Claude Code's `Update(src/app.rs)`, in a Markdown link,
-and as a bare `name.ext` when that file is in the pane's folder. Only
-web, mail and local file links open. A file that would run when
-opened, such as a program, script, shortcut or installer, is shown
-selected in Explorer instead, and so is one no program opens.
+and as a bare `name.ext` when that file is in the pane's folder. A path
+with spaces is a link only as a hyperlink, and a path through a
+symbolic link or junction is none. Only web and local file links open.
+Folders, text, source code, images and PDFs open with their program;
+any other file, such as a program, script, shortcut or installer, is
+shown selected in Explorer instead, and so is one no program opens.
 
 With an editor set in `editor_uri`, Ctrl+click opens a file there at
 the line and column after its path, as in `src/app.rs:12:5` or
@@ -376,7 +382,7 @@ fullscreen, clicks and the wheel go to it, and the pointer is an arrow
 rather than an I-beam. Hold Shift as well to use blitz's: Shift+drag
 selects, Ctrl+Shift+click opens a link, and Shift+right-click copies or
 pastes. Over a full-screen program, such as less or man, the wheel
-presses the arrow keys when the program asks for that, but never in
+presses the arrow keys unless the program turns that off, but never in
 Claude Code, where they would bring back an earlier prompt.
 
 ## Paste and drop
@@ -389,19 +395,20 @@ that does not. Claude Code never asks once its hooks have reported.
 Nothing is pasted into a pane whose program has exited.
 
 Files copied in Explorer paste as their paths, in quotes when they hold
-a space, and so do files dropped on a pane. A folder dropped on the
-sidebar opens in a new tab. Windows does not let you drop from Explorer
-onto blitz running as administrator. With an image on the clipboard and
-no text, such as a screenshot, Ctrl+V in a Claude Code pane whose hooks
-have reported sends Alt+V, which pastes the image; other programs get
-Ctrl+V.
+a space or anything else a shell would read, and so do files dropped on
+a pane. A folder dropped on the sidebar opens in a new tab. Windows
+does not let you drop from Explorer onto blitz running as
+administrator. With an image on the clipboard and no text, such as a
+screenshot, Ctrl+V in a Claude Code pane whose hooks have reported
+sends Alt+V, which pastes the image; other programs get Ctrl+V.
 
 In the find bar, the command palette, the theme picker and the settings
 panel, a paste adds the first line of the clipboard and Ctrl+Backspace
 deletes a word.
 
 Programs can copy to the clipboard with OSC 52, as tmux and Neovim do
-over SSH, and the pane says so. They cannot read it.
+over SSH, and the pane says so. Only the pane you are in can, while
+blitz is in front, and no program can read the clipboard.
 
 ## Find and prompts
 
@@ -412,7 +419,8 @@ ignoring case unless what you type has a capital letter, and shows every
 match in view in the selection colour, the current one outlined. Enter
 or F3 goes to the next match up, Shift+Enter or Shift+F3 to the next one
 down, and Esc closes the bar, leaving the view where it is and the match
-selected, so Ctrl+C copies it. Any other shortcut does what it does and
+selected, so Ctrl+C copies it. Esc before you type or move puts the view
+back and selects nothing. Any other shortcut does what it does and
 closes the bar, unless it scrolls, and a click in the pane closes it
 too. A full-screen program is searched on its screen only, as the bar
 says.
@@ -502,12 +510,12 @@ a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
 `space`, `backspace`, or a punctuation key by its character or its name,
 such as `,` or `comma` and `=` or `plus`, and on the keypad `numpad0` to
 `numpad9`, `numpadadd`, `numpadsubtract`, `numpadmultiply`,
-`numpaddivide` and `numpaddecimal`. The modifiers must match
-exactly. A binding replaces the default on the same chord, and the other
-defaults stay. Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them,
-on layouts where those keys type digits; on others, such as French
-AZERTY, they go to the program unless bound to `go_to_tab_1` to
-`go_to_tab_8` or `last_tab`.
+`numpaddivide` and `numpaddecimal`. Case and spaces do not matter. The
+modifiers must match exactly. A binding replaces the default on the
+same chord, and the other defaults stay. Ctrl+1 to Ctrl+9 go to a tab
+unless a binding takes them, on layouts where those keys type digits;
+on others, such as French AZERTY, they go to the program unless bound
+to `go_to_tab_1` to `go_to_tab_8` or `last_tab`.
 Lines blitz cannot read are skipped.
 
 The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,

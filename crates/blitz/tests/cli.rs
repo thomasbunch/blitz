@@ -172,7 +172,9 @@ fn cli_setup_claude_for_wsl() {
         hook[3..].replace('\\', "/")
     );
     assert_eq!(cmd, want);
-    assert!(text(&out.stderr).contains("inside WSL"));
+    let err = text(&out.stderr);
+    assert!(err.contains("inside WSL"), "{err}");
+    assert!(err.contains("automount"), "{err}");
 }
 
 /// Hooks pasted before blitz loaded its own are pointed out: with both,

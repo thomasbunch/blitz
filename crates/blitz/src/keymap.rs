@@ -315,12 +315,13 @@ const KEY_NAMES: &[(&str, u16)] = &[
 
 /// A binding as `config.toml` writes it: a chord, `=`, and an action's
 /// name from [`ACTIONS`] or `none`, as in `ctrl+shift+r=split_right`. The
-/// chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`.
+/// chord is any of `ctrl`, `shift` and `alt`, each once, and one key,
+/// joined by `+`. Case and spaces around the parts do not matter.
 pub fn binding(s: &str) -> Option<Binding> {
     let (chord, name) = s.rsplit_once('=')?;
     let action = match name.trim() {
-        "none" => None,
-        name => Some(ACTIONS.iter().find(|a| a.1 == name)?.0),
+        n if n.eq_ignore_ascii_case("none") => None,
+        n => Some(ACTIONS.iter().find(|a| a.1.eq_ignore_ascii_case(n))?.0),
     };
     let (mods, vk) = parse_chord(chord)?;
     Some((mods, vk, action))
@@ -356,7 +357,10 @@ pub fn unesc(s: &str) -> Vec<u8> {
             b't' => out.push(b'\t'),
             b's' => out.push(b' '),
             b'\\' => out.push(b'\\'),
-            b'x' => match s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            b'x' => match (s.get(i..i + 2))
+                .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
                 Some(v) => {
                     out.push(v);
                     i += 2;
@@ -372,19 +376,24 @@ pub fn unesc(s: &str) -> Vec<u8> {
 /// A chord's modifiers and virtual key.
 fn parse_chord(chord: &str) -> Option<(u8, u16)> {
     let chord = chord.trim();
-    // A + key leaves a second + at the end.
-    let (mods, key) = match chord.strip_suffix("++") {
-        Some(mods) => (mods, "+"),
+    // A + key ends the chord, after the + that joins it on, if any.
+    let (mods, key) = match chord.strip_suffix('+').map(str::trim_end) {
+        Some("") => ("", "+"),
+        Some(mods) => (mods.strip_suffix('+')?, "+"),
         None => chord.rsplit_once('+').unwrap_or(("", chord)),
     };
     let mut bits = 0;
-    for m in mods.split('+').filter(|m| !m.is_empty()) {
-        bits |= match m.trim().to_ascii_lowercase().as_str() {
+    for m in mods.split('+').filter(|_| !mods.is_empty()) {
+        let bit = match m.trim().to_ascii_lowercase().as_str() {
             "ctrl" => CTRL,
             "shift" => SHIFT,
             "alt" => ALT,
             _ => return None,
         };
+        if bits & bit != 0 {
+            return None;
+        }
+        bits |= bit;
     }
     Some((bits, key_code(key.trim())?))
 }
@@ -394,7 +403,9 @@ fn key_code(name: &str) -> Option<u16> {
     if let Some(&(_, vk)) = KEY_NAMES.iter().find(|k| k.0.eq_ignore_ascii_case(name)) {
         return Some(vk);
     }
-    let f = (name.strip_prefix(['f', 'F'])).and_then(|n| n.parse::<u16>().ok());
+    let f = (name.strip_prefix(['f', 'F']))
+        .filter(|n| !n.starts_with('0'))
+        .and_then(|n| n.parse::<u16>().ok());
     let pad = (name.get(..6).filter(|p| p.eq_ignore_ascii_case("numpad")))
         .and_then(|_| name[6..].parse::<u16>().ok());
     match (f, name.as_bytes()) {
@@ -500,10 +511,10 @@ pub fn held_before(lparam: isize) -> bool {
 
 /// Whether the auto-repeat of a held key does again what its press did,
 /// when blitz took the press (`panel` when the theme picker or settings
-/// panel did). Moving, scrolling and typing do. Anything that confirms,
-/// toggles, opens or closes does not: a held key would answer its own
-/// "press again", flicker, close pane after pane, or reach the program
-/// once its press closed what took it.
+/// panel did). Moving, scrolling, the font size and typing do. Anything
+/// that confirms, toggles, opens or closes does not: a held key would
+/// answer its own "press again", flicker, close pane after pane, or reach
+/// the program once its press closed what took it.
 pub fn repeats(k: &KeyInput, user: &[Binding], panel: bool) -> bool {
     match action(k, user) {
         Some(a) => matches!(
@@ -514,6 +525,7 @@ pub fn repeats(k: &KeyInput, user: &[Binding], panel: bool) -> bool {
                 | Action::Focus(_)
                 | Action::Resize(_)
                 | Action::Swap(_)
+                | Action::FontSize(_)
         ),
         None => panel && !matches!(k.key, Key::Enter | Key::Escape | Key::Delete),
     }
@@ -1217,6 +1229,17 @@ mod msg_to_key_tests {
         assert_eq!(binding("ctrl+,=copy"), binding("ctrl+comma=copy"));
         assert_eq!(binding("shift+pgup=copy"), binding("shift+PageUp=copy"));
         assert_eq!(binding("7=copy"), Some((0, 0x37, Some(Action::Copy))));
+        // Case and spaces do not matter, around a + key either.
+        assert_eq!(
+            binding("Ctrl+E=Split_Right"),
+            Some((CTRL, 0x45, Some(Action::SplitRight)))
+        );
+        assert_eq!(
+            binding("ctrl+shift+r=None"),
+            Some((CTRL | SHIFT, 0x52, None))
+        );
+        assert_eq!(binding("ctrl + + = copy"), plus);
+        assert_eq!(binding("+=copy"), Some((0, 0xbb, Some(Action::Copy))));
         for bad in [
             "ctrl+shift+r",
             "ctrl+shift+r=split_sideways",
@@ -1224,6 +1247,11 @@ mod msg_to_key_tests {
             "ctrl+f25=copy",
             "ctrl+caps=copy",
             "=copy",
+            "ctrl+=copy",
+            "ctrl++a=copy",
+            "shift+ctrl+shift+a=copy",
+            "a+b=copy",
+            "f01=copy",
         ] {
             assert_eq!(binding(bad), None, "{bad}");
         }
@@ -1259,6 +1287,8 @@ mod msg_to_key_tests {
             text_binding(r"alt+==text:a=b\e[A\x41\s"),
             Some((ALT, 0xbb, b"a=b\x1b[AA ".to_vec()))
         );
+        // Only two hex digits make a byte.
+        assert_eq!(unesc(r"\x+f\x4"), br"\x+f\x4");
         assert_eq!(text_binding("ctrl+e=text:"), None, "nothing to type");
         assert_eq!(text_binding("ctrl+bogus+e=text:x"), None);
         assert_eq!(text_binding("ctrl+e=split_right"), None);
@@ -1470,7 +1500,7 @@ mod msg_to_key_tests {
                 assert!(!repeats_with(vk, held, panel), "{vk:#x} panel {panel}");
             }
         }
-        // Moving and scrolling go on while the key is held.
+        // Moving, scrolling and the font size go on while the key is held.
         for (vk, held) in [
             (0x21, &[0xa0][..]),         // ScrollPage
             (0x09, &[0xa2]),             // CycleTab
@@ -1478,6 +1508,7 @@ mod msg_to_key_tests {
             (0x25, &[0xa2, 0xa4]),       // Focus
             (0x26, &[0xa4, 0xa0]),       // Resize
             (0x27, &[0xa2, 0xa4, 0xa0]), // Swap
+            (0xbb, &[0xa2]),             // FontSize
         ] {
             assert!(repeats_with(vk, held, false), "{vk:#x}");
         }

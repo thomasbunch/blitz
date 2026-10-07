@@ -783,7 +783,7 @@ mod tests {
         assert_eq!(done(&back).iter().flatten().count(), 1);
         let odd = json.replace(r#""done":"Fixed the \"login\" bug.""#, r#""done":7"#);
         assert_eq!(done(&from_json(&odd).expect("still a session"))[2], None);
-        let lines = json.replace(r#"Fixed the \"login\" bug."#, r"one\ntwo\u0007");
+        let lines = json.replace(r#"Fixed the \"login\" bug."#, r"one\ntwo\u0007\u202e");
         let read = from_json(&lines).expect("still a session");
         assert_eq!(done(&read)[2].as_deref(), Some("one two"));
     }

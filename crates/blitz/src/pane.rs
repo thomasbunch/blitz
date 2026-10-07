@@ -142,11 +142,13 @@ impl Pane {
                         let mut term = lock(&t);
                         term.feed(chunk);
                         term.take_replies(&mut replies);
-                        drop(term);
-                        // Replies go out in the order the queries came in.
+                        // Replies go out in the order the queries came in,
+                        // and before the lock goes, so a focus report the
+                        // UI thread sends next follows any queued here.
                         if !replies.is_empty() {
                             w.reply(std::mem::take(&mut replies));
                         }
+                        drop(term);
                     }
                     if !d.swap(true, Ordering::AcqRel) {
                         notify(id, Note::Dirty);

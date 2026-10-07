@@ -63,6 +63,12 @@ impl Rect {
         self.y + self.h
     }
 
+    /// Whether the point (`x`, `y`) is inside: the right and bottom edges
+    /// are the next rect's.
+    pub fn contains(self, x: i32, y: i32) -> bool {
+        (self.x..self.right()).contains(&x) && (self.y..self.bottom()).contains(&y)
+    }
+
     /// Splits off a divider along `axis`. `a` gets `ratio` of what is left
     /// after the divider, rounded, and `b` gets the rest.
     /// Returns `(a, divider, b)`.
@@ -568,8 +574,9 @@ impl Window {
 
     /// Collapses the sidebar when the window gets narrower than `NARROW`
     /// px at 96 DPI, and expands it again once it is `WIDE`, unless the
-    /// user chose otherwise in between.
-    pub fn fit_width(&mut self, width: f32) {
+    /// user chose otherwise in between. Returns whether the sidebar changed.
+    pub fn fit_width(&mut self, width: f32) -> bool {
+        let was = self.sidebar_expanded;
         match self.narrow {
             None if width < NARROW => {
                 self.narrow = Some(self.sidebar_expanded);
@@ -581,6 +588,7 @@ impl Window {
             }
             _ => {}
         }
+        self.sidebar_expanded != was
     }
 
     /// Whether the sidebar is expanded by the user's choice, which is what
@@ -682,6 +690,13 @@ mod tests {
 
     fn ids(v: &[u32]) -> Vec<PaneId> {
         v.iter().map(|&n| PaneId(n)).collect()
+    }
+
+    #[test]
+    fn rects_hold_points_up_to_their_right_and_bottom_edges() {
+        let a = r(10, 20, 5, 4);
+        assert!(a.contains(10, 20) && a.contains(14, 23));
+        assert!(!a.contains(15, 20) && !a.contains(10, 24) && !a.contains(9, 21));
     }
 
     #[test]
@@ -1133,14 +1148,14 @@ mod tests {
         let mut w = Window::default();
         w.tabs.push(Tab::new("t".into(), PaneId(1)));
         assert!(w.tabs[0].split(Dir::Right, PaneId(2), AREA, MIN));
-        w.fit_width(1200.0);
+        assert!(!w.fit_width(1200.0));
         assert!(w.sidebar_expanded);
-        w.fit_width(790.0);
+        assert!(w.fit_width(790.0), "changed");
         assert!(!w.sidebar_expanded && w.chosen_expanded());
         // Back over the line, but not by enough to flip it back.
-        w.fit_width(820.0);
+        assert!(!w.fit_width(820.0));
         assert!(!w.sidebar_expanded);
-        w.fit_width(880.0);
+        assert!(w.fit_width(880.0), "changed");
         assert!(w.sidebar_expanded && w.narrow.is_none());
 
         // Collapsed by hand, it stays collapsed when the window widens.

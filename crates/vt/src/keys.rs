@@ -136,10 +136,14 @@ pub fn encode_key(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     }
 }
 
-/// Whether `k` is the interrupt chord: C or Break with Ctrl, and neither
-/// Shift nor Alt. Ctrl+Shift+C is copy in most terminals.
+/// Whether `k` is the interrupt chord: C or Break with Ctrl and not Alt,
+/// and C without Shift, as Ctrl+Shift+C is copy in most terminals.
 pub fn is_interrupt(k: &KeyInput) -> bool {
-    matches!(k.vk, VK_C | VK_CANCEL) && mod_bits(k) & 7 == 4
+    match k.vk {
+        VK_C => mod_bits(k) & 7 == 4,
+        VK_CANCEL => mod_bits(k) & 6 == 4,
+        _ => false,
+    }
 }
 
 /// Whether `k` reaches the program as Ctrl+C, which interrupts it: the
