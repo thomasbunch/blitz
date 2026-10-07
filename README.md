@@ -216,6 +216,7 @@ writes it.
 | `check_updates` | `true` | Look for a newer release |
 | `flash` | `true` | Flash the taskbar button when a session needs you |
 | `bell_attention` | `true` | Treat a bell or a notification in a background pane as needing you |
+| `right_click_paste` | `true` | A right click copies the selection, or pastes when nothing is selected |
 | `editor_uri` | `""` | Ctrl+click on a file path opens it at its line through this URI, such as `"vscode://file/{path}:{line}:{col}"`. Empty opens the file with its program, or shows it in Explorer when it has none |
 | `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
 | `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
@@ -279,6 +280,7 @@ good place to start.
 | Alt+drag | Select a block of columns |
 | Shift+click | Extend the selection |
 | Ctrl+click | Open a link |
+| Right-click | Copy the selection, or paste when nothing is selected |
 | Wheel | Scroll; in less, man and other full-screen programs, press the arrow keys |
 
 A selection can reach into scrollback and stays on its text while
