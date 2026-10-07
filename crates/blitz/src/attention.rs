@@ -984,7 +984,7 @@ mod tests {
     fn a_long_command_ends_done_or_error() {
         assert_eq!(
             command(134, Some(101)).1,
-            Some((Ev::Error { sticky: false }, "exit 101 \u{b7} 2m 14s".into()))
+            Some((Ev::Error { sticky: false }, "exit 101 \u{b7} 2m".into()))
         );
         assert_eq!(
             command(10, Some(0)).1,
@@ -993,7 +993,7 @@ mod tests {
         // Stopped with Ctrl+C, as Windows and as a POSIX shell say it.
         assert_eq!(
             command(60, Some(CTRL_C_EXIT as i32)).1,
-            Some((Ev::Done, "Ctrl+C \u{b7} 1m 0s".into()))
+            Some((Ev::Done, "Ctrl+C \u{b7} 1m".into()))
         );
         assert_eq!(command(60, Some(130)).1.map(|e| e.0), Some(Ev::Done));
         // The next prompt ends it either way.
