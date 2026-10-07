@@ -87,12 +87,19 @@ fn session_files_round_trip() {
     std::fs::write(&file, b"\xff\xfe{").expect("write");
     assert_eq!(session::load(), None, "not UTF-8");
 
-    // Another window's temporary file is not this one's business.
+    // Another window's temporary file is not this one's business while
+    // that window may be writing it, but one left by a crash goes.
     let other = dir.join("session.json.4294967295.tmp");
     std::fs::write(&other, "{").expect("write");
     session::save(&two).expect("save");
     assert_eq!(session::load(), Some(two.clone()));
-    std::fs::remove_file(&other).expect("remove");
+    assert!(other.exists(), "a fresh one stays");
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    (std::fs::File::options().write(true).open(&other))
+        .and_then(|f| f.set_modified(hour_ago))
+        .expect("age it");
+    session::save(&two).expect("save");
+    assert!(!other.exists(), "a stale one goes");
 
     session::clear();
     assert_eq!(session::load(), None);
