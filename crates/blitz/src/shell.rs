@@ -63,15 +63,13 @@ fn pwsh(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            let major: u32 = name
-                .split(|c: char| !c.is_ascii_digit())
-                .next()?
-                .parse()
-                .ok()?;
+            let digits = name.split(|c: char| !c.is_ascii_digit()).next()?;
+            let major: u32 = digits.parse().ok()?;
             let exe = e.path().join("pwsh.exe");
-            exe.is_file().then_some((major, exe))
+            // `7` beats `7-preview` whichever the folder lists first.
+            exe.is_file().then_some(((major, digits == name), exe))
         })
-        .max_by_key(|(major, _)| *major)
+        .max_by_key(|(key, _)| *key)
         .map(|(_, exe)| exe)
 }
 
@@ -391,5 +389,28 @@ mod tests {
         assert_eq!(found[0].1, on_path.join("pwsh.exe").to_string_lossy());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Folders are listed in name order, which puts `7-preview` after `7`.
+    #[test]
+    fn detect_prefers_a_release_to_a_preview_of_it() {
+        let root = std::env::temp_dir().join(format!("blitz-preview-{}", std::process::id()));
+        let pf = root.join("pf");
+        for d in ["7", "7-preview", "6"] {
+            let p = pf.join("PowerShell").join(d);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("pwsh.exe"), b"").unwrap();
+        }
+        let env = |k: &str| (k == "ProgramFiles").then(|| pf.clone().into_os_string());
+        let got = detect_with(env);
+        // A preview of a newer major still wins over an older release.
+        std::fs::remove_dir_all(pf.join("PowerShell").join("7")).unwrap();
+        let only_preview = detect_with(env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, pf.join("PowerShell").join("7").join("pwsh.exe"));
+        assert_eq!(
+            only_preview,
+            pf.join("PowerShell").join("7-preview").join("pwsh.exe")
+        );
     }
 }
