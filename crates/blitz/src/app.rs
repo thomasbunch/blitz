@@ -5739,7 +5739,7 @@ mod tests {
         let mut win = layout::Window::default();
         win.tabs.push(Tab::new("a".into(), PaneId(1)));
         win.tabs.push(Tab::new("b".into(), PaneId(2)));
-        let offer = crate::update::banner(None, "0.2.0", None, true).unwrap();
+        let offer = crate::update::banner(None, "0.2.0", None, true).expect("an offer");
         let update = ("0.2.0".to_string(), offer);
         let note = "Sessions are busy, and updating restarts blitz.                     Press Ctrl+Alt+Shift+F12 again";
         let area = |note| panes_area(&win, (1440, 900), 1.0, Some(&update), note, 7);
