@@ -1533,6 +1533,12 @@ impl App {
             self.eaten.press(k.vk);
             return;
         }
+        // The program saw neither the press nor the release of a key blitz
+        // took, so it gets none of its repeats either, even once they stop
+        // doing anything, such as a swap that reached the edge.
+        if held && k.down && self.eaten.0.contains(&k.vk) {
+            return;
+        }
         let Some(v) = self.current() else {
             return;
         };
@@ -2475,7 +2481,10 @@ impl App {
             .filter_map(|v| Some(v.resume.as_ref()?.1))
             .min();
         // A changed layout waiting to be saved, and a renderer to retry.
-        let gfx = self.gfx_retry.filter(|_| self.gfx.is_none());
+        // A minimized window draws nothing, so it has nothing to retry.
+        let shown = (self.window.as_ref())
+            .is_some_and(|w| w.inner_size().width > 0 && w.inner_size().height > 0);
+        let gfx = self.gfx_retry.filter(|_| self.gfx.is_none() && shown);
         [sync, notice, timer, resume, self.save_after, gfx]
             .into_iter()
             .flatten()
@@ -2485,15 +2494,19 @@ impl App {
 
 /// Whether a layout that `changed` since the last save is written now. A
 /// divider drag or a held resize key changes it many times a second, so a
-/// change is written `SAVE_DELAY` after it was first seen, or once the drag
-/// ends; `due` holds when.
+/// change is written `SAVE_DELAY` after it was first seen, or that long
+/// after the drag ends; `due` holds when. A drag holds no deadline, which
+/// would wake the event loop over and over once passed.
 fn save_now(changed: bool, dragging: bool, now: Instant, due: &mut Option<Instant>) -> bool {
     if !changed {
         *due = None;
         return false;
     }
     match *due {
-        _ if dragging => false,
+        _ if dragging => {
+            *due = None;
+            false
+        }
         None => {
             *due = Some(now + SAVE_DELAY);
             false
@@ -2830,6 +2843,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                // Releases and the end of a drag now go to another window.
+                if !f {
+                    self.eaten = Eaten::default();
+                    self.mouse.divider = None;
+                }
                 let mut out = Vec::new();
                 vt::encode_focus(f, &self.modes(), &mut out);
                 self.send(out);
@@ -3458,6 +3476,13 @@ mod tests {
         }
         assert!(!save_now(true, false, at(5001), &mut due));
         assert!(save_now(true, false, at(5501), &mut due));
+        // A save already due when a drag starts waits for it too, leaving
+        // no deadline in the past for the event loop to spin on.
+        let mut due = Some(at(0));
+        assert!(!save_now(true, true, at(600), &mut due));
+        assert_eq!(due, None);
+        assert!(!save_now(true, false, at(700), &mut due));
+        assert!(save_now(true, false, at(1200), &mut due));
     }
 
     fn input(vk: u16, down: bool, key: vt::Key, text: &'static str) -> KeyInput<'static> {
