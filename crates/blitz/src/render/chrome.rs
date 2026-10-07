@@ -548,13 +548,12 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 // Line 2: directory and branch.
                 let ty = ly + (l2 - th) / 2;
                 let (gap6, icon) = (s(6.0), s(10.0));
-                let bw = x
-                    .branch
-                    .as_deref()
-                    .map_or(0, |b| 2 * gap6 + icon + text_w(b, tw));
+                // A long branch name leaves the folder room to show.
+                let branch = (x.branch.as_deref()).map(|b| fit(b, (right - left) * 45 / 100, tw));
+                let bw = (branch.as_deref()).map_or(0, |b| 2 * gap6 + icon + text_w(b, tw));
                 let cwd = fit_left(&x.cwd, right - left - bw, tw);
                 text(p, left, ty, &cwd, c.dim, false);
-                if let Some(b) = x.branch.as_deref() {
+                if let Some(b) = branch.as_deref() {
                     let ix = left + text_w(&cwd, tw) + gap6;
                     let r = Rect {
                         x: ix,
@@ -1699,6 +1698,21 @@ mod tests {
             let rows: Vec<_> = c.rows.iter().map(|(id, _)| id.0).collect();
             assert_eq!(rows, [2, 1, 3]);
         }
+    }
+
+    #[test]
+    fn a_long_branch_leaves_room_for_the_folder() {
+        let (win, mut sessions, now) = fleet(true);
+        sessions[0].branch = Some("feature/paging-for-every-list-endpoint".into());
+        let c = build(&model(&win, &sessions, now));
+        let t = texts(&c);
+        // The row's text runs from 32 to 220 px, in 7 px cells.
+        let branch = t
+            .iter()
+            .find(|s| s.starts_with("feature/"))
+            .expect("branch");
+        assert!(branch.ends_with('\u{2026}') && text_w(branch, 7) <= 188 * 45 / 100);
+        assert!(t.contains(&r"C:\dev\api"), "{t:?}");
     }
 
     #[test]
