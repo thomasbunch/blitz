@@ -41,10 +41,6 @@ jobs:
       - name: Licenses and sources
         run: |
           cat > "$RUNNER_TEMP/deny.toml" <<'EOF'
-          [graph]
-          targets = ["x86_64-pc-windows-msvc"]
-          exclude-dev = true
-
           [licenses]
           allow = ["MIT", "Apache-2.0", "Zlib", "Unicode-3.0"]
 
@@ -52,7 +48,10 @@ jobs:
           unknown-registry = "deny"
           unknown-git = "deny"
           EOF
-          cargo deny --config "$RUNNER_TEMP/deny.toml" --locked check licenses sources
+          # Licenses cover what ships: Windows, no dev dependencies.
+          cargo deny --config "$RUNNER_TEMP/deny.toml" --locked --target x86_64-pc-windows-msvc --exclude-dev check licenses
+          # Sources cover every crate CI builds, on every target.
+          cargo deny --config "$RUNNER_TEMP/deny.toml" --locked check sources
 
   test:
     name: test (${{ matrix.os }})
