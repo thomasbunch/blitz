@@ -111,6 +111,12 @@ writes it.
 | `check_updates` | `true` | Look for a newer release |
 | `flash` | `true` | Flash the taskbar button when a session needs you |
 | `bell_attention` | `true` | Treat a bell in a background pane as needing you |
+| `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
+| `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
+
+blitz run, the last row of the panel, is a game rather than a setting:
+Enter starts it, and it keeps its best score in
+`%LOCALAPPDATA%\blitz\run-best`.
 
 ## Themes
 
