@@ -9,7 +9,11 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 - Tabs and splits; every pane is its own shell.
 - With two or more sessions, a sidebar lists them with their directory,
   git branch and state: *needs you*, *working*, *done*, *error*.
-  Ctrl+Shift+B collapses it to a narrow rail of status dots.
+  Ctrl+Shift+B collapses it to a narrow rail of status dots, and a click
+  on the rail expands it again; a window under 800 pixels wide (at 100%
+  scaling) shows the rail. Click a session or a tab's heading to go
+  there. Sessions that do not fit are counted at the foot, in the accent
+  colour when one of them needs you, and a click there goes to it.
 - Claude Code's title tells blitz when a session works and when it
   stops, and its hooks, which blitz sets up itself, when it needs input;
   the taskbar button flashes if blitz is in the background.
@@ -46,13 +50,14 @@ Shift+right-click also offers **Open in new blitz window**. Untick the
 option during setup to leave the menu alone.
 
 blitz asks GitHub for the latest release when it starts and every six
-hours. If there is a newer one, a strip under the panes says so. Ctrl+Shift+U
-downloads the installer, checks it against the release's `SHA256SUMS.txt`
-and restarts blitz on the new version. That ends every session, so blitz
-asks you to press it twice if one is busy. A copy run from the zip opens
+hours. If there is a newer one, the foot of the sidebar says so, or a
+strip under the panes while the sidebar is collapsed or not shown.
+Ctrl+Shift+U downloads the installer, checks it against the release's
+`SHA256SUMS.txt` and restarts blitz on the new version. That ends every
+session, so blitz asks you to press it twice if one is busy. A copy run from the zip opens
 the release page instead. If the installer fails, blitz starts again on
-the old version and the strip names the installer's log. With no strip,
-Ctrl+Shift+U asks GitHub right away and says what it found.
+the old version and names the installer's log there. With nothing
+shown, Ctrl+Shift+U asks GitHub right away and says what it found.
 
 ## Build
 
