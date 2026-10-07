@@ -405,7 +405,10 @@ mod gpu {
                     }
                 }
             }
-            let on_cursor = on_cursor(cursor_rgb, pal);
+            let on_cursor = match pal.cursor_text {
+                Some(text) if cursor_rgb == pal.cursor => text,
+                _ => on_cursor(cursor_rgb, pal),
+            };
             // The current match is outlined in the cursor's colour, one run
             // of cells a row.
             for r in (0..rows).filter(|_| !marks.is_empty()) {
@@ -442,7 +445,7 @@ mod gpu {
                     let fg = if under_block {
                         on_cursor
                     } else if selected(c, r) || marked(c, r) != 0 {
-                        pal.fg
+                        pal.selection_fg
                     } else if faint {
                         super::mix(cl.fg, cl.bg)
                     } else {
@@ -1589,6 +1592,33 @@ mod tests {
         let i = ((ch / 2 * w + cw / 2) * 4) as usize;
         let at = u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]]);
         assert_eq!(at, p.fg);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_theme_colours_for_selected_text_and_text_on_the_cursor() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = Palette {
+            selection_fg: 0x00ff00,
+            cursor_text: Some(0xff0000),
+            ..pal()
+        };
+        let mut snap = text_snapshot("\u{2588}\u{2588}", 2, 1, &p);
+        snap.selection = Some(((0, 0), (0, 0)));
+        snap.cursor = Some((1, 0, vt::CursorShape::Block));
+        let (cw, ch) = r.cell();
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert_eq!(pixel(&px, w, cw / 2, ch / 2), 0x00ff00, "selected text");
+        assert_eq!(
+            pixel(&px, w, cw + cw / 2, ch / 2),
+            0xff0000,
+            "on the cursor"
+        );
+        // The theme's text colour is for its cursor colour, not one a
+        // program chose.
+        snap.cursor_color = Some(0x0000ff);
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), p.fg);
     }
 
     #[cfg(windows)]

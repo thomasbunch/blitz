@@ -75,7 +75,9 @@ fn modify_other_keys_is_not_sgr() {
         fg: 1,
         bg: 2,
         cursor: 3,
+        cursor_text: None,
         selection_bg: 4,
+        selection_fg: 1,
         ansi: [0; 16],
     };
     t.snapshot(&mut s, &pal);
@@ -105,7 +107,9 @@ const PAL: vt::Palette = vt::Palette {
     fg: 1,
     bg: 2,
     cursor: 3,
+    cursor_text: None,
     selection_bg: 4,
+    selection_fg: 1,
     ansi: [0; 16],
 };
 

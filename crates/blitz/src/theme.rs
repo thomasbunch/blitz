@@ -207,13 +207,20 @@ impl Ui {
     }
 }
 
-/// A theme file: `key = value` lines, `#` starts a comment line. Takes
-/// Ghostty's `background`, `foreground`, `cursor-color`,
-/// `selection-background` and `palette = N=#rrggbb`, plus the chrome keys
-/// of [`Ui::field`]. Anything else is skipped, so a Ghostty theme works
-/// as is, and colours a file leaves out come from the blitz theme of the
-/// same lightness.
-pub fn parse(name: &str, text: &str) -> Theme {
+/// The terminal colour keys of a theme file, Ghostty's, besides
+/// `palette`; [`Ui::field`] has the chrome's.
+const KEYS: &[&str] = &[
+    "background",
+    "foreground",
+    "cursor-color",
+    "cursor-text",
+    "selection-background",
+    "selection-foreground",
+];
+
+/// The `key = #rrggbb` lines of a theme file in order, and its
+/// `palette = N=#rrggbb` lines. `#` starts a comment line.
+fn lines(text: &str) -> (Vec<(&str, u32)>, [Option<u32>; 16]) {
     let mut colors = Vec::new();
     let mut ansi = [None; 16];
     for line in text.trim_start_matches('\u{feff}').lines() {
@@ -235,6 +242,23 @@ pub fn parse(name: &str, text: &str) -> Theme {
             colors.push((key, c));
         }
     }
+    (colors, ansi)
+}
+
+/// Whether `text` sets a colour a theme can, so a README or a picture
+/// left in the themes folder is not offered as a theme.
+fn is_theme(text: &str) -> bool {
+    let (colors, ansi) = lines(text);
+    ansi.iter().any(Option::is_some)
+        || (colors.iter()).any(|&(k, _)| KEYS.contains(&k) || Ui::default().field(k).is_some())
+}
+
+/// A theme file: the colours of [`KEYS`] and `palette = N=#rrggbb`, plus
+/// the chrome keys of [`Ui::field`]. Anything else is skipped, so a
+/// Ghostty theme works as is, and colours a file leaves out come from the
+/// blitz theme of the same lightness.
+pub fn parse(name: &str, text: &str) -> Theme {
+    let (colors, ansi) = lines(text);
     let get = |k: &str| colors.iter().rev().find(|c| c.0 == k).map(|c| c.1);
     let light = get("background").is_some_and(|bg| luminance(bg) > 0.18);
     let base = if light { self::light() } else { dark() };
@@ -246,8 +270,10 @@ pub fn parse(name: &str, text: &str) -> Theme {
         fg,
         bg,
         cursor: get("cursor-color").unwrap_or(fg),
+        cursor_text: get("cursor-text"),
         selection_bg: get("selection-background")
             .unwrap_or_else(|| mix(bg, fg, if light { 0.15 } else { 0.2 })),
+        selection_fg: get("selection-foreground").unwrap_or(fg),
         ansi: std::array::from_fn(|i| ansi[i].unwrap_or(base.ansi[i])),
     };
     let mut ui = Ui::derive(&pal, light);
@@ -339,33 +365,37 @@ pub fn all() -> Vec<Theme> {
 }
 
 fn all_in(dir: Option<&Path>) -> Vec<Theme> {
-    let mut files: Vec<(String, PathBuf)> = dir
+    // A file being saved may not be readable for a moment; the save that
+    // follows reloads it.
+    let mut files: Vec<(String, PathBuf, String)> = dir
         .and_then(|d| std::fs::read_dir(d).ok())
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file())
-        .filter_map(|p| Some((file_name(&p)?, p)))
+        .filter_map(|p| {
+            let name = file_name(&p)?;
+            let text = crate::config::decode(&std::fs::read(&p).ok()?);
+            is_theme(&text).then_some((name, p, text))
+        })
         .collect();
     files.sort_by(|a, b| (a.0.to_lowercase(), &a.1).cmp(&(b.0.to_lowercase(), &b.1)));
     // `X` and `X.conf` name one theme; the first in that order wins.
     files.dedup_by(|b, a| a.0.eq_ignore_ascii_case(&b.0));
-    // A file being saved may not be readable for a moment; the save that
-    // follows reloads it.
-    let read = |(name, p): (String, PathBuf)| {
-        let text = crate::config::decode(&std::fs::read(p).ok()?);
-        Some(parse(&name, &text))
-    };
     let mut out: Vec<Theme> = BUILTIN
         .iter()
-        .map(|&(name, text)| {
-            let i = files.iter().position(|f| f.0.eq_ignore_ascii_case(name));
-            i.and_then(|i| read(files.remove(i)))
-                .unwrap_or_else(|| parse(name, text))
-        })
+        .map(
+            |&(name, text)| match files.iter().position(|f| f.0.eq_ignore_ascii_case(name)) {
+                Some(i) => {
+                    let (name, _, text) = files.remove(i);
+                    parse(&name, &text)
+                }
+                None => parse(name, text),
+            },
+        )
         .collect();
-    out.extend(files.into_iter().filter_map(read));
+    out.extend((files.iter()).map(|(name, _, text)| parse(name, text)));
     out
 }
 
@@ -432,7 +462,9 @@ pub fn dark() -> Palette {
         fg: 0xd6d7d9,
         bg: 0x131417,
         cursor: 0xececea,
+        cursor_text: None,
         selection_bg: 0x2c2e33,
+        selection_fg: 0xd6d7d9,
         ansi: [
             0x26282d, 0xe5534b, 0x8cc39a, 0xf2b84b, 0x6aa1ff, 0xb392f0, 0x4fc1b0, 0xc8c9cc,
             0x63666d, 0xff7b72, 0xa6d6af, 0xf8d27a, 0x93bcff, 0xcbb3f6, 0x7fd8ca, 0xececea,
@@ -445,7 +477,9 @@ pub fn light() -> Palette {
         fg: 0x2f3135,
         bg: 0xfcfcfb,
         cursor: 0x141518,
+        cursor_text: None,
         selection_bg: 0xdfdfdb,
+        selection_fg: 0x2f3135,
         ansi: [
             0x141518, 0xc8382f, 0x2e7a45, 0x9a6700, 0x2160c4, 0x8250df, 0x1b7c83, 0x6f7278,
             0x5c5f65, 0xe5534b, 0x3a9157, 0xb07d00, 0x3b7be0, 0x9a6ae0, 0x2a9aa2, 0xa9acb1,
@@ -567,8 +601,11 @@ mod tests {
              font-size = 13\n\
              cursor-color = red\n\
              sidebar-background = #eee8d5\n\
-             accent = #2160c4\n",
+             accent = #2160c4\n\
+             selection-foreground = #000001\n\
+             cursor-text = #000002\n",
         );
+        assert_eq!((t.pal.selection_fg, t.pal.cursor_text), (1, Some(2)));
         assert!(t.light);
         assert_eq!((t.pal.bg, t.pal.fg), (0xfdf6e3, 0x657b83));
         assert_eq!(t.pal.ansi[1], 0xdc322f);
@@ -579,6 +616,9 @@ mod tests {
         assert_eq!(t.ui.term_bg, 0xfdf6e3);
         let (e, d) = (parse("e", "").pal, dark());
         assert_eq!((e.bg, e.fg, e.ansi), (d.bg, d.fg, d.ansi));
+        // Left out, selected text is the text colour and the cursor's
+        // text is picked to suit the cursor.
+        assert_eq!((e.selection_fg, e.cursor_text), (e.fg, None));
     }
 
     #[test]
@@ -622,13 +662,6 @@ mod tests {
 
     #[test]
     fn every_builtin_line_is_a_known_key_with_a_good_colour() {
-        let known = [
-            "background",
-            "foreground",
-            "cursor-color",
-            "selection-background",
-            "palette",
-        ];
         for &(name, text) in BUILTIN {
             for line in text
                 .lines()
@@ -650,7 +683,8 @@ mod tests {
                     "{name}: {line}"
                 );
                 let chrome = Ui::default().field(key).is_some();
-                assert!(known.contains(&key) || chrome, "{name}: unknown key {key}");
+                let known = key == "palette" || KEYS.contains(&key);
+                assert!(known || chrome, "{name}: unknown key {key}");
             }
         }
     }
@@ -809,6 +843,10 @@ mod tests {
                 ("Midnight~", b"background = #000004\n"),
                 (".hidden", b"background = #000005\n"),
                 ("Latin", b"# Th\xe8me\nbackground = #000006\n"),
+                ("README.md", b"# Themes\n\nGhostty themes go here.\n"),
+                ("logo.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
+                ("Nord", b"notes = for Nord\n"),
+                ("nord.conf", b"palette = 0=#000007\n"),
             ],
         );
         std::fs::create_dir(f.0.join("folder")).unwrap();
@@ -818,9 +856,19 @@ mod tests {
         let extra: Vec<(&str, u32)> = (t[BUILTIN.len()..].iter())
             .map(|t| (t.name.as_str(), t.pal.bg))
             .collect();
-        // `Alpha` and `alpha.CONF` are one theme; backups, hidden files
-        // and folders are none; a file that is not UTF-8 still reads.
-        assert_eq!(extra, [("Alpha", 3), ("Latin", 6), ("Zed", 0xffffff)]);
+        // `Alpha` and `alpha.CONF` are one theme; backups, hidden files,
+        // folders and files that set no colour are none, so `nord.conf`
+        // is the only Nord; a file that is not UTF-8 still reads.
+        let nord = dark().bg;
+        assert_eq!(
+            extra,
+            [
+                ("Alpha", 3),
+                ("Latin", 6),
+                ("nord", nord),
+                ("Zed", 0xffffff)
+            ]
+        );
         assert_eq!(all_in(None).len(), BUILTIN.len());
         assert_eq!(all_in(Some(&f.0.join("missing"))).len(), BUILTIN.len());
     }

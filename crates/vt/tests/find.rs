@@ -30,7 +30,9 @@ fn shot(t: &mut Terminal) -> Snapshot {
         fg: 0xffffff,
         bg: 0,
         cursor: 0xffffff,
+        cursor_text: None,
         selection_bg: 0x333333,
+        selection_fg: 0xffffff,
         ansi: [0; 16],
     };
     let mut s = Snapshot::default();
