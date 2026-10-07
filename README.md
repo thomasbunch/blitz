@@ -338,8 +338,9 @@ unless what you type has a capital letter, and shows every match in
 view in the selection colour, the current one outlined. Enter or F3 goes
 to the next match up, Shift+Enter or Shift+F3 to the next one down, and
 Esc closes the bar, leaving the view where it is. Any other shortcut
-closes the bar and does what it does, and a click in the pane closes it
-too. A full-screen program is searched on its screen only.
+does what it does and closes the bar, unless it scrolls, and a click in
+the pane closes it too. A full-screen program is searched on its screen
+only.
 
 With shell integration on, Ctrl+Shift+Up and Ctrl+Shift+Down scroll to
 the previous and next prompt; down from the last one goes back to the
