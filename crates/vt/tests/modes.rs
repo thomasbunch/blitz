@@ -122,6 +122,8 @@ fn host_reset_is_ris_but_keeps_the_modes() {
     });
     t.feed(b"\x1b[?9001h\x1b[?1004h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1h");
     t.feed(b"\x1b[?1049h\x1b[>1u\x1b[?2026hx");
+    // Even old numbers the alternate screen started over itself.
+    t.feed(b"\x1b[H\x1bM");
     let (before, epoch) = (t.input_modes(), t.line_epoch());
     t.reset();
     let m = t.input_modes();
