@@ -630,6 +630,24 @@ pub fn split_program(cmdline: &str) -> (&str, &str) {
     }
 }
 
+/// The words of `args` as `CommandLineToArgvW` splits them, so that
+/// `"C:\My Projects"` is one, though without its `\"`.
+fn words(args: &str) -> Vec<String> {
+    let (mut out, mut word, mut quoted) = (Vec::new(), None::<String>, false);
+    for c in args.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                word.get_or_insert_default();
+            }
+            ' ' | '\t' if !quoted => out.extend(word.take()),
+            c => word.get_or_insert_default().push(c),
+        }
+    }
+    out.extend(word);
+    out
+}
+
 /// Whether PowerShell `args` already say what to run, which the
 /// integration's own `-Command` would take the place of. PowerShell takes
 /// any start of a parameter's name, and `-e` is `-EncodedCommand`. A word
@@ -651,7 +669,7 @@ fn runs_command(args: &str) -> bool {
         "windowstyle",
         "workingdirectory",
     ];
-    let mut words = args.split_whitespace();
+    let mut words = words(args).into_iter();
     while let Some(w) = words.next() {
         let Some(p) = w.strip_prefix(['-', '/']) else {
             return true;
@@ -1103,7 +1121,13 @@ declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""#;
             assert_eq!(ps(s), s);
         }
         // A parameter's value is not what to run.
-        for s in ["pwsh -wd c", "pwsh -WorkingDirectory c", "pwsh -wd:c -ex f"] {
+        for s in [
+            "pwsh -wd c",
+            "pwsh -WorkingDirectory c",
+            "pwsh -wd:c -ex f",
+            r#"pwsh -wd "C:\My Projects" -NoProfile"#,
+            r#"pwsh -SettingsFile "C:\Program Files\x.json""#,
+        ] {
             assert!(ps(s).contains(" -NoExit -Command "), "{s}");
         }
     }
