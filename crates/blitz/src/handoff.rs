@@ -4,17 +4,21 @@
 //!
 //! Any process on the desktop at the same or a higher integrity level can
 //! send this message, so it only ever carries a folder, never a command.
+//!
+//! The same window procedure sees the window messages winit does not pass
+//! on.
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, SMTO_ABORTIFHUNG,
-    SendMessageTimeoutW, WM_COPYDATA,
+    AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, HTCLIENT, SMTO_ABORTIFHUNG,
+    SendMessageTimeoutW, WM_COPYDATA, WM_MOUSEACTIVATE,
 };
 use windows::core::HSTRING;
 use winit::event_loop::EventLoopProxy;
@@ -116,16 +120,47 @@ pub fn send(dir: Option<&Path>) -> Option<bool> {
     Some(sent.0 != 0 && took == 1)
 }
 
-/// Makes `hwnd` take hand-offs: each launch it is sent arrives as
+/// A press of a mouse button on the window while it was in the
+/// background: the click that brings blitz to the front.
+static ACTIVATING: AtomicBool = AtomicBool::new(false);
+
+/// Whether `msg` says the press that comes next is a click on the
+/// terminal that brings the window to the front. A click on the title bar
+/// or a border has no press after it.
+fn activating(msg: u32, lparam: LPARAM) -> bool {
+    msg == WM_MOUSEACTIVATE && (lparam.0 & 0xffff) as u32 == HTCLIENT
+}
+
+/// Whether the press being handled is the click that brought the window
+/// to the front. Asked once per press, so it is true for that one only.
+pub fn take_activating_click() -> bool {
+    ACTIVATING.swap(false, Ordering::Relaxed)
+}
+
+/// Forgets a click that brought the window to the front: it went to the
+/// background again before the press came.
+pub fn forget_activating_click() {
+    ACTIVATING.store(false, Ordering::Relaxed);
+}
+
+/// What the window procedure is given.
+struct Sub {
+    proxy: EventLoopProxy<UserEvent>,
+    /// The main window: it takes launches.
+    launches: bool,
+}
+
+/// Watches `hwnd` for the messages winit does not pass on. With
+/// `launches`, it takes hand-offs too: each launch it is sent arrives as
 /// `UserEvent::Handoff`.
-pub fn install(hwnd: isize, proxy: EventLoopProxy<UserEvent>) {
+pub fn install(hwnd: isize, proxy: EventLoopProxy<UserEvent>, launches: bool) {
     // Leaked on purpose: the window lives as long as the process.
-    let proxy = Box::into_raw(Box::new(proxy));
+    let sub = Box::into_raw(Box::new(Sub { proxy, launches }));
     // SAFETY: a live window owned by this thread; the subclass proc only
-    // reads `proxy`, which is never freed.
-    let ok = unsafe { SetWindowSubclass(HWND(hwnd as *mut c_void), Some(proc), 1, proxy as usize) };
+    // reads `sub`, which is never freed.
+    let ok = unsafe { SetWindowSubclass(HWND(hwnd as *mut c_void), Some(proc), 1, sub as usize) };
     if !ok.as_bool() {
-        eprintln!("blitz: cannot take folders from other blitz launches");
+        eprintln!("blitz: cannot watch the window's messages");
     }
 }
 
@@ -135,9 +170,14 @@ unsafe extern "system" fn proc(
     wparam: WPARAM,
     lparam: LPARAM,
     _id: usize,
-    proxy: usize,
+    sub: usize,
 ) -> LRESULT {
-    if msg == WM_COPYDATA {
+    // SAFETY: `install` leaked this for the window's lifetime.
+    let sub = unsafe { &*(sub as *const Sub) };
+    if activating(msg, lparam) {
+        ACTIVATING.store(true, Ordering::Relaxed);
+    }
+    if msg == WM_COPYDATA && sub.launches {
         // SAFETY: WM_COPYDATA carries a COPYDATASTRUCT; the system copied
         // it and its data into this process, valid until this returns.
         let cds = unsafe { &*(lparam.0 as *const COPYDATASTRUCT) };
@@ -150,11 +190,7 @@ unsafe extern "system" fn proc(
         };
         let took = decode(cds.dwData, bytes)
             .filter(|a| !matches!(a, Ask::Open(d) if !d.is_dir()))
-            .is_some_and(|a| {
-                // SAFETY: `install` leaked this proxy for the window's lifetime.
-                let proxy = unsafe { &*(proxy as *const EventLoopProxy<UserEvent>) };
-                proxy.send_event(UserEvent::Handoff(a)).is_ok()
-            });
+            .is_some_and(|a| sub.proxy.send_event(UserEvent::Handoff(a)).is_ok());
         return LRESULT(took.into());
     }
     // SAFETY: passes the message on unchanged.
@@ -174,6 +210,23 @@ mod tests {
         let dir = Path::new(r"C:\Users\jo\Desktop\café ünï 文件");
         let ask = decode(MAGIC, &bytes(&encode(dir)));
         assert_eq!(ask, Some(Ask::Open(dir.into())));
+    }
+
+    /// Only a press on the terminal follows; a click on the title bar or a
+    /// border brings no press that could be swallowed.
+    #[test]
+    fn handoff_only_a_click_on_the_terminal_is_kept_from_it() {
+        const HTCAPTION: u32 = 2;
+        let click = |hit: u32| LPARAM((0x0201 << 16 | hit) as isize);
+        assert!(activating(WM_MOUSEACTIVATE, click(HTCLIENT)));
+        assert!(!activating(WM_MOUSEACTIVATE, click(HTCAPTION)));
+        assert!(!activating(WM_COPYDATA, click(HTCLIENT)));
+        ACTIVATING.store(true, Ordering::Relaxed);
+        assert!(take_activating_click());
+        assert!(!take_activating_click(), "only the first press");
+        ACTIVATING.store(true, Ordering::Relaxed);
+        forget_activating_click();
+        assert!(!take_activating_click());
     }
 
     /// A second launch without a folder only brings blitz to the front.

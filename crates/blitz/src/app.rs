@@ -1159,9 +1159,7 @@ impl App {
         {
             self.hwnd = h.hwnd.get();
         }
-        if !self.args.new_window {
-            crate::handoff::install(self.hwnd, self.proxy.clone());
-        }
+        crate::handoff::install(self.hwnd, self.proxy.clone(), !self.args.new_window);
         watch_settings(self.proxy.clone());
         self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
         self.frame_theme();
@@ -3166,14 +3164,27 @@ impl App {
     }
 
     fn on_mouse_button(&mut self, el: &ActiveEventLoop, state: ElementState, button: MouseButton) {
+        let pressed = state == ElementState::Pressed;
+        // Asked for every press, so a click with another button never
+        // leaves it for the next one.
+        let activating = pressed && crate::handoff::take_activating_click();
         let b = match button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
             MouseButton::Right => 2,
             _ => return,
         };
+        // The click that brings blitz to the front only moves focus. Sent
+        // on, it could pick an option of a Claude Code prompt the user has
+        // not read yet.
+        if activating {
+            let open = self.commands.is_some() || self.settings.is_some() || self.game.is_some();
+            if let (Some(id), false) = (self.hit(self.mouse.pos).0, open) {
+                self.show(id);
+            }
+            return;
+        }
         let mods = mods_now();
-        let pressed = state == ElementState::Pressed;
         // Presses go to the command palette or the settings panel; a
         // release still goes wherever its press went.
         if pressed && self.commands.is_some() {
@@ -4487,6 +4498,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if !f {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
+                    crate::handoff::forget_activating_click();
                 }
                 // Ctrl may be let go while another window has the keys.
                 self.set_hover(None);
