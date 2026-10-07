@@ -43,7 +43,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowId};
 
 use crate::arcade::run::{self, Run};
-use crate::attention::{Attn, Ev};
+use crate::attention::{Attn, Ev, claude_title};
 use crate::config::{Config, Kind};
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
@@ -1940,7 +1940,10 @@ impl App {
                     since: p.attn.since,
                     seen: p.attn.seen,
                     msg: if p.msg.is_empty() {
-                        p.title.clone()
+                        // Without the mark Claude Code puts in front.
+                        claude_title(&p.title)
+                            .map_or(&p.title[..], |c| c.1)
+                            .to_owned()
                     } else {
                         p.msg.clone()
                     },
@@ -2569,6 +2572,9 @@ impl App {
         }
     }
 
+    /// One thing a session's output did. Where Claude Code's signals
+    /// disagree, its title says whether it is working, and its hooks say
+    /// when it needs the user, what to show and which session it is.
     fn on_term_event(&mut self, id: PaneId, e: Event) {
         let focus = self.focus_id() == Some(id);
         let Some(v) = self.view_mut(id) else {
@@ -2576,10 +2582,30 @@ impl App {
         };
         match e {
             Event::Title(t) => {
+                let (was, now) = (v.pane.claude_title, claude_title(&t).map(|c| c.0));
+                let asked = v.pane.attn.state == Attn::NeedsYou;
+                v.pane.claude_title = now;
                 v.pane.title = t;
                 if focus {
                     let t = v.pane.title.clone();
                     self.set_title(&t);
+                }
+                // This needs no hooks, and it sees a turn the user
+                // interrupted end, which runs no hook at all.
+                match (was, now) {
+                    // Back at work: a question it showed was answered.
+                    (w, Some(true)) if w != Some(true) => {
+                        if self.attention(id, Ev::Busy)
+                            && asked
+                            && let Some(v) = self.view_mut(id)
+                        {
+                            v.pane.msg.clear();
+                        }
+                    }
+                    (Some(true), Some(false)) => {
+                        self.attention(id, Ev::Quiet);
+                    }
+                    _ => {}
                 }
             }
             Event::Cwd(dir) => {
@@ -2594,19 +2620,8 @@ impl App {
             }
             Event::Notify { title, body } => {
                 if let Some((ev, session)) = Ev::from_notify(&title, &v.pane.token) {
-                    // `idle` is SessionEnd: the user quit Claude, so there is
-                    // nothing left to resume.
-                    if ev == Ev::Idle {
-                        v.pane.claude = None;
-                    } else if let Some(id) = session {
-                        v.pane.claude = Some(id.to_owned());
-                    }
-                    let changed = self.attention(id, ev);
-                    if relabels(ev, changed)
-                        && let Some(v) = self.view_mut(id)
-                    {
-                        v.pane.msg = body;
-                    }
+                    note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
+                    self.attention(id, ev);
                 }
             }
             Event::Progress { state, pct } => {
@@ -3625,13 +3640,25 @@ fn late_jump(vk: u16, since: Option<Duration>) -> bool {
     is_jump(vk) && since.is_some_and(|d| d < LATE_JUMP)
 }
 
-/// Whether a notification replaces the session's sidebar message. It is
-/// kept with the state it came with, so a repeat or an ignored event does
-/// not relabel the session. Idle always does: the hook sends it with an
-/// empty body when the session ends, which clears the last reply even
-/// when the session was already idle.
-fn relabels(ev: Ev, changed: bool) -> bool {
-    changed || ev == Ev::Idle
+/// What a hook's notification says besides the state. Its text replaces
+/// the session's message, even when the state stays: the title may have
+/// ended the turn before the hook with the reply came, and `idle`, sent
+/// with none, clears it. It names the Claude Code session, which `idle`
+/// (SessionEnd: the user quit Claude) ends, so there is nothing left to
+/// resume.
+fn note_hook(
+    msg: &mut String,
+    claude: &mut Option<String>,
+    ev: Ev,
+    session: Option<&str>,
+    body: String,
+) {
+    if ev == Ev::Idle {
+        *claude = None;
+    } else if let Some(id) = session {
+        *claude = Some(id.to_owned());
+    }
+    *msg = body;
 }
 
 /// How to flash the taskbar for a session that just changed to `state`
@@ -4951,17 +4978,25 @@ mod tests {
     }
 
     #[test]
-    fn app_message_follows_the_state_and_idle_clears_it() {
-        let t0 = Instant::now();
-        let mut a = crate::attention::PaneAttn::new(t0);
-        let mut feed = |ev, attended| relabels(ev, a.apply(ev, attended, t0));
-        assert!(feed(Ev::Working, true));
-        assert!(!feed(Ev::Working, true), "a repeat");
-        assert!(feed(Ev::NeedsYou, true), "seen, but it still asks");
-        // Watched to the end: done is seen at once and lands on idle, and
-        // the end of the session still clears the message.
-        assert!(feed(Ev::Done, true));
-        assert!(feed(Ev::Idle, true));
+    fn app_hooks_set_the_message_and_the_session() {
+        let id = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
+        let (mut msg, mut claude) = (String::new(), None);
+        note_hook(
+            &mut msg,
+            &mut claude,
+            Ev::Working,
+            Some(id),
+            "Fix it".into(),
+        );
+        assert_eq!((msg.as_str(), claude.as_deref()), ("Fix it", Some(id)));
+        // The reply replaces it, whatever the state does.
+        note_hook(&mut msg, &mut claude, Ev::Done, None, "Fixed.".into());
+        assert_eq!((msg.as_str(), claude.as_deref()), ("Fixed.", Some(id)));
+        note_hook(&mut msg, &mut claude, Ev::Done, Some(id), "Again.".into());
+        assert_eq!(msg, "Again.");
+        // The session ended: nothing to show or resume.
+        note_hook(&mut msg, &mut claude, Ev::Idle, Some(id), String::new());
+        assert_eq!((msg.as_str(), claude), ("", None));
     }
 
     #[test]

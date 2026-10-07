@@ -30,6 +30,10 @@ pub struct Pane {
     pub name: String,
     /// Latest title set by the program (OSC 0/2).
     pub title: String,
+    /// What Claude Code's mark in `title` says: true while it works, false
+    /// once it stopped, `None` with no such mark. See
+    /// [`crate::attention::claude_title`].
+    pub claude_title: Option<bool>,
     /// Latest directory reported by the shell, else the spawn directory.
     pub cwd: String,
     /// Git branch of `cwd`, read from `.git/HEAD`.
@@ -164,6 +168,7 @@ impl Pane {
             attn: PaneAttn::new(Instant::now()),
             name: String::new(),
             title: String::new(),
+            claude_title: None,
             cwd: s.cwd.map(|p| p.display().to_string()).unwrap_or_default(),
             branch: None,
             msg: String::new(),

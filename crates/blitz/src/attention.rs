@@ -21,7 +21,12 @@ pub enum Ev {
     /// A bell: it needs the user until they look at the pane.
     Bell,
     Working,
+    /// Claude Code's title shows it working.
+    Busy,
     Done,
+    /// Claude Code's title stopped showing work. That ends a turn, but a
+    /// question stays: while one waits the title looks the same.
+    Quiet,
     Error {
         sticky: bool,
     },
@@ -74,6 +79,19 @@ impl Ev {
             _ => Ev::Error { sticky: true },
         }
     }
+}
+
+/// What Claude Code's terminal title says: whether it is working (◐ or ◑,
+/// which it turns while it works) or not (✳), and the title after that
+/// mark, which names the task. `None` for any other title.
+pub fn claude_title(title: &str) -> Option<(bool, &str)> {
+    let mut chars = title.chars();
+    let working = match chars.next()? {
+        '\u{25D0}' | '\u{25D1}' => true,
+        '\u{2733}' => false,
+        _ => return None,
+    };
+    Some((working, chars.as_str().strip_prefix(' ')?.trim()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,9 +171,21 @@ impl PaneAttn {
                 self.bell = ev == Ev::Bell;
                 NeedsYou
             }
-            Ev::Working => Working,
+            Ev::Working | Ev::Busy => Working,
             Ev::Done if attended => Idle,
             Ev::Done => DoneUnseen,
+            Ev::Quiet => match self.state {
+                Working if attended => Idle,
+                Working => DoneUnseen,
+                // Answered, it finds the turn over.
+                NeedsYou => {
+                    if self.prev == Working {
+                        self.prev = DoneUnseen;
+                    }
+                    return false;
+                }
+                s => s,
+            },
             Ev::Error { sticky } => {
                 self.sticky = sticky;
                 if attended && !sticky { Idle } else { Error }
@@ -298,6 +328,73 @@ mod tests {
     }
 
     #[test]
+    fn claude_titles() {
+        assert_eq!(
+            claude_title("\u{2733} Claude Code"),
+            Some((false, "Claude Code"))
+        );
+        assert_eq!(
+            claude_title("\u{25D0} Fix the login"),
+            Some((true, "Fix the login"))
+        );
+        assert_eq!(
+            claude_title("\u{25D1} Fix the login"),
+            Some((true, "Fix the login"))
+        );
+        for other in [
+            "",
+            "\u{2733}",
+            "\u{2733}Claude",
+            "pwsh",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            "Claude \u{2733} Code",
+        ] {
+            assert_eq!(claude_title(other), None, "{other:?}");
+        }
+    }
+
+    /// The title says when a turn ends, which no hook does when the user
+    /// interrupts it.
+    #[test]
+    fn title_marks_start_and_end_work() {
+        let mut p = pane(Attn::Idle);
+        assert!(p.apply(Ev::Busy, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::Working);
+        assert!(p.apply(Ev::Quiet, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::DoneUnseen);
+        // A quiet title says nothing about a pane that was not working.
+        for state in [Attn::Idle, Attn::DoneUnseen, Attn::Error] {
+            let mut p = pane(state);
+            assert!(!p.apply(Ev::Quiet, AWAY, Instant::now()));
+            assert_eq!(p.state, state);
+        }
+        let mut p = pane(Attn::Working);
+        assert!(p.apply(Ev::Quiet, HERE, Instant::now()));
+        assert_eq!(p.state, Attn::Idle);
+    }
+
+    /// Working again after a question means it was answered; going quiet
+    /// does not end the question, but answering it then finds the turn
+    /// over rather than back at work.
+    #[test]
+    fn title_marks_around_a_question() {
+        let mut p = pane(Attn::Working);
+        p.apply(Ev::NeedsYou, AWAY, Instant::now());
+        assert!(p.apply(Ev::Busy, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::Working);
+
+        let mut p = pane(Attn::Working);
+        p.apply(Ev::NeedsYou, AWAY, Instant::now());
+        assert!(!p.apply(Ev::Quiet, AWAY, Instant::now()));
+        assert_eq!(p.state, Attn::NeedsYou);
+        assert!(p.apply(Ev::Answered, HERE, Instant::now()));
+        assert_eq!(p.state, Attn::Idle);
+        // Once answered, the title shows it at work again.
+        assert!(p.apply(Ev::Busy, HERE, Instant::now()));
+        assert_eq!(p.state, Attn::Working);
+    }
+
+    #[test]
     fn sticky_error_ignores_everything() {
         for start in [Attn::Idle, Attn::Working, Attn::NeedsYou] {
             let mut p = pane(start);
@@ -312,6 +409,8 @@ mod tests {
                 Ev::Attended,
                 Ev::Bell,
                 Ev::Answered,
+                Ev::Busy,
+                Ev::Quiet,
             ] {
                 assert!(!p.apply(ev, AWAY, Instant::now()), "{ev:?}");
                 assert!(!p.apply(ev, HERE, Instant::now()), "{ev:?}");
