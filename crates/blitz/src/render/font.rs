@@ -12,8 +12,8 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_MEASURING_MODE_NATURAL, DWRITE_READING_DIRECTION,
     DWRITE_READING_DIRECTION_LEFT_TO_RIGHT, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
     DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, DWRITE_TEXTURE_ALIASED_1x1, DWriteCreateFactory,
-    IDWriteFactory2, IDWriteFont1, IDWriteFontCollection, IDWriteFontFace, IDWriteFontFallback,
-    IDWriteRenderingParams1, IDWriteTextAnalysisSource,
+    IDWriteFactory2, IDWriteFont1, IDWriteFont2, IDWriteFontCollection, IDWriteFontFace,
+    IDWriteFontFallback, IDWriteFontFamily, IDWriteRenderingParams1, IDWriteTextAnalysisSource,
 };
 use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, w};
 
@@ -124,6 +124,33 @@ fn strike_row(baseline: i32, up: f32) -> i32 {
     (baseline - up.round() as i32).min(baseline - 1).max(0)
 }
 
+/// The face of `fam` closest to `style`.
+fn face_of(fam: &IDWriteFontFamily, style: u8) -> Result<IDWriteFontFace> {
+    let (weight, slant) = weight_style(style);
+    // SAFETY: COM calls on a live family.
+    unsafe {
+        fam.GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, slant)?
+            .CreateFontFace()
+    }
+}
+
+/// The face of the installed family `name` closest to `style`.
+fn named_face(
+    collection: &IDWriteFontCollection,
+    name: PCWSTR,
+    style: u8,
+) -> Option<IDWriteFontFace> {
+    let (mut index, mut exists) = (0u32, BOOL(0));
+    // SAFETY: `name` is NUL-terminated; the out-pointers are valid.
+    unsafe {
+        collection
+            .FindFamilyName(name, &mut index, &mut exists)
+            .ok()?;
+        let fam = exists.as_bool().then(|| collection.GetFontFamily(index))?;
+        face_of(&fam.ok()?, style).ok()
+    }
+}
+
 fn glyph_index(face: &IDWriteFontFace, c: char) -> u16 {
     let cp = c as u32;
     let mut g = 0u16;
@@ -153,11 +180,7 @@ impl Font {
             }
             let (family, index) = found.ok_or(windows::core::Error::from(E_FAIL))?;
             let fam = collection.GetFontFamily(index)?;
-            let face = |style| -> Result<IDWriteFontFace> {
-                let (weight, slant) = weight_style(style);
-                fam.GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, slant)?
-                    .CreateFontFace()
-            };
+            let face = |style| face_of(&fam, style);
             let faces = [face(0)?, face(BOLD)?, face(ITALIC)?, face(BOLD | ITALIC)?];
             let fallback = factory.GetSystemFontFallback()?;
 
@@ -327,7 +350,9 @@ impl Font {
         }
     }
 
-    /// The system's fallback font face for `c`, cached.
+    /// The system's fallback font face for `c`, cached. Emoji are drawn
+    /// in one colour, so where the system picks its emoji font, Segoe UI
+    /// Symbol's text form of the symbol comes first.
     fn fallback_face(&mut self, c: char, style: u8) -> Result<Option<IDWriteFontFace>> {
         if let Some(f) = self.fallbacks.get(&(c, style)) {
             return Ok(f.clone());
@@ -365,6 +390,16 @@ impl Font {
                 &mut scale,
             )?;
             match font {
+                Some(f)
+                    if f.cast::<IDWriteFont2>()
+                        .is_ok_and(|f| f.IsColorFont().as_bool()) =>
+                {
+                    let symbol = named_face(&self.collection, w!("Segoe UI Symbol"), style);
+                    match symbol.filter(|s| glyph_index(s, c) != 0) {
+                        Some(s) => Some(s),
+                        None => Some(f.CreateFontFace()?),
+                    }
+                }
                 Some(f) => Some(f.CreateFontFace()?),
                 None => None,
             }
@@ -597,6 +632,20 @@ mod tests {
             a.alpha != i.alpha || a.dx != i.dx || a.w != i.w,
             "italic differs"
         );
+    }
+
+    #[test]
+    fn symbols_come_in_their_text_form_before_emoji() {
+        use windows::Win32::Graphics::DirectWrite::IDWriteFontFace2;
+
+        let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        // The system picks Segoe UI Emoji, a colour font, for these.
+        for c in ['\u{2714}', '\u{26A0}', '\u{2B50}'] {
+            let face = font.fallback_face(c, 0).expect("lookup").expect("a face");
+            let face = face.cast::<IDWriteFontFace2>().expect("face 2");
+            // SAFETY: a plain query on a live face.
+            assert!(!unsafe { face.IsColorFont() }.as_bool(), "{c}");
+        }
     }
 
     #[test]
