@@ -468,6 +468,9 @@ pub fn quote(s: &str) -> String {
 }
 
 const FILE: &str = "config.toml";
+/// How old another process's temporary file is before it is taken for one
+/// a crash left.
+const STALE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `%APPDATA%\blitz`, which holds `config.toml` and the themes folder.
 pub fn dir() -> Option<PathBuf> {
@@ -515,6 +518,24 @@ fn save_in(dir: &Path, key: &str, value: Option<&str>) -> std::io::Result<()> {
     // Named for this process, so two blitz windows saving at once never
     // write or move each other's file.
     let tmp = path.with_file_name(format!("{FILE}.{}.new", std::process::id()));
+    // A crash between the write and the move leaves one that no later
+    // process, with another id, replaces. A minute old, it is no save in
+    // progress.
+    let folder = path.parent().unwrap_or(dir);
+    for e in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        let name = e.file_name();
+        let id = (name.to_str()).and_then(|n| {
+            n.strip_prefix(FILE)?
+                .strip_prefix('.')?
+                .strip_suffix(".new")
+        });
+        let stale = (e.metadata().and_then(|m| m.modified()).ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE);
+        if stale && id.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
     let saved = std::fs::write(&tmp, with_value(&old, key, value))
         .and_then(|()| std::fs::rename(&tmp, &path));
     if saved.is_err() {
@@ -1034,6 +1055,24 @@ scenery = stars
             .map(|e| e.file_name())
             .collect();
         assert_eq!(left, ["blitz.toml"]);
+    }
+
+    #[test]
+    fn save_clears_what_a_crash_left() {
+        let t = Temp::new("stale");
+        let tmp = |id: &str| t.0.join(format!("{FILE}.{id}.new"));
+        for id in ["4294967295", "4294967294", "x"] {
+            std::fs::write(tmp(id), "x").unwrap();
+        }
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for id in ["4294967295", "x"] {
+            let f = std::fs::File::options().write(true).open(tmp(id)).unwrap();
+            f.set_modified(an_hour_ago).unwrap();
+        }
+        save_in(&t.0, "flash", Some("false")).unwrap();
+        assert!(!tmp("4294967295").exists(), "a crashed save's");
+        assert!(tmp("4294967294").exists(), "another window's, saving now");
+        assert!(tmp("x").exists(), "not one of blitz's");
     }
 
     #[test]
