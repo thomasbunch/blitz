@@ -95,8 +95,12 @@ fn hook_prints_each_event() {
             notify("done", "Fixed the \\\"flaky\\\" test."),
         ),
         (
-            r#"{"hook_event_name":"Stop","background_tasks":[{"id":"bash_1"}]}"#,
-            notify("working", ""),
+            r#"{"hook_event_name":"Stop","background_tasks":[{"type":"subagent","agent_id":"a1"},{"type":"shell","command":"npm test"}]}"#,
+            notify("working", "waiting on 1 agent"),
+        ),
+        (
+            r#"{"hook_event_name":"Stop","background_tasks":[{"type":"shell","command":"npm run dev"}],"last_assistant_message":"Started it."}"#,
+            notify("done", "Started it. \u{b7} 1 background"),
         ),
         (
             r#"{"hook_event_name":"StopFailure","error":"overloaded"}"#,

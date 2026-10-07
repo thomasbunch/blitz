@@ -114,14 +114,30 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
             if ev.get("stop_hook_active") == Some(&Json::Bool(true)) {
                 return None;
             }
-            match ev.get("background_tasks") {
-                Some(Json::Arr(tasks)) if !tasks.is_empty() => ("working", String::new()),
-                _ => {
-                    let reply = field(ev, "last_assistant_message");
-                    let first = reply.lines().map(str::trim).find(|l| !l.is_empty());
-                    ("done", first.unwrap_or("").to_owned())
-                }
+            let tasks = match ev.get("background_tasks") {
+                Some(Json::Arr(tasks)) => &tasks[..],
+                _ => &[],
+            };
+            // Agents report back and wake Claude up; a shell or a server
+            // started in the background may run for hours.
+            let agents = (tasks.iter())
+                .filter(|t| matches!(field(t, "type"), "subagent" | "workflow" | "teammate"))
+                .count();
+            if agents > 0 {
+                let s = if agents == 1 { "" } else { "s" };
+                return Some(("working", format!("waiting on {agents} agent{s}")));
             }
+            let reply = field(ev, "last_assistant_message");
+            let first = reply.lines().map(str::trim).find(|l| !l.is_empty());
+            let msg = match (tasks.len(), first.unwrap_or("")) {
+                (0, line) => line.to_owned(),
+                (n, "") => format!("{n} background"),
+                (n, line) => {
+                    let more = format!(" \u{b7} {n} background");
+                    one_line_max(line, MAX_MSG - more.chars().count()) + &more
+                }
+            };
+            ("done", msg)
         }
         "StopFailure" => ("error", field(ev, "error").to_owned()),
         "SessionEnd" => ("idle", String::new()),
@@ -148,16 +164,21 @@ pub fn notify_json(token: &str, state: &str, session: Option<&str>, msg: &str) -
 /// Drops control characters (which could end the OSC early), folds runs of
 /// whitespace into one space, and caps the length at `MAX_MSG` chars.
 pub fn one_line(s: &str) -> String {
+    one_line_max(s, MAX_MSG)
+}
+
+/// [`one_line`], capped at `max` chars.
+fn one_line_max(s: &str, max: usize) -> String {
     let words: Vec<String> = s
         .split_whitespace()
         .map(|w| w.replace(char::is_control, ""))
         .filter(|w| !w.is_empty())
         .collect();
     let line = words.join(" ");
-    if line.chars().count() <= MAX_MSG {
+    if line.chars().count() <= max {
         return line;
     }
-    let mut cut: String = line.chars().take(MAX_MSG - 1).collect();
+    let mut cut: String = line.chars().take(max.saturating_sub(1)).collect();
     cut.push('…');
     cut
 }
@@ -682,9 +703,23 @@ mod tests {
                 r#"{"hook_event_name":"Stop","stop_hook_active":true}"#,
                 None,
             ),
+            // Only agents keep the turn going; a shell or server started in
+            // the background, or a task of no known type, does not.
             (
-                r#"{"hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[{"id":"1"}]}"#,
-                Some(("working", "")),
+                r#"{"hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[{"type":"subagent","agent_id":"a1"}]}"#,
+                Some(("working", "waiting on 1 agent")),
+            ),
+            (
+                r#"{"hook_event_name":"Stop","background_tasks":[{"type":"workflow"},{"type":"shell"},{"type":"teammate"}]}"#,
+                Some(("working", "waiting on 2 agents")),
+            ),
+            (
+                r#"{"hook_event_name":"Stop","background_tasks":[{"type":"shell","command":"npm run dev"}],"last_assistant_message":"Server is up."}"#,
+                Some(("done", "Server is up. \u{b7} 1 background")),
+            ),
+            (
+                r#"{"hook_event_name":"Stop","background_tasks":[{"id":"1"},{"type":7}]}"#,
+                Some(("done", "2 background")),
             ),
             (
                 r#"{"hook_event_name":"Stop","background_tasks":[],"last_assistant_message":"ok"}"#,
@@ -854,6 +889,19 @@ mod tests {
         assert_eq!(one_line(evil), "a]0;pwnedbc d ef");
         assert_eq!(one_line("  lots   of\n\n space  "), "lots of space");
         assert_eq!(one_line(" \x1b \x07 "), "");
+    }
+
+    /// The count of background tasks survives a long reply.
+    #[test]
+    fn done_keeps_the_background_count() {
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","background_tasks":[{{"type":"shell"}}],"last_assistant_message":"{}"}}"#,
+            "word ".repeat(100)
+        );
+        let (_, msg) = state(&payload).unwrap();
+        assert_eq!(msg.chars().count(), MAX_MSG);
+        assert!(msg.ends_with(" word\u{2026} \u{b7} 1 background"), "{msg}");
+        assert_eq!(one_line(&msg), msg, "nothing more is cut on the way out");
     }
 
     #[test]
