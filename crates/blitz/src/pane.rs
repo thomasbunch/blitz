@@ -28,6 +28,8 @@ pub struct Pane {
     pub attn: PaneAttn,
     /// Shown in the sidebar and the pane header.
     pub name: String,
+    /// The name the user gave the session, which wins over any other.
+    pub named: Option<String>,
     /// Latest title set by the program (OSC 0/2).
     pub title: String,
     /// What Claude Code's mark in `title` says: true while it works, false
@@ -171,6 +173,7 @@ impl Pane {
             pty,
             attn: PaneAttn::new(Instant::now()),
             name: String::new(),
+            named: None,
             title: String::new(),
             claude_title: None,
             cwd: s.cwd.map(|p| p.display().to_string()).unwrap_or_default(),

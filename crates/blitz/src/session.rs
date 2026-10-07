@@ -66,6 +66,8 @@ pub struct PaneMeta {
     pub key: String,
     /// The pane had a result the user had not seen yet, with its message.
     pub done: Option<String>,
+    /// The name the user gave the session.
+    pub name: Option<String>,
 }
 
 impl NodeState {
@@ -310,6 +312,11 @@ fn node_json(n: &NodeState, out: &mut String) {
                 escape_json(d, out);
                 out.push('"');
             }
+            if let Some(n) = &m.name {
+                out.push_str(",\"name\":\"");
+                escape_json(n, out);
+                out.push('"');
+            }
             out.push_str("}}");
         }
         NodeState::Split { axis, ratio, a, b } => {
@@ -367,7 +374,11 @@ pub fn from_json(s: &str) -> Option<State> {
         let name = t.get("name")?.as_str()?;
         let named = flag(t.get("named")) == Some(true);
         tabs.push(TabState {
-            name: if named { name.into() } else { String::new() },
+            name: if named {
+                crate::hook::one_line(name)
+            } else {
+                String::new()
+            },
             focus,
             zoom,
             root,
@@ -398,13 +409,17 @@ fn node(j: &Json) -> Option<NodeState> {
             .filter(|k| is_key(k))
             .unwrap_or_default()
             .into();
-        // Only shown, so one edited by hand is made a plain line.
+        // Only shown, so ones edited by hand are made plain lines.
         let done = (p.get("done").and_then(Json::as_str)).map(crate::hook::one_line);
+        let name = (p.get("name").and_then(Json::as_str))
+            .map(crate::hook::one_line)
+            .filter(|n| !n.is_empty());
         return Some(NodeState::Pane(PaneMeta {
             cwd,
             claude,
             key,
             done,
+            name,
         }));
     }
     let axis = match j.get("split")?.as_str()? {
@@ -493,6 +508,7 @@ mod tests {
             claude: claude.map(Into::into),
             key: String::new(),
             done: None,
+            name: None,
         })
     }
 
@@ -538,6 +554,7 @@ mod tests {
                             0.25,
                             NodeState::Pane(PaneMeta {
                                 done: Some("Fixed the \"login\" bug.".into()),
+                                name: Some("Login \u{2014} \"v2\"".into()),
                                 ..PaneMeta {
                                     cwd: r"C:\dev\shop\crates".into(),
                                     claude: Some("3f2a0c1e-0000-4000-8000-00000000abcd".into()),
@@ -651,6 +668,21 @@ mod tests {
         assert_eq!(done(&read)[2].as_deref(), Some("one two"));
     }
 
+    /// A session keeps the name the user gave it.
+    #[test]
+    fn session_names_are_kept() {
+        let json = to_json(&sample());
+        let name = |s: &State| s.layout(1).1[2].1.name.clone();
+        assert_eq!(
+            name(&from_json(&json).expect("reads")).as_deref(),
+            Some("Login \u{2014} \"v2\"")
+        );
+        // A blank one, from a file edited by hand, is none.
+        let blank = json.replace(r#""name":"Login"#, r#""name":" \n","was":"Login"#);
+        assert_ne!(blank, json);
+        assert_eq!(name(&from_json(&blank).expect("reads")), None);
+    }
+
     /// A tab keeps a name the user gave it; one from an older file, which
     /// is only the folder it started in, is dropped so the tab follows its
     /// pane.
@@ -753,6 +785,7 @@ mod tests {
             claude: None,
             key: format!("{:032x}", p.0),
             done: None,
+            name: None,
         });
         let s = from_json(&to_json(&s)).expect("reads back");
         // Leaf order is 1, 2, 4, 3: the left split put 4 before 3.

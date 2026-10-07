@@ -117,6 +117,9 @@ pub struct Commands<'a> {
     pub items: Vec<(&'a str, String)>,
     /// The highlighted item.
     pub sel: usize,
+    /// What the typed line renames, such as `Rename session`, instead of
+    /// narrowing the list.
+    pub rename: Option<&'a str>,
 }
 
 /// Rows the theme picker and the command palette show at once.
@@ -781,6 +784,8 @@ struct List<'a> {
     /// Shown when nothing matches.
     empty: &'a str,
     hint: &'a str,
+    /// Shown in place of an empty filter.
+    prompt: &'a str,
     /// Panel width at 96 DPI.
     width: f32,
 }
@@ -828,7 +833,7 @@ fn list(
     text(p, left, ty(y), l.title.into(), c.name, true);
     let fx = left + text_w(l.title, tw) + 2 * tw;
     let (filter, color) = if l.filter.is_empty() {
-        ("type to filter", c.dim)
+        (l.prompt, c.dim)
     } else {
         (l.filter, c.msg)
     };
@@ -895,6 +900,7 @@ fn picker(
         sel: pk.sel,
         empty: "no theme matches",
         hint: "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel",
+        prompt: "type to filter",
         width: 380.0,
     };
     // Six of the theme's colours on its own background.
@@ -933,14 +939,27 @@ fn commands(
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
 ) -> (Rect, Vec<(usize, Rect)>) {
-    let l = List {
-        title: "Commands",
-        filter: cm.filter,
-        names: cm.items.iter().map(|i| i.0).collect(),
-        sel: cm.sel,
-        empty: "no command matches",
-        hint: "\u{2191}\u{2193} choose  \u{b7}  Enter run  \u{b7}  Esc close",
-        width: 460.0,
+    let l = match cm.rename {
+        Some(title) => List {
+            title,
+            filter: cm.filter,
+            names: Vec::new(),
+            sel: 0,
+            empty: "With no name, blitz picks one again",
+            hint: "Enter rename  \u{b7}  Esc cancel",
+            prompt: "type a name",
+            width: 460.0,
+        },
+        None => List {
+            title: "Commands",
+            filter: cm.filter,
+            names: cm.items.iter().map(|i| i.0).collect(),
+            sel: cm.sel,
+            empty: "no command matches",
+            hint: "\u{2191}\u{2193} choose  \u{b7}  Enter run  \u{b7}  Esc close",
+            prompt: "type to filter",
+            width: 460.0,
+        },
     };
     list(p, &l, c, size, s, (tw, th), |p, i, row, right| {
         let keys = &cm.items[i].1;
@@ -1904,6 +1923,7 @@ mod tests {
             filter: "",
             items,
             sel: 15,
+            rename: None,
         });
         let c = build(&m);
         let (panel, rows) = c.commands.clone().expect("palette hits");
@@ -1914,6 +1934,30 @@ mod tests {
         let t = texts(&c);
         assert!(t.contains(&"Commands") && t.contains(&"Ctrl+15"));
         assert!(!t.contains(&"Ctrl+3"), "scrolled out");
+    }
+
+    /// Renaming takes the palette's line for the name.
+    #[test]
+    fn command_palette_takes_a_name() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.commands = Some(Commands {
+            filter: "",
+            items: Vec::new(),
+            sel: 0,
+            rename: Some("Rename tab"),
+        });
+        let t: Vec<String> = texts(&build(&m)).iter().map(|t| t.to_string()).collect();
+        assert!(t.contains(&"Rename tab".into()) && t.contains(&"type a name".into()));
+        m.commands = Some(Commands {
+            filter: "shop api",
+            items: Vec::new(),
+            sel: 0,
+            rename: Some("Rename tab"),
+        });
+        let c = build(&m);
+        assert!(texts(&c).contains(&"shop api"));
+        assert!(c.commands.expect("palette").1.is_empty(), "no rows to pick");
     }
 
     #[test]

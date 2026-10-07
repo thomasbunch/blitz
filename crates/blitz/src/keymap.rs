@@ -53,6 +53,11 @@ pub enum Action {
     JumpToPrompt(i8),
     /// Open the find bar on the focused pane, or close it.
     Find,
+    /// Name the focused session on the command palette's line; an empty
+    /// name gives back the one blitz picks.
+    RenameSession,
+    /// The same for the focused session's tab.
+    RenameTab,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -65,6 +70,8 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::ScrollPage(-1), "scroll_page_down", "Scroll down a page"),
     (Action::NewTab, "new_tab", "New tab"),
     (Action::ClosePane, "close_pane", "Close pane"),
+    (Action::RenameSession, "rename_session", "Rename session"),
+    (Action::RenameTab, "rename_tab", "Rename tab"),
     (Action::CycleTab(1), "next_tab", "Next tab"),
     (Action::CycleTab(-1), "previous_tab", "Previous tab"),
     (Action::SplitRight, "split_right", "Split right"),

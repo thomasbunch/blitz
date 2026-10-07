@@ -855,12 +855,25 @@ struct Commands {
     filter: String,
     /// The highlighted action, among the matching ones.
     sel: usize,
+    /// What the typed text names instead, with no actions to pick.
+    rename: Option<Rename>,
+}
+
+/// What the command palette's line names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rename {
+    Session(PaneId),
+    /// The tab that holds this session.
+    Tab(PaneId),
 }
 
 impl Commands {
     /// The matching actions and their labels, in [`keymap::ACTIONS`] order.
     /// The palette leaves itself out.
     fn matches(&self) -> Vec<(Action, &'static str)> {
+        if self.rename.is_some() {
+            return Vec::new();
+        }
         let words: Vec<String> = (self.filter.split_whitespace())
             .map(str::to_lowercase)
             .collect();
@@ -1198,6 +1211,9 @@ impl App {
                 v.pane.attn.apply(Ev::Done, false, Instant::now());
                 v.pane.msg.clone_from(msg);
             }
+            if let Some(v) = self.views.last_mut() {
+                v.pane.named.clone_from(&meta.name);
+            }
             if let Some(line) = resume_line(self.config.restore_claude, meta.claude.as_deref())
                 && let Some(v) = self.views.last_mut()
             {
@@ -1464,6 +1480,10 @@ impl App {
                     })
                     .collect(),
                 sel: cm.sel,
+                rename: cm.rename.map(|r| match r {
+                    Rename::Session(_) => "Rename session",
+                    Rename::Tab(_) => "Rename tab",
+                }),
             }),
             find: self.find.as_ref().map(|f| chrome::FindBar {
                 query: &f.query,
@@ -1799,8 +1819,11 @@ impl App {
             VK_ESCAPE => self.commands = None,
             VK_RETURN => {
                 let picked = cm.matches().get(cm.sel).map(|a| a.0);
+                let rename = cm.rename.map(|r| (r, crate::hook::one_line(&cm.filter)));
                 self.commands = None;
-                if let Some(a) = picked {
+                if let Some((r, name)) = rename {
+                    self.rename(r, name);
+                } else if let Some(a) = picked {
                     self.act(el, a);
                 }
             }
@@ -1815,6 +1838,24 @@ impl App {
                 cm.sel = 0;
             }
             _ => return,
+        }
+        self.request_redraw();
+    }
+
+    /// Gives a session or a tab the name `name`, or with an empty one lets
+    /// blitz pick it again.
+    fn rename(&mut self, r: Rename, name: String) {
+        match r {
+            Rename::Session(id) => {
+                if let Some(v) = self.view_mut(id) {
+                    v.pane.named = (!name.is_empty()).then_some(name);
+                }
+            }
+            Rename::Tab(id) => {
+                if let Some(t) = self.win.tabs.iter_mut().find(|t| t.root.contains(id)) {
+                    t.name = name;
+                }
+            }
         }
         self.request_redraw();
     }
@@ -1936,7 +1977,8 @@ impl App {
         let mut list: Vec<chrome::Session> = (self.views.iter())
             .map(|v| {
                 let p = &v.pane;
-                let (name, msg) = label(&p.name, &p.title, p.claude_title.is_some(), &p.msg);
+                let claude = p.claude_title.is_some();
+                let (name, msg) = label(p.named.as_deref(), &p.name, &p.title, claude, &p.msg);
                 chrome::Session {
                     id: p.id,
                     name,
@@ -2507,6 +2549,29 @@ impl App {
                     return false;
                 };
                 self.find = Some(Find::new(id));
+                self.request_redraw();
+            }
+            // The palette's line takes the name, starting from the one the
+            // user gave before.
+            Action::RenameSession | Action::RenameTab => {
+                let Some(id) = before else {
+                    return false;
+                };
+                let (rename, name) = if a == Action::RenameSession {
+                    let named = self.view(id).and_then(|v| v.pane.named.clone());
+                    (Rename::Session(id), named.unwrap_or_default())
+                } else {
+                    let tab = self.win.tabs.get(self.win.active);
+                    (
+                        Rename::Tab(id),
+                        tab.map(|t| t.name.clone()).unwrap_or_default(),
+                    )
+                };
+                self.commands = Some(Commands {
+                    filter: name,
+                    sel: 0,
+                    rename: Some(rename),
+                });
                 self.request_redraw();
             }
         }
@@ -3475,6 +3540,7 @@ impl App {
                 key: v.map(|v| v.key.clone()).unwrap_or_default(),
                 done: (v.filter(|v| v.pane.attn.state == Attn::DoneUnseen))
                     .map(|v| v.pane.msg.clone()),
+                name: v.and_then(|v| v.pane.named.clone()),
             }
         };
         let mut s = session::State::capture(&self.win, self.placed, meta);
@@ -3878,21 +3944,28 @@ fn new_tab(win: &mut layout::Window, id: PaneId) -> bool {
     true
 }
 
-/// What the sidebar calls a session, and the message under its name.
-/// Claude Code's title names the task, and Claude's /rename changes it;
-/// `claude` says the title has its mark. Other programs keep their name,
-/// as a shell's title is often only its exe's path; their title shows as
-/// the message when there is none.
-fn label(program: &str, title: &str, claude: bool, msg: &str) -> (String, String) {
+/// What the sidebar calls a session, and the message under its name: the
+/// name the user gave it, else for Claude Code the task its title names,
+/// which Claude's /rename changes too (`claude` says the title has its
+/// mark), else its program. A shell's title is often only its exe's path,
+/// so that is never a name. The title shows as the message when there is
+/// none, unless it is the name already.
+fn label(
+    named: Option<&str>,
+    program: &str,
+    title: &str,
+    claude: bool,
+    msg: &str,
+) -> (String, String) {
     // Without the mark Claude Code puts in front.
     let task = claude_title(title).map_or(title, |c| c.1);
-    let name = if claude && !task.is_empty() {
-        task
-    } else {
-        program
+    let name = match named {
+        Some(n) => n,
+        None if claude && !task.is_empty() => task,
+        None => program,
     };
     let msg = match msg {
-        "" if claude => "",
+        "" if task == name => "",
         "" => task,
         m => m,
     };
@@ -5047,7 +5120,7 @@ mod tests {
     #[test]
     fn app_claude_sessions_go_by_their_task() {
         let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
-        let l = |title, claude, msg| label("pwsh", title, claude, msg);
+        let l = |title, claude, msg| label(None, "pwsh", title, claude, msg);
         let s = |a: &str, b: &str| (a.to_owned(), b.to_owned());
         assert_eq!(l(pwsh, false, ""), s("pwsh", pwsh));
         assert_eq!(
@@ -5064,6 +5137,25 @@ mod tests {
             l("\u{2733} Fix the login", false, ""),
             s("pwsh", "Fix the login")
         );
+        // A name the user gave wins, and the task goes under it.
+        let named = label(Some("auth"), "pwsh", "\u{2733} Fix", true, "");
+        assert_eq!(named, s("auth", "Fix"));
+        let named = label(Some("auth"), "pwsh", "\u{2733} Fix", true, "Done.");
+        assert_eq!(named, s("auth", "Done."));
+    }
+
+    #[test]
+    fn palette_renames_on_its_line() {
+        let mut c = Commands {
+            filter: "Split".into(),
+            rename: Some(Rename::Tab(PaneId(1))),
+            ..Commands::default()
+        };
+        assert!(c.matches().is_empty(), "the line is a name, not a filter");
+        c.rename = None;
+        assert!(!c.matches().is_empty());
+        let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
+        assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
     }
 
     #[test]
