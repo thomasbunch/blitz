@@ -514,10 +514,12 @@ struct Mouse {
     /// A left-button drag is moving this divider of the active tab; the
     /// second value is the smallest pane it may leave.
     divider: Option<(usize, (i32, i32))>,
-    /// The pointer is over a divider along this axis and shows it.
-    over_divider: Option<Axis>,
     /// What in the sidebar the pointer is over.
     over_side: Option<Side>,
+    /// The pointer's shape; see [`pointer`].
+    icon: CursorIcon,
+    /// The pointer is hidden while typing.
+    hidden: bool,
     /// A left-button drag is making a selection.
     drag: Option<Drag>,
     /// When the drag next scrolls, while the pointer is outside its pane.
@@ -950,6 +952,8 @@ struct App {
     game_ended: Option<Instant>,
     /// Windows shows animations; scenery and the spark keep still if not.
     motion: bool,
+    /// Windows hides the pointer while typing.
+    vanish: bool,
     /// The command palette, while it is open.
     commands: Option<Commands>,
     /// Where the command palette and its rows were in the last frame, for
@@ -1312,6 +1316,7 @@ impl App {
             game: None,
             game_ended: None,
             motion: animations_on(),
+            vanish: mouse_vanish(),
             commands: None,
             commands_hits: None,
             font_zoom: 0.0,
@@ -2684,6 +2689,7 @@ impl App {
             match input {
                 Input::Text(t) => {
                     if !self.filter_text(&t) {
+                        self.hide_pointer(true);
                         self.typed(t.into_bytes());
                     }
                 }
@@ -2699,6 +2705,8 @@ impl App {
     fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput, held: bool) {
         if matches!(k.key, vt::Key::Control | vt::Key::Shift) {
             self.update_hover();
+            // Shift takes the mouse back from a program.
+            self.update_pointer();
         }
         if !k.down && self.eaten.release(k.vk) {
             return;
@@ -2848,6 +2856,7 @@ impl App {
         let mut out = Vec::new();
         vt::encode_key(k, &self.modes(), &mut out);
         if k.down && !modifier && !out.is_empty() {
+            self.hide_pointer(true);
             self.typed(out);
         } else {
             self.send(out);
@@ -4215,16 +4224,8 @@ impl App {
             return;
         }
         self.hover = hover;
-        self.show_cursor();
+        self.update_pointer();
         self.request_redraw();
-    }
-
-    /// Shows the pointer for what is under it.
-    fn show_cursor(&self) {
-        if let Some(w) = &self.window {
-            let hand = self.hover.is_some() || self.mouse.over_side.is_some();
-            w.set_cursor(cursor_icon(self.mouse.over_divider, hand));
-        }
     }
 
     /// Notes what in the sidebar the pointer is over: the hand says a
@@ -4234,8 +4235,48 @@ impl App {
             return;
         }
         self.mouse.over_side = over;
-        self.show_cursor();
+        self.update_pointer();
         self.request_redraw();
+    }
+
+    /// Shows the pointer for what is under it; see [`pointer`].
+    fn update_pointer(&mut self) {
+        let pos = self.mouse.pos;
+        let (x, y) = (pos.x as i32, pos.y as i32);
+        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let panel = self.commands.is_some()
+            || self.settings.is_some()
+            || self.picker.is_some()
+            || self.game.is_some();
+        let divider = self.divider_at(pos).map(|d| d.1).filter(|_| !panel);
+        let hand = self.hover.is_some()
+            || self.banner.as_ref().is_some_and(inside)
+            || self.mouse.over_side.is_some();
+        let mods = mods_now();
+        let grid = (!panel).then(|| self.hit(pos)).and_then(|(id, side)| {
+            let v = self.view(id.filter(|_| !side)?)?;
+            v.rect.filter(inside)?;
+            let mouse = lock(&v.pane.term).input_modes().mouse;
+            Some(mouse != MouseMode::Off && !(mods.lshift || mods.rshift))
+        });
+        let icon = pointer(divider, hand && !panel, grid);
+        if icon != self.mouse.icon {
+            self.mouse.icon = icon;
+            if let Some(w) = &self.window {
+                w.set_cursor(icon);
+            }
+        }
+    }
+
+    /// Hides the pointer while typing, or shows it again, as Windows'
+    /// "hide pointer while typing" asks.
+    fn hide_pointer(&mut self, hide: bool) {
+        if hide != self.mouse.hidden && (self.vanish || !hide) {
+            self.mouse.hidden = hide;
+            if let Some(w) = &self.window {
+                w.set_cursor_visible(!hide);
+            }
+        }
     }
 
     /// Opens a link, or says in the pane why not.
@@ -4248,6 +4289,10 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, pos: PhysicalPosition<f64>) {
+        // Windows may send a move that is none, as when a window opens.
+        if pos != self.mouse.pos {
+            self.hide_pointer(false);
+        }
         self.mouse.pos = pos;
         if let Some((i, min)) = self.mouse.divider {
             let (area, active) = (self.tab_area(), self.win.active);
@@ -4265,11 +4310,7 @@ impl App {
             }
             return;
         }
-        let over = self.divider_at(pos).map(|d| d.1);
-        if over != self.mouse.over_divider {
-            self.mouse.over_divider = over;
-            self.show_cursor();
-        }
+        self.update_pointer();
         // blitz run covers the panes, so programs see no motion under it.
         if self.game.is_some() {
             return;
@@ -4805,18 +4846,6 @@ fn route_button(
     }
 }
 
-/// The pointer over a divider along `divider`, or with `hand` over a
-/// link or something in the sidebar a click acts on. Kept in one place,
-/// so leaving one of them cannot take the hand away from another.
-fn cursor_icon(divider: Option<Axis>, hand: bool) -> CursorIcon {
-    match divider {
-        Some(Axis::Row) => CursorIcon::ColResize,
-        Some(Axis::Column) => CursorIcon::RowResize,
-        None if hand => CursorIcon::Pointer,
-        None => CursorIcon::Default,
-    }
-}
-
 /// The one of `hidden`, sessions the sidebar has no room for, that a
 /// click on their count goes to: the one waiting longest for the user,
 /// else the one after `focus`, so clicks go round them all.
@@ -4868,6 +4897,39 @@ fn right_click_does(on: bool, selected: bool) -> Option<Action> {
     } else {
         Action::Paste
     })
+}
+
+/// The pointer's shape: a resize arrow on a `divider` between panes, the
+/// hand on a link, a session row or the banner (`hand`), the I-beam over a
+/// pane's text that blitz selects, and the arrow over a pane whose program
+/// takes the mouse (`grid` says which) and anywhere else.
+fn pointer(divider: Option<Axis>, hand: bool, grid: Option<bool>) -> CursorIcon {
+    match (divider, hand, grid) {
+        (Some(Axis::Row), ..) => CursorIcon::ColResize,
+        (Some(Axis::Column), ..) => CursorIcon::RowResize,
+        (None, true, _) => CursorIcon::Pointer,
+        (None, false, Some(false)) => CursorIcon::Text,
+        _ => CursorIcon::Default,
+    }
+}
+
+/// Whether Windows hides the pointer while typing: Mouse settings,
+/// Pointer Options. Read once at start.
+fn mouse_vanish() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETMOUSEVANISH, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut on = windows::core::BOOL(0);
+    // SAFETY: SPI_GETMOUSEVANISH writes one BOOL.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSEVANISH,
+            0,
+            Some((&raw mut on).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    read.is_ok() && on.as_bool()
 }
 
 /// Whether Windows shows animations; off under Accessibility, Visual
@@ -6058,6 +6120,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Ctrl may be let go while another window has the keys.
                 self.set_hover(None);
+                self.hide_pointer(false);
                 // The cursor is hollow while the window is in the background.
                 self.request_redraw();
                 if let Some(v) = self.current() {
@@ -6073,6 +6136,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // that could run or escape anything.
                 text.retain(|c| !c.is_control());
                 if !self.filter_text(&text) {
+                    self.hide_pointer(true);
                     self.typed(text.into_bytes());
                 }
             }
@@ -6808,6 +6872,36 @@ mod tests {
         let (range, found) = crate::links::scan(&l.text).remove(0);
         assert_eq!(found, Link::Url("https://e.com/abc".into()));
         assert_eq!(l.span(range), ((0, 3), (1, 9)), "across the wrap");
+    }
+
+    #[test]
+    fn app_pointer_shows_what_a_click_does() {
+        assert_eq!(
+            pointer(None, false, Some(false)),
+            CursorIcon::Text,
+            "selectable text"
+        );
+        assert_eq!(
+            pointer(None, false, Some(true)),
+            CursorIcon::Default,
+            "the program's"
+        );
+        assert_eq!(
+            pointer(None, true, Some(false)),
+            CursorIcon::Pointer,
+            "a link"
+        );
+        assert_eq!(
+            pointer(None, true, None),
+            CursorIcon::Pointer,
+            "a row or the banner"
+        );
+        assert_eq!(pointer(None, false, None), CursorIcon::Default);
+        assert_eq!(pointer(Some(Axis::Row), true, None), CursorIcon::ColResize);
+        assert_eq!(
+            pointer(Some(Axis::Column), false, Some(false)),
+            CursorIcon::RowResize
+        );
     }
 
     #[test]
@@ -8436,11 +8530,11 @@ mod tests {
 
     #[test]
     fn the_pointer_shows_what_is_under_it() {
-        assert_eq!(cursor_icon(None, false), CursorIcon::Default);
-        assert_eq!(cursor_icon(None, true), CursorIcon::Pointer);
-        assert_eq!(cursor_icon(Some(Axis::Row), true), CursorIcon::ColResize);
+        assert_eq!(pointer(None, false, None), CursorIcon::Default);
+        assert_eq!(pointer(None, true, None), CursorIcon::Pointer);
+        assert_eq!(pointer(Some(Axis::Row), true, None), CursorIcon::ColResize);
         assert_eq!(
-            cursor_icon(Some(Axis::Column), false),
+            pointer(Some(Axis::Column), false, None),
             CursorIcon::RowResize
         );
     }
