@@ -64,6 +64,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # On Windows this runs on the system's console host.
       - run: cargo test --workspace --locked
+      # Otherwise the installer script is only compiled once a tag is pushed.
+      - if: runner.os == 'Windows'
+        name: Installer script compiles
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "Inno Setup 6 is not on this runner image" }
+          $src = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\iss-src").FullName
+          New-Item -ItemType File -Force "$src\blitz.exe" | Out-Null
+          & $iscc /Q /DAppVersion=0.0.0 "/DSrcDir=$src" "/DOutDir=$env:RUNNER_TEMP\iss-out" .github\blitz.iss
+          if ($LASTEXITCODE) { throw "ISCC exited with $LASTEXITCODE" }
       - if: runner.os == 'Windows'
         name: Bundled ConPTY
         shell: pwsh
