@@ -23,6 +23,8 @@ pub mod handoff;
 #[cfg(windows)]
 pub mod links;
 #[cfg(windows)]
+pub mod notify;
+#[cfg(windows)]
 pub mod pane;
 #[cfg(windows)]
 pub mod pty;

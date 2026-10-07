@@ -43,7 +43,7 @@ use winit::platform::windows::{
     EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Icon, Window, WindowId};
 
 use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev, claude_title, exit_text};
@@ -99,8 +99,8 @@ const UPDATE_FIRST: Duration = Duration::from_secs(10);
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// Why an update or a look for one stopped when its thread panicked.
 const INTERNAL: &str = "blitz stopped after an internal error";
-/// Taskbar flashes per session are at least this far apart.
-const FLASH_GAP: Duration = Duration::from_secs(10);
+/// Alerts about one session are at least this far apart.
+const ALERT_GAP: Duration = Duration::from_secs(10);
 /// After this long with no key or mouse input anywhere, the user counts as
 /// away from the screen, even with blitz in front.
 const AWAY_AFTER: Duration = Duration::from_secs(30);
@@ -894,8 +894,8 @@ struct View {
     /// hidden.
     rect: Option<Rect>,
     notice: Option<Notice>,
-    /// When the taskbar last flashed for this session.
-    flashed: Option<Instant>,
+    /// When blitz last alerted the user about this session.
+    alerted: Option<Instant>,
     /// A thread is reading the git branch of the session's directory.
     finding_branch: bool,
     /// A line to type at the shell's first prompt, and when to type it
@@ -1791,7 +1791,7 @@ impl App {
             resize_at: None,
             rect: None,
             notice: None,
-            flashed: None,
+            alerted: None,
             finding_branch: false,
             resume: None,
             prompted: false,
@@ -3882,20 +3882,27 @@ impl App {
         // view. Nor is anything while the user is away from the screen.
         let here = present(self.focused, idle_for());
         let attended = here && self.game.is_none() && self.focus_id() == Some(id);
-        let away = !here && self.config.flash;
-        let Some(v) = self.view_mut(id) else {
+        let away = !here;
+        let Some(v) = self.views.iter_mut().find(|v| v.pane.id == id) else {
             return false;
         };
         let changed = v.pane.attn.apply(ev, attended, now);
-        let kind = (changed && away)
-            .then(|| flash_kind(v.pane.attn.state, &mut v.flashed, now))
+        let alert = (changed && away)
+            .then(|| alert(v.pane.attn.state, &self.config, &mut v.alerted, now))
             .flatten();
         // The sidebar shows the new state.
         self.request_redraw();
-        if let (Some(kind), Some(w)) = (kind, &self.window) {
-            w.request_user_attention(Some(kind));
+        if let Some(a) = alert {
+            self.alert(a);
         }
         changed
+    }
+
+    /// Tells the user, who is in another program, about a session.
+    fn alert(&mut self, a: Alert) {
+        if a.flashes > 0 {
+            crate::notify::flash(self.hwnd, a.flashes);
+        }
     }
 
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> (u16, u16) {
@@ -5465,21 +5472,31 @@ fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) 
     update.map(|u| note.unwrap_or(&u.1))
 }
 
-/// How to flash the taskbar for a session that just changed to `state`
-/// while the window is in the background: urgently when it needs the
-/// user or failed, gently when it finished, and at most once per session
-/// every `FLASH_GAP`. `last` is when this session last flashed.
-fn flash_kind(state: Attn, last: &mut Option<Instant>, now: Instant) -> Option<UserAttentionType> {
-    let kind = match state {
-        Attn::NeedsYou | Attn::Error => UserAttentionType::Critical,
-        Attn::DoneUnseen => UserAttentionType::Informational,
+/// How blitz tells the user, who is in another program, about a session.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Alert {
+    /// Times to flash the taskbar button.
+    flashes: u32,
+}
+
+/// How to tell the user about a session that just changed to `state`
+/// while the window is in the background: three flashes when it needs
+/// the user or failed, one when it finished, and at most once per session
+/// every `ALERT_GAP`. `last` is when this session last alerted.
+fn alert(state: Attn, c: &Config, last: &mut Option<Instant>, now: Instant) -> Option<Alert> {
+    let flashes = match state {
+        Attn::NeedsYou | Attn::Error => 3,
+        Attn::DoneUnseen => 1,
         Attn::Working | Attn::Idle => return None,
     };
-    if last.is_some_and(|t| now.saturating_duration_since(t) < FLASH_GAP) {
+    let a = Alert {
+        flashes: if c.flash { flashes } else { 0 },
+    };
+    if a == Alert::default() || last.is_some_and(|t| now.saturating_duration_since(t) < ALERT_GAP) {
         return None;
     }
     *last = Some(now);
-    Some(kind)
+    Some(a)
 }
 
 /// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
@@ -8140,23 +8157,44 @@ mod tests {
     }
 
     #[test]
-    fn app_taskbar_flashes_once_per_session_every_ten_seconds() {
+    fn app_alerts_once_per_session_every_ten_seconds() {
         let t0 = Instant::now();
+        let c = Config::default();
         let mut last = None;
-        let flash = |state, last: &mut Option<Instant>, s| {
-            flash_kind(state, last, t0 + Duration::from_secs(s))
+        let alert = |state, last: &mut Option<Instant>, s| {
+            alert(state, &c, last, t0 + Duration::from_secs(s))
         };
-        assert_eq!(flash(Attn::Working, &mut last, 0), None);
-        assert_eq!(flash(Attn::Idle, &mut last, 0), None);
-        assert_eq!(last, None, "only flashes count");
-        let critical = Some(UserAttentionType::Critical);
-        assert_eq!(flash(Attn::NeedsYou, &mut last, 0), critical);
-        assert_eq!(flash(Attn::Error, &mut last, 9), None);
-        assert_eq!(flash(Attn::Error, &mut last, 10), critical);
-        let gentle = Some(UserAttentionType::Informational);
-        assert_eq!(flash(Attn::DoneUnseen, &mut last, 20), gentle);
+        assert_eq!(alert(Attn::Working, &mut last, 0), None);
+        assert_eq!(alert(Attn::Idle, &mut last, 0), None);
+        assert_eq!(last, None, "only alerts count");
+        let urgent = Some(Alert { flashes: 3 });
+        assert_eq!(alert(Attn::NeedsYou, &mut last, 0), urgent);
+        assert_eq!(alert(Attn::Error, &mut last, 9), None);
+        assert_eq!(alert(Attn::Error, &mut last, 10), urgent);
+        assert_eq!(
+            alert(Attn::DoneUnseen, &mut last, 20),
+            Some(Alert { flashes: 1 })
+        );
         // Another session has its own limit.
-        assert_eq!(flash(Attn::NeedsYou, &mut None, 21), critical);
+        assert_eq!(alert(Attn::NeedsYou, &mut None, 21), urgent);
+    }
+
+    /// A flash with no count goes on until blitz is in front; a few are
+    /// enough, as the button stays lit after them.
+    #[test]
+    fn app_flashes_a_few_times_and_none_when_off() {
+        let now = Instant::now();
+        for state in [Attn::NeedsYou, Attn::Error, Attn::DoneUnseen] {
+            let a = alert(state, &Config::default(), &mut None, now).expect("an alert");
+            assert!((1..=3).contains(&a.flashes), "{state:?}");
+        }
+        let off = Config {
+            flash: false,
+            ..Config::default()
+        };
+        let mut last = None;
+        assert_eq!(alert(Attn::NeedsYou, &off, &mut last, now), None);
+        assert_eq!(last, None, "nothing happened, so nothing to space out");
     }
 
     #[test]
