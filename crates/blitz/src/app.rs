@@ -466,8 +466,12 @@ enum Ask {
     /// An error: the next key in its pane takes it away, read by then.
     Key,
     /// The action that showed it, run again in its pane, confirms. Any
-    /// other key takes it away and goes on to do what it does.
+    /// other key takes it away and goes on to do what it does. Pasting
+    /// confirms only while the clipboard still holds this text.
     Paste(String),
+    /// Files dropped on the pane, as their paths: pasting confirms them,
+    /// whatever the clipboard holds.
+    Drop(String),
     ClosePane,
     CloseTab,
     Update,
@@ -483,7 +487,7 @@ impl Ask {
         let by = match self {
             Ask::Nothing => return false,
             Ask::Key => return here,
-            Ask::Paste(_) => Action::Paste,
+            Ask::Paste(_) | Ask::Drop(_) => Action::Paste,
             Ask::ClosePane => Action::ClosePane,
             Ask::CloseTab => Action::CloseTab,
             Ask::Update => Action::Update,
@@ -3076,9 +3080,10 @@ impl App {
     }
 
     /// Pastes `text` into pane `id`, the focused one, or asks first as
-    /// [`vt::keys::needs_paste_confirm`] says; `confirmed` when this is the
-    /// answer. A single line goes without its line break, so it is not run.
-    fn paste(&mut self, id: PaneId, text: &str, confirmed: bool) {
+    /// [`vt::keys::needs_paste_confirm`] says, as `ask` makes the question;
+    /// `confirmed` when this is the answer. A single line goes without its
+    /// line break, so it is not run.
+    fn paste(&mut self, id: PaneId, text: &str, confirmed: bool, ask: fn(String) -> Ask) {
         let text = trim_paste(text);
         let Some(v) = self.view(id).filter(|_| !text.is_empty()) else {
             return;
@@ -3099,7 +3104,7 @@ impl App {
         if !confirmed && vt::keys::needs_paste_confirm(text, bracketed, trusted) {
             let key = keymap::keys_for(Action::Paste, &self.config.keys);
             let asked = paste_question(text, key.as_deref());
-            self.ask(id, asked, Ask::Paste(text.to_owned()));
+            self.ask(id, asked, ask(text.to_owned()));
             return;
         }
         let mut out = Vec::new();
@@ -3191,27 +3196,26 @@ impl App {
                 let Some(id) = before else {
                     return false;
                 };
-                // The answer to a question pastes what it asked about.
-                let asked = (self.view_mut(id))
-                    .and_then(|v| v.notice.take_if(|n| matches!(n.ask, Ask::Paste(_))));
-                if let Some(Notice {
-                    ask: Ask::Paste(text),
-                    ..
-                }) = asked
-                {
+                // Files copied in Explorer paste as their paths.
+                let text = (crate::clipboard::get_text().filter(|t| !t.is_empty()))
+                    .or_else(|| crate::clipboard::get_files().map(|f| quote_paths(&f)));
+                // The answer to a question pastes what it asked about; a
+                // clipboard that changed since asks again.
+                let asked = (self.view_mut(id)).and_then(|v| {
+                    v.notice
+                        .take_if(|n| matches!(n.ask, Ask::Paste(_) | Ask::Drop(_)))
+                });
+                if asked.is_some() {
                     self.request_redraw();
-                    self.paste(id, &text, true);
+                }
+                if let Some(answer) = asked.and_then(|n| answers(n.ask, text.as_deref())) {
+                    self.paste(id, &answer, true, Ask::Paste);
                     return true;
                 }
-                let text = match crate::clipboard::get_text().filter(|t| !t.is_empty()) {
-                    Some(t) => t,
-                    // Files copied in Explorer paste as their paths.
-                    None => match crate::clipboard::get_files() {
-                        Some(files) => quote_paths(&files),
-                        None => return self.paste_image(id),
-                    },
+                let Some(text) = text else {
+                    return self.paste_image(id);
                 };
-                self.paste(id, &text, false);
+                self.paste(id, &text, false, Ask::Paste);
             }
             Action::QuickSelect => {
                 let Some(v) = self.current() else {
@@ -4014,7 +4018,7 @@ impl App {
         match dropped(paths, self.hit(pos)) {
             Some(Dropped::Paste(id, text)) => {
                 self.show(id);
-                self.paste(id, &text, false);
+                self.paste(id, &text, false, Ask::Drop);
             }
             Some(Dropped::Open(dirs)) => {
                 for dir in dirs {
@@ -6152,6 +6156,17 @@ fn paste_refused(label: &str, code: Option<u32>) -> Option<String> {
     Some(format!(
         "{label} exited with code {code}, so nothing was pasted \u{b7} Enter close"
     ))
+}
+
+/// What pasting answers paste question `ask` with, the clipboard holding
+/// `now`: the text it asked about, while the clipboard still holds it.
+/// Dropped files are answered whatever the clipboard holds.
+fn answers(ask: Ask, now: Option<&str>) -> Option<String> {
+    match ask {
+        Ask::Drop(text) => Some(text),
+        Ask::Paste(text) if now.map(trim_paste) == Some(text.as_str()) => Some(text),
+        _ => None,
+    }
 }
 
 /// `text` without the line break at its end when that is its only one: a
@@ -8822,6 +8837,17 @@ mod tests {
         assert!(!paste_trusted(&t, false), "a shell asks once first");
         t.confirm_paste();
         assert!(paste_trusted(&t, false));
+    }
+
+    #[test]
+    fn app_a_paste_question_is_answered_only_while_the_clipboard_holds_its_text() {
+        let asked = || Ask::Paste("a\nb".into());
+        assert_eq!(answers(asked(), Some("a\nb")), Some("a\nb".into()));
+        assert_eq!(answers(asked(), Some("x\ny")), None, "copied since");
+        assert_eq!(answers(asked(), None), None, "an image since");
+        let dropped = Ask::Drop("C:\\a.txt".into());
+        assert_eq!(answers(dropped, Some("x")), Some("C:\\a.txt".into()));
+        assert_eq!(answers(Ask::ClosePane, Some("a\nb")), None);
     }
 
     #[test]
