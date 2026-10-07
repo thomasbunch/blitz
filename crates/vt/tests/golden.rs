@@ -337,6 +337,18 @@ fn line_cells_read_scrollback_as_drawn() {
 }
 
 #[test]
+fn line_cells_leave_out_a_wide_character_past_the_edge_as_drawn() {
+    let mut t = run(4, 2, "中");
+    t.resize(1, 2);
+    let mut snap = vt::Snapshot::default();
+    t.snapshot(&mut snap, &PAL);
+    let mut cells = Vec::new();
+    t.line_cells(t.view_top(), &PAL, &mut cells);
+    assert_eq!(cells, snap.cells[..1]);
+    assert_eq!(line_text(&t, t.view_top()).as_deref(), Some(""));
+}
+
+#[test]
 fn pending_wrap_and_autowrap() {
     let mut t = run(5, 3, "abcde");
     assert_eq!(t.cursor(), (4, 0, true));
