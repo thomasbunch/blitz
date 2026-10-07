@@ -52,9 +52,14 @@ The shell is PowerShell 7 if installed, else Windows PowerShell, else cmd.
 The installer adds **Open in blitz** to the right-click menu of folders
 and drives; on Windows 11 it is under **Show more options**.
 Shift+right-click also offers **Open in new blitz window**. Untick the
-option during setup to leave the menu alone. Setup can also start blitz
-when you sign in, with the tabs and sessions you left; that option is off
-unless you tick it.
+option during setup to leave the menu alone. Setup for the current user
+can also start blitz when you sign in, with the tabs and sessions you
+left; that option is off unless you tick it.
+
+From a shell, `blitz DIR` opens a tab in that folder, and `blitz .` in
+the one you are in, in the blitz already running if there is one;
+`--new-window` gives it a window of its own. `blitz --help` lists the
+rest.
 
 blitz asks GitHub for the latest release when it starts and every six
 hours, through the proxy Windows is set to use. If there is a newer
@@ -64,8 +69,9 @@ notes, and its × hides it until a newer release. Ctrl+Shift+U downloads
 the installer, checks it against the release's `SHA256SUMS.txt` and
 restarts blitz on the new version. That ends every session and closes
 any other blitz window, so blitz asks first. When a session is busy in
-the only blitz window, the first press leaves the update to install when
-you close blitz, and a second press restarts now. A copy run from the
+the main blitz window and no other is open, the first press leaves the
+update to install when you close blitz, and the next press restarts
+now. A copy run from the
 zip opens the release page instead. If the installer fails, blitz starts
 again on the old version and a strip under the panes names the
 installer's log. With nothing shown, Ctrl+Shift+U asks GitHub right away
