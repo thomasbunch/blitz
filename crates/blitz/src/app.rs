@@ -4725,7 +4725,7 @@ impl App {
         // reports at its own cell. Outside the panes it is the focused one's.
         let mods = mods_now();
         let (under, side) = self.hit(self.mouse.pos);
-        let Some(v) = under.or(self.focus_id()).and_then(|id| self.view(id)) else {
+        let Some(v) = wheel_pane(under, side, self.focus_id()).and_then(|id| self.view(id)) else {
             return;
         };
         let id = v.pane.id;
@@ -5731,6 +5731,14 @@ fn wheel_does(m: &InputModes, mods: &Mods, claude: bool, focused: bool, cells: b
     } else {
         Wheel::Nothing
     }
+}
+
+/// The pane the wheel goes by over `under`, the pane [`App::hit`] found,
+/// which is a session's row in the sidebar when `side`: that pane, or the
+/// focused one elsewhere. Ctrl+wheel over a row sizes the font as the
+/// focused pane says, not as a row the user cannot tell apart says.
+fn wheel_pane(under: Option<PaneId>, side: bool, focus: Option<PaneId>) -> Option<PaneId> {
+    under.filter(|_| !side).or(focus)
 }
 
 /// Lines a wheel notch scrolls with Windows' "lines to scroll" set to
@@ -7751,6 +7759,11 @@ mod tests {
         let does = |m: &InputModes| wheel_does(m, &ctrl, false, false, true);
         assert_eq!(does(&InputModes::default()), Wheel::Font);
         assert_eq!(does(&mouse), Wheel::Report);
+        // Over a session's row in the sidebar, the focused pane decides.
+        let (row, focus) = (Some(PaneId(2)), Some(PaneId(1)));
+        assert_eq!(wheel_pane(row, true, focus), focus);
+        assert_eq!(wheel_pane(row, false, focus), row);
+        assert_eq!(wheel_pane(None, false, focus), focus);
     }
 
     #[test]
