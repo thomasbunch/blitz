@@ -138,3 +138,30 @@ jobs:
         with:
           tool: cargo-about@0.9.2
       - run: cargo about generate --locked --fail --config .github/about.toml .github/about.hbs -o /dev/null
+
+  # The width tables must be exactly what the generator makes of the
+  # Unicode release they claim.
+  unicode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Unicode 17.0.0 data
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir ucd && cd ucd
+          base=https://www.unicode.org/Public/17.0.0/ucd
+          for f in EastAsianWidth.txt extracted/DerivedGeneralCategory.txt auxiliary/GraphemeBreakProperty.txt emoji/emoji-data.txt; do
+            curl -fsSL --retry 5 --retry-all-errors -o "${f##*/}" "$base/$f"
+          done
+          sha256sum -c - <<'EOF'
+          ea7ce50f3444a050333448dffef1cadd9325af55cbb764b4a2280faf52170a33  EastAsianWidth.txt
+          d62e5bab70ca74f099343f71224fa051cb1fdd61a1ab45c0488c44cfc0b6102e  DerivedGeneralCategory.txt
+          d6b51d1d2ae5c33b451b7ed994b48f1f4dc62b2272a5831e7fd418514a6bae89  GraphemeBreakProperty.txt
+          2cb2bb9455cda83e8481541ecf5b6dfda66a3bb89efa3fa7c5297eccf607b72b  emoji-data.txt
+          EOF
+      - run: cargo run -p vt --example gen_unicode --locked -- "$RUNNER_TEMP/ucd"
+      - run: git diff --exit-code crates/vt/src/width_tables.rs
