@@ -1166,7 +1166,7 @@ mod msg_to_key_tests {
             assert!(!repeats_with(vk, &[], true), "{vk:#x}");
         }
         // Outside a panel, a key blitz took that is no shortcut, as Enter
-        // closing an exited pane, does not go on to the next pane.
+        // restarting an exited pane, does not go on to the new one.
         assert!(!repeats_with(0x0d, &[], false));
 
         let drops = |vk: u16, held: &[usize], taken: bool| {
@@ -1180,7 +1180,11 @@ mod msg_to_key_tests {
         for (vk, held) in [(0x56, &[0xa2][..]), (0x57, CS), (0x55, CS)] {
             assert!(drops(vk, held, false), "{vk:#x}");
         }
-        assert!(drops(0x0d, &[], true), "Enter that closed an exited pane");
+        assert!(
+            drops(0x0d, &[], true),
+            "Enter that restarted an exited pane"
+        );
+        assert!(drops(0x1b, &[], true), "Esc that closed one");
         // Typing, and moving that repeats, go on.
         assert!(!drops(0x41, &[], false));
         assert!(!drops(0x0d, &[], false));

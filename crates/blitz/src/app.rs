@@ -751,6 +751,8 @@ struct View {
     sync_until: Option<Instant>,
     /// Names the session's saved output; kept across restarts.
     key: String,
+    /// The command line it runs in place of the shell.
+    cmd: Option<String>,
     /// The progress the program last reported, and when.
     progress: Option<(chrome::Progress, Instant)>,
     /// When the title first showed Claude Code working.
@@ -1271,17 +1273,47 @@ impl App {
             if let Some(v) = self.views.last_mut() {
                 v.pane.named.clone_from(&meta.name);
             }
-            if let Some(line) = resume_line(self.config.restore_claude, meta.claude.as_deref())
-                && let Some(v) = self.views.last_mut()
-            {
-                // Known from the start, so closing blitz again before the
-                // first prompt still resumes it next time.
-                v.pane.claude = meta.claude.clone();
-                v.resume = Some((line, Instant::now() + RESUME_AFTER));
-            }
+            self.resume(id, meta.claude.clone());
         }
         self.install(win);
         Ok(())
+    }
+
+    /// Has the shell of the new pane `id` resume Claude Code session
+    /// `claude` once it is ready.
+    fn resume(&mut self, id: PaneId, claude: Option<String>) {
+        if let Some(line) = resume_line(self.config.restore_claude, claude.as_deref())
+            && let Some(v) = self.view_mut(id)
+        {
+            // Known from the start, so closing blitz again before the
+            // first prompt still resumes it next time.
+            v.pane.claude = claude;
+            v.resume = Some((line, Instant::now() + RESUME_AFTER));
+        }
+    }
+
+    /// Starts the program of pane `id`, which exited, again in its place:
+    /// in its folder, resuming its Claude Code session. The new session
+    /// gets a new id, so nothing still on its way from the old one lands
+    /// in it.
+    fn restart(&mut self, id: PaneId) {
+        let Some(i) = self.views.iter().position(|v| v.pane.id == id) else {
+            return;
+        };
+        let (old, new) = (&self.views[i], PaneId(self.next_id));
+        let (cwd, cmd) = (start_dir(&old.pane.cwd), old.cmd.clone());
+        let claude = old.pane.claude.clone().filter(|_| cmd.is_none());
+        let mut win = self.win.clone();
+        win.replace_pane(id, new);
+        let grids = self.grids(&win);
+        if let Err(e) = self.spawn(new, &grids, cmd.as_deref(), cwd, None) {
+            self.error(id, e);
+            return;
+        }
+        // The new session takes the old one's row in the sidebar.
+        self.views.swap_remove(i);
+        self.resume(new, claude);
+        self.install(win);
     }
 
     /// Starts a session for pane `id`, sized as `grids` lays it out (or
@@ -1358,12 +1390,13 @@ impl App {
             prompted: false,
             sync_until: None,
             key,
+            cmd: cmd.map(str::to_owned),
             progress: None,
             claude_working: None,
             hooks_seen: false,
         });
         self.find_branch(id);
-        self.next_id = id.0 + 1;
+        self.next_id = self.next_id.max(id.0 + 1);
         Ok(())
     }
 
@@ -2347,11 +2380,14 @@ impl App {
             return;
         };
         if v.pane.exit_code.is_some() {
-            if k.down && k.vk == VK_RETURN {
+            if k.down && matches!(k.vk, VK_RETURN | VK_ESCAPE) {
                 let id = v.pane.id;
                 // The release must not reach the pane that takes focus.
                 self.eaten.press(k.vk);
-                self.close(el, id);
+                match k.vk {
+                    VK_RETURN => self.restart(id),
+                    _ => self.close(el, id),
+                }
             }
             return;
         }
@@ -2770,7 +2806,7 @@ impl App {
                 }
                 self.set_notice(
                     id,
-                    format!("{} \u{b7} Enter close", exit_text(code)),
+                    format!("{} \u{b7} Enter restart \u{b7} Esc close", exit_text(code)),
                     None,
                     false,
                 );
