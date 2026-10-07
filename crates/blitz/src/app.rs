@@ -6187,13 +6187,15 @@ fn trim_paste(text: &str) -> &str {
 /// What a paste that needs confirming asks: how many lines, how they
 /// start, and the paste `key`, when one is bound.
 fn paste_question(text: &str, key: Option<&str>) -> String {
-    let first = text.trim_start().lines().next().unwrap_or_default();
-    let mut chars = first.chars().filter(|c| !c.is_control());
-    let mut start: String = chars.by_ref().take(40).collect();
-    if chars.next().is_some() {
+    // A lone CR is Enter too, and the preview leaves out what would hide
+    // or reorder the text.
+    let first = (text.trim_start().split(['\r', '\n']).next()).unwrap_or_default();
+    let mut start = vt::osc::clean(first, 41);
+    if start.chars().count() > 40 {
+        start.pop();
         start.push('\u{2026}');
     }
-    let lines = text.lines().count();
+    let lines = text.replace("\r\n", "\n").replace('\r', "\n").lines().count();
     let s = if lines == 1 { "" } else { "s" };
     let again = match key {
         Some(k) => format!("Press {k} again"),
@@ -8944,6 +8946,16 @@ mod tests {
         assert_eq!(
             paste_question("a\nb", None),
             "Paste 2 lines starting \"a\"? Paste again"
+        );
+        // A lone CR runs a line too.
+        assert_eq!(
+            paste_question("echo hi\rcalc\r", None),
+            "Paste 2 lines starting \"echo hi\"? Paste again"
+        );
+        // Nothing invisible or reordering in the preview.
+        assert_eq!(
+            paste_question("\u{202e}\u{200b}ab\nc", None),
+            "Paste 2 lines starting \"ab\"? Paste again"
         );
     }
 
