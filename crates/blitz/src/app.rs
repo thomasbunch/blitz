@@ -3580,17 +3580,17 @@ impl App {
         if hover == self.hover {
             return;
         }
-        if let Some(w) = &self.window
-            && hover.is_some() != self.hover.is_some()
-        {
-            w.set_cursor(if hover.is_some() {
-                CursorIcon::Pointer
-            } else {
-                CursorIcon::Default
-            });
-        }
         self.hover = hover;
+        self.show_cursor();
         self.request_redraw();
+    }
+
+    /// Shows the pointer for what is under it.
+    fn show_cursor(&self) {
+        if let Some(w) = &self.window {
+            let hand = self.hover.is_some() || self.mouse.over_side.is_some();
+            w.set_cursor(cursor_icon(self.mouse.over_divider, hand));
+        }
     }
 
     /// Notes what in the sidebar the pointer is over: the hand says a
@@ -3599,16 +3599,8 @@ impl App {
         if over == self.mouse.over_side {
             return;
         }
-        if let Some(w) = &self.window
-            && over.is_some() != self.mouse.over_side.is_some()
-        {
-            w.set_cursor(if over.is_some() {
-                CursorIcon::Pointer
-            } else {
-                CursorIcon::Default
-            });
-        }
         self.mouse.over_side = over;
+        self.show_cursor();
         self.request_redraw();
     }
 
@@ -3642,13 +3634,7 @@ impl App {
         let over = self.divider_at(pos).map(|d| d.1);
         if over != self.mouse.over_divider {
             self.mouse.over_divider = over;
-            if let Some(w) = &self.window {
-                w.set_cursor(match over {
-                    Some(Axis::Row) => CursorIcon::ColResize,
-                    Some(Axis::Column) => CursorIcon::RowResize,
-                    None => CursorIcon::Default,
-                });
-            }
+            self.show_cursor();
         }
         // blitz run covers the panes, so programs see no motion under it.
         if self.game.is_some() {
@@ -4146,6 +4132,18 @@ fn route_button(
         program
     } else {
         reported[b].take()
+    }
+}
+
+/// The pointer over a divider along `divider`, or with `hand` over a
+/// link or something in the sidebar a click acts on. Kept in one place,
+/// so leaving one of them cannot take the hand away from another.
+fn cursor_icon(divider: Option<Axis>, hand: bool) -> CursorIcon {
+    match divider {
+        Some(Axis::Row) => CursorIcon::ColResize,
+        Some(Axis::Column) => CursorIcon::RowResize,
+        None if hand => CursorIcon::Pointer,
+        None => CursorIcon::Default,
     }
 }
 
@@ -6638,5 +6636,16 @@ mod tests {
         // Only the focused one hidden: nowhere to go.
         assert_eq!(hidden_target(&ids(&[7]), Some(PaneId(7))), None);
         assert_eq!(hidden_target(&[], None), None);
+    }
+
+    #[test]
+    fn the_pointer_shows_what_is_under_it() {
+        assert_eq!(cursor_icon(None, false), CursorIcon::Default);
+        assert_eq!(cursor_icon(None, true), CursorIcon::Pointer);
+        assert_eq!(cursor_icon(Some(Axis::Row), true), CursorIcon::ColResize);
+        assert_eq!(
+            cursor_icon(Some(Axis::Column), false),
+            CursorIcon::RowResize
+        );
     }
 }
