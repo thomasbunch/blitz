@@ -2133,14 +2133,11 @@ impl App {
         true
     }
 
-    /// The size in cells of each pane `win` would show now.
+    /// The size in cells of each pane of `win` in the window as it is now.
     fn grids(&self, win: &layout::Window) -> Vec<(PaneId, (i32, i32))> {
-        let (cw, ch) = self.cell();
-        let c = chrome::build(&self.model(win, &[], None));
-        c.panes
-            .iter()
-            .map(|&(id, r)| (id, (r.w / cw as i32, r.h / ch as i32)))
-            .collect()
+        tab_grids(win, self.cell(), |w| {
+            chrome::build(&self.model(w, &[], None)).panes
+        })
     }
 
     /// Every session as the sidebar shows it.
@@ -4302,6 +4299,26 @@ fn min_window(cell: (u32, u32), scale: f32, expanded: bool) -> PhysicalSize<u32>
     PhysicalSize::new((w + rail) as u32, h as u32)
 }
 
+/// The size in cells of `cw` by `ch` pixels of each pane in every tab of
+/// `win`, which `panes` lays out with a given tab shown. Hidden tabs count
+/// too: a pane restored in one would start at 80 columns, and Claude Code
+/// would draw its conversation at that width until the tab shows.
+fn tab_grids(
+    win: &layout::Window,
+    (cw, ch): (u32, u32),
+    panes: impl Fn(&layout::Window) -> Vec<(PaneId, Rect)>,
+) -> Vec<(PaneId, (i32, i32))> {
+    (0..win.tabs.len())
+        .flat_map(|active| {
+            panes(&layout::Window {
+                active,
+                ..win.clone()
+            })
+        })
+        .map(|(id, r)| (id, (r.w / cw as i32, r.h / ch as i32)))
+        .collect()
+}
+
 /// Whether a window kept hidden `until` then shows now: once a frame was
 /// `presented`, or at `until` without one, so a renderer that fails still
 /// leaves a window to see.
@@ -5761,6 +5778,32 @@ mod tests {
         assert!(!c.matches().is_empty());
         let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
         assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
+    }
+
+    /// Restored panes in tabs not shown start at their real size, so Claude
+    /// Code resumes at the width it will be seen at.
+    #[test]
+    fn app_panes_in_hidden_tabs_start_at_their_size() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("a".into(), PaneId(1)));
+        let mut b = Tab::new("b".into(), PaneId(2));
+        let any = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 400,
+        };
+        assert!(b.split(Dir::Right, PaneId(3), any, (0, 0)));
+        win.tabs.push(b);
+        let shown = |w: &layout::Window| w.tabs[w.active].rects(any);
+        let grids = tab_grids(&win, (10, 20), shown);
+        let ids: Vec<PaneId> = grids.iter().map(|g| g.0).collect();
+        assert_eq!(ids, [PaneId(1), PaneId(2), PaneId(3)], "every tab");
+        assert_eq!(grids[0].1, (80, 20));
+        assert!(
+            grids[1..].iter().all(|g| g.1.0 < 80 && g.1.1 == 20),
+            "{grids:?}"
+        );
     }
 
     /// The window shows with its first frame, never blank before it, and
