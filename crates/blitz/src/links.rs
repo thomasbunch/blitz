@@ -607,6 +607,11 @@ mod tests {
             let text = format!("{word}{}", ")]".repeat(50_000));
             assert_eq!(quick(&text, word), 1);
         }
+        // A path may start after each of these inside a word.
+        for open in ["(", "[", "=", "'"] {
+            let text = format!("a{open}").repeat(50_000);
+            assert_eq!(quick(&text, open), 0);
+        }
         // Every letter carries a mark or joiner, so none starts a word, and
         // a run of marks on a space or quote starts none either.
         let mut marks = vec!["a\u{300}".repeat(100_000), "a\u{200D}".repeat(100_000)];
@@ -617,7 +622,7 @@ mod tests {
         // Lines of everything that has ever made a walk start over: each
         // its own mix, so some hold long words and some long runs of marks.
         let parts: Vec<_> =
-            "a|Z|/|.|:|(|)|[|]|\u{300}|\u{941}|\u{200D}|\u{200C}|\u{D4E}|\u{111C2}|漢| |https://"
+            "a|Z|/|.|:|(|)|[|]|=|'|\u{300}|\u{941}|\u{200D}|\u{200C}|\u{D4E}|\u{111C2}|漢| |https://"
                 .split('|')
                 .collect();
         let mut seed = 0x2545_f491_4f6c_dd1du64;
