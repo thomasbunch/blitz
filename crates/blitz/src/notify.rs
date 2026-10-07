@@ -220,7 +220,7 @@ pub fn toast_xml(lines: &[&str], silent: bool) -> String {
                 '<' => xml.push_str("&lt;"),
                 '>' => xml.push_str("&gt;"),
                 // XML has no place for most of them.
-                c if c.is_control() => xml.push(' '),
+                c if c.is_control() || c == '\u{fffe}' || c == '\u{ffff}' => xml.push(' '),
                 c => xml.push(c),
             }
         }
@@ -344,12 +344,13 @@ mod tests {
 
     #[test]
     fn notifications_carry_their_text_safely() {
-        let xml = toast_xml(&["pwsh 3 needs you", "", "Bash: a <b> & \"c\"\x07"], true);
+        let text = "Bash: a <b> & \"c\"\x07\u{fffe}\u{ffff}";
+        let xml = toast_xml(&["pwsh 3 needs you", "", text], true);
         assert_eq!(
             xml,
             "<toast><visual><binding template=\"ToastGeneric\">\
              <text>pwsh 3 needs you</text>\
-             <text>Bash: a &lt;b&gt; &amp; \"c\" </text>\
+             <text>Bash: a &lt;b&gt; &amp; \"c\"   </text>\
              </binding></visual><audio silent=\"true\"/></toast>"
         );
         // Windows reads it; nothing is shown.
