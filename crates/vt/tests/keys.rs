@@ -940,6 +940,20 @@ fn paste_filters_controls_and_line_breaks() {
 }
 
 #[test]
+fn paste_drops_controls_before_joining_line_breaks() {
+    // CR LF with a dropped control between them is still one line break.
+    assert_eq!(paste("a\r\x1b\nb", false), "a\rb");
+    assert_eq!(paste("a\r\u{9b}\nb", false), "a\rb");
+    // Breaks in other orders stay apart.
+    assert_eq!(paste("a\n\rb", false), "a\r\rb");
+    assert_eq!(paste("a\r\r\nb", false), "a\r\rb");
+    assert_eq!(paste("\r\n\r\n", false), "\r\r");
+    // NEL is C1 and dropped like the rest.
+    assert_eq!(paste("a\u{85}b", false), "ab");
+    assert_eq!(paste("a\tb", true), "\x1b[200~a\tb\x1b[201~");
+}
+
+#[test]
 fn paste_bracketed() {
     assert_eq!(paste("hi\n", true), "\x1b[200~hi\r\x1b[201~");
     assert_eq!(paste("", true), "\x1b[200~\x1b[201~");

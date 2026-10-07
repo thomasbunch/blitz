@@ -583,13 +583,15 @@ pub fn encode_paste(text: &str, bracketed: bool, out: &mut Vec<u8>) {
     if bracketed {
         out.extend_from_slice(b"\x1b[200~");
     }
+    // Dropped characters are left out before line breaks are paired, so CR,
+    // ESC, LF is one break.
     let mut prev = '\0';
     for c in text.chars() {
         match c {
             '\n' if prev == '\r' => {}
             '\n' | '\r' => out.push(b'\r'),
             '\t' => out.push(b'\t'),
-            '\0'..='\x1f' | '\x7f'..='\u{9f}' => {}
+            '\0'..='\x1f' | '\x7f'..='\u{9f}' => continue,
             _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
         }
         prev = c;
