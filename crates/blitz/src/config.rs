@@ -208,7 +208,8 @@ pub const SETTINGS: &[Setting] = &[
         key: "scenery",
         group: "Easter eggs",
         label: "Scenery",
-        help: "Pixel stars, hills or snow drifting behind the panes, faint                enough to read over. Still when Windows animations are off.",
+        help: "Pixel stars, hills or snow drifting behind the panes, faint \
+               enough to read over. Still when Windows animations are off.",
         kind: Kind::Choice,
         applies: NOW,
     },
