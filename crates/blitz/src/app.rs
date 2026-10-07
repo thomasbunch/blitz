@@ -3598,16 +3598,16 @@ impl App {
     }
 
     /// Pastes `text` into pane `id`, the focused one, or asks first as
-    /// [`vt::keys::needs_paste_confirm`] says, or for file `names` that
-    /// [`quote_paths`] would ask about, as `ask` makes the question;
-    /// `confirmed` when this is the answer. A single line goes without its
-    /// line break, so it is not run.
+    /// [`vt::keys::needs_paste_confirm`] says, or for the file `names`
+    /// [`quote_paths`] lists, as `ask` makes the question; `confirmed` when
+    /// this is the answer. A single line goes without its line break, so
+    /// it is not run.
     fn paste(
         &mut self,
         id: PaneId,
         text: &str,
         confirmed: bool,
-        names: bool,
+        names: &[String],
         ask: fn(String) -> Ask,
     ) {
         let text = trim_paste(text);
@@ -3626,7 +3626,7 @@ impl App {
             term.confirm_paste();
         }
         drop(term);
-        if !confirmed && asks_first(text, names, bracketed, trusted) {
+        if !confirmed && asks_first(text, !names.is_empty(), bracketed, trusted) {
             self.ask_paste(id, text, names, ask);
             return;
         }
@@ -3636,7 +3636,7 @@ impl App {
     }
 
     /// Asks before pasting `text` into pane `id`; the paste key confirms.
-    fn ask_paste(&mut self, id: PaneId, text: &str, names: bool, ask: fn(String) -> Ask) {
+    fn ask_paste(&mut self, id: PaneId, text: &str, names: &[String], ask: fn(String) -> Ask) {
         let key = keymap::keys_for(Action::Paste, &self.config.keys);
         let asked = paste_question(text, names, key.as_deref());
         self.ask(id, asked, ask(text.to_owned()));
@@ -3730,7 +3730,7 @@ impl App {
                 };
                 // Files copied in Explorer paste as their paths.
                 let text = (crate::clipboard::get_text().filter(|t| !t.is_empty()))
-                    .map(|t| (t, false))
+                    .map(|t| (t, Vec::new()))
                     .or_else(|| {
                         let shell = self.shell_of(id);
                         crate::clipboard::get_files().map(|f| quote_paths(&f, shell))
@@ -3746,11 +3746,11 @@ impl App {
                 }
                 let now = text.as_ref().map(|t| t.0.as_str());
                 if let Some(answer) = asked.and_then(|n| answers(n.ask, now)) {
-                    self.paste(id, &answer, true, false, Ask::Paste);
+                    self.paste(id, &answer, true, &[], Ask::Paste);
                     return true;
                 }
                 match text {
-                    Some((text, names)) => self.paste(id, &text, false, names, Ask::Paste),
+                    Some((text, names)) => self.paste(id, &text, false, &names, Ask::Paste),
                     None => return self.paste_image(id),
                 }
             }
@@ -4796,7 +4796,7 @@ impl App {
             Some(Dropped::Paste(id, paths)) => {
                 self.show(id);
                 let (text, names) = quote_paths(&paths, self.shell_of(id));
-                self.paste(id, &text, false, names, Ask::Drop);
+                self.paste(id, &text, false, &names, Ask::Drop);
             }
             Some(Dropped::Open(dirs)) if dirs.is_empty() => {
                 if let Some(id) = self.focus_id() {
@@ -6651,10 +6651,43 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
 
 /// The rows a notice takes in a pane of `grid` cells: broken at spaces
 /// onto as many as it needs, so its end, which often names the key to
-/// press, is not cut off in a narrow pane.
+/// press, is not cut off in a narrow pane. Each further line of it, such
+/// as a file name a question is about, starts a row of its own after
+/// that, as many as fit whole, then a row says how many more there are.
+/// The first such line shows whole if it fits at all, and else as much
+/// as fits, with a row that says it is cut.
 fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
-    let lines = chrome::wrap(text, i32::from(cols) - 1, 1, usize::from(rows.max(1)));
-    lines.into_iter().map(|l| format!(" {l}")).collect()
+    let (max, n) = (i32::from(cols) - 1, usize::from(rows.max(1)));
+    let mut lines = text.split('\n');
+    let mut out = chrome::wrap(lines.next().unwrap_or_default(), max, 1, n);
+    let items: Vec<&str> = lines.collect();
+    for (i, item) in items.iter().enumerate() {
+        let left = n - out.len();
+        let more = items.len() - i - 1;
+        let room = if i == 0 {
+            left
+        } else {
+            left.saturating_sub(usize::from(more > 0))
+        };
+        let rows = chrome::wrap(item, max, 1, usize::MAX);
+        if rows.len() <= room {
+            out.extend(rows);
+            continue;
+        }
+        let tail = match (i, more) {
+            (0, 0) => "name cut to fit the pane".to_owned(),
+            (0, m) => format!("name cut to fit the pane, and {m} more"),
+            (_, m) => format!("and {} more", m + 1),
+        };
+        if i == 0 && left > 1 {
+            out.extend(chrome::wrap(item, max, 1, left - 1));
+        }
+        if out.len() < n {
+            out.extend(chrome::wrap(&tail, max, 1, 1));
+        }
+        break;
+    }
+    out.into_iter().map(|l| format!(" {l}")).collect()
 }
 
 /// Puts a hint nobody asked for in a pane's notice `slot`, dim until
@@ -7359,30 +7392,30 @@ fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
 }
 
 /// Paths as a paste types them into a pane that started `shell`, joined
-/// by spaces, and whether to ask before pasting them. A name with anything
-/// but letters, digits and `_.-:\/` is quoted for that shell: cmd gets
-/// double quotes, PowerShell single ones with each single quote mark
+/// by spaces, and the names a question before pasting them lists: none
+/// when nothing asks, else all of them, those that ask first. A name with
+/// anything but letters, digits and `_.-:\/` is quoted for that shell: cmd
+/// gets double quotes, PowerShell single ones with each single quote mark
 /// doubled, and any other shell is taken for bash, where `\` needs quoting
 /// too and `'\''` puts a `'` in single quotes. The line may be read by a
 /// shell started inside the pane, by other rules, so a name with anything
 /// but letters, digits, spaces and `._-\/:~()[]+,@=`, none of which a shell
 /// reads as syntax inside either kind of quotes, asks first, whatever the
 /// pane runs.
-fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, bool) {
+fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, Vec<String>) {
     use crate::shell::Kind::{Cmd, Other, PowerShell};
     let plain =
         |c: char| c.is_alphanumeric() || "_.-:/".contains(c) || (c == '\\' && shell != Other);
     let safe = |c: char| c.is_alphanumeric() || r" ._-\/:~()[]+,@=".contains(c);
-    let mut asks = false;
-    let quoted: Vec<String> = (paths.iter())
+    let mut quoted: Vec<(bool, String)> = (paths.iter())
         .map(|p| {
             let s = p.to_string_lossy();
-            asks |= !s.chars().all(safe);
+            let asks = !s.chars().all(safe);
             if s.chars().all(plain) {
-                return s.into_owned();
+                return (asks, s.into_owned());
             }
             if shell == Cmd {
-                return format!("\"{s}\"");
+                return (asks, format!("\"{s}\""));
             }
             let mut q = String::from('\'');
             for c in s.chars() {
@@ -7392,10 +7425,17 @@ fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, bool) {
                     _ => q.push(c),
                 }
             }
-            q + "'"
+            (asks, q + "'")
         })
         .collect();
-    (quoted.join(" "), asks)
+    let text = (quoted.iter().map(|q| q.1.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !quoted.iter().any(|q| q.0) {
+        return (text, Vec::new());
+    }
+    quoted.sort_by_key(|q| !q.0);
+    (text, quoted.into_iter().map(|q| q.1).collect())
 }
 
 /// What files dropped on the window do.
@@ -7498,7 +7538,9 @@ fn asks_first(text: &str, names: bool, bracketed: bool, trusted: bool) -> bool {
 
 /// What a paste that needs confirming asks: how many lines, how they
 /// start, or why file `names` ask, and the paste `key`, when one is bound.
-fn paste_question(text: &str, names: bool, key: Option<&str>) -> String {
+/// File names follow on lines of their own, in the order [`quote_paths`]
+/// lists them, so [`notice_rows`] shows what, why and the key first.
+fn paste_question(text: &str, names: &[String], key: Option<&str>) -> String {
     // A lone CR is Enter too, and the preview leaves out what would hide
     // or reorder the text.
     let first = (text.trim_start().split(['\r', '\n']).next()).unwrap_or_default();
@@ -7517,16 +7559,20 @@ fn paste_question(text: &str, names: bool, key: Option<&str>) -> String {
         Some(k) => format!("Press {k} again"),
         None => "Paste again".into(),
     };
-    if names && lines == 1 {
-        // All of it, as the name that asks may be anywhere in a long line,
-        // with what the preview leaves out shown as left out. Quoted
-        // already, as only a quoted name asks.
+    if !names.is_empty() {
+        // Each name whole, with what the preview leaves out shown as left
+        // out. Quoted already, as only a quoted name asks.
         let shown = |c: char| !vt::osc::clean(c.encode_utf8(&mut [0; 4]), 1).is_empty();
-        let all: String = text
-            .chars()
-            .map(|c| if shown(c) { c } else { '\u{fffd}' })
-            .collect();
-        return format!("Paste {all}? A shell may run part of a file name. {again}");
+        let what = match names.len() {
+            1 => "this file name".to_owned(),
+            n => format!("{n} file names"),
+        };
+        let mut ask = format!("Paste {what}? A shell may run part of a file name. {again}");
+        for name in names {
+            ask.push('\n');
+            ask.extend(name.chars().map(|c| if shown(c) { c } else { '\u{fffd}' }));
+        }
+        return ask;
     }
     format!("Paste {lines} line{s} starting \"{start}\"? {again}")
 }
@@ -11147,13 +11193,13 @@ mod tests {
         use crate::shell::Kind::{Cmd, Other, PowerShell};
         let paths = [r"C:\some dir\shot.png", r"D:\b.txt"].map(PathBuf::from);
         let cmd = r#""C:\some dir\shot.png" D:\b.txt"#;
-        assert_eq!(quote_paths(&paths, Cmd), (cmd.into(), false));
+        assert_eq!(quote_paths(&paths, Cmd), (cmd.into(), Vec::new()));
         let ps = r"'C:\some dir\shot.png' D:\b.txt";
-        assert_eq!(quote_paths(&paths, PowerShell), (ps.into(), false));
+        assert_eq!(quote_paths(&paths, PowerShell), (ps.into(), Vec::new()));
         let bash = r"'C:\some dir\shot.png' 'D:\b.txt'";
         assert_eq!(
             quote_paths(&paths, Other),
-            (bash.into(), false),
+            (bash.into(), Vec::new()),
             "bash reads `\\`"
         );
         let one = |p: &str, shell| quote_paths(&[PathBuf::from(p)], shell).0;
@@ -11178,7 +11224,7 @@ mod tests {
     #[test]
     fn app_file_names_ask_first_with_anything_a_shell_might_read() {
         use crate::shell::Kind::{Cmd, Other, PowerShell};
-        let asks = |p: &str, shell| quote_paths(&[PathBuf::from(p)], shell).1;
+        let asks = |p: &str, shell| !quote_paths(&[PathBuf::from(p)], shell).1.is_empty();
         for shell in [Cmd, PowerShell, Other] {
             // Nothing in these is syntax inside quotes, in any shell.
             for name in [
@@ -11209,9 +11255,13 @@ mod tests {
                 assert!(asks(name, shell), "{name:?} in {shell:?}");
             }
         }
-        // One such name among them is enough.
+        // One such name among them is enough, and the question lists it
+        // first.
         let paths = [r"C:\a.txt", r"C:\x&calc&.txt"].map(PathBuf::from);
-        assert!(quote_paths(&paths, Cmd).1);
+        assert_eq!(
+            quote_paths(&paths, Cmd).1,
+            [r#""C:\x&calc&.txt""#, r"C:\a.txt"]
+        );
     }
 
     #[test]
@@ -11262,54 +11312,56 @@ mod tests {
     #[test]
     fn app_paste_question_says_what_and_which_key() {
         assert_eq!(
-            paste_question("\r\ngit status\r\ngit diff\r\n", false, Some("Ctrl+V")),
+            paste_question("\r\ngit status\r\ngit diff\r\n", &[], Some("Ctrl+V")),
             "Paste 3 lines starting \"git status\"? Press Ctrl+V again"
         );
         // The first 40 characters, without tabs or other controls.
         let long = format!("{}\tyz", "x".repeat(39));
         assert_eq!(
-            paste_question(&long, false, Some("Shift+Insert")),
+            paste_question(&long, &[], Some("Shift+Insert")),
             format!(
                 "Paste 1 line starting \"{}y\u{2026}\"? Press Shift+Insert again",
                 "x".repeat(39)
             )
         );
         assert_eq!(
-            paste_question("a\nb", false, None),
+            paste_question("a\nb", &[], None),
             "Paste 2 lines starting \"a\"? Paste again"
         );
         // A lone CR runs a line too.
         assert_eq!(
-            paste_question("echo hi\rcalc\r", false, None),
+            paste_question("echo hi\rcalc\r", &[], None),
             "Paste 2 lines starting \"echo hi\"? Paste again"
         );
         // Nothing invisible or reordering in the preview.
         assert_eq!(
-            paste_question("\u{202e}\u{200b}ab\nc", false, None),
+            paste_question("\u{202e}\u{200b}ab\nc", &[], None),
             "Paste 2 lines starting \"ab\"? Paste again"
         );
-        // File names say why they ask.
+        // File names say what, why they ask and which key first, then
+        // each name whole on a line of its own, with what is left out of a
+        // preview shown as left out.
+        let one = [r#""C:\a”;calc;”.txt""#.to_owned()];
         assert_eq!(
-            paste_question(r#""C:\a”;calc;”.txt""#, true, Some("Ctrl+V")),
-            "Paste \"C:\\a”;calc;”.txt\"? A shell may run part of a file name. \
-             Press Ctrl+V again"
+            paste_question(&one[0], &one, Some("Ctrl+V")),
+            "Paste this file name? A shell may run part of a file name. \
+             Press Ctrl+V again\n\"C:\\a”;calc;”.txt\""
         );
-        // All of a long name, and of every name dropped with it, with
-        // what is left out of a preview shown as left out.
-        let long = r#""C:\Users\me\OneDrive - Contoso\Documents\Report “final” v2.docx""#;
+        let many = [
+            "\"C:\\x\u{202e}”;calc;”\u{7}.txt\"",
+            "C:\\a.txt",
+            "\"C:\\me\\b c.txt\"",
+        ];
+        let many = many.map(String::from);
         assert_eq!(
-            paste_question(long, true, None),
-            format!("Paste {long}? A shell may run part of a file name. Paste again")
-        );
-        let many = "C:\\a.txt \"C:\\me\\b c.txt\" \"C:\\x\u{202e}”;calc;”\u{7}.txt\"";
-        assert_eq!(
-            paste_question(many, true, None),
-            "Paste C:\\a.txt \"C:\\me\\b c.txt\" \"C:\\x\u{fffd}”;calc;”\u{fffd}.txt\"? \
-             A shell may run part of a file name. Paste again"
+            paste_question(&many.join(" "), &many, None),
+            "Paste 3 file names? A shell may run part of a file name. Paste again\n\
+             \"C:\\x\u{fffd}”;calc;”\u{fffd}.txt\"\nC:\\a.txt\n\"C:\\me\\b c.txt\""
         );
         // A pane too narrow for it goes on over more rows, the end of the
         // name too.
-        let ask = paste_question(r#""C:\Downloads\a-long-folder\x&calc&.txt""#, true, None);
+        let name = [r#""C:\Downloads\a-long-folder\x&calc&.txt""#.to_owned()];
+        let ask = paste_question(&name[0], &name, None);
         let rows = notice_rows(&ask, (16, 24));
         let all: String = rows.iter().map(|r| r.trim_start()).collect();
         assert!(all.contains(r"a-long-folder\x&calc&.txt"), "{rows:?}");
@@ -11331,6 +11383,72 @@ mod tests {
         t.vouch_paste(true);
         assert!(ask(&t, "'C:\\x$&calc&.txt'", true));
         assert!(!ask(&t, "a\nb", false));
+    }
+
+    #[test]
+    fn app_a_file_question_says_why_and_which_key_before_the_names() {
+        let rows = |paths: &[PathBuf], grid| {
+            let (text, names) = quote_paths(paths, crate::shell::Kind::Cmd);
+            notice_rows(&paste_question(&text, &names, Some("Ctrl+V")), grid)
+        };
+        let head = " Paste 30 file names? A shell may run part of a file name. Press Ctrl+V again";
+        // Every name asks: the question, as many names as fit, and how
+        // many more.
+        let jerry = (1..=30).map(|i| format!(r"C:\Users\me\Downloads\Tom & Jerry\IMG_{i:04}.jpg"));
+        let shown = rows(&jerry.map(PathBuf::from).collect::<Vec<_>>(), (80, 24));
+        assert_eq!(shown.len(), 24, "{shown:?}");
+        assert_eq!(shown[0], head);
+        assert_eq!(
+            shown[1],
+            r#" "C:\Users\me\Downloads\Tom & Jerry\IMG_0001.jpg""#
+        );
+        assert_eq!(
+            shown[22],
+            r#" "C:\Users\me\Downloads\Tom & Jerry\IMG_0022.jpg""#
+        );
+        assert_eq!(shown[23], " and 8 more");
+        let notes =
+            (1..=30).map(|i| format!(r"C:\Users\me\OneDrive - Contoso\Q&A notes\week {i}.docx"));
+        let shown = rows(&notes.map(PathBuf::from).collect::<Vec<_>>(), (100, 12));
+        assert_eq!(shown.len(), 12, "{shown:?}");
+        assert_eq!(shown[0], head);
+        assert_eq!(
+            shown[10],
+            r#" "C:\Users\me\OneDrive - Contoso\Q&A notes\week 10.docx""#
+        );
+        assert_eq!(shown[11], " and 20 more");
+        // The name that asks comes first and whole, over the rows it
+        // needs, wherever it was among those dropped.
+        let mut pics: Vec<PathBuf> = (1..=29)
+            .map(|i| PathBuf::from(format!(r"C:\Users\me\Pictures\IMG_{i:04}.jpg")))
+            .collect();
+        let risky =
+            r"C:\Users\me\Pictures\a long folder name\holiday $(calc) and then the rest of it.jpg";
+        pics.insert(20, PathBuf::from(risky));
+        let shown = rows(&pics, (80, 6));
+        assert_eq!(shown.len(), 6, "{shown:?}");
+        assert_eq!(shown[0], head);
+        assert_eq!(shown[1..3].concat(), format!(r#" "{risky}""#));
+        assert_eq!(shown[3], r" C:\Users\me\Pictures\IMG_0001.jpg");
+        assert_eq!(shown[4], r" C:\Users\me\Pictures\IMG_0002.jpg");
+        assert_eq!(shown[5], " and 27 more");
+        // A name too long for the pane says it is cut.
+        let huge = format!(r"C:\{}x&calc&.txt", r"deep\".repeat(100));
+        let shown = rows(&[PathBuf::from(&huge)], (80, 6));
+        assert_eq!(shown.len(), 6, "{shown:?}");
+        assert_eq!(
+            shown[0],
+            " Paste this file name? A shell may run part of a file name. Press Ctrl+V again"
+        );
+        assert!(shown[1].starts_with(r#" "C:\deep\deep\"#), "{shown:?}");
+        assert!(shown[4].ends_with('\u{2026}'), "{shown:?}");
+        assert_eq!(shown[5], " name cut to fit the pane");
+        let two = [PathBuf::from(&huge), PathBuf::from(r"C:\a.txt")];
+        let shown = rows(&two, (80, 6));
+        assert_eq!(
+            shown[5], " name cut to fit the pane, and 1 more",
+            "{shown:?}"
+        );
     }
 
     #[test]
