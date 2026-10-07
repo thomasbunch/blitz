@@ -428,6 +428,16 @@ The actions are `copy`, `copy_without_indent`, `paste`,
 `claude_setup`, `go_to_tab_1` to `go_to_tab_8` and `last_tab`. Typing a
 name in the command palette finds its action.
 
+A binding can also type text into the focused pane: `text:` and the
+text, with `\e` for Esc, `\r` for Enter, `\n`, `\t`, `\s` for a space,
+`\\` for a backslash and `\xNN` for any byte. Put the line in single
+quotes to keep a `#` in the text.
+
+```
+keybind = ctrl+shift+g=text:git status\r
+keybind = 'alt+c=text:claude --continue # last session\r'
+```
+
 ## License
 
 [MIT](LICENSE)
