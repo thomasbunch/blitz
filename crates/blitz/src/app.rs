@@ -124,6 +124,9 @@ const FIRST_FRAME: Duration = Duration::from_millis(500);
 /// changing size, as in a live resize or a divider drag: each new size
 /// makes the program redraw its whole screen.
 const RESIZE_GAP: Duration = Duration::from_millis(80);
+/// How often the find bar searches again while output streams into its
+/// pane: each search reads all of the scrollback.
+const FIND_EVERY: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -1145,6 +1148,8 @@ struct Find {
     cur: Option<usize>,
     /// Output came since the last search.
     stale: bool,
+    /// When the last search ran; `None` asks for one at once.
+    searched: Option<Instant>,
     /// The query was put there when the bar opened and is drawn selected:
     /// typing replaces it.
     fresh: bool,
@@ -1158,6 +1163,7 @@ impl Find {
             found: Vec::new(),
             cur: None,
             stale: false,
+            searched: None,
             fresh: false,
         }
     }
@@ -1196,6 +1202,7 @@ impl Find {
         };
         self.found = term.find(&self.query);
         self.stale = false;
+        self.searched = Some(Instant::now());
         let above = self.found.partition_point(|m| m.start <= anchor);
         self.cur = (!self.found.is_empty()).then(|| above.saturating_sub(1));
     }
@@ -1204,6 +1211,15 @@ impl Find {
     fn step(&mut self, by: isize) {
         let n = self.found.len() as isize;
         self.cur = (self.cur).map(|i| (i as isize + by).rem_euclid(n) as usize);
+    }
+
+    /// When output that came since the last search is searched: at once
+    /// after a quiet spell, else `FIND_EVERY` after the last search, so a
+    /// pane streaming output is searched a few times a second, not on
+    /// every frame. `None` with nothing to search.
+    fn due(&self) -> Option<Instant> {
+        self.stale
+            .then(|| self.searched.map_or(Instant::now(), |t| t + FIND_EVERY))
     }
 }
 
@@ -4370,9 +4386,10 @@ impl App {
                     }
                     drop(term);
                     lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
-                    // A new width rewraps the lines that matched.
+                    // A new width rewraps the lines that matched, which a
+                    // search must find again before they are drawn.
                     if let Some(f) = &mut find {
-                        f.stale = true;
+                        (f.stale, f.searched) = (true, None);
                     }
                 }
             }
@@ -4392,10 +4409,10 @@ impl App {
             }
             v.snap.highlights.clear();
             if let Some(f) = find {
-                // ponytail: searches all of the scrollback again on each
-                // frame with new output, ~50 ms for 100,000 full rows; keep
-                // the matches in scrollback rows if that ever shows.
-                if f.stale {
+                // ponytail: searches all of the scrollback again, ~50 ms for
+                // 100,000 full rows, at most every FIND_EVERY; keep the
+                // matches in scrollback rows if that ever shows.
+                if f.due().is_some_and(|t| t <= Instant::now()) {
                     f.search(&term, v.grid.1);
                 }
                 v.snap.highlight(&f.found, f.cur);
@@ -4644,6 +4661,10 @@ impl App {
         let shown = (self.window.as_ref())
             .is_some_and(|w| w.inner_size().width > 0 && w.inner_size().height > 0);
         let gfx = self.gfx_retry.filter(|_| self.gfx.is_none() && shown);
+        // Only a frame searches.
+        let find = (self.find.as_ref())
+            .filter(|_| shown && self.gfx.is_some())
+            .and_then(Find::due);
         // Only a window in use animates.
         let still =
             !self.motion || (self.config.scenery == "off" && !(self.config.mascot && sidebar));
@@ -4658,6 +4679,7 @@ impl App {
             timer,
             resume,
             resize,
+            find,
             self.save_after,
             gfx,
             anim,
@@ -7153,6 +7175,21 @@ mod tests {
         for a in [Action::Copy, Action::SplitRight, Action::FontSize(1)] {
             assert!(!find_keeps(a), "{a:?}");
         }
+    }
+
+    #[test]
+    fn app_find_searches_streaming_output_a_few_times_a_second() {
+        let t = fed(10, 2, "abc");
+        let mut f = Find::new(PaneId(1));
+        f.query = "b".into();
+        assert_eq!(f.due(), None, "nothing new");
+        f.stale = true;
+        assert!(f.due().is_some_and(|t| t <= Instant::now()), "at once");
+        f.search(&t, 2);
+        assert_eq!(f.due(), None);
+        f.stale = true;
+        let at = f.due().expect("a search to come");
+        assert!(at > Instant::now() && at <= Instant::now() + FIND_EVERY);
     }
 
     #[test]
