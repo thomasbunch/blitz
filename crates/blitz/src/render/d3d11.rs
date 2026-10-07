@@ -563,6 +563,15 @@ mod tests {
     }
 
     #[test]
+    fn only_a_removed_or_reset_device_is_lost() {
+        assert!(is_device_lost(&Error::from(DXGI_ERROR_DEVICE_REMOVED)));
+        assert!(is_device_lost(&Error::from(DXGI_ERROR_DEVICE_RESET)));
+        for other in [E_FAIL, DXGI_STATUS_OCCLUDED] {
+            assert!(!is_device_lost(&Error::from(other)), "{other:?}");
+        }
+    }
+
+    #[test]
     fn gamma_ratios_match_directwrite_defaults() {
         let close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
         // The values DirectWrite uses at its default gamma of 1.8.
@@ -612,19 +621,13 @@ mod tests {
         assert_eq!(at(15, 7), [128, 0, 0]);
     }
 
-    /// A hidden 64x48 popup window, or `None` without desktop
-    /// composition: flip-model swap chains need it, and a service session
-    /// (some CI runners) does not have it.
-    fn hidden_window() -> Option<HWND> {
-        use windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled;
+    /// A hidden 64x48 popup window. Desktop composition, which flip-model
+    /// swap chains need, is always on since Windows 8, so these tests run
+    /// everywhere blitz does, CI included, and fail rather than skip.
+    fn hidden_window() -> HWND {
         use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WINDOW_EX_STYLE, WS_POPUP};
         use windows::core::w;
 
-        // SAFETY: plain query.
-        if !unsafe { DwmIsCompositionEnabled() }.is_ok_and(|b| b.as_bool()) {
-            eprintln!("skipped: no desktop composition in this session");
-            return None;
-        }
         // SAFETY: a plain hidden top-level window of a system class.
         let hwnd = unsafe {
             CreateWindowExW(
@@ -642,7 +645,7 @@ mod tests {
                 None,
             )
         };
-        Some(hwnd.expect("window"))
+        hwnd.expect("window")
     }
 
     fn destroy(hwnd: HWND) {
@@ -665,9 +668,7 @@ mod tests {
 
     #[test]
     fn swapchain_on_a_hidden_window_presents_and_resizes() {
-        let Some(hwnd) = hidden_window() else {
-            return;
-        };
+        let hwnd = hidden_window();
         let mut gpu = Gpu::new(true).expect("WARP device");
         let mut chain = Swapchain::new(&gpu, hwnd, 64, 48).expect("swap chain");
         for (w, h) in [(64, 48), (32, 20), (0, 0)] {
@@ -683,9 +684,7 @@ mod tests {
     /// chain, then build both again on the same window.
     #[test]
     fn swapchain_can_be_rebuilt_on_the_same_window() {
-        let Some(hwnd) = hidden_window() else {
-            return;
-        };
+        let hwnd = hidden_window();
         for _ in 0..3 {
             let mut gpu = Gpu::new(true).expect("WARP device");
             let mut chain = Swapchain::new(&gpu, hwnd, 64, 48).expect("swap chain");
