@@ -2215,6 +2215,9 @@ impl App {
 
     /// Every session as the sidebar shows it.
     fn sessions(&self) -> Vec<chrome::Session> {
+        // Only a pane on screen shows how far it is scrolled back; the
+        // others' terminals are left to their output.
+        let shown = (self.win.tabs.get(self.win.active)).map_or_else(Vec::new, |t| t.panes());
         let mut list: Vec<chrome::Session> = (self.views.iter())
             .map(|v| {
                 let p = &v.pane;
@@ -2234,7 +2237,11 @@ impl App {
                     msg,
                     progress: v.progress.map(|p| p.0),
                     exit_code: p.exit_code,
-                    below: lock(&p.term).viewport(),
+                    below: if shown.contains(&p.id) {
+                        lock(&p.term).viewport()
+                    } else {
+                        0
+                    },
                 }
             })
             .collect();
