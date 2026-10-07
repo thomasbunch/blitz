@@ -34,8 +34,11 @@ pub(crate) fn system_root(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     absolute(var("SystemRoot")).unwrap_or_else(|| r"C:\Windows".into())
 }
 
+/// `v` as a path, unless Windows would read it against the current folder.
+/// Elsewhere a Windows path is never absolute, and nothing runs from it.
 fn absolute(v: Option<OsString>) -> Option<PathBuf> {
-    v.map(PathBuf::from).filter(|p| p.is_absolute())
+    v.map(PathBuf::from)
+        .filter(|p| cfg!(not(windows)) || p.is_absolute())
 }
 
 fn windows_powershell(root: &Path) -> PathBuf {
