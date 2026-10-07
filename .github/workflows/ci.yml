@@ -76,9 +76,13 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
           BODY: ${{ github.event.pull_request.body }}
+        # Only AI attribution: a person's Co-authored-by, as GitHub adds for
+        # a committed review suggestion, is fine. The log is read first so
+        # that a range it cannot read fails the step instead of passing it.
         run: |
-          if { git log --format=%B "$BASE..$HEAD"; printf '%s\n' "$BODY"; } |
-            grep -iE '^(Co-Authored-By|Claude-Session):|Generated with \[Claude Code\]'; then
+          log="$(git log --format=%B "$BASE..$HEAD")" || exit 1
+          if printf '%s\n%s\n' "$log" "$BODY" |
+            grep -iE '^Co-Authored-By:.*(Claude|anthropic\.com)|^Claude-Session:|Generated with \[Claude Code\]'; then
             echo "::error::AI attribution is not allowed in this repo"
             exit 1
           fi
