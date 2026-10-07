@@ -5,6 +5,7 @@
 const USAGE: &str = "usage: blitz [DIR | --cwd DIR] [--new-window] [--cmd CMD]
        blitz --version | --help
        blitz setup claude [--wsl]
+       blitz setup shell bash|zsh
        blitz debug run --script FILE [--cmd CMD] [--cwd DIR] [--cols N --rows N]
              [--timeout MS] [--trace FILE] [--setenv K=V]...
        blitz debug render (--vt FILE | --text FILE | --demo) --bmp OUT

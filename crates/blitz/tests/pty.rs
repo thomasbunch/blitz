@@ -399,6 +399,47 @@ fn pty_shells_print_prompt_marks() {
     }
 }
 
+/// What `blitz setup shell bash` prints, in Git Bash: the prompt is
+/// marked, its folder reported, and a failed command's code comes with
+/// the next prompt.
+#[test]
+fn pty_git_bash_runs_the_bash_integration() {
+    let pf = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    let bash = pf.unwrap_or_default().join(r"Git\bin\bash.exe");
+    if !bash.is_file() {
+        eprintln!("SKIPPED: no Git Bash at {}", bash.display());
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("blitz-bash-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let rc = dir.join("rc");
+    // A prompt command of the user's, which ends with `;` and reads `$?`.
+    let mine = "PROMPT_COMMAND='printf \"<%s>\" $?;'\n";
+    std::fs::write(&rc, format!("{mine}{}", blitz::shell::BASH_INTEGRATION)).expect("rc");
+    let rc = rc.display().to_string().replace('\\', "/");
+    let cmdline = format!("\"{}\" --noprofile --rcfile {rc} -i", bash.display());
+    let env = [("BLITZ_PANE_TOKEN".to_string(), TOKEN.to_string())];
+    let (pty, _, rx) = spawn_in(&cmdline, &env, Some(&dir));
+    let mut out = Vec::new();
+    let mark = format!("\x1b]133;A;blitz={TOKEN}\x07");
+    let prompt = wait_for(&rx, &mut out, mark.as_bytes())
+        && wait_for(&rx, &mut out, b"\x1b]7;file:///")
+        && wait_for(&rx, &mut out, b"\x1b]133;B\x07");
+    pty.writer().send(&b"false\r"[..]);
+    let ran = prompt
+        && wait_for(&rx, &mut out, b"\x1b]133;C\x07")
+        && wait_for(&rx, &mut out, b"<1>")
+        && wait_for(&rx, &mut out, b"\x1b]133;D;1\x07")
+        && wait_for(&rx, &mut out, mark.as_bytes());
+    drop(pty);
+    let _ = std::fs::remove_dir_all(&dir);
+    let shown = String::from_utf8_lossy(&out);
+    assert!(ran, "{shown:?}");
+    let name = dir.file_name().expect("name").to_string_lossy();
+    let url = (shown.split("\x1b]7;").nth(1)).and_then(|s| s.split('\x07').next());
+    assert!(url.is_some_and(|u| u.ends_with(&*name)), "{url:?}");
+}
+
 /// cmd shows a prompt the user set, between blitz's marks.
 #[test]
 fn pty_cmd_keeps_the_users_prompt() {

@@ -101,6 +101,21 @@ fn cli_usage_lists_every_option() {
     assert!(seen > 20, "found only {seen} options");
 }
 
+/// The shell integration goes to stdout, ready to append to the startup
+/// file, and where to put it to stderr.
+#[test]
+fn cli_setup_shell_prints_the_integration() {
+    for (sh, script, rc) in [
+        ("bash", blitz::shell::BASH_INTEGRATION, "~/.bashrc"),
+        ("zsh", blitz::shell::ZSH_INTEGRATION, "~/.zshrc"),
+    ] {
+        let out = blitz(Path::new(BLITZ), &["setup", "shell", sh], &tmp("cli"));
+        assert_eq!(out.status.code(), Some(0), "{sh}");
+        assert_eq!(text(&out.stdout), script);
+        assert!(text(&out.stderr).contains(rc), "{sh}");
+    }
+}
+
 /// The settings name the `blitz-hook` next to this exe, and the message
 /// names the settings file Claude Code reads.
 #[test]

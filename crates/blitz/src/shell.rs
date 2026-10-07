@@ -419,6 +419,64 @@ pub const POWERSHELL_INTEGRATION: &str = r"if (-not (Test-Path variable:global:_
   }
 }";
 
+/// The same marks, reset and folder for bash, in Git Bash or WSL, which
+/// `blitz setup shell bash` prints for `~/.bashrc`. It runs last among the
+/// prompt commands, so a prompt they set still gets its B mark. Only a
+/// Windows folder is reported: Git Bash's, or one under WSL's `/mnt`.
+/// Needs bash 4.4 for `PS0`.
+pub const BASH_INTEGRATION: &str = r#"# blitz shell integration: marks each prompt and reports the folder.
+# It does nothing outside blitz.
+if [ -n "$BLITZ_PANE_TOKEN" ] && [ -z "$__blitz_code" ]; then
+  __blitz_code=0
+  __blitz_status() { __blitz_code=$?; return $__blitz_code; }
+  __blitz_prompt() {
+    local dir=
+    printf '\e[?1049h\e[?1049l\e[!p\e[?5W'
+    [ -n "$__blitz_ran" ] && printf '\e]133;D;%s\a' "$__blitz_code"
+    __blitz_ran=
+    printf '\e]133;A;blitz=%s\a' "$BLITZ_PANE_TOKEN"
+    case $PWD in
+      /mnt/[a-z]|/mnt/[a-z]/*) dir=${PWD:5:1}:/${PWD:7} ;;
+      *) [ -n "$MSYSTEM" ] && dir=$(pwd -W) ;;
+    esac
+    [ -n "$dir" ] && printf '\e]7;file:///%s\a' "${dir//\%/%25}"
+    case $PS1 in *'\e]133;B'*) ;; *) PS1=$PS1'\[\e]133;B\a\]' ;; esac
+    return $__blitz_code
+  }
+  # Lines, not `;`, as the commands there may end with one.
+  PROMPT_COMMAND=__blitz_status$'\n'${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__blitz_prompt
+  # When a command starts. The arithmetic sets the flag and prints nothing.
+  PS0=$PS0'\e]133;C\a${__blitz_ran:0:$((__blitz_ran = 1, 0))}'
+fi
+"#;
+
+/// [`BASH_INTEGRATION`] for zsh, which `blitz setup shell zsh` prints for
+/// `~/.zshrc`.
+pub const ZSH_INTEGRATION: &str = r#"# blitz shell integration: marks each prompt and reports the folder.
+# It does nothing outside blitz.
+if [[ -n $BLITZ_PANE_TOKEN && -z $__blitz_ran ]]; then
+  __blitz_ran=0
+  __blitz_precmd() {
+    local code=$? dir=
+    print -n '\e[?1049h\e[?1049l\e[!p\e[?5W'
+    (( __blitz_ran )) && print -n "\e]133;D;$code\a"
+    __blitz_ran=0
+    print -n "\e]133;A;blitz=$BLITZ_PANE_TOKEN\a"
+    case $PWD in
+      /mnt/[a-z]|/mnt/[a-z]/*) dir=${PWD[6]}:/${PWD[8,-1]} ;;
+      *) [[ -n $MSYSTEM ]] && dir=$(cygpath -m $PWD) ;;
+    esac
+    [[ -n $dir ]] && print -n "\e]7;file:///${dir//\%/%25}\a"
+    [[ $PS1 == *'133;B'* ]] || PS1=$PS1$'%{\e]133;B\a%}'
+    return $code
+  }
+  __blitz_preexec() { __blitz_ran=1; print -n '\e]133;C\a'; }
+  autoload -Uz add-zsh-hook
+  add-zsh-hook precmd __blitz_precmd
+  add-zsh-hook preexec __blitz_preexec
+fi
+"#;
+
 /// cmd's prompt `own`, such as `$P$G`, with the same marks and reset. cmd
 /// cannot report exit codes, nor expand variables in its prompt, so the
 /// token is written in.
@@ -593,6 +651,29 @@ mod tests {
                 got
             };
             assert_eq!(got.as_deref(), Some(arg), "{arg:?} as {line}");
+        }
+    }
+
+    #[test]
+    fn bash_and_zsh_mark_prompts_only_in_blitz() {
+        for (sh, script) in [("bash", BASH_INTEGRATION), ("zsh", ZSH_INTEGRATION)] {
+            let body: Vec<&str> = (script.lines()).filter(|l| !l.starts_with('#')).collect();
+            assert!(
+                body[0].starts_with("if [") && body[0].contains("-n"),
+                "{sh}"
+            );
+            assert!(body[0].contains("$BLITZ_PANE_TOKEN"), "{sh}");
+            assert_eq!(body.last(), Some(&"fi"), "{sh}");
+            for mark in [
+                r"\e[?1049h\e[?1049l\e[!p\e[?5W",
+                r"\e]133;A;blitz=",
+                r"\e]133;B\a",
+                r"\e]133;C\a",
+                r"\e]133;D;",
+                r"\e]7;file:///",
+            ] {
+                assert!(script.contains(mark), "{sh}: {mark}");
+            }
         }
     }
 

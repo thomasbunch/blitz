@@ -405,17 +405,28 @@ pub fn plugin_dirs(inherited: Option<&str>, ours: &str) -> String {
 ///
 /// `blitz setup claude` says that blitz loads its hooks itself, and prints
 /// them, pointing at the `blitz-hook` next to this exe, for a Claude Code
-/// that does not load them. It never edits the settings file itself; that
-/// file belongs to the user.
+/// that does not load them; with `--wsl`, for one in WSL. It never edits
+/// the settings file itself; that file belongs to the user. `blitz setup
+/// shell bash` or `zsh` prints the shell integration to add to the shell's
+/// startup file, which is the user's too.
 pub fn setup(args: &[String]) -> i32 {
-    let wsl = match args {
-        [app] if app == "claude" => false,
-        [app, flag] if app == "claude" && flag == "--wsl" => true,
+    let (rc, script) = match args {
+        [a] if a == "claude" => return setup_claude(false),
+        [a, flag] if a == "claude" && flag == "--wsl" => return setup_claude(true),
+        [a, sh] if a == "shell" && sh == "bash" => ("~/.bashrc", crate::shell::BASH_INTEGRATION),
+        [a, sh] if a == "shell" && sh == "zsh" => ("~/.zshrc", crate::shell::ZSH_INTEGRATION),
         _ => {
-            eprintln!("usage: blitz setup claude [--wsl]");
+            eprintln!("usage: blitz setup claude [--wsl]\n       blitz setup shell bash|zsh");
             return 2;
         }
     };
+    eprintln!("Add the lines below to {rc}, in Git Bash or WSL.\n");
+    print!("{script}");
+    0
+}
+
+/// `blitz setup claude`, for a Claude Code in WSL when `wsl`.
+fn setup_claude(wsl: bool) -> i32 {
     let hook = match hook_exe() {
         Ok(hook) => hook,
         Err(e) => {
@@ -1192,6 +1203,10 @@ mod tests {
     fn setup_needs_an_app() {
         assert_eq!(setup(&[]), 2);
         assert_eq!(setup(&["vim".into()]), 2);
+        assert_eq!(setup(&["shell".into()]), 2);
+        assert_eq!(setup(&["shell".into(), "fish".into()]), 2);
+        assert_eq!(setup(&["shell".into(), "bash".into()]), 0);
+        assert_eq!(setup(&["shell".into(), "zsh".into()]), 0);
         assert_eq!(setup(&["claude".into(), "--wls".into()]), 2);
     }
 
