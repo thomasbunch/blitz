@@ -1208,7 +1208,7 @@ fn list(
     y += s(4.0);
 
     if l.names.is_empty() {
-        text(p, left, ty(y), l.empty.into(), c.dim, false);
+        text(p, left, ty(y), fit(l.empty, right - left, tw), c.dim, false);
     }
     let mut rows = Vec::new();
     let first = (l.sel + 1).saturating_sub(PICKER_ROWS);
@@ -1259,7 +1259,8 @@ fn picker(
         filter: pk.filter,
         names: pk.items.iter().map(|t| t.name.as_str()).collect(),
         sel: pk.sel,
-        empty: "no theme matches",
+        // Where more themes come from, which nothing else here says.
+        empty: "no match \u{b7} add themes to %APPDATA%\\blitz\\themes",
         hint: "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel",
         prompt: "type to filter",
         width: 380.0,
@@ -3342,8 +3343,17 @@ mod tests {
             sel: 0,
         });
         let c = build(&m);
-        assert!(texts(&c).contains(&"no theme matches"));
+        let empty = "no match \u{b7} add themes to %APPDATA%\\blitz\\themes";
+        assert!(texts(&c).contains(&empty), "{:?}", texts(&c));
         assert!(texts(&c).contains(&"zzz"));
+        // Cut to fit a narrow window rather than drawn past the panel.
+        m.size = (300, 400);
+        let c = build(&m);
+        let t = texts(&c);
+        assert!(
+            t.iter()
+                .any(|s| s.starts_with("no match") && s.ends_with('\u{2026}'))
+        );
     }
 
     #[test]
