@@ -4639,13 +4639,16 @@ fn shows(until: Option<Instant>, presented: bool, now: Instant) -> bool {
 
 /// Asks Windows to start blitz again, with its saved session, after it
 /// restarts for an update or the user signs back in with "restart apps"
-/// on. Not after a crash or a hang, which could happen again at once.
+/// on. Not after a crash or a hang, which could happen again at once,
+/// nor after an installer closes it: blitz's own starts it again itself,
+/// and one run as administrator would start it elevated.
 fn restart_after_reboot() {
     use windows::Win32::System::Recovery::{
-        RESTART_NO_CRASH, RESTART_NO_HANG, RegisterApplicationRestart,
+        RESTART_NO_CRASH, RESTART_NO_HANG, RESTART_NO_PATCH, RegisterApplicationRestart,
     };
+    let flags = RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_PATCH;
     // SAFETY: no command line, so blitz starts with none.
-    let _ = unsafe { RegisterApplicationRestart(None, RESTART_NO_CRASH | RESTART_NO_HANG) };
+    let _ = unsafe { RegisterApplicationRestart(None, flags) };
 }
 
 /// Whether a session `now` differs from the one last `saved`. The window's
@@ -6274,7 +6277,7 @@ mod tests {
     #[test]
     fn app_a_restart_for_an_update_finds_the_window_where_it_was() {
         use windows::Win32::System::Recovery::{
-            GetApplicationRestartSettings, RESTART_NO_CRASH, RESTART_NO_HANG,
+            GetApplicationRestartSettings, RESTART_NO_CRASH, RESTART_NO_HANG, RESTART_NO_PATCH,
         };
         use windows::Win32::System::Threading::GetCurrentProcess;
         let win = layout::Window {
@@ -6301,7 +6304,10 @@ mod tests {
             )
         }
         .expect("registered");
-        assert_eq!(flags, (RESTART_NO_CRASH | RESTART_NO_HANG).0);
+        assert_eq!(
+            flags,
+            (RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_PATCH).0
+        );
     }
 
     /// A window moved to another monitor and maximized there opens
