@@ -148,7 +148,8 @@ fn is_format(c: char) -> bool {
 pub fn parse_color(spec: &str) -> Option<u32> {
     // Scales a channel of `n` hex digits to 8 bits.
     let chan = |h: &str| -> Option<u32> {
-        if h.is_empty() || h.len() > 4 {
+        // `from_str_radix` alone would take a sign.
+        if h.is_empty() || h.len() > 4 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let v = u32::from_str_radix(h, 16).ok()?;
@@ -334,6 +335,20 @@ mod tests {
         assert_eq!(parse_color("#12345"), None);
         assert_eq!(parse_color("#ééé"), None);
         assert_eq!(parse_color("red"), None);
+        // Hex digits only: no signs, as in XParseColor.
+        for bad in [
+            "#+f+f+f",
+            "rgb:+ff/0/0",
+            "rgb:-1/0/0",
+            "#-1-1-1",
+            "rgb:/0/0",
+            "#",
+            "rgb:12345/0/0",
+        ] {
+            assert_eq!(parse_color(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_color("#ABCDEF"), Some(0xABCDEF));
+        assert_eq!(parse_color("#1234"), None);
         let mut out = Vec::new();
         color_reply(11, 0x131417, true, &mut out);
         color_reply(10, 0xD6D7D9, false, &mut out);
