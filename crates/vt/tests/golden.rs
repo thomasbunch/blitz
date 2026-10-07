@@ -1,7 +1,7 @@
 //! Screen goldens: synthetic byte streams and the screen they must leave.
 
 use vt::snapshot::attr;
-use vt::{Options, Palette, RenderCell, Snapshot, Terminal};
+use vt::{CursorShape, Options, Palette, RenderCell, Snapshot, Terminal};
 
 const PAL: Palette = Palette {
     fg: 0xC0C0C0,
@@ -436,6 +436,75 @@ fn edits_never_leave_half_a_wide_character() {
     // where the spacer was, not a hole in the row.
     let t = run(5, 2, "abcd中\x1b[1;1H\x1b[P\x1b[1;5Hx");
     assert_eq!(t.screen_text(), "bcd x\n中");
+}
+
+#[test]
+fn wide_characters_that_cannot_fit() {
+    // With autowrap off, a wide character at the last column is dropped.
+    assert_eq!(run(3, 2, "\x1b[?7lab中").screen_text(), "ab\n");
+    // One column holds no wide character, and dropping it neither wraps
+    // nor scrolls.
+    let t = run(1, 1, "a中");
+    assert_eq!(
+        (t.screen_text(), t.scrollback_text()),
+        ("a".into(), "".into())
+    );
+    assert_eq!(t.cursor(), (0, 0, true));
+    // VS16 on the last column keeps the emoji narrow: the cluster cannot
+    // grow into the next row.
+    let mut t = run(3, 2, "ab\u{2764}\u{FE0F}x");
+    assert_eq!(t.screen_text(), "ab\u{2764}\u{FE0F}\nx");
+    let s = snap(&mut t);
+    assert_eq!(
+        (text(&cell(&s, 2, 0)), cell(&s, 2, 0).width),
+        ("\u{2764}\u{FE0F}", 1)
+    );
+}
+
+#[test]
+fn degenerate_sizes() {
+    // Zero is one; nothing reaches past the single cell.
+    let mut t = Terminal::new(Options {
+        cols: 0,
+        rows: 0,
+        ..Options::default()
+    });
+    feed(
+        &mut t,
+        "a中\x1b[5;5H\x1b[6n\x1b[9@\x1b[9P\x1b[9L\x1b[9M\x1b[9X\t\x1b[9Z",
+    );
+    let mut r = Vec::new();
+    t.take_replies(&mut r);
+    assert_eq!(r, b"\x1b[1;1R");
+    t.resize(0, 0);
+    t.resize(1, 3);
+    assert_eq!(t.cursor().1, 0);
+    feed(&mut t, "bcd");
+    assert_eq!(t.screen_text(), "b\nc\nd");
+
+    // One column does not rewrap: rows are cut, and the cursor stays on.
+    let mut t = run(4, 2, "abcdef");
+    t.resize(1, 2);
+    assert_eq!(t.screen_text(), "a\ne");
+    assert_eq!(t.cursor(), (0, 1, true));
+    t.resize(4, 2);
+    assert!(t.cursor().0 < 4 && t.cursor().1 < 2);
+
+    // No scrollback: rows that leave the screen are gone, and the view
+    // cannot scroll.
+    let mut t = Terminal::new(Options {
+        cols: 4,
+        rows: 2,
+        scrollback_lines: 0,
+        ambiguous_wide: false,
+    });
+    feed(&mut t, "a\r\nb\r\nc");
+    t.scroll_viewport(5);
+    assert_eq!(
+        (t.screen_text(), t.scrollback_text()),
+        ("b\nc".into(), "".into())
+    );
+    assert_eq!(snap(&mut t).cursor, Some((1, 1, CursorShape::Block)));
 }
 
 #[test]

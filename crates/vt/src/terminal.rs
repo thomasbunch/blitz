@@ -538,11 +538,15 @@ impl Terminal {
 
     /// Writes one character at the cursor and moves past it.
     fn put(&mut self, c: char, wide: bool) {
+        // One column holds no wide character; dropping it moves nothing.
+        if wide && self.cols() < 2 {
+            return;
+        }
         if self.cur.pending_wrap {
             self.wrap();
         }
         if wide && self.cur.x + 1 >= self.cols() {
-            if !self.autowrap || self.cols() < 2 {
+            if !self.autowrap {
                 return;
             }
             // Wide characters never straddle rows: leave a spacer and wrap.
