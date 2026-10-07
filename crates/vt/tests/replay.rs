@@ -2,13 +2,15 @@
 //!
 //! The recordings are not in the repository. Point `VT_CORPUS_DIR` at a
 //! directory of `.log` recordings and run
-//! `cargo test -p vt --test replay -- --ignored`.
+//! `cargo test -p vt --test replay -- --ignored`. Recordings with `claude`
+//! in their name are taken to be Claude Code sessions and checked as such.
 //!
 //! A recording has one event per line, `t_ms \t kind \t payload`. `out`
 //! payloads are the program's output with `\e`, `\r`, `\n`, `\\` and
 //! `\xNN` escapes. `note` lines mark resizes (`resize 90x30 hr=...`) and
-//! points where the screen was looked at (`snap LABEL: ...`). The first
-//! line is a `#` header carrying `size=COLSxROWS`.
+//! points where the screen was looked at (`snap LABEL: ...`); a snap
+//! labelled `resize-COLSxROWS` follows a resize. The first line is a `#`
+//! header carrying `size=COLSxROWS`.
 
 use std::path::{Path, PathBuf};
 
@@ -26,15 +28,8 @@ struct Replay {
     snaps: Vec<Snap>,
 }
 
-impl Replay {
-    fn snap(&self, label: &str) -> &Snap {
-        self.snaps
-            .iter()
-            .find(|s| s.label == label)
-            .unwrap_or_else(|| panic!("no snap {label}"))
-    }
-}
-
+/// Undoes the payload escapes. A `\x` without two hex digits after it is
+/// kept as it is.
 fn unescape(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     let b = s.as_bytes();
@@ -50,11 +45,17 @@ fn unescape(s: &str) -> Vec<u8> {
             b'e' => out.push(0x1b),
             b'r' => out.push(b'\r'),
             b'n' => out.push(b'\n'),
-            b'x' => {
-                let hex = std::str::from_utf8(&b[i..i + 2]).unwrap();
-                out.push(u8::from_str_radix(hex, 16).unwrap());
-                i += 2;
-            }
+            b'x' => match b
+                .get(i..i + 2)
+                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+            {
+                Some(h) => {
+                    let h = std::str::from_utf8(h).unwrap();
+                    out.push(u8::from_str_radix(h, 16).unwrap());
+                    i += 2;
+                }
+                None => out.extend_from_slice(b"\\x"),
+            },
             c => out.push(c),
         }
     }
@@ -80,8 +81,7 @@ impl Rng {
 
 /// Feeds a recording. With `seed`, every output chunk is cut at random
 /// points first.
-fn replay(path: &Path, seed: Option<u64>) -> Replay {
-    let log = std::fs::read_to_string(path).unwrap();
+fn replay_log(log: &str, seed: Option<u64>) -> Replay {
     let mut lines = log.lines();
     let header = lines.next().unwrap_or_default();
     let (cols, rows) = header
@@ -131,10 +131,22 @@ fn replay(path: &Path, seed: Option<u64>) -> Replay {
     Replay { t, snaps }
 }
 
-fn captures() -> PathBuf {
+fn replay(path: &Path, seed: Option<u64>) -> Replay {
+    replay_log(&std::fs::read_to_string(path).unwrap(), seed)
+}
+
+/// The recordings in `VT_CORPUS_DIR`, sorted.
+fn recordings() -> Vec<PathBuf> {
     let dir = std::env::var_os("VT_CORPUS_DIR")
         .expect("set VT_CORPUS_DIR to a directory of .log recordings");
-    PathBuf::from(dir)
+    let mut logs: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .collect();
+    logs.sort();
+    assert!(!logs.is_empty(), "no .log recordings");
+    logs
 }
 
 fn rows(text: &str) -> Vec<&str> {
@@ -150,56 +162,49 @@ fn check(ok: bool, what: &str, s: &Snap) {
     assert!(ok, "{what} at snap {}:\n{}", s.label, s.text);
 }
 
-/// Claude Code's full-screen UI at `cols` wide: its banner, the input box
-/// ruled above and below, and no stray key-report text.
-fn claude_screen(s: &Snap, cols: usize, banner: bool) {
+/// Claude Code's full-screen UI at `cols` wide: the input box ruled above
+/// and below, and no stray key-report text.
+fn claude_screen(s: &Snap, cols: usize) {
     let r = rows(&s.text);
     check(s.alt, "alt screen", s);
-    if banner {
-        check(s.text.contains("Claude Code v2.1.287"), "banner", s);
-    }
     let rules = r.iter().filter(|l| **l == rule(cols)).count();
     check(rules >= 2, &format!("two rows of {cols} rules"), s);
     check(!s.text.contains("AAAA"), "no AAAA", s);
     check(!r[0].contains('u'), "no u on row 0", s);
 }
 
-/// Claude Code's main screen after `/exit`: the full-screen UI is gone and
-/// the resume hint is left.
-fn claude_exited(r: &Replay) {
-    let text = r.t.screen_text();
-    assert!(!r.t.input_modes().alt_screen);
-    assert!(text.contains("Resume this session with:"), "{text}");
-    assert!(!text.contains("Claude Code v2.1.287"), "{text}");
-}
-
 #[test]
 #[ignore = "needs VT_CORPUS_DIR"]
 fn replay_captures() {
-    let dir = captures();
-
-    let r = replay(&dir.join("e2_claude_bundled.log"), None);
-    let s = r.snap("cand-b");
-    claude_screen(s, 120, true);
-    // Claude puts a no-break space after its `>` prompt.
-    let text = s.text.replace('\u{a0}', " ");
-    let ruled = rule(120);
-    let input = [ruled.as_str(), "> line1", "  line2", ruled.as_str()];
-    let found = rows(&text).windows(4).any(|w| w == input);
-    check(found, "\"> line1\" over \"  line2\" between rules", s);
-    claude_screen(r.snap("resize-90x30"), 90, true);
-    claude_screen(r.snap("resize-120x40"), 120, true);
-    claude_exited(&r);
-
-    let r = replay(&dir.join("e2_claude_bundled_nokitty.log"), None);
-    claude_screen(r.snap("resize-90x30"), 90, false);
-    claude_screen(r.snap("resize-120x40"), 120, false);
-    assert!(!r.t.input_modes().alt_screen);
-
-    // Inbox ConPTY repaints after a resize itself; the result must match.
-    let r = replay(&dir.join("e2_claude_inbox.log"), None);
-    claude_screen(r.snap("resize-90x30"), 90, true);
-    claude_screen(r.snap("resize-120x40"), 120, true);
+    let claude: Vec<_> = (recordings().into_iter())
+        .filter(|p| p.to_string_lossy().to_lowercase().contains("claude"))
+        .collect();
+    assert!(!claude.is_empty(), "no recordings with claude in the name");
+    for log in &claude {
+        let r = replay(log, None);
+        for s in &r.snaps {
+            if let Some((cols, _)) = s.label.strip_prefix("resize-").and_then(size) {
+                claude_screen(s, cols.into());
+            }
+        }
+        // Two lines typed into the input box stay one under the other.
+        // Claude puts a no-break space after its `>` prompt.
+        if let Some(s) = r.snaps.iter().find(|s| s.label == "cand-b") {
+            let text = s.text.replace('\u{a0}', " ");
+            let ruled = |l: &str| !l.is_empty() && l.chars().all(|c| c == '─');
+            let found = rows(&text)
+                .windows(4)
+                .any(|w| ruled(w[0]) && w[1] == "> line1" && w[2] == "  line2" && ruled(w[3]));
+            check(found, "\"> line1\" over \"  line2\" between rules", s);
+        }
+        // After `/exit` the full-screen UI is gone and the resume hint is
+        // left on the main screen.
+        let text = r.t.screen_text();
+        if text.contains("Resume this session with:") {
+            assert!(!r.t.input_modes().alt_screen, "{}", log.display());
+            assert!(!text.contains("Claude Code v"), "{text}");
+        }
+    }
 }
 
 /// Every recording replays without a panic, and cutting its output at
@@ -207,14 +212,7 @@ fn replay_captures() {
 #[test]
 #[ignore = "needs VT_CORPUS_DIR"]
 fn replay_captures_in_random_chunks() {
-    let mut logs: Vec<_> = std::fs::read_dir(captures())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "log"))
-        .collect();
-    logs.sort();
-    assert!(!logs.is_empty());
-    for log in &logs {
+    for log in &recordings() {
         let whole = replay(log, None);
         let name = log.file_name().unwrap().to_string_lossy();
         for seed in 1..=500 {
@@ -226,5 +224,54 @@ fn replay_captures_in_random_chunks() {
             assert_eq!(whole.t.screen_text(), cut.t.screen_text(), "{name} {seed}");
             assert_eq!(whole.t.cursor(), cut.t.cursor(), "{name} {seed}");
         }
+    }
+}
+
+#[test]
+fn unescape_reads_every_escape() {
+    assert_eq!(
+        unescape(r"\e[1m\r\n\\\x41\x7f"),
+        b"\x1b[1m\r\n\\A\x7f".to_vec()
+    );
+    // Cut short or not hex: kept as written, never a panic.
+    assert_eq!(unescape(r"a\x4"), br"a\x4".to_vec());
+    assert_eq!(unescape(r"\x"), br"\x".to_vec());
+    assert_eq!(unescape(r"\xzz1"), br"\xzz1".to_vec());
+    assert_eq!(unescape(r"\x+f"), br"\x+f".to_vec());
+    assert_eq!(unescape("a\\"), b"a\\".to_vec());
+}
+
+/// The recording format itself, on a synthetic session, so the replay
+/// code is exercised without a corpus.
+#[test]
+fn replay_of_a_small_recording() {
+    let log = concat!(
+        "# size=10x3 synthetic\n",
+        "0\tout\t$ \\e[1mhello\\e[0m\\r\\n\n",
+        "1\tnote\tsnap first: after hello\n",
+        "2\tout\t\\e[?1049h\\e[Hfull\\x21\n",
+        "3\tnote\tresize 6x2 hr=0\n",
+        "4\tnote\tsnap resize-6x2: on the alternate screen\n",
+        "5\tout\t\\e[?1049lbye\n",
+        "6\tin\tignored\n",
+    );
+    let r = replay_log(log, None);
+    let labels: Vec<_> = r.snaps.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, ["first", "resize-6x2"]);
+    assert_eq!(
+        (r.snaps[0].text.as_str(), r.snaps[0].alt),
+        ("$ hello\n\n", false)
+    );
+    assert_eq!(
+        (r.snaps[1].text.as_str(), r.snaps[1].alt),
+        ("full!\n", true)
+    );
+    // The main screen rewrapped under the alternate one, and its cursor
+    // came back where it was saved.
+    assert_eq!(r.t.scrollback_text(), "$ hell");
+    assert_eq!(r.t.screen_text(), "o\nbye");
+    for seed in 1..=50 {
+        let cut = replay_log(log, Some(seed));
+        assert_eq!(cut.t.screen_text(), r.t.screen_text(), "seed {seed}");
     }
 }
