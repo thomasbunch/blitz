@@ -557,7 +557,9 @@ impl Terminal {
     /// Writes one character at the cursor and moves past it.
     fn put(&mut self, c: char, wide: bool) {
         // One column holds no wide character; dropping it moves nothing.
+        // A mark or REP after it goes with it, not onto the cell before.
         if wide && self.cols() < 2 {
+            (self.cluster, self.rep) = (None, None);
             return;
         }
         if self.cur.pending_wrap {
@@ -565,6 +567,7 @@ impl Terminal {
         }
         if wide && self.cur.x + 1 >= self.cols() {
             if !self.autowrap {
+                (self.cluster, self.rep) = (None, None);
                 return;
             }
             // Wide characters never straddle rows: leave a spacer and wrap.

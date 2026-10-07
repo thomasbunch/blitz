@@ -457,6 +457,15 @@ fn wide_characters_that_cannot_fit() {
         ("a".into(), "".into())
     );
     assert_eq!(t.cursor(), (0, 0, true));
+    // A mark or REP after a dropped wide character goes with it, never
+    // onto, or repeating, the cell before.
+    assert_eq!(run(3, 2, "\x1b[?7lab中\x1b[b").screen_text(), "ab\n");
+    assert_eq!(run(3, 2, "\x1b[?7lab中\u{301}").screen_text(), "ab\n");
+    assert_eq!(
+        run(3, 2, "\x1b[?7lab\u{1F44D}\u{1F3FD}").screen_text(),
+        "ab\n"
+    );
+    assert_eq!(run(1, 1, "a中\u{301}").screen_text(), "a");
     // VS16 on the last column keeps the emoji narrow: the cluster cannot
     // grow into the next row.
     let mut t = run(3, 2, "ab\u{2764}\u{FE0F}x");
