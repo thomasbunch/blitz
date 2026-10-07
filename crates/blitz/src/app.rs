@@ -2345,8 +2345,9 @@ impl App {
 
     /// Opens the settings panel on its first setting.
     fn open_settings(&mut self) {
-        let fonts = crate::render::font::monospace_families();
-        self.settings = Some(Panel::new(fonts, crate::shell::choices()));
+        let fonts = crate::render::font::families();
+        let themes = crate::theme::all().into_iter().map(|t| t.name).collect();
+        self.settings = Some(Panel::new(fonts, crate::shell::choices(), themes));
         self.request_redraw();
     }
 

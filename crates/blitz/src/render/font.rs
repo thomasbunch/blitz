@@ -25,7 +25,7 @@ pub const ITALIC: u8 = 2;
 pub const E_PENDING: HRESULT = HRESULT(0x8000_000A_u32 as i32);
 
 /// Families tried in order; Consolas ships with every Windows.
-pub const DEFAULT_FAMILIES: &[&str] = &["Cascadia Mono", "Consolas", "Courier New"];
+pub const DEFAULT_FAMILIES: &[&str] = crate::config::FALLBACK_FONTS;
 
 /// Coverage of a rasterized glyph, placed relative to the top-left corner
 /// of its first cell.
@@ -84,9 +84,10 @@ fn weight_style(style: u8) -> (DWRITE_FONT_WEIGHT, DWRITE_FONT_STYLE) {
     (weight, slant)
 }
 
-/// The names of the fixed-width font families installed, sorted. Empty
-/// when DirectWrite cannot list them.
-pub fn monospace_families() -> Vec<String> {
+/// The names of the font families installed, sorted, each with whether it
+/// is fixed-width and no symbol font. Empty when DirectWrite cannot list
+/// them.
+pub fn families() -> Vec<(String, bool)> {
     // SAFETY: COM calls with valid out-pointers and buffers of the length
     // passed.
     let list = || unsafe {
@@ -98,13 +99,11 @@ pub fn monospace_families() -> Vec<String> {
         for i in 0..collection.GetFontFamilyCount() {
             let fam = collection.GetFontFamily(i)?;
             let font = fam.GetFont(0)?;
-            let mono = font.cast::<IDWriteFont1>()?.IsMonospacedFont().as_bool();
-            if !mono || font.IsSymbolFont().as_bool() {
-                continue;
-            }
-            out.push(family_name(&fam)?);
+            let mono = font.cast::<IDWriteFont1>()?.IsMonospacedFont().as_bool()
+                && !font.IsSymbolFont().as_bool();
+            out.push((family_name(&fam)?, mono));
         }
-        out.sort_by_key(|n| n.to_lowercase());
+        out.sort_by_key(|n| n.0.to_lowercase());
         out.dedup();
         Result::Ok(out)
     };

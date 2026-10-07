@@ -1,7 +1,7 @@
 //! The settings panel: which settings match what was typed, what each one
 //! shows, and the value the arrow keys move it to.
 
-use crate::config::{Config, Kind, SETTINGS, Setting, TOASTS, quote};
+use crate::config::{Config, FALLBACK_FONTS, Kind, SETTINGS, Setting, TOASTS, quote};
 use crate::render::chrome::SettingRow;
 
 /// Font sizes offered, in points.
@@ -32,17 +32,34 @@ pub struct Panel {
     pub top: usize,
     /// Fixed-width fonts installed, sorted.
     pub fonts: Vec<String>,
+    /// Every font family installed; a font set that is not among them is
+    /// not found. Empty when not known.
+    pub families: Vec<String>,
     /// Shells to choose from, as (name, path); an empty path is automatic.
     pub shells: Vec<(String, String)>,
+    /// The names of the themes there are; a theme set that is not among
+    /// them is not found. Empty when not known.
+    pub themes: Vec<String>,
     /// Why the last change was not saved.
     pub error: Option<String>,
 }
 
 impl Panel {
-    pub fn new(fonts: Vec<String>, shells: Vec<(String, String)>) -> Panel {
+    /// The panel on the font `families` installed, each with whether it is
+    /// fixed-width, and the `shells` and `themes` there are.
+    pub fn new(
+        families: Vec<(String, bool)>,
+        shells: Vec<(String, String)>,
+        themes: Vec<String>,
+    ) -> Panel {
         Panel {
-            fonts,
+            fonts: (families.iter())
+                .filter(|f| f.1)
+                .map(|f| f.0.clone())
+                .collect(),
+            families: families.into_iter().map(|f| f.0).collect(),
             shells,
+            themes,
             ..Panel::default()
         }
     }
@@ -106,6 +123,12 @@ impl Panel {
                 "font_size" => format!("{} pt", c.font_size),
                 "scrollback_lines" => format!("{} lines", thousands(c.scrollback_lines)),
                 "shell" => crate::shell::label(&c.shell),
+                "font_family" => {
+                    let used = (FALLBACK_FONTS.iter())
+                        .find(|f| self.families.iter().any(|g| g.eq_ignore_ascii_case(f)))
+                        .unwrap_or(&FALLBACK_FONTS[0]);
+                    found_or(&c.font_family, &self.families, used)
+                }
                 _ => c.get(s.key).trim_matches(['"', '\'']).into(),
             };
             out.push((shown, now));
@@ -123,7 +146,9 @@ impl Panel {
         match s.kind {
             Kind::Toggle => if c.get(s.key) == "true" { "on" } else { "off" }.into(),
             Kind::Theme => {
-                crate::theme::choose(&c.theme, crate::theme::system_is_light()).to_string()
+                let light = crate::theme::system_is_light();
+                let used = crate::theme::choose(crate::theme::DEFAULT, light);
+                found_or(crate::theme::choose(&c.theme, light), &self.themes, used)
             }
             Kind::Game => "play".into(),
             Kind::Choice => {
@@ -187,6 +212,16 @@ impl Panel {
     }
 }
 
+/// `name`, saying `used` takes its place when it is not among `known`.
+/// Just `name` when `known` is empty, as nothing is known then.
+fn found_or(name: &str, known: &[String], used: &str) -> String {
+    if known.is_empty() || known.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+        name.into()
+    } else {
+        format!("{name} (not found, using {used})")
+    }
+}
+
 /// `stars` as `Stars`.
 fn title(s: &str) -> String {
     let mut c = s.chars();
@@ -214,7 +249,11 @@ mod tests {
 
     fn panel() -> Panel {
         Panel::new(
-            vec!["Cascadia Mono".into(), "Consolas".into()],
+            vec![
+                ("Arial".into(), false),
+                ("Cascadia Mono".into(), true),
+                ("Consolas".into(), true),
+            ],
             vec![
                 ("Automatic (PowerShell 7)".into(), String::new()),
                 (
@@ -222,6 +261,9 @@ mod tests {
                     r"C:\Windows\System32\cmd.exe".into(),
                 ),
             ],
+            ["blitz dark", "blitz light", "Rose Pine"]
+                .map(Into::into)
+                .to_vec(),
         )
     }
 
@@ -324,7 +366,10 @@ mod tests {
         // A font that is not installed sits after the installed ones.
         c.font_family = "Fira Code".into();
         let font = setting("font_family");
-        assert_eq!(p.shown(font, &c), "Fira Code");
+        assert_eq!(
+            p.shown(font, &c),
+            "Fira Code (not found, using Cascadia Mono)"
+        );
         assert_eq!(p.step(font, &c, -1, false).as_deref(), Some("\"Consolas\""));
         assert_eq!(p.step(font, &c, 1, false), None);
         assert_eq!(
@@ -341,6 +386,32 @@ mod tests {
         let theme = setting("theme");
         assert_eq!(p.step(theme, &c, 1, false), None);
         assert_eq!(p.step(theme, &c, 1, true), None);
+    }
+
+    #[test]
+    fn a_theme_or_font_that_is_not_there_says_what_takes_its_place() {
+        let (mut p, mut c) = (panel(), Config::default());
+        let (theme, font) = (setting("theme"), setting("font_family"));
+        let light = crate::theme::system_is_light();
+        let blitz = crate::theme::choose(crate::theme::DEFAULT, light);
+        assert_eq!(p.shown(theme, &c), blitz);
+        c.theme = "rose pine".into();
+        assert_eq!(p.shown(theme, &c), "rose pine");
+        c.theme = "Nord".into();
+        let missing = format!("Nord (not found, using {blitz})");
+        assert_eq!(p.shown(theme, &c), missing);
+        assert_eq!(p.rows(&c, None)[0].value, missing);
+        // Installed, though not fixed-width: blitz uses it.
+        c.font_family = "arial".into();
+        assert_eq!(p.shown(font, &c), "arial");
+        // Without Cascadia Mono, Consolas takes the place of a missing one.
+        p.families.retain(|f| f != "Cascadia Mono");
+        c.font_family = "Fira Code".into();
+        assert_eq!(p.shown(font, &c), "Fira Code (not found, using Consolas)");
+        // When nothing is known, nothing is said.
+        let p = Panel::default();
+        assert_eq!(p.shown(theme, &c), "Nord");
+        assert_eq!(p.shown(font, &c), "Fira Code");
     }
 
     #[test]

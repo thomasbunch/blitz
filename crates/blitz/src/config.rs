@@ -628,6 +628,10 @@ pub fn quote(s: &str) -> String {
 
 const FILE: &str = "config.toml";
 
+/// Font families tried in order when `font_family` is not installed;
+/// Consolas ships with every Windows.
+pub const FALLBACK_FONTS: &[&str] = &["Cascadia Mono", "Consolas", "Courier New"];
+
 /// `%APPDATA%\blitz`, which holds `config.toml` and the themes folder.
 pub fn dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("blitz"))
