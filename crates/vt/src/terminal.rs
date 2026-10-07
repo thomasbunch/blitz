@@ -941,13 +941,12 @@ impl Terminal {
                 0..self.cur.y
             }
             2 => 0..self.rows(),
+            // The alternate screen has no scrollback. A full-screen program
+            // clearing its own this way, as Claude Code does on a redraw,
+            // must not take the shell's history with it.
+            3 if self.alt => return,
             3 => {
-                let main = if self.alt {
-                    &mut self.other
-                } else {
-                    &mut self.screen
-                };
-                main.grid.clear_scrollback();
+                self.screen.grid.clear_scrollback();
                 self.viewport = 0;
                 return;
             }
