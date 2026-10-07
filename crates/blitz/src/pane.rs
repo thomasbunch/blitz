@@ -560,13 +560,7 @@ mod tests {
     /// there next lands beside it.
     #[test]
     fn pane_keeps_its_prompt_after_starting_over() {
-        // The bundled OpenConsole usually echoes beside the prompt after
-        // the clear and resize, but now and then at the top-left corner:
-        // a race inside the console host, so the check would only flake.
-        if std::env::var_os("BLITZ_CONPTY_DIR").is_some() {
-            eprintln!("SKIPPED: the bundled ConPTY places the echo after a clear by timing");
-            return;
-        }
+        let bundled = std::env::var_os("BLITZ_CONPTY_DIR").is_some();
         let (tx, rx) = mpsc::channel();
         let pane = Pane::spawn(
             PaneId(9),
@@ -605,7 +599,14 @@ mod tests {
         start_over(&mut lock(&pane.term), vt::Terminal::feed);
         pane.repaint(40, 5);
         pane.send("echo pane-three\r");
-        let again = shows("pane-two>echo pane-three");
+        // The bundled OpenConsole usually echoes beside the prompt after
+        // the clear and resize, but now and then at the top-left corner:
+        // a race inside the console host. Either way the output shows.
+        let again = shows(if bundled {
+            "\npane-three"
+        } else {
+            "pane-two>echo pane-three"
+        });
         let text = lock(&pane.term).screen_text();
         pane.send("exit\r");
         assert!(again, "screen: {text:?}");
