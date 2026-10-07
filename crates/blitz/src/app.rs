@@ -684,6 +684,17 @@ impl Selection {
     }
 }
 
+/// A selection of the text of match `m`.
+fn found_selection(term: &vt::Terminal, pal: &Palette, m: Found) -> Selection {
+    let drag = Drag {
+        epoch: term.line_epoch(),
+        anchor: (m.start, m.end),
+        unit: 1,
+        block: false,
+    };
+    Selection::new(term, pal, drag, m.start)
+}
+
 /// The cells from `start` to `end`, or the block they are the corners
 /// of, that a view of `cols` by `rows` cells from line `top` shows, as
 /// (column, row) of the first and last.
@@ -2268,7 +2279,8 @@ impl App {
 
     /// A key while the find bar is open: typing searches as it goes, Enter
     /// or F3 goes to the next match up, with Shift the next one down, and
-    /// Esc closes the bar, leaving the view where it is.
+    /// Esc closes the bar, leaving the view where it is and the current
+    /// match selected, ready to copy.
     fn find_key(&mut self, k: &KeyInput) {
         let Some(f) = &mut self.find else {
             return;
@@ -2278,7 +2290,18 @@ impl App {
         let by = if m.lshift || m.rshift { 1 } else { -1 };
         match k.vk {
             VK_ESCAPE => {
-                self.find = None;
+                let pal = self.theme.pal;
+                if let Some(mut f) = self.find.take()
+                    && let Some(v) = self.views.iter_mut().find(|v| v.pane.id == f.pane)
+                {
+                    let term = lock(&v.pane.term);
+                    if f.stale {
+                        f.search(&term, v.grid.1);
+                    }
+                    let sel = f.cur.map(|i| found_selection(&term, &pal, f.found[i]));
+                    drop(term);
+                    v.selection = sel.or(v.selection.take());
+                }
                 self.request_redraw();
             }
             VK_RETURN | VK_F3 => self.find_go(false, by),
@@ -7066,6 +7089,23 @@ mod tests {
         for a in [Action::Copy, Action::SplitRight, Action::FontSize(1)] {
             assert!(!find_keeps(a), "{a:?}");
         }
+    }
+
+    #[test]
+    fn app_closing_find_leaves_the_match_selected() {
+        let pal = crate::theme::dark();
+        let mut t = fed(6, 3, "one Needle, \u{4e2d}x");
+        let mut f = Find::new(PaneId(1));
+        f.query = "needle, \u{4e2d}".into();
+        f.search(&t, 3);
+        let m = f.found[f.cur.expect("a match")];
+        let mut sel = found_selection(&t, &pal, m);
+        assert_eq!(selection_text(&t, &pal, &sel, 0), "Needle, \u{4e2d}");
+        let mut s = Snapshot::default();
+        assert!(
+            refresh(&mut t, &mut s, &pal, Some(&mut sel)),
+            "a selection like any"
+        );
     }
 
     #[test]
