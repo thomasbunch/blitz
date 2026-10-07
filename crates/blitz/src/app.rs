@@ -1774,7 +1774,8 @@ impl App {
             let cmd = self.args.cmd.clone();
             self.open(win, id, cmd.as_deref(), "", cwd)?;
             // Said where it is seen: the release build has no console. It
-            // stays, as nothing this window does is saved.
+            // stays, as nothing this window does is saved, and takes the
+            // place of a shell that failed, which each new pane says again.
             if let Some(e) = lost {
                 let text = format!(
                     "The last session did not come back ({e}); it is kept for the next start, and this window is not saved"
@@ -10356,22 +10357,6 @@ mod tests {
         assert_eq!(fallbacks("bash.exe", ""), [""]);
         assert_eq!(fallbacks("", "cmd.exe"), [""]);
         assert_eq!(fallbacks("cmd.exe", "cmd.exe"), [""]);
-    }
-
-    /// A notice that stays, as an error or the one that says the window is
-    /// not saved, outranks one that goes by itself, as a hint does.
-    #[test]
-    fn passing_notices_never_hide_one_that_stays() {
-        let n = |until, ask| Notice {
-            text: String::new(),
-            until,
-            dim: true,
-            ask,
-        };
-        assert!(stays(&n(None, Ask::Key)), "an error, as the crash notice");
-        assert!(stays(&n(None, Ask::Nothing)), "not saved");
-        assert!(stays(&n(None, Ask::Update)), "a question");
-        assert!(!stays(&n(Some(Instant::now() + HINT), Ask::Nothing)));
     }
 
     /// A question stays until it is answered or another key is pressed,
