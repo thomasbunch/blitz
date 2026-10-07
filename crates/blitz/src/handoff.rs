@@ -146,26 +146,40 @@ pub fn to_current_desktop(hwnd: HWND) {
         {
             return;
         }
-        let mut windows = Vec::new();
-        for mut w in [
+        let next = |w| GetWindow(w, GW_HWNDNEXT).unwrap_or_default();
+        let shown = |w| w != hwnd && IsWindowVisible(w).as_bool();
+        let tops = [
             GetForegroundWindow(),
             GetTopWindow(None).unwrap_or_default(),
-        ] {
-            // ponytail: looks at the first 64 shown windows down from each.
-            let seen = windows.len();
-            while !w.is_invalid() && windows.len() - seen < 64 {
-                if w != hwnd && IsWindowVisible(w).as_bool() {
-                    let here = desktops.IsWindowOnCurrentVirtualDesktop(w);
-                    let id = desktops.GetWindowDesktopId(w).unwrap_or_default();
-                    windows.push((here.is_ok_and(|b| b.as_bool()), id));
-                }
-                w = GetWindow(w, GW_HWNDNEXT).unwrap_or_default();
-            }
-        }
-        if let Some(id) = current_desktop(windows.into_iter()) {
+        ];
+        let windows = (tops.into_iter())
+            .flat_map(|w| down_from(w, next, shown))
+            .map(|w| {
+                let here = desktops.IsWindowOnCurrentVirtualDesktop(w);
+                let id = desktops.GetWindowDesktopId(w).unwrap_or_default();
+                (here.is_ok_and(|b| b.as_bool()), id)
+            });
+        if let Some(id) = current_desktop(windows) {
             let _ = desktops.MoveWindowToDesktop(hwnd, &id);
         }
     }
+}
+
+/// The first 64 windows `shown` keeps, down the z-order from `w` by
+/// `next`. It looks at 1024 at most: the z-order changes while it is
+/// walked, and any program can make hidden windows as fast as it likes.
+fn down_from(mut w: HWND, next: impl Fn(HWND) -> HWND, shown: impl Fn(HWND) -> bool) -> Vec<HWND> {
+    let mut out = Vec::new();
+    for _ in 0..1024 {
+        if w.is_invalid() || out.len() == 64 {
+            break;
+        }
+        if shown(w) {
+            out.push(w);
+        }
+        w = next(w);
+    }
+    out
 }
 
 /// The current virtual desktop, from windows in front-to-back order, each
@@ -303,6 +317,21 @@ mod tests {
         );
         assert_eq!(current_desktop([everywhere].into_iter()), None);
         assert_eq!(current_desktop(std::iter::empty()), None);
+    }
+
+    /// A z-order that never ends, as one a program keeps adding hidden
+    /// windows to, is walked only so far.
+    #[test]
+    fn handoff_walks_the_windows_only_so_far() {
+        let h = |n: usize| HWND(n as *mut c_void);
+        let next = |w: HWND| h(w.0 as usize + 1);
+        assert!(down_from(h(1), next, |_| false).is_empty(), "all hidden");
+        let every_other = down_from(h(1), next, |w| w.0 as usize % 2 == 0);
+        assert_eq!(every_other.len(), 64);
+        assert_eq!(every_other[0], h(2));
+        let few = down_from(h(1), next, |w| w.0 as usize % 100 == 0);
+        assert_eq!(few, (1..=10).map(|i| h(i * 100)).collect::<Vec<_>>());
+        assert!(down_from(h(0), next, |_| true).is_empty(), "none");
     }
 
     /// A second launch without a folder only brings blitz to the front.
