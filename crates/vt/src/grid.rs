@@ -370,7 +370,11 @@ impl Grid {
     /// Every place `query` appears, oldest first. Rows joined by soft wraps
     /// are searched as one line, so a match can run from one into the
     /// next. Case is ignored unless the query has a capital letter. Matches
-    /// do not overlap.
+    /// do not overlap. Characters are compared one code point at a time,
+    /// as written: `cafe` matches the start of a `café` written with a
+    /// combining accent, a `café` with the accent built in does not match
+    /// that one, and a letter whose lower case is more than one character,
+    /// such as `İ`, only matches itself.
     // ponytail: plain substring, regex if asked
     pub fn find(&self, query: &str) -> Vec<Found> {
         let exact = query.chars().any(char::is_uppercase);
