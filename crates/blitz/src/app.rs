@@ -1333,7 +1333,8 @@ fn quick_label(k: &KeyInput) -> Option<(usize, bool)> {
 }
 
 /// Where `text` holds a commit hash: 7 to 40 hex digits with a letter and
-/// a digit among them, a word of its own.
+/// a digit among them, a word of its own. Not a piece of a path, a GUID
+/// or a name such as cargo's `blitz-3f2a1b9c8d7e6f50`.
 fn hashes(text: &str) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let b = text.as_bytes();
@@ -1341,7 +1342,8 @@ fn hashes(text: &str) -> Vec<Range<usize>> {
     while i < b.len() {
         let len = b[i..].iter().take_while(|c| c.is_ascii_hexdigit()).count();
         let word = &b[i..i + len];
-        let alone = |j: Option<&u8>| j.is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_');
+        let alone =
+            |j: Option<&u8>| j.is_none_or(|c| !c.is_ascii_alphanumeric() && !b"_-/\\".contains(c));
         if (7..=40).contains(&len)
             && word.iter().any(u8::is_ascii_digit)
             && word.iter().any(u8::is_ascii_alphabetic)
@@ -7193,6 +7195,9 @@ mod tests {
         let text = "abc1234 deadbeefcafe 1234567 abcdefa x1a2b3c4 1a2b3c4_ 9f8e7d6c5b.";
         let found: Vec<&str> = hashes(text).into_iter().map(|r| &text[r]).collect();
         assert_eq!(found, ["abc1234", "9f8e7d6c5b"]);
+        let text = "abc1234..def5678 build/a1b2c3d/x blitz-3f2a1b9c8d7e6f50                     550e8400-e29b-41d4-a716-446655440000 (fe12ab3)";
+        let found: Vec<&str> = hashes(text).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(found, ["abc1234", "def5678", "fe12ab3"]);
     }
 
     #[test]
