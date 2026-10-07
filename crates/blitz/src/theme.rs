@@ -8,6 +8,9 @@ use vt::Palette;
 /// Attention accent of the blitz themes; text on it is near-black.
 pub const ACCENT: u32 = 0xf2b84b;
 
+/// The least contrast a divider has with the panes' background.
+const DIVIDER_CONTRAST: f64 = 1.3;
+
 /// The `theme` setting when there is none: follow the Windows app theme.
 pub const DEFAULT: &str = "light:blitz light,dark:blitz dark";
 
@@ -252,6 +255,13 @@ pub fn parse(name: &str, text: &str) -> Theme {
         if let Some(f) = ui.field(key) {
             *f = c;
         }
+    }
+    // Between two panes that are not dimmed, such as one that needs you
+    // beside the focused one, the divider is all that parts them.
+    let (border, mut t) = (ui.border, 0.0);
+    while contrast(ui.border, ui.term_bg) < DIVIDER_CONTRAST && t < 1.0 {
+        t = (t + 0.05f32).min(1.0);
+        ui.border = mix(border, ui.term_fg, t);
     }
     ui.set_accent(ui.accent);
     Theme {
@@ -704,6 +714,21 @@ mod tests {
         assert!(luminance(light.mark) < luminance(ACCENT));
         let [_, r, g, b] = light.mark.to_be_bytes();
         assert!(r > g && g > b, "still amber: {:06x}", light.mark);
+    }
+
+    #[test]
+    fn dividers_never_vanish_into_the_background() {
+        for t in all_in(None) {
+            let on = contrast(t.ui.border, t.ui.term_bg);
+            assert!(on >= DIVIDER_CONTRAST, "{}: divider {on:.2}", t.name);
+        }
+        // Even one a theme file sets to the background.
+        let t = parse("x", "background = #131417\nborder = #131417");
+        assert!(contrast(t.ui.border, t.ui.term_bg) >= DIVIDER_CONTRAST);
+        assert!(
+            luminance(t.ui.border) > luminance(0x131417),
+            "toward the text"
+        );
     }
 
     #[test]
