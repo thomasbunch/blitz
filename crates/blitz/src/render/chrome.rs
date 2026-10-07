@@ -563,12 +563,12 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 continue;
             }
             y += skip;
-            // Group heading: the tab's number for Ctrl+1 to 9, in line
-            // with the rows' marks, then its name, a hairline and the
-            // session count.
+            // Group heading: the tab's number for Ctrl+1 to 9 when there
+            // are tabs to pick from, in line with the rows' marks, then its
+            // name, a hairline and the session count.
             let (gx, gr) = (s(32.0), side - s(19.0));
             let gy = y + (gh - th) / 2;
-            if ti < 9 {
+            if ti < 9 && m.win.tabs.len() > 1 {
                 let num = (ti + 1).to_string();
                 text(p, s(20.0) - text_w(&num, tw) / 2, gy, &num, c.dim, false);
             }
@@ -804,8 +804,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 y += row.h;
             }
-            // A line down the left edge holds the active tab's group.
-            if ti == m.win.active {
+            // A line down the left edge holds the active tab's group, when
+            // there are others.
+            if ti == m.win.active && m.win.tabs.len() > 1 {
                 let line = Rect {
                     x: 0,
                     y: top,
@@ -2015,6 +2016,18 @@ mod tests {
             ..Window::default()
         };
         (win, sessions, now)
+    }
+
+    #[test]
+    fn one_tab_has_no_number_and_no_line() {
+        let (mut win, sessions, now) = crowd(3);
+        let c = build(&model(&win, &sessions, now));
+        assert!(!texts(&c).contains(&"1"), "{:?}", texts(&c));
+        win.sidebar_expanded = false;
+        let c = build(&model(&win, &sessions, now));
+        let lines =
+            (c.prims.iter()).filter(|p| matches!(p, Prim::Rect(r, _) if r.x == 0 && r.w == 2));
+        assert_eq!(lines.count(), 0);
     }
 
     #[test]
