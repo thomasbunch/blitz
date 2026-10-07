@@ -15,7 +15,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Microsoft's redistributable ConPTY, pinned by hash. 1.25 keeps
-  # PowerShell's cursor in place after a resize; 1.24 does not.
+  # PowerShell's cursor in place after a resize; 1.24 does not. CI tests
+  # this one too: keep ci.yml in step, which its lint job checks.
   CONPTY_VERSION: 1.25.260710002-preview
   CONPTY_SHA256: 86edb1054c6f56d7377117ff75489197a5f095fe9835df3ad04c2ba9d826b114
 

@@ -16,6 +16,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The ConPTY that releases ship, for the release-mode tests. Must match
+  # release.yml; the lint job checks.
+  CONPTY_VERSION: 1.25.260710002-preview
+  CONPTY_SHA256: 86edb1054c6f56d7377117ff75489197a5f095fe9835df3ad04c2ba9d826b114
 
 jobs:
   lint:
@@ -29,6 +33,13 @@ jobs:
         run: |
           bad="$(git ls-files -ci --exclude-standard)"
           [ -z "$bad" ] || { echo "::error::tracked files excluded by .gitignore:"; echo "$bad"; exit 1; }
+      - name: CI tests the ConPTY that releases ship
+        run: |
+          for k in CONPTY_VERSION CONPTY_SHA256; do
+            a="$(grep -E "^  $k: " .github/workflows/ci.yml)"
+            b="$(grep -E "^  $k: " .github/workflows/release.yml)"
+            [ -n "$a" ] && [ "$a" = "$b" ] || { echo "::error::$k differs between ci.yml and release.yml"; exit 1; }
+          done
       - run: rustup toolchain install
       - run: cargo fmt --all --check
 
@@ -51,8 +62,23 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # On Windows this runs on the system's console host.
       - run: cargo test --workspace --locked
-      # The hook tests also run against the optimized blitz-hook.exe that
-      # ships in releases.
+      - if: runner.os == 'Windows'
+        name: Bundled ConPTY
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $pkg = "$env:RUNNER_TEMP\conpty.zip"
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.Windows.Console.ConPTY/$env:CONPTY_VERSION" -OutFile $pkg
+          if ((Get-FileHash $pkg -Algorithm SHA256).Hash -ne $env:CONPTY_SHA256) {
+            throw "ConPTY $env:CONPTY_VERSION does not match its pinned hash"
+          }
+          Expand-Archive $pkg "$env:RUNNER_TEMP\conpty-pkg"
+          $dir = (New-Item -ItemType Directory "$env:RUNNER_TEMP\conpty").FullName
+          Copy-Item "$env:RUNNER_TEMP\conpty-pkg\runtimes\win-x64\native\conpty.dll", "$env:RUNNER_TEMP\conpty-pkg\build\native\runtimes\x64\OpenConsole.exe" $dir
+          "BLITZ_CONPTY_DIR=$dir" >> $env:GITHUB_ENV
+      # What ships: the optimized blitz-hook.exe, a static C runtime and the
+      # bundled ConPTY.
       - if: runner.os == 'Windows'
         run: cargo test --release -p blitz --locked
