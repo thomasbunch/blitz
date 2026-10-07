@@ -1013,7 +1013,7 @@ enum Rename {
 
 impl Commands {
     /// The matching actions and their labels, in [`keymap::ACTIONS`] order.
-    /// The palette leaves itself out.
+    /// The palette leaves out itself and going to a tab by number.
     fn matches(&self) -> Vec<(Action, &'static str)> {
         if self.rename.is_some() {
             return Vec::new();
@@ -1022,7 +1022,7 @@ impl Commands {
             .map(str::to_lowercase)
             .collect();
         (keymap::ACTIONS.iter())
-            .filter(|a| a.0 != Action::Palette)
+            .filter(|a| !matches!(a.0, Action::Palette | Action::GoToTab(_) | Action::LastTab))
             .filter(|a| {
                 let text = format!("{} {}", a.2, a.1).to_lowercase();
                 words.iter().all(|w| text.contains(w.as_str()))
@@ -2783,9 +2783,13 @@ impl App {
                     self.focus_moved(before);
                 }
             }
-            Action::GoToTab(i) => {
-                if usize::from(i) < self.win.tabs.len() {
-                    self.win.active = usize::from(i);
+            Action::GoToTab(_) | Action::LastTab => {
+                let i = match a {
+                    Action::GoToTab(i) => usize::from(i),
+                    _ => self.win.tabs.len().saturating_sub(1),
+                };
+                if i < self.win.tabs.len() {
+                    self.win.active = i;
                     self.focus_moved(before);
                 }
             }
@@ -7041,7 +7045,9 @@ mod tests {
     #[test]
     fn palette_matches_every_word_of_the_label_or_name() {
         let mut c = Commands::default();
-        assert_eq!(c.matches().len(), keymap::ACTIONS.len() - 1, "not itself");
+        assert_eq!(c.matches().len(), keymap::ACTIONS.len() - 10, "not itself");
+        c.filter = "tab".into();
+        assert!(c.matches().iter().all(|m| m.1 != "Go to the last tab"));
         c.filter = "Split R".into();
         assert_eq!(c.matches(), [(Action::SplitRight, "Split right")]);
         c.filter = "font_size_up".into();

@@ -27,8 +27,9 @@ pub enum Action {
     ReopenClosed,
     /// Next (1) or previous (-1) tab.
     CycleTab(i8),
-    /// Tab 1 to 9, 0-based.
+    /// Tab 1 to 8, 0-based. With no such tab the key does nothing.
     GoToTab(u8),
+    LastTab,
     SplitRight,
     SplitDown,
     Focus(Dir),
@@ -122,6 +123,15 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Find, "find", "Find in the scrollback"),
     (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
     (Action::SystemMenu, "system_menu", "Window menu"),
+    (Action::GoToTab(0), "go_to_tab_1", "Go to tab 1"),
+    (Action::GoToTab(1), "go_to_tab_2", "Go to tab 2"),
+    (Action::GoToTab(2), "go_to_tab_3", "Go to tab 3"),
+    (Action::GoToTab(3), "go_to_tab_4", "Go to tab 4"),
+    (Action::GoToTab(4), "go_to_tab_5", "Go to tab 5"),
+    (Action::GoToTab(5), "go_to_tab_6", "Go to tab 6"),
+    (Action::GoToTab(6), "go_to_tab_7", "Go to tab 7"),
+    (Action::GoToTab(7), "go_to_tab_8", "Go to tab 8"),
+    (Action::LastTab, "last_tab", "Go to the last tab"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
@@ -334,8 +344,14 @@ pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
     if let Some(b) = bindings(user).find(|b| (b.0, b.1) == (mods, k.vk)) {
         return b.2;
     }
-    let tab = mods == CTRL && (0x31..=0x39).contains(&k.vk);
-    tab.then(|| Action::GoToTab((k.vk - 0x31) as u8))
+    // Ctrl and a digit go to a tab, 9 to the last, where the key types
+    // that digit. On AZERTY the same keys type & é " ' ( - è _ ç, and
+    // Ctrl+- and Ctrl+_ are for the program.
+    let digit = (0x31..=0x39).contains(&k.vk) && k.key == Key::Char(char::from(k.vk as u8));
+    (mods == CTRL && digit).then(|| match k.vk {
+        0x39 => Action::LastTab,
+        vk => Action::GoToTab((vk - 0x31) as u8),
+    })
 }
 
 /// Whether a key message is an auto-repeat: lParam bit 30 says the key was
@@ -577,6 +593,16 @@ mod msg_to_key_tests {
     const US: &[(u16, &str, &str, &str)] = &[
         (0x0d, "\r", "\r", ""),
         (0x20, " ", " ", ""),
+        (0x30, "0", ")", ""),
+        (0x31, "1", "!", ""),
+        (0x32, "2", "@", ""),
+        (0x33, "3", "#", ""),
+        (0x34, "4", "$", ""),
+        (0x35, "5", "%", ""),
+        (0x36, "6", "^", ""),
+        (0x37, "7", "&", ""),
+        (0x38, "8", "*", ""),
+        (0x39, "9", "(", ""),
         (0x41, "a", "A", ""),
         (0x4a, "j", "J", ""),
         (0x51, "q", "Q", ""),
@@ -589,6 +615,14 @@ mod msg_to_key_tests {
         (0x51, "q", "Q", "@"),
         (0x5a, "z", "Z", ""),
         (0x6e, ",", ",", ""),
+    ];
+
+    /// French AZERTY: the digit keys type symbols, and digits with Shift.
+    const FR: &[(u16, &str, &str, &str)] = &[
+        (0x31, "&", "1", ""),
+        (0x36, "-", "6", "|"),
+        (0x38, "_", "8", "\\"),
+        (0x39, "\u{e7}", "9", "^"),
     ];
 
     /// Polish (214): AltGr+Q is a backslash.
@@ -1072,6 +1106,35 @@ mod msg_to_key_tests {
     }
 
     #[test]
+    fn keymap_ctrl_digits_go_to_tabs_where_the_key_types_the_digit() {
+        let press_on = |vk, rows, user: &[Binding]| {
+            let mut t = String::new();
+            let lp = lp(0x09, false, true, 1);
+            let k = msg_to_key(vk, lp, &state(&[0xa2], &[]), layout(rows), &mut t);
+            action(&k, user)
+        };
+        assert_eq!(press_on(0x31, US, &[]), Some(Action::GoToTab(0)));
+        assert_eq!(press_on(0x38, US, &[]), Some(Action::GoToTab(7)));
+        assert_eq!(press_on(0x39, US, &[]), Some(Action::LastTab));
+        // AZERTY: Ctrl+_ and Ctrl+- go to the program, and so do the rest.
+        for vk in [0x31, 0x36, 0x38, 0x39] {
+            assert_eq!(press_on(vk, FR, &[]), None, "{vk:#x}");
+        }
+        // Bound by name, a digit key goes to its tab on any layout.
+        let user: Vec<Binding> = ["ctrl+1=go_to_tab_1", "ctrl+9=last_tab"]
+            .into_iter()
+            .filter_map(binding)
+            .collect();
+        assert_eq!(press_on(0x31, FR, &user), Some(Action::GoToTab(0)));
+        assert_eq!(press_on(0x39, FR, &user), Some(Action::LastTab));
+        assert_eq!(
+            binding("alt+3=go_to_tab_3"),
+            Some((ALT, 0x33, Some(Action::GoToTab(2))))
+        );
+        assert_eq!(binding("ctrl+0=go_to_tab_9"), None, "Ctrl+9 is the last");
+    }
+
+    #[test]
     fn keymap_altgr_types_rather_than_running_a_ctrl_alt_binding() {
         let user: Vec<Binding> = ["ctrl+alt+q=new_tab", "ctrl+alt+left=split_right"]
             .into_iter()
@@ -1127,9 +1190,10 @@ mod msg_to_key_tests {
                 }
             }
         }
-        for i in 0..9 {
+        for i in 0..8 {
             assert_eq!(press(0x31 + i, &[0xa2]), Some(Action::GoToTab(i as u8)));
         }
+        assert_eq!(press(0x39, &[0xa2]), Some(Action::LastTab), "Ctrl+9");
         assert_eq!(press(0x30, &[0xa2]), Some(Action::FontSize(0)), "Ctrl+0");
         assert_eq!(press(0x31, &[0xa2, 0xa0]), None, "Ctrl+Shift+1");
         assert_eq!(press(0x31, &[0xa2, 0xa4]), None, "AltGr+1");
