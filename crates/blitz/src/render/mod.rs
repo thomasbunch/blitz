@@ -572,15 +572,16 @@ mod gpu {
                 clip(q, r.x, r.y, r.right(), r.bottom());
             }
         }
+
         /// Queues the outline of a `w` by `h` box with its top-left corner
         /// at (`x`, `y`), its lines `t` thick.
-        #[allow(clippy::too_many_arguments)]
         fn frame(&mut self, x: i32, y: i32, w: u32, h: u32, t: u32, rgb: u32) {
             self.rect(x, y, w, t, rgb);
-            self.rect(x, y + (h - t) as i32, w, t, rgb);
+            self.rect(x, y + h.saturating_sub(t) as i32, w, t, rgb);
             self.rect(x, y, t, h, rgb);
-            self.rect(x + (w - t) as i32, y, t, h, rgb);
+            self.rect(x + w.saturating_sub(t) as i32, y, t, h, rgb);
         }
+
         /// Queues a cursor of `shape`, `w` pixels wide with its top-left
         /// corner at (`x`, `y`); with `hollow` a block is an outline.
         fn cursor(&mut self, x: i32, y: i32, w: u32, shape: CursorShape, hollow: bool, rgb: u32) {
