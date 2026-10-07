@@ -1,5 +1,6 @@
-//! `blitz-hook claude` reports Claude Code's state to the pane it runs in;
-//! `blitz setup claude` prints the hook settings to install.
+//! `blitz-hook claude` reports Claude Code's state to the pane it runs in.
+//! blitz has Claude Code load the hooks as a plugin; `blitz setup claude`
+//! prints them for a Claude Code that does not.
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
@@ -323,9 +324,10 @@ pub fn plugin_dirs(inherited: Option<&str>, ours: &str) -> String {
 
 /// `blitz setup <app>`. Returns the process exit code.
 ///
-/// `blitz setup claude` prints the hooks to add to Claude Code's settings,
-/// pointing at the `blitz-hook` next to this exe. It never edits the
-/// settings file itself; that file belongs to the user.
+/// `blitz setup claude` says that blitz loads its hooks itself, and prints
+/// them, pointing at the `blitz-hook` next to this exe, for a Claude Code
+/// that does not load them. It never edits the settings file itself; that
+/// file belongs to the user.
 pub fn setup(args: &[String]) -> i32 {
     if args != ["claude"] {
         eprintln!("usage: blitz setup claude");
@@ -363,12 +365,26 @@ pub fn setup(args: &[String]) -> i32 {
         .unwrap_or_default()
         .join("settings.json");
     eprintln!(
-        "Merge the \"hooks\" below into {}.\n\
+        "blitz loads these hooks itself in its panes, with Claude Code 2.1.280 or\n\
+         later: there is nothing to set up. An older Claude Code, or settings that\n\
+         turn off plugin folders, need them merged into {}.\n\
          Claude Code picks the change up without a restart.\n",
         settings.display()
     );
+    if runs_blitz_hook(&settings) {
+        eprintln!(
+            "note: {} runs blitz-hook already. With Claude Code 2.1.280 or later\n\
+             blitz's own hooks report each event too; remove those to report once.\n",
+            settings.display()
+        );
+    }
     print!("{}", claude_settings(&hook.to_string_lossy()));
     0
+}
+
+/// Whether the Claude Code settings file at `path` runs blitz-hook.
+fn runs_blitz_hook(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|s| s.to_ascii_lowercase().contains("blitz-hook"))
 }
 
 /// Whether anyone but this user, SYSTEM, Administrators or TrustedInstaller

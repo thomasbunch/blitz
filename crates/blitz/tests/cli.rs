@@ -86,6 +86,32 @@ fn cli_setup_claude_prints_the_hooks() {
         "{err}"
     );
     assert!(!err.contains("is missing"), "{err}");
+    assert!(err.contains("nothing to set up"), "{err}");
+    assert!(!err.contains("runs blitz-hook already"), "{err}");
+}
+
+/// Hooks pasted before blitz loaded its own are pointed out: with both,
+/// every event reports twice.
+#[test]
+fn cli_setup_claude_flags_pasted_hooks() {
+    let config = tmp("cli-claude-pasted");
+    std::fs::create_dir_all(&config).expect("dir");
+    let settings = config.join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"C:\\Tools\\Blitz-Hook.exe","args":["claude"]}]}]}}"#,
+    )
+    .expect("settings");
+    let out = blitz(Path::new(BLITZ), &["setup", "claude"], &config);
+    assert_eq!(out.status.code(), Some(0));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains(&format!("{} runs blitz-hook already", settings.display())),
+        "{err}"
+    );
+    std::fs::write(&settings, r#"{"model":"opus"}"#).expect("settings");
+    let out = blitz(Path::new(BLITZ), &["setup", "claude"], &config);
+    assert!(!text(&out.stderr).contains("already"));
 }
 
 #[test]
