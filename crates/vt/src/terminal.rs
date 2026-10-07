@@ -514,6 +514,13 @@ impl Terminal {
         self.changed = true;
     }
 
+    /// Starts over on blank screens of the same size, as RIS does, keeping
+    /// what the host told it. For a host that cannot trust the state any
+    /// more, say once parsing panicked.
+    pub fn reset(&mut self) {
+        self.full_reset();
+    }
+
     /// The host's theme: whether it is dark, for `CSI ? 996 n`, and its
     /// colours, for colour queries. The next snapshot recolours every cell.
     /// A program that set mode 2031 is told of any change, so it can query

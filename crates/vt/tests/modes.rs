@@ -104,6 +104,27 @@ fn ris_keeps_conpty_modes() {
     assert!(!t.input_modes().w32im);
 }
 
+/// The host starting a pane's screen over, as after a parser panic, is RIS:
+/// the size and ConPTY's modes stay, and old line numbers name nothing.
+#[test]
+fn host_reset_is_ris() {
+    let mut t = Terminal::new(Options {
+        cols: 10,
+        rows: 3,
+        ..Options::default()
+    });
+    t.feed(b"\x1b[?9001h\x1b[?1004h\x1b[?2004h\x1b[?1049hx");
+    let epoch = t.line_epoch();
+    t.reset();
+    let m = t.input_modes();
+    assert!(m.w32im && m.focus);
+    assert!(!m.bracketed && !m.alt_screen);
+    assert_eq!(t.screen_text(), "\n\n");
+    assert_ne!(t.line_epoch(), epoch);
+    t.feed(b"0123456789ab");
+    assert_eq!(t.screen_text(), "0123456789\nab\n");
+}
+
 const PAL: vt::Palette = vt::Palette {
     fg: 1,
     bg: 2,
