@@ -4423,7 +4423,9 @@ impl App {
     /// the main window only, or gives it back. Says so in the focused pane
     /// when another program has it.
     fn global_jump(&mut self) {
-        let on = self.config.global_jump && self.persist;
+        // Not `persist`, which a session that failed to come back turns
+        // off while the window still takes launches.
+        let on = self.config.global_jump && !self.args.new_window && !self.args.scripted();
         if on == self.jump_key {
             return;
         }
