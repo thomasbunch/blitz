@@ -466,10 +466,16 @@ pub fn build(m: &ChromeModel) -> Chrome {
             if ti > 0 {
                 y += s(14.0);
             }
-            // Group heading: name, a hairline, the session count.
+            // Group heading: the tab's number for Ctrl+1 to 9, in line
+            // with the rows' marks, then its name, a hairline and the
+            // session count.
             let (gx, gr) = (s(32.0), side - s(19.0));
             let gh = s(26.0);
             let gy = y + (gh - th) / 2;
+            if ti < 9 {
+                let num = (ti + 1).to_string();
+                text(p, s(20.0) - text_w(&num, tw) / 2, gy, &num, c.dim, false);
+            }
             let count = list.len().to_string();
             let cx = gr - text_w(&count, tw);
             // A tab nobody named is called after where its focused pane is.
@@ -632,6 +638,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             if ti > 0 {
                 y += s(12.0);
             }
+            let top = y;
             for x in members(t) {
                 let row = Rect {
                     x: 0,
@@ -661,6 +668,16 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     }
                 }
                 y += row.h;
+            }
+            // A line down the left edge holds the active tab's group.
+            if ti == m.win.active {
+                let line = Rect {
+                    x: 0,
+                    y: top,
+                    w: s(2.0),
+                    h: y - top,
+                };
+                p.push(Prim::Rect(line, c.idle));
             }
         }
     }
@@ -1586,6 +1603,12 @@ mod tests {
         }
         assert!(t.contains(&"idle"));
         assert!(t.contains(&r"C:\dev\api") && t.contains(&"main"));
+        // Each heading starts with its tab's number, dim.
+        let dim = crate::theme::blitz(false).ui.dim;
+        let num = |n: &str| {
+            (c.prims.iter()).any(|p| matches!(p, Prim::Text { text, color, x, .. } if text == n && *color == dim && *x < 32))
+        };
+        assert!(num("1") && num("2"));
         assert!(
             c.prims
                 .iter()
@@ -1838,6 +1861,31 @@ mod tests {
             .filter(|p| matches!(p, Prim::Shape { r, .. } if r.right() <= 15))
             .count();
         assert_eq!(dots, 2);
+        // The active tab's two rows have a line down the left edge, over
+        // the focused row's tint.
+        let ui = crate::theme::blitz(false).ui;
+        let (first, last) = (c.rows[0].1, c.rows[1].1);
+        let line = Prim::Rect(
+            Rect {
+                x: 0,
+                y: first.y,
+                w: 2,
+                h: last.bottom() - first.y,
+            },
+            ui.idle,
+        );
+        let at = |want: &Prim| c.prims.iter().position(|p| p == want);
+        let focus = c
+            .rows
+            .iter()
+            .find(|r| r.0 == win.tabs[0].focus)
+            .expect("row")
+            .1;
+        let tint = at(&Prim::Rect(focus, ui.rail_focus)).expect("focused row");
+        assert!(at(&line).expect("group line") > tint);
+        let lines =
+            (c.prims.iter()).filter(|p| matches!(p, Prim::Rect(r, _) if r.x == 0 && r.w == 2));
+        assert_eq!(lines.count(), 1);
     }
 
     #[test]
