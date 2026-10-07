@@ -4667,6 +4667,10 @@ impl App {
         }
         // A narrow window has no room for the sidebar.
         self.win.fit_width(size.width as f32 / self.scale as f32);
+        // What is under a still pointer can change too, as when a program
+        // takes the mouse or a panel opens from the keyboard.
+        self.update_pointer();
+
         self.ensure_gfx();
         let Some(g) = &self.gfx else {
             return;
