@@ -363,7 +363,8 @@ that, or typing, goes back to the bottom.
 | Alt+Shift+Arrows | Resize the focused pane (or drag the line between panes) |
 | Ctrl+Alt+Shift+Arrows | Swap the focused pane with its neighbour |
 | Ctrl+Shift+Z | Zoom the focused pane to fill the tab, or show every pane again |
-| Ctrl+Shift+J | Jump to the next session that needs you |
+| Ctrl+Shift+J | Jump to the next session that needs you, or back when none does |
+| Ctrl+Shift+O | Go to a session, picked from a list you can type to narrow |
 | Ctrl+Shift+B | Expand or collapse the sidebar |
 | Ctrl+Shift+U | Update, or look for a newer release now |
 | Ctrl+Shift+K | Pick a theme |
@@ -432,7 +433,8 @@ The actions are `copy`, `copy_without_indent`, `paste`,
 `rename_tab`, `next_tab`, `previous_tab`, `move_tab_left`,
 `move_tab_right`, `move_pane_to_new_tab`, `split_right`, `split_down`,
 `new_claude`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
-`jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
+`jump_to_attention`, `go_to_session`, `toggle_sidebar`, `update`,
+`theme_picker`,
 `settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
 `resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
 `equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
