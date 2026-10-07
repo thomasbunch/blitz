@@ -855,7 +855,8 @@ struct App {
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
-    /// Every session, oldest first, which is the order the sidebar lists.
+    /// Every session, oldest first. The sidebar lists them as their panes
+    /// sit.
     views: Vec<View>,
     /// What a click in the sidebar acted on in the last frame.
     side: chrome::SideHits,
