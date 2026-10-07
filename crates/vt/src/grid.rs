@@ -258,7 +258,8 @@ impl Row {
             self.split_pair(cols);
             self.cells.truncate(cols);
             self.drop_graphemes(cols..usize::MAX);
-        } else {
+        } else if cols > self.cells.len() {
+            // The spacer marks the last column, which this one stops being.
             if let Some(last) = self.cells.last_mut() {
                 last.flags &= !cf::SPACER_HEAD;
             }

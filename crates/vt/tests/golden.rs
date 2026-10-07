@@ -684,6 +684,16 @@ fn resize_under_a_bare_alternate_screen_keeps_the_main_bottom() {
     assert_eq!(t.screen_text(), "top\ntext");
 }
 
+/// A change of rows alone keeps the spacer a wide character leaves when it
+/// wraps early, or the next width change rewraps it around a blank.
+#[test]
+fn rows_only_resize_keeps_the_wrap_spacer() {
+    let mut t = run(5, 2, "abcd中");
+    t.resize(5, 3);
+    t.resize(6, 3);
+    assert_eq!(t.screen_text(), "abcd中\n\n");
+}
+
 #[test]
 fn resize_rewraps_the_main_screen_under_the_alternate_one() {
     let mut t = run(5, 3, "abcdefg\x1b[?1049hALT-SCREEN");
