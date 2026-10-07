@@ -554,9 +554,13 @@ if [ -n "$BLITZ_PANE_TOKEN" ]; then
     done
     PROMPT_COMMAND=(__blitz_status "${__blitz_pc[@]}" __blitz_prompt)
   else
-    __blitz_pc=${PROMPT_COMMAND//__blitz_status$'\n'/}
+    # The pair first: with nothing of the rc's between, the two share
+    # their line break, and the rc's own may stick to either side.
+    __blitz_pc=${PROMPT_COMMAND//__blitz_status$'\n'__blitz_prompt/}
+    __blitz_pc=${__blitz_pc//__blitz_status$'\n'/}
     __blitz_pc=${__blitz_pc//$'\n'__blitz_prompt/}
-    [ "$__blitz_pc" = __blitz_prompt ] && __blitz_pc=
+    # What `$PROMPT_COMMAND;foo` leaves of the pair, which bash refuses.
+    __blitz_pc=${__blitz_pc#;}
     PROMPT_COMMAND=__blitz_status$'\n'${__blitz_pc:+$__blitz_pc$'\n'}__blitz_prompt
   fi
   unset __blitz_pc __blitz_c
@@ -922,6 +926,8 @@ mod tests {
         std::fs::write(&file, BASH_INTEGRATION).unwrap();
         let script = r#"PROMPT_COMMAND='history -a'; . "$1"; . "$1"; PROMPT_COMMAND='history -a'; . "$1"
 declare -p PROMPT_COMMAND; PROMPT_COMMAND="history -a${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; . "$1"
+declare -p PROMPT_COMMAND; unset PROMPT_COMMAND; . "$1"; PROMPT_COMMAND="foo;$PROMPT_COMMAND"; . "$1"
+declare -p PROMPT_COMMAND; unset PROMPT_COMMAND; . "$1"; PROMPT_COMMAND="$PROMPT_COMMAND;foo"; . "$1"
 declare -p PROMPT_COMMAND; unset PROMPT_COMMAND; PROMPT_COMMAND=(one two); . "$1"; . "$1"
 PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""#;
         let out = std::process::Command::new(bash)
@@ -935,6 +941,8 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
             String::from_utf8_lossy(&out.stdout),
             "declare -- PROMPT_COMMAND=$'__blitz_status\\nhistory -a\\n__blitz_prompt'\n\
              declare -- PROMPT_COMMAND=$'__blitz_status\\nhistory -a; history -a\\n__blitz_prompt'\n\
+             declare -- PROMPT_COMMAND=$'__blitz_status\\nfoo;\\n__blitz_prompt'\n\
+             declare -- PROMPT_COMMAND=$'__blitz_status\\nfoo\\n__blitz_prompt'\n\
              declare -a PROMPT_COMMAND=([0]=\"__blitz_status\" [1]=\"one\" [2]=\"two\" [3]=\"three\" [4]=\"__blitz_prompt\")\n\
              C\n"
         );
