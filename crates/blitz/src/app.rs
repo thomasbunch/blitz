@@ -1322,6 +1322,16 @@ fn quick_items(
     out
 }
 
+/// The label a key types for quick select, `a` as 0, and whether Shift
+/// asks to open rather than copy. By the key, not its text, so Caps Lock
+/// does not turn a copy into an open, and a label types on any layout.
+fn quick_label(k: &KeyInput) -> Option<(usize, bool)> {
+    let m = &k.mods;
+    let letter = (0x41..=0x5a).contains(&k.vk);
+    let other = m.lctrl || m.rctrl || m.lalt || m.ralt || m.lsuper || m.rsuper;
+    (letter && !other).then(|| (usize::from(k.vk - 0x41), m.lshift || m.rshift))
+}
+
 /// Where `text` holds a commit hash: 7 to 40 hex digits with a letter and
 /// a digit among them, a word of its own.
 fn hashes(text: &str) -> Vec<Range<usize>> {
@@ -2465,19 +2475,13 @@ impl App {
             return;
         };
         self.request_redraw();
-        let m = &k.mods;
-        let mut chars = k.text.chars();
-        let (Some(c), None, false) = (chars.next(), chars.next(), m.lctrl || m.rctrl) else {
+        let Some((i, open)) = quick_label(k) else {
             return;
         };
-        let label = c.to_ascii_lowercase();
-        let i = (label.is_ascii_lowercase()).then(|| usize::from(label as u8 - b'a'));
-        let Some((_, text, target)) = i.and_then(|i| q.items.get(i)) else {
+        let Some((_, text, target)) = q.items.get(i) else {
             return;
         };
-        if c.is_ascii_uppercase()
-            && let Some(t) = target
-        {
+        if open && let Some(t) = target {
             self.open_link(t);
             return;
         }
@@ -7137,6 +7141,51 @@ mod tests {
         assert_eq!(items[2].2, Some(Target::Uri("https://x.com/a".into())));
         // Only what is in view.
         assert_eq!(quick_items(&t, &pal, 1, found).len(), 1);
+    }
+
+    #[test]
+    fn app_quick_select_labels_go_by_the_key() {
+        let key = |vk: u16, text, mods, caps| KeyInput {
+            vk,
+            scan: 0,
+            extended: false,
+            down: true,
+            repeat: 1,
+            mods,
+            locks: vt::Locks {
+                caps,
+                ..vt::Locks::default()
+            },
+            text,
+            uc: 0,
+            cs: 0,
+            key: vt::Key::Char('x'),
+            us_base: None,
+        };
+        let shift = Mods {
+            lshift: true,
+            ..Mods::default()
+        };
+        let ctrl = Mods {
+            rctrl: true,
+            ..Mods::default()
+        };
+        let label = |vk, text, mods, caps| quick_label(&key(vk, text, mods, caps));
+        assert_eq!(label(0x43, "c", Mods::default(), false), Some((2, false)));
+        assert_eq!(label(0x43, "C", shift, false), Some((2, true)));
+        assert_eq!(
+            label(0x43, "C", Mods::default(), true),
+            Some((2, false)),
+            "Caps Lock"
+        );
+        assert_eq!(
+            label(0x41, "\u{444}", Mods::default(), false),
+            Some((0, false)),
+            "Cyrillic"
+        );
+        assert_eq!(label(0x5a, "z", Mods::default(), false), Some((25, false)));
+        assert_eq!(label(0x43, "c", ctrl, false), None);
+        assert_eq!(label(0x31, "1", Mods::default(), false), None);
     }
 
     #[test]
