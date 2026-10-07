@@ -701,6 +701,25 @@ mod tests {
                 let on = contrast(ui.mark, c);
                 assert!(on >= 3.0, "{}: mark on the {what} {on:.2}", t.name);
             }
+            // SGR 90, the grey of hints and Claude Code's tool results.
+            let grey = contrast(p.ansi[8], p.bg);
+            assert!(grey >= 1.5, "{}: palette 8 contrast {grey:.2}", t.name);
+        }
+    }
+
+    #[test]
+    fn every_builtin_accent_is_an_attention_colour() {
+        // Palette 3 is brown in some themes, which reads as text rather
+        // than as a session that needs you; those set an accent of their
+        // own.
+        for t in all_in(None) {
+            let [_, r, g, b] = t.ui.accent.to_be_bytes();
+            assert!(
+                r > b && g > b && r >= 0x90,
+                "{}: accent {:06x}",
+                t.name,
+                t.ui.accent
+            );
         }
     }
 
