@@ -1536,7 +1536,6 @@ impl App {
             motion: animations_on(),
             vanish: mouse_vanish(),
             contrast: crate::theme::system_contrast(),
-
             commands: None,
             commands_hits: None,
             font_zoom: 0.0,
