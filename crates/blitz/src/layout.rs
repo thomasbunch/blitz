@@ -536,6 +536,22 @@ impl Default for Window {
 }
 
 impl Window {
+    /// Whether the sidebar or its rail shows: there are two sessions or
+    /// more.
+    pub fn has_sidebar(&self) -> bool {
+        self.tabs.iter().map(|t| t.panes().len()).sum::<usize>() >= 2
+    }
+
+    /// Expands or collapses the sidebar. Returns false when there is none
+    /// to change, so the key goes to the program.
+    pub fn toggle_sidebar(&mut self) -> bool {
+        if !self.has_sidebar() {
+            return false;
+        }
+        self.sidebar_expanded = !self.sidebar_expanded;
+        true
+    }
+
     /// Closes pane `p` wherever it is. Closing a tab's last pane removes
     /// the tab; the window should close once `tabs` is empty. Returns false
     /// if no tab has `p`.
@@ -1030,5 +1046,19 @@ mod tests {
         assert_eq!(w.tabs[1].rects(AREA), moved.collect::<Vec<_>>());
         assert!(!w.replace_pane(PaneId(4), PaneId(8)));
         assert_eq!(w.tabs[0], Tab::new("a".into(), PaneId(9)));
+    }
+
+    #[test]
+    fn the_sidebar_key_needs_a_sidebar() {
+        let mut w = Window::default();
+        w.tabs.push(Tab::new("t".into(), PaneId(1)));
+        // One session: no sidebar, so the key is the program's.
+        assert!(!w.toggle_sidebar());
+        assert!(w.sidebar_expanded);
+        assert!(w.tabs[0].split(Dir::Right, PaneId(2), AREA, MIN));
+        assert!(w.toggle_sidebar());
+        assert!(!w.sidebar_expanded);
+        assert!(w.toggle_sidebar());
+        assert!(w.sidebar_expanded);
     }
 }

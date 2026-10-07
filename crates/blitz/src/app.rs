@@ -2649,7 +2649,9 @@ impl App {
                 }
             }
             Action::ToggleSidebar => {
-                self.win.sidebar_expanded = !self.win.sidebar_expanded;
+                if !self.win.toggle_sidebar() {
+                    return false;
+                }
                 self.fit_min_size();
                 self.request_redraw();
             }

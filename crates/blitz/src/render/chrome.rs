@@ -224,7 +224,7 @@ const HEADER_H: f32 = 22.0;
 /// banner strip.
 pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: bool) -> Rect {
     let s = |v: f32| (v * scale).round() as i32;
-    let fleet = win.tabs.iter().map(|t| t.panes().len()).sum::<usize>() >= 2;
+    let fleet = win.has_sidebar();
     let side = match (fleet, win.sidebar_expanded) {
         (false, _) => 0,
         (true, true) => s(SIDEBAR_W),
@@ -259,7 +259,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let Some(tab) = m.win.tabs.get(m.win.active) else {
         return out;
     };
-    let fleet = m.win.tabs.iter().map(|t| t.panes().len()).sum::<usize>() >= 2;
+    let fleet = m.win.has_sidebar();
     let expanded = m.win.sidebar_expanded;
     let area = area(m.win, m.size, m.scale, m.banner.is_some());
     let (side, bh) = (area.x, m.banner.map_or(0, |_| s(BANNER_H)));
