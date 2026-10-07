@@ -3268,16 +3268,14 @@ impl App {
         self.focus_moved(before);
     }
 
-    /// Shows the one of `ids`, sessions the sidebar has no room for, that
-    /// has waited longest for the user, else the first.
+    /// Shows one of `ids`, the sessions the sidebar has no room for (see
+    /// [`hidden_target`]).
     fn show_hidden(&mut self, ids: &[PaneId]) {
-        let others: Vec<PaneId> = (ids.iter().copied())
-            .filter(|&id| Some(id) != self.focus_id())
+        let states = (ids.iter()).filter_map(|&id| self.view(id));
+        let hidden: Vec<_> = states
+            .map(|v| (v.pane.id, v.pane.attn.state, v.pane.attn.since))
             .collect();
-        let states = (others.iter()).filter_map(|&id| self.view(id));
-        let waiting = states.map(|v| (v.pane.id, v.pane.attn.state, v.pane.attn.since));
-        let id = crate::attention::jump_target(waiting).or(others.first().copied());
-        if let Some(id) = id {
+        if let Some(id) = hidden_target(&hidden, self.focus_id()) {
             self.show(id);
         }
     }
@@ -4144,6 +4142,20 @@ fn route_button(
     } else {
         reported[b].take()
     }
+}
+
+/// The one of `hidden`, sessions the sidebar has no room for, that a
+/// click on their count goes to: the one waiting longest for the user,
+/// else the one after `focus`, so clicks go round them all.
+fn hidden_target(hidden: &[(PaneId, Attn, Instant)], focus: Option<PaneId>) -> Option<PaneId> {
+    let others = (hidden.iter().copied()).filter(|h| Some(h.0) != focus);
+    crate::attention::jump_target(others).or_else(|| {
+        let next = (hidden.iter())
+            .position(|h| Some(h.0) == focus)
+            .map_or(0, |i| i + 1);
+        let h = hidden.get(next).or(hidden.first())?;
+        (Some(h.0) != focus).then_some(h.0)
+    })
 }
 
 /// Whether Windows shows animations; off under Accessibility, Visual
@@ -6599,5 +6611,27 @@ mod tests {
         assert_eq!(last_lines("a\n\nb", 10), "a\n\nb");
         assert_eq!(last_lines("  a\n", 10), "  a");
         assert_eq!(last_lines("\n\n", 10), "");
+    }
+
+    #[test]
+    fn the_count_of_hidden_sessions_goes_round_them() {
+        let now = Instant::now();
+        let ids = |v: &[u32]| -> Vec<(PaneId, Attn, Instant)> {
+            v.iter().map(|&i| (PaneId(i), Attn::Idle, now)).collect()
+        };
+        let hidden = ids(&[7, 8, 9]);
+        // Nothing waits: from a pane in view, the first; then each in turn.
+        assert_eq!(hidden_target(&hidden, Some(PaneId(1))), Some(PaneId(7)));
+        assert_eq!(hidden_target(&hidden, Some(PaneId(7))), Some(PaneId(8)));
+        assert_eq!(hidden_target(&hidden, Some(PaneId(8))), Some(PaneId(9)));
+        assert_eq!(hidden_target(&hidden, Some(PaneId(9))), Some(PaneId(7)));
+        // One that needs you comes first, unless it is already shown.
+        let mut waiting = hidden.clone();
+        waiting[2].1 = Attn::NeedsYou;
+        assert_eq!(hidden_target(&waiting, Some(PaneId(7))), Some(PaneId(9)));
+        assert_eq!(hidden_target(&waiting, Some(PaneId(9))), Some(PaneId(7)));
+        // Only the focused one hidden: nowhere to go.
+        assert_eq!(hidden_target(&ids(&[7]), Some(PaneId(7))), None);
+        assert_eq!(hidden_target(&[], None), None);
     }
 }
