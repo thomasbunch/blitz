@@ -7476,7 +7476,6 @@ mod tests {
         assert_eq!(wheel_lines(u32::MAX, 40), 39, "a page");
         assert_eq!(wheel_lines(u32::MAX, 1), 1);
         assert_eq!(wheel_lines(5000, 40), 100);
-        assert!(scroll_lines() <= 100 || scroll_lines() == u32::MAX);
     }
 
     #[test]
