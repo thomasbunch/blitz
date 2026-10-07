@@ -413,6 +413,7 @@ mod tests {
         let file = |p: &str| Some(Open::File(p.into()));
         let reveal = |p: &str| Some(Open::Reveal(p.into()));
         assert_eq!(plan("file:///C:/docs/a%20b.txt"), file(r"C:\docs\a b.txt"));
+        assert_eq!(plan("FILE:///C:/docs/a%20b.txt"), file(r"C:\docs\a b.txt"));
         assert_eq!(plan("file:///C:/docs/"), file(r"C:\docs\"));
         assert_eq!(plan("file:///C:/x/setup.EXE"), reveal(r"C:\x\setup.EXE"));
         assert_eq!(
