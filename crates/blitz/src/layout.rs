@@ -121,6 +121,26 @@ pub struct Split {
     pub b: Node,
 }
 
+impl Split {
+    /// Gives `a` `px` pixels of `area` along the axis, or as near to that
+    /// as keeps every pane at least `min`.
+    fn set(&mut self, area: Rect, px: i32, min: (i32, i32)) {
+        let axis = self.axis;
+        let (free, unit) = match axis {
+            Axis::Row => (area.w - DIVIDER, min.0),
+            Axis::Column => (area.h - DIVIDER, min.1),
+        };
+        let least = |n: &Node| {
+            let k = n.span(axis);
+            k * unit + (k - 1) * DIVIDER
+        };
+        let (lo, hi) = (least(&self.a), free - least(&self.b));
+        if free > 0 && lo <= hi {
+            self.ratio = px.clamp(lo, hi) as f32 / free as f32;
+        }
+    }
+}
+
 impl Node {
     pub fn contains(&self, p: PaneId) -> bool {
         match self {
@@ -202,20 +222,47 @@ impl Node {
         if inner || s.axis != axis {
             return inner;
         }
-        let (free, unit) = match axis {
-            Axis::Row => (area.w - DIVIDER, min.0),
-            Axis::Column => (area.h - DIVIDER, min.1),
+        let now = match axis {
+            Axis::Row => ra.w,
+            Axis::Column => ra.h,
         };
-        let least = |n: &Node| {
-            let k = n.span(axis);
-            k * unit + (k - 1) * DIVIDER
-        };
-        let (lo, hi) = (least(&s.a), free - least(&s.b));
-        if free > 0 && lo <= hi {
-            let now = (free as f32 * s.ratio).round() as i32;
-            s.ratio = (now + delta).clamp(lo, hi) as f32 / free as f32;
-        }
+        s.set(area, now + delta, min);
         true
+    }
+
+    /// Puts each of `p` and `q` where the other was.
+    fn swap(&mut self, p: PaneId, q: PaneId) {
+        match self {
+            Node::Leaf(x) if *x == p => *x = q,
+            Node::Leaf(x) if *x == q => *x = p,
+            Node::Leaf(_) => {}
+            Node::Split(s) => {
+                s.a.swap(p, q);
+                s.b.swap(p, q);
+            }
+        }
+    }
+
+    fn splits(&self) -> usize {
+        match self {
+            Node::Leaf(_) => 0,
+            Node::Split(s) => 1 + s.a.splits() + s.b.splits(),
+        }
+    }
+
+    /// Split `n` in the order [`Tab::dividers`] lists their dividers, and
+    /// the area it divides.
+    fn nth_split(&mut self, n: usize, area: Rect) -> Option<(&mut Split, Rect)> {
+        let Node::Split(s) = self else {
+            return None;
+        };
+        let (ra, _, rb) = area.cut(s.axis, s.ratio);
+        let k = s.a.splits();
+        match n.cmp(&k) {
+            std::cmp::Ordering::Less => s.a.nth_split(n, ra),
+            std::cmp::Ordering::Equal => Some((&mut **s, area)),
+            std::cmp::Ordering::Greater => s.b.nth_split(n - k - 1, rb),
+        }
     }
 
     fn equalize(&mut self) {
@@ -227,13 +274,13 @@ impl Node {
         }
     }
 
-    fn walk(&self, area: Rect, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Rect>) {
+    fn walk(&self, area: Rect, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<(Axis, Rect)>) {
         match self {
             Node::Leaf(p) => panes.push((*p, area)),
             Node::Split(s) => {
                 let (a, d, b) = area.cut(s.axis, s.ratio);
                 s.a.walk(a, panes, dividers);
-                dividers.push(d);
+                dividers.push((s.axis, d));
                 s.b.walk(b, panes, dividers);
             }
         }
@@ -293,7 +340,41 @@ impl Tab {
         if self.zoom.is_none() {
             self.root.walk(area, &mut Vec::new(), &mut dividers);
         }
-        dividers
+        dividers.into_iter().map(|d| d.1).collect()
+    }
+
+    /// The divider within `slop` pixels of (x, y), as its index in
+    /// [`Tab::dividers`] and its split's axis.
+    pub fn divider_at(&self, area: Rect, x: i32, y: i32, slop: i32) -> Option<(usize, Axis)> {
+        if self.zoom.is_some() {
+            return None;
+        }
+        let mut dividers = Vec::new();
+        self.root.walk(area, &mut Vec::new(), &mut dividers);
+        dividers.into_iter().enumerate().find_map(|(i, (axis, d))| {
+            let (sx, sy) = match axis {
+                Axis::Row => (slop, 0),
+                Axis::Column => (0, slop),
+            };
+            let hit =
+                (d.x - sx..d.right() + sx).contains(&x) && (d.y - sy..d.bottom() + sy).contains(&y);
+            hit.then_some((i, axis))
+        })
+    }
+
+    /// Moves divider `i` of [`Tab::dividers`] to (x, y), along its axis
+    /// and as far as keeps every pane at least `min`. Returns false if
+    /// there is no such divider.
+    pub fn drag(&mut self, i: usize, x: i32, y: i32, area: Rect, min: (i32, i32)) -> bool {
+        let Some((s, r)) = self.root.nth_split(i, area) else {
+            return false;
+        };
+        let px = match s.axis {
+            Axis::Row => x - r.x,
+            Axis::Column => y - r.y,
+        };
+        s.set(r, px, min);
+        true
     }
 
     /// Rects for every pane, ignoring the zoom.
@@ -340,11 +421,29 @@ impl Tab {
     /// the edges, since jumping to the far side by accident is worse than
     /// not moving. Returns whether focus moved.
     pub fn focus_dir(&mut self, dir: Dir, area: Rect) -> bool {
-        let tiles = self.tiles(area);
-        let Some(&(_, f)) = tiles.iter().find(|t| t.0 == self.focus) else {
+        let Some(p) = self.neighbour(dir, area) else {
             return false;
         };
-        let best = tiles
+        self.focus(p);
+        true
+    }
+
+    /// Swaps the focused pane with the one [`Tab::focus_dir`] would pick,
+    /// moving it a place toward `dir`. It keeps focus. Returns whether it
+    /// moved.
+    pub fn swap(&mut self, dir: Dir, area: Rect) -> bool {
+        let Some(q) = self.neighbour(dir, area) else {
+            return false;
+        };
+        self.root.swap(self.focus, q);
+        self.zoom = None;
+        true
+    }
+
+    fn neighbour(&self, dir: Dir, area: Rect) -> Option<PaneId> {
+        let tiles = self.tiles(area);
+        let &(_, f) = tiles.iter().find(|t| t.0 == self.focus)?;
+        tiles
             .iter()
             .filter(|t| t.0 != self.focus)
             .filter_map(|&(p, r)| {
@@ -361,12 +460,8 @@ impl Tab {
                 let rank = self.mru.iter().position(|&q| q == p);
                 (gap >= 0 && overlap > 0).then_some((gap, -overlap, rank.unwrap_or(usize::MAX), p))
             })
-            .min();
-        let Some((.., p)) = best else {
-            return false;
-        };
-        self.focus(p);
-        true
+            .min()
+            .map(|(.., p)| p)
     }
 
     /// Moves the nearest divider above the focused pane that runs across
@@ -614,6 +709,49 @@ mod tests {
         let before = t.clone();
         assert!(!t.resize(Dir::Up, 10, AREA, MIN));
         assert_eq!(t, before);
+    }
+
+    #[test]
+    fn swap_trades_places_with_the_neighbour() {
+        let mut t = four();
+        let (r3, r2) = (t.rects(AREA)[2].1, t.rects(AREA)[1].1);
+        assert!(t.swap(Dir::Left, AREA));
+        assert_eq!(t.panes(), ids(&[1, 2, 4, 3]));
+        assert_eq!(t.focus, PaneId(4));
+        assert_eq!(t.rects(AREA)[2], (PaneId(4), r3));
+        assert!(t.swap(Dir::Up, AREA));
+        assert_eq!(t.panes(), ids(&[1, 4, 2, 3]));
+        assert_eq!(t.rects(AREA)[1], (PaneId(4), r2));
+        assert_eq!(t.mru, ids(&[4, 3, 2, 1]), "swapping is not focusing");
+        // Nothing is above the top.
+        let before = t.clone();
+        assert!(!t.swap(Dir::Up, AREA));
+        assert_eq!(t, before);
+    }
+
+    #[test]
+    fn dividers_are_found_and_dragged() {
+        let mut t = four();
+        // Dividers: the root at x 500, 2 over (3 | 4) at y 300, 3 | 4 at
+        // x 751.
+        assert_eq!(t.divider_at(AREA, 503, 100, 3), Some((0, Axis::Row)));
+        assert_eq!(t.divider_at(AREA, 600, 297, 3), Some((1, Axis::Column)));
+        assert_eq!(t.divider_at(AREA, 751, 400, 3), Some((2, Axis::Row)));
+        assert_eq!(t.divider_at(AREA, 504, 100, 3), None);
+        assert_eq!(t.divider_at(AREA, 751, 100, 3), None, "2 has no divider");
+
+        assert!(t.drag(0, 300, 0, AREA, MIN));
+        assert_eq!(t.rects(AREA)[0].1, r(0, 0, 300, 601));
+        assert!(t.drag(1, 0, 100, AREA, MIN));
+        assert_eq!(t.rects(AREA)[1].1, r(301, 0, 700, 100));
+        // 4 stops at the minimum width.
+        assert!(t.drag(2, 10_000, 0, AREA, MIN));
+        assert_eq!(t.rects(AREA)[3].1.w, 80);
+        assert!(!t.drag(3, 0, 0, AREA, MIN));
+
+        t.focus(PaneId(1));
+        t.toggle_zoom();
+        assert_eq!(t.divider_at(AREA, 300, 100, 3), None);
     }
 
     #[test]
