@@ -1810,18 +1810,12 @@ impl App {
                 })
                 .flatten();
             let (cwd, old) = (start_dir(&meta.cwd), old.as_deref());
-            // When the retries fail too, the first failure says why.
-            let started =
-                (self.spawn(id, &grids, None, &meta.shell, cwd.clone(), old)).or_else(|first| {
-                    (self.spawn(id, &grids, None, &meta.shell, None, old))
-                        .or_else(|e| {
-                            if meta.shell.is_empty() {
-                                return Err(e);
-                            }
-                            self.spawn(id, &grids, None, "", cwd, old)
-                        })
-                        .map_err(|then| joined(first, then))
-                });
+            // When the retry fails too, the first failure says why. A shell
+            // that has gone gives way in `spawn` itself.
+            let started = (self.spawn(id, &grids, None, &meta.shell, cwd, old)).or_else(|first| {
+                (self.spawn(id, &grids, None, &meta.shell, None, old))
+                    .map_err(|then| joined(first, then))
+            });
             if let Err(e) = started {
                 self.views.clear();
                 self.next_num = 1;
@@ -1973,17 +1967,30 @@ impl App {
         let mut pane = match start(&launch) {
             Ok(p) => p,
             // A shell setting that names a missing or mistyped program would
-            // fail every pane, and blitz would close as it opened. The shell
-            // blitz finds runs instead, and the pane says why.
+            // fail every pane, and blitz would close as it opened. A pane's
+            // own shell gives way to the one in the settings, and that to
+            // the shell blitz finds; the pane says why.
             Err(e) if cmd.is_none() && !setting.is_empty() => {
-                let mut auto = launch_of("");
-                auto.env.extend(plugin);
-                let p =
-                    (start(&auto)).map_err(|e| format!("cannot start {}: {e}", auto.cmdline))?;
-                let keys = keymap::keys_for(Action::Settings, &self.config.keys);
-                let using = program_name(&auto.cmdline);
+                let mut started = Err(String::new());
+                for next in fallbacks(shell, &self.config.shell) {
+                    let mut l = launch_of(next);
+                    l.env.extend(plugin.clone());
+                    match start(&l) {
+                        Ok(p) => {
+                            started = Ok((p, l));
+                            break;
+                        }
+                        Err(e) => started = Err(format!("cannot start {}: {e}", l.cmdline)),
+                    }
+                }
+                let (p, used) = started?;
+                // The settings are where to fix only their own shell.
+                let keys = (shell.is_empty())
+                    .then(|| keymap::keys_for(Action::Settings, &self.config.keys))
+                    .flatten();
+                let using = program_name(&used.cmdline);
                 fell_back = Some(shell_failed(setting, &e, &using, keys));
-                launch = auto;
+                launch = used;
                 p
             }
             Err(e) => return Err(format!("cannot start {}: {e}", launch.cmdline)),
@@ -2008,7 +2015,8 @@ impl App {
             key,
             cmd: cmd.map(str::to_owned),
             num: self.next_num,
-            shell: shell.into(),
+            // What runs: once fallen back, the shell the settings name.
+            shell: if fell_back.is_some() { "" } else { shell }.into(),
             progress: None,
             claude_working: None,
             hooks_seen: false,
@@ -6526,6 +6534,14 @@ fn shell_failed(
     format!("The shell {shell} could not start ({err}); using {using}{fix}")
 }
 
+/// The shells to try, in order, once a pane's own `shell` failed, or the
+/// one in the settings, `settings`, when it has none: the one in the
+/// settings, unless that was it, then the one blitz finds.
+fn fallbacks<'a>(shell: &str, settings: &'a str) -> Vec<&'a str> {
+    let own = !shell.is_empty() && !settings.is_empty() && shell != settings;
+    (own.then_some(settings).into_iter()).chain([""]).collect()
+}
+
 /// What blitz says when it cannot start at all, `e` being why: a GUI
 /// program has no console to print it to.
 fn start_failed(e: &str, config: Option<&Path>) -> String {
@@ -9714,6 +9730,16 @@ mod tests {
         ] {
             assert_eq!(resume_line(true, Some(bad)), None, "{bad:?}");
         }
+    }
+
+    /// A palette's shell that has gone gives way to the one the user set,
+    /// before the one blitz finds.
+    #[test]
+    fn a_shell_that_failed_gives_way_to_the_settings_then_to_blitz() {
+        assert_eq!(fallbacks("bash.exe", "cmd.exe"), ["cmd.exe", ""]);
+        assert_eq!(fallbacks("bash.exe", ""), [""]);
+        assert_eq!(fallbacks("", "cmd.exe"), [""]);
+        assert_eq!(fallbacks("cmd.exe", "cmd.exe"), [""]);
     }
 
     /// A notice that stays, as an error or the one that says the window is
