@@ -231,6 +231,7 @@ pub fn system_layout(vk: u16, scan: u16, keystate: &[u8; 256]) -> String {
     // Flag 4 leaves the dead key state alone, so the WM_CHAR that
     // TranslateMessage makes for this key still composes. A dead key
     // returns a negative count.
+    // SAFETY: `keystate` and `buf` are valid for the whole call.
     let n = unsafe { ToUnicode(vk.into(), scan.into(), Some(keystate), &mut buf, 4) };
     let n = usize::try_from(n).unwrap_or(0).min(buf.len());
     String::from_utf16_lossy(&buf[..n])
