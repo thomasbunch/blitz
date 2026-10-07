@@ -4060,12 +4060,12 @@ fn prompt_back(prompted: &mut bool, resume: &mut Option<(String, Instant)>) -> P
 fn tell_focus(v: &View, focused: bool) {
     let mut out = Vec::new();
     // Under one lock, so a program turning reports on meanwhile is told
-    // either way.
+    // either way, and its reports reach it in the order they were made.
     let mut term = lock(&v.pane.term);
     term.set_focused(focused);
     vt::encode_focus(focused, &term.input_modes(), &mut out);
-    drop(term);
     v.pane.send(out);
+    drop(term);
 }
 
 /// Whether the user is at the window: it is in front, and they touched a
