@@ -424,8 +424,9 @@ pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
         Open::Uri(u) => (u, String::new()),
         Open::File(p) => (p.display().to_string(), String::new()),
         Open::Reveal(p) => {
-            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-            let explorer = Path::new(&root).join("explorer.exe");
+            // A relative SystemRoot would run a planted explorer.exe.
+            let root = crate::shell::system_root(|k| std::env::var_os(k));
+            let explorer = root.join("explorer.exe");
             (
                 explorer.display().to_string(),
                 format!("/select,\"{}\"", p.display()),

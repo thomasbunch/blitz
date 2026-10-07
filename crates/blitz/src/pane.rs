@@ -223,6 +223,7 @@ pub fn restored(text: &str, stamp: &str, rows: u16) -> Vec<u8> {
         s.extend(line.chars().filter(|c| !c.is_control()));
         s.push_str("\r\n");
     }
+    let stamp: String = stamp.chars().filter(|c| !c.is_control()).collect();
     s.push_str(&format!("\x1b[2m── restored · {stamp} ──\x1b[m\r\n"));
     s.push_str(&"\n".repeat(rows.into()));
     s.push_str("\x1b[H");
@@ -326,6 +327,12 @@ mod tests {
         term.take_replies(&mut replies);
         assert!(replies.is_empty(), "{replies:?}");
         assert!(term.scrollback_text().starts_with("a[cb]0;t\n"));
+        // The stamp is the first line of the same file.
+        let mut term = vt::Terminal::new(vt::Options::default());
+        term.feed(&restored("a", "14:32\x1b[6n", 24));
+        term.take_replies(&mut replies);
+        assert!(replies.is_empty(), "{replies:?}");
+        assert!(term.scrollback_text().contains("restored · 14:32[6n"));
     }
 
     #[test]

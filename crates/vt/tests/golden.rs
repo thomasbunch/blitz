@@ -524,6 +524,12 @@ fn whole_clusters_reach_the_snapshot() {
     let kept = &over[..32];
     assert_eq!(t.screen_text(), format!("{kept}x"));
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), kept);
+    // Once a code point does not fit, none after it gets in, however
+    // small: the cell keeps the start of the cluster, never a gap.
+    let start = format!("a{}\u{20D0}", "\u{301}".repeat(11));
+    let mut t = run(10, 1, &format!("{start}\u{1D167}\u{20D0}x"));
+    assert_eq!(text(&cell(&snap(&mut t), 0, 0)), start);
+    assert_eq!(t.screen_text(), format!("{start}x"));
 }
 
 #[test]
@@ -592,6 +598,15 @@ fn wide_characters_that_cannot_fit() {
         ("a".into(), "".into())
     );
     assert_eq!(t.cursor(), (0, 0, true));
+    // A mark or REP after a dropped wide character goes with it, never
+    // onto, or repeating, the cell before.
+    assert_eq!(run(3, 2, "\x1b[?7lab中\x1b[b").screen_text(), "ab\n");
+    assert_eq!(run(3, 2, "\x1b[?7lab中\u{301}").screen_text(), "ab\n");
+    assert_eq!(
+        run(3, 2, "\x1b[?7lab\u{1F44D}\u{1F3FD}").screen_text(),
+        "ab\n"
+    );
+    assert_eq!(run(1, 1, "a中\u{301}").screen_text(), "a");
     // VS16 on the last column keeps the emoji narrow: the cluster cannot
     // grow into the next row.
     let mut t = run(3, 2, "ab\u{2764}\u{FE0F}x");
@@ -1075,6 +1090,22 @@ fn resize_under_a_bare_alternate_screen_keeps_the_main_bottom() {
     t.resize(10, 2);
     feed(&mut t, "\x1b[?47l");
     assert_eq!(t.screen_text(), "top\ntext");
+}
+
+/// Squeezed to one column and back under the alternate screen, the main
+/// screen keeps its text: its saved cursor, past the end of a one-column
+/// row, must not lose its place in the rewrap.
+#[test]
+fn hidden_main_screen_survives_a_squeeze_to_one_column() {
+    let main: String = (0..20).map(|i| format!("line {i}\r\n")).collect();
+    let mut t = run(80, 3, &format!("{main}\x1b[50Gx\x1b[?1049h"));
+    t.resize(1, 3);
+    t.resize(80, 3);
+    feed(&mut t, "\x1b[?1049l");
+    assert_eq!(t.scrollback_text(), lines(0..=17));
+    // One column is too narrow to rewrap into, so the rows on screen were
+    // cut to it; scrollback was not.
+    assert_eq!(t.screen_text(), "l\nl\n");
 }
 
 /// A change of rows alone keeps the spacer a wide character leaves when it
