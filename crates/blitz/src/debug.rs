@@ -416,6 +416,8 @@ impl Runner {
             ..Default::default()
         });
         term.set_prompt_token(&token);
+        // A script types as the user would, into a pane with focus.
+        term.set_focused(true);
         let s = Arc::new(Shared {
             state: Mutex::new(State {
                 term,

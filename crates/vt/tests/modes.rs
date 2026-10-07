@@ -62,7 +62,8 @@ fn colon_in_a_mode_list_ignores_it() {
     t.feed(b"\x1b[?7$p\x1b[4$p");
     let mut r = Vec::new();
     t.take_replies(&mut r);
-    assert_eq!(r, b"\x1b[?7;1$y\x1b[4;2$y");
+    // After the focus report that turning 1004 on sends.
+    assert_eq!(r, b"\x1b[O\x1b[?7;1$y\x1b[4;2$y");
 }
 
 #[test]

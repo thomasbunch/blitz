@@ -99,7 +99,8 @@ fn decrqm_table() {
         ("\x1b[?1000h\x1b[?1000$p", "\x1b[?1000;1$y"),
         ("\x1b[?1002h\x1b[?1002$p", "\x1b[?1002;1$y"),
         ("\x1b[?1004$p", "\x1b[?1004;2$y"),
-        ("\x1b[?1004h\x1b[?1004$p", "\x1b[?1004;1$y"),
+        // Turning it on also reports focus, which the terminal has not.
+        ("\x1b[?1004h\x1b[?1004$p", "\x1b[O\x1b[?1004;1$y"),
         ("\x1b[?1006h\x1b[?1006$p", "\x1b[?1006;1$y"),
         ("\x1b[?1048$p", "\x1b[?1048;2$y"),
         ("\x1b[?1048h\x1b[?1048$p", "\x1b[?1048;2$y"),
@@ -141,6 +142,24 @@ fn device_status() {
     assert_eq!(ask("\x1b[5n"), "\x1b[0n");
     // Reports blitz does not make get no answer at all.
     assert_eq!(ask("\x1b[?5n\x1b[?15n\x1b[?26n\x1b[7n\x1b[n"), "");
+}
+
+/// Turning focus reports on tells the program where focus is now, even
+/// when they were on already, as ConPTY turns them on for itself first.
+#[test]
+fn focus_reports_start_with_the_state() {
+    assert_eq!(ask("\x1b[?1004h"), "\x1b[O");
+    let mut t = Terminal::new(opts());
+    t.set_focused(true);
+    assert_eq!(ask_on(&mut t, "\x1b[?1004h"), "\x1b[I");
+    assert_eq!(ask_on(&mut t, "\x1b[?1004h"), "\x1b[I", "on already");
+    // Not when it goes off.
+    assert_eq!(ask_on(&mut t, "\x1b[?1004l"), "");
+    t.set_focused(false);
+    assert_eq!(ask_on(&mut t, "\x1b[?1004h"), "\x1b[O");
+    // A reset keeps what the host said.
+    t.set_focused(true);
+    assert_eq!(ask_on(&mut t, "\x1b[?1004l\x1bc\x1b[?1004h"), "\x1b[I");
 }
 
 #[test]

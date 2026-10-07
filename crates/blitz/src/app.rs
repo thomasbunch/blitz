@@ -1346,9 +1346,7 @@ impl App {
         if self.focused {
             for (id, f) in [(before, false), (now, true)] {
                 if let Some(v) = id.and_then(|id| self.view(id)) {
-                    let mut out = Vec::new();
-                    vt::encode_focus(f, &lock(&v.pane.term).input_modes(), &mut out);
-                    v.pane.send(out);
+                    tell_focus(v, f);
                 }
             }
             if let Some(id) = now {
@@ -3683,6 +3681,19 @@ fn note_hook(
     *msg = body;
 }
 
+/// Tells the program in `v` whether its pane has keyboard focus: now if it
+/// asked for focus reports, or else once it does.
+fn tell_focus(v: &View, focused: bool) {
+    let mut out = Vec::new();
+    // Under one lock, so a program turning reports on meanwhile is told
+    // either way.
+    let mut term = lock(&v.pane.term);
+    term.set_focused(focused);
+    vt::encode_focus(focused, &term.input_modes(), &mut out);
+    drop(term);
+    v.pane.send(out);
+}
+
 /// Whether the user is at the window: it is in front, and they touched a
 /// key or the mouse in the last `AWAY_AFTER`, `idle` being how long ago.
 /// Walking away from blitz must not let a question pass as seen.
@@ -4038,9 +4049,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.set_hover(None);
                 // The cursor is hollow while the window is in the background.
                 self.request_redraw();
-                let mut out = Vec::new();
-                vt::encode_focus(f, &self.modes(), &mut out);
-                self.send(out);
+                if let Some(v) = self.current() {
+                    tell_focus(v, f);
+                }
                 if f && let Some(id) = self.focus_id() {
                     self.attention(id, Ev::Attended);
                 }
