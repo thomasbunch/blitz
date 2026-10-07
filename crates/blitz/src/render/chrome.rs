@@ -20,6 +20,9 @@ pub struct Session {
     pub state: Attn,
     /// When `state` last changed.
     pub since: Instant,
+    /// The user has looked at `state`; a question they saw is drawn
+    /// outlined until they answer it.
+    pub seen: bool,
     /// Latest one-line message: the hook message, else the title.
     pub msg: String,
     /// What the program last reported of its progress.
@@ -348,7 +351,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             }
             let cy = r.y + (hh - 1) / 2;
             match state {
-                Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, 0.0, c.accent),
+                Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, ring(sess), c.accent),
                 Attn::DoneUnseen => mark(p, right - s(4.0), cy, 7.0, 1.5, c.name),
                 Attn::Error => mark(p, right - s(4.0), cy, 7.0, 0.0, c.error),
                 Attn::Working | Attn::Idle => {}
@@ -482,7 +485,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let (mx, my) = (row.x + s(12.0), y + s(7.0) + s(5.0) + s(4.0));
                 match x.state {
-                    Attn::NeedsYou => mark(p, mx, my, 8.0, 0.0, c.accent),
+                    Attn::NeedsYou => mark(p, mx, my, 8.0, ring(Some(x)), c.accent),
                     Attn::DoneUnseen => mark(p, mx, my, 8.0, 1.5, c.name),
                     Attn::Error => mark(p, mx, my, 8.0, 0.0, c.error),
                     Attn::Working | Attn::Idle => {}
@@ -505,11 +508,12 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     p.push(Prim::Shape {
                         r: chip,
                         radius: 4.0 * m.scale,
-                        stroke: 0.0,
+                        stroke: ring(Some(x)) * m.scale,
                         color: c.accent,
                     });
                     let cy = chip.y + (chip_h - th) / 2;
-                    text(p, chip.x + s(6.0), cy, &word, c.chip_fg, true);
+                    let fg = if x.seen { c.accent } else { c.chip_fg };
+                    text(p, chip.x + s(6.0), cy, &word, fg, true);
                     chip.x
                 } else {
                     let wx = right - text_w(&word, tw);
@@ -610,7 +614,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let (cx, cy) = (row.w / 2, y + row.h / 2);
                 match x.state {
-                    Attn::NeedsYou => mark(p, cx, cy, 7.0, 0.0, c.accent),
+                    Attn::NeedsYou => mark(p, cx, cy, 7.0, ring(Some(x)), c.accent),
                     Attn::DoneUnseen => mark(p, cx, cy, 8.0, 1.5, c.name),
                     Attn::Error => mark(p, cx, cy, 7.0, 0.0, c.error),
                     Attn::Idle => mark(p, cx, cy, 3.0, 0.0, c.idle),
@@ -1206,6 +1210,12 @@ fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
     lines.into_iter().map(|l| fit(&l, max, cw)).collect()
 }
 
+/// The stroke of a needs-you mark: filled until the user has seen the
+/// question, then a ring until they answer it.
+fn ring(x: Option<&Session>) -> f32 {
+    if x.is_some_and(|x| x.seen) { 1.5 } else { 0.0 }
+}
+
 /// The state shown on the right of a sidebar row.
 fn state_word(x: &Session, now: Instant) -> String {
     match (x.state, x.exit_code) {
@@ -1363,6 +1373,7 @@ mod tests {
             branch: Some("main".into()),
             state,
             since: now - Duration::from_secs(72),
+            seen: false,
             msg: String::new(),
             progress: None,
             exit_code: None,
@@ -1462,6 +1473,28 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, Prim::Branch(r, _) if r.w == 10))
         );
+    }
+
+    /// A question the user saw but did not answer stays, outlined.
+    #[test]
+    fn a_seen_question_is_outlined() {
+        let (win, mut sessions, now) = fleet(true);
+        let accent = crate::theme::blitz(false).ui.accent;
+        let strokes = |sessions: &[Session]| -> Vec<f32> {
+            let c = build(&model(&win, sessions, now));
+            (c.prims.iter())
+                .filter_map(|p| match p {
+                    Prim::Shape { stroke, color, .. } if *color == accent => Some(*stroke),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The pane header's dot, the row's dot and the chip.
+        assert_eq!(strokes(&sessions), [0.0; 3]);
+        sessions[0].seen = true;
+        assert_eq!(strokes(&sessions), [1.5; 3]);
+        let c = build(&model(&win, &sessions, now));
+        assert!(texts(&c).contains(&"needs you"));
     }
 
     #[test]

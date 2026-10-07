@@ -1938,6 +1938,7 @@ impl App {
                     branch: p.branch.clone(),
                     state: p.attn.state,
                     since: p.attn.since,
+                    seen: p.attn.seen,
                     msg: if p.msg.is_empty() {
                         p.title.clone()
                     } else {
@@ -2187,7 +2188,8 @@ impl App {
         }
     }
 
-    /// Sends input the user typed: the view follows the cursor again.
+    /// Sends input the user typed: the view follows the cursor again, and
+    /// it answers what the session asked.
     fn typed(&mut self, bytes: Vec<u8>) {
         if self.selection.take().is_some() {
             self.request_redraw();
@@ -2195,6 +2197,22 @@ impl App {
         if let Some(v) = self.current() {
             lock(&v.pane.term).scroll_viewport(isize::MIN);
             v.pane.send(bytes);
+            let id = v.pane.id;
+            self.answered(id);
+        }
+    }
+
+    /// The user typed, pasted or clicked into session `id`. A question it
+    /// showed is answered, so its text goes too.
+    fn answered(&mut self, id: PaneId) {
+        let asked = self
+            .view(id)
+            .is_some_and(|v| v.pane.attn.state == Attn::NeedsYou);
+        if self.attention(id, Ev::Answered)
+            && asked
+            && let Some(v) = self.view_mut(id)
+        {
+            v.pane.msg.clear();
         }
     }
 
@@ -2363,7 +2381,7 @@ impl App {
             Action::JumpToAttention => {
                 let waiting = (self.views.iter())
                     .filter(|v| Some(v.pane.id) != before)
-                    .map(|v| (v.pane.id, v.pane.attn.state, v.pane.attn.since));
+                    .map(|v| (v.pane.id, v.pane.attn));
                 if let Some(id) = crate::attention::jump_target(waiting) {
                     self.show(id);
                 }
@@ -2597,10 +2615,10 @@ impl App {
                 self.taskbar_progress();
                 self.request_redraw();
             }
-            // Like a question from Claude Code: it needs the user, unless
-            // they are already looking at the pane.
+            // It needs the user, unless they are already looking at the
+            // pane; looking is all it asks for.
             Event::Bell if self.config.bell_attention => {
-                self.attention(id, Ev::NeedsYou);
+                self.attention(id, Ev::Bell);
             }
             _ => {}
         }
@@ -2878,6 +2896,10 @@ impl App {
                 MouseKind::Release
             };
             self.mouse_report(id, kind, b as u8, mods);
+            // A click can pick an answer in the program's menu.
+            if pressed {
+                self.answered(id);
+            }
             return;
         }
         if b != 0 {
@@ -4935,7 +4957,7 @@ mod tests {
         let mut feed = |ev, attended| relabels(ev, a.apply(ev, attended, t0));
         assert!(feed(Ev::Working, true));
         assert!(!feed(Ev::Working, true), "a repeat");
-        assert!(!feed(Ev::NeedsYou, true), "ignored while looking");
+        assert!(feed(Ev::NeedsYou, true), "seen, but it still asks");
         // Watched to the end: done is seen at once and lands on idle, and
         // the end of the session still clears the message.
         assert!(feed(Ev::Done, true));
@@ -4956,13 +4978,17 @@ mod tests {
         a.apply(Ev::NeedsYou, false, t0);
         assert!(!ends_game(a, Ev::NeedsYou, t0), "a repeat");
         // The rule `attention()` relies on by closing the game first: a
-        // needs-you on a pane in view is seen and does not relabel it.
-        // This pins `PaneAttn` only; the order inside `attention()` is
-        // not covered here.
+        // needs-you on a pane in view is seen at once. This pins
+        // `PaneAttn` only; the order inside `attention()` is not covered
+        // here.
         let mut b = crate::attention::PaneAttn::new(t0);
         b.apply(Ev::Working, true, t0);
-        assert!(!relabels(Ev::NeedsYou, b.apply(Ev::NeedsYou, true, t0)));
-        assert_eq!(b.state, Attn::Working);
+        assert!(b.apply(Ev::NeedsYou, true, t0));
+        assert_eq!((b.state, b.seen), (Attn::NeedsYou, true));
+        // A bell there needs nothing at all.
+        let mut c = crate::attention::PaneAttn::new(t0);
+        assert!(ends_game(c, Ev::Bell, t0));
+        assert!(!c.apply(Ev::Bell, true, t0));
     }
 
     #[test]
