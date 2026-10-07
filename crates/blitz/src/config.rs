@@ -6,26 +6,20 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub font_family: String,
-    /// Used when `font_family` is not installed.
-    pub font_fallback: String,
     /// Points; pixels = pt * dpi / 72.
     pub font_size: f32,
-    pub line_height: f32,
     /// A theme name, or `light:NAME,dark:NAME` to follow the Windows app
     /// theme; see [`crate::theme::choose`].
     pub theme: String,
-    pub accent: Option<u32>,
     /// Empty means detect: pwsh, then Windows PowerShell, then cmd.
     pub shell: String,
-    pub shell_args: Vec<String>,
     pub shell_integration: bool,
     pub scrollback_lines: usize,
     /// Flash the taskbar button when a session needs attention.
     pub flash: bool,
     /// Whether BEL in an unfocused pane asks for attention.
     pub bell_attention: bool,
-    pub command_finish_after_ms: u64,
-    /// Look for a newer release on GitHub at start and once a day.
+    /// Look for a newer release on GitHub at start and every six hours.
     pub check_updates: bool,
     /// Reopen the last window's tabs, splits and folders at start.
     pub restore_session: bool,
@@ -34,31 +28,23 @@ pub struct Config {
     /// Save each pane's recent output and show it again on the next start.
     /// Off by default: old output can hold secrets.
     pub restore_scrollback: bool,
-    /// Overrides as (chord, action) pairs, e.g. ("ctrl+shift+r", "split_right").
-    pub keys: Vec<(String, String)>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             font_family: "Cascadia Mono".into(),
-            font_fallback: "Consolas".into(),
             font_size: 11.0,
-            line_height: 1.0,
             theme: crate::theme::DEFAULT.into(),
-            accent: None,
             shell: String::new(),
-            shell_args: Vec::new(),
             shell_integration: true,
             scrollback_lines: 10_000,
             flash: true,
             bell_attention: true,
-            command_finish_after_ms: 5000,
             check_updates: true,
             restore_session: true,
             restore_claude: true,
             restore_scrollback: false,
-            keys: vec![("ctrl+shift+r".into(), "split_right".into())],
         }
     }
 }
@@ -204,8 +190,8 @@ impl Config {
     pub fn parse(text: &str) -> Config {
         let mut c = Config::default();
         // Notepad may save with a byte order mark.
-        for line in text.trim_start_matches('\u{feff}').lines() {
-            if let Some((key, value)) = entry(line) {
+        for line in split_lines(text.trim_start_matches('\u{feff}')).0 {
+            if let Some((key, value, _)) = entry(line) {
                 c.set(key, value);
             }
         }
@@ -239,10 +225,11 @@ impl Config {
     pub fn set(&mut self, key: &str, value: &str) -> bool {
         let text = unquote(value);
         let bare = text.is_none().then_some(value);
-        let num = bare.and_then(|v| v.parse::<f64>().ok());
-        let text = text.unwrap_or(value).to_string();
+        let num = bare.and_then(number);
+        let text = text.unwrap_or_else(|| value.to_string());
         match key {
-            "theme" if !text.is_empty() => self.theme = text,
+            "theme" | "font_family" if text.is_empty() => return false,
+            "theme" => self.theme = text,
             "font_family" => self.font_family = text,
             "shell" => self.shell = text,
             "font_size" => match num.filter(|n| (4.0..=72.0).contains(n)) {
@@ -282,47 +269,114 @@ impl Config {
     /// Reads `config.toml` again while blitz runs. `None` when the file is
     /// there but cannot be read now, as while an editor saves it.
     pub fn reload() -> Option<Config> {
-        let Some(d) = dir() else {
-            return Some(Config::default());
-        };
-        match std::fs::read_to_string(d.join(FILE)) {
-            Ok(text) => Some(Config::parse(&text)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Config::default()),
+        match dir() {
+            Some(d) => Config::reload_from(&d.join(FILE)),
+            None => Some(Config::default()),
+        }
+    }
+
+    fn reload_from(path: &Path) -> Option<Config> {
+        match std::fs::read(path) {
+            Ok(bytes) => Some(Config::parse(&decode(&bytes))),
+            // A folder in its place never becomes readable.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound || path.is_dir() => {
+                Some(Config::default())
+            }
             Err(_) => None,
         }
     }
 
     /// A missing or unreadable file gives the defaults.
     fn read(path: &Path) -> Config {
-        Config::parse(&std::fs::read_to_string(path).unwrap_or_default())
+        Config::parse(&std::fs::read(path).map_or_else(|_| String::new(), |b| decode(&b)))
     }
 }
 
-/// The key and value of a `key = value` line, without the comment after
-/// it. A quoted value keeps its quotes and may hold a `#`.
-fn entry(line: &str) -> Option<(&str, &str)> {
+/// A config file's text. Notepad can save UTF-16 ("Unicode"), and a file
+/// saved as ANSI is not UTF-8: its other bytes become U+FFFD rather than
+/// costing every setting in the file.
+fn decode(bytes: &[u8]) -> String {
+    let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
+        let units: Vec<u16> = rest.as_chunks().0.iter().map(|&c| unit(c)).collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xff, 0xfe, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xfe, 0xff, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The lines of `text` and the line ending it uses: `\r\n`, `\n`, or a
+/// lone `\r` as old Mac editors wrote.
+fn split_lines(text: &str) -> (Vec<&str>, &'static str) {
+    if text.contains('\n') || !text.contains('\r') {
+        let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        return (text.lines().collect(), nl);
+    }
+    let body = text.strip_suffix('\r').unwrap_or(text);
+    (body.split('\r').collect(), "\r")
+}
+
+/// A number as TOML writes it: `11`, `13.5`, `+12`, `100_000`. An
+/// underscore must sit between two digits.
+fn number(v: &str) -> Option<f64> {
+    let b = v.as_bytes();
+    let digit = |i: Option<usize>| i.and_then(|i| b.get(i)).is_some_and(u8::is_ascii_digit);
+    let ok = (0..b.len())
+        .filter(|&i| b[i] == b'_')
+        .all(|i| digit(i.checked_sub(1)) && digit(Some(i + 1)));
+    ok.then(|| v.replace('_', "").parse().ok()).flatten()
+}
+
+/// The key and value of a `key = value` line, and what follows the value,
+/// such as a comment. A quoted value keeps its quotes and may hold a `#`.
+fn entry(line: &str) -> Option<(&str, &str, &str)> {
     let (key, rest) = line.split_once('=')?;
     let rest = rest.trim_start();
-    let value = match rest.chars().next() {
-        Some(q @ ('"' | '\'')) => &rest[..rest[1..].find(q)? + 2],
-        _ => rest.split('#').next().unwrap_or_default().trim(),
+    let (value, after) = match rest.chars().next() {
+        Some(q @ ('"' | '\'')) => rest.split_at(closing(rest, q)? + 1),
+        _ => match rest.find('#') {
+            Some(i) => (rest[..i].trim(), &rest[i..]),
+            None => (rest.trim(), ""),
+        },
     };
-    Some((key.trim(), value))
+    Some((key.trim(), value, after))
+}
+
+/// Where the string that starts `s` with quote `q` ends. In a `"` string
+/// `\"` is a quote, unless that leaves the string open: then the first
+/// `"` ends it, so a path ending in `\` reads as it always did.
+fn closing(s: &str, q: char) -> Option<usize> {
+    let first = s[1..].find(q)? + 1;
+    if q == '\'' {
+        return Some(first);
+    }
+    let b = s.as_bytes();
+    let escaped = (first..b.len()).find(|&i| b[i] == b'"' && b[i - 1] != b'\\');
+    Some(escaped.unwrap_or(first))
 }
 
 /// The text of a quoted value; `None` when it is not quoted.
-fn unquote(value: &str) -> Option<&str> {
+fn unquote(value: &str) -> Option<String> {
     let q = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
-    value.strip_prefix(q)?.strip_suffix(q)
+    let inner = value.strip_prefix(q)?.strip_suffix(q)?;
+    Some(match q {
+        '"' => inner.replace("\\\"", "\""),
+        _ => inner.to_string(),
+    })
 }
 
 /// `s` as a TOML string. One holding `"` or `\` is a literal string, as a
-/// basic one would read those as escapes.
+/// basic one would read those as escapes; one that also holds `'` is a
+/// basic string with its `"` escaped.
 pub fn quote(s: &str) -> String {
-    if s.contains(['"', '\\']) && !s.contains('\'') {
+    if !s.contains(['"', '\\']) {
+        format!("\"{s}\"")
+    } else if !s.contains('\'') {
         format!("'{s}'")
     } else {
-        format!("\"{s}\"")
+        format!("\"{}\"", s.replace('"', "\\\""))
     }
 }
 
@@ -338,43 +392,70 @@ pub fn dir() -> Option<PathBuf> {
 /// moves it over the old one, so a failed save never leaves half a file.
 pub fn save(key: &str, value: Option<&str>) -> std::io::Result<()> {
     let dir = dir().ok_or_else(|| std::io::Error::other("no APPDATA"))?;
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(FILE);
-    let old = match std::fs::read_to_string(&path) {
+    save_in(&dir, key, value)
+}
+
+fn save_in(dir: &Path, key: &str, value: Option<&str>) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut path = dir.join(FILE);
+    // A config.toml linked from elsewhere, as from a dotfiles folder, is
+    // written where the link points, so the link stays.
+    if path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        path = std::fs::canonicalize(&path)?;
+    }
+    let old = match std::fs::read(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        r => r?,
+        r => decode(&r?),
     };
-    let tmp = dir.join("config.toml.new");
-    std::fs::write(&tmp, with_value(&old, key, value))?;
-    std::fs::rename(tmp, path)
+    // Named for this process, so two blitz windows saving at once never
+    // write or move each other's file.
+    let tmp = path.with_file_name(format!("{FILE}.{}.new", std::process::id()));
+    let saved = std::fs::write(&tmp, with_value(&old, key, value))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    saved
 }
 
 /// `text` with its last `key` line, the one that counts, set to `value`,
-/// or one added at the end. With no value, every `key` line goes.
+/// keeping a comment after the old value, or one added before the first
+/// `[table]` (or at the end). With no value, every `key` line goes. The
+/// file keeps its line endings.
 fn with_value(text: &str, key: &str, value: Option<&str>) -> String {
     let bom = if text.starts_with('\u{feff}') {
         "\u{feff}"
     } else {
         ""
     };
-    let mut lines: Vec<String> = (text.trim_start_matches('\u{feff}').lines())
-        .map(str::to_string)
-        .collect();
-    let is_key = |l: &String| entry(l).is_some_and(|(k, _)| k == key);
+    let (lines, nl) = split_lines(text.trim_start_matches('\u{feff}'));
+    let mut lines: Vec<String> = lines.into_iter().map(str::to_string).collect();
+    let is_key = |l: &String| entry(l).is_some_and(|(k, _, _)| k == key);
     match value {
-        Some(v) => {
-            let line = format!("{key} = {v}");
-            match lines.iter().rposition(is_key) {
-                Some(i) => lines[i] = line,
-                None => lines.push(line),
+        Some(v) => match lines.iter().rposition(is_key) {
+            Some(i) => {
+                let after = entry(&lines[i]).map_or("", |e| e.2).trim_start();
+                let comment = if after.starts_with('#') {
+                    format!(" {after}")
+                } else {
+                    String::new()
+                };
+                lines[i] = format!("{key} = {v}{comment}");
             }
-        }
+            None => {
+                let table = lines.iter().position(|l| l.trim_start().starts_with('['));
+                lines.insert(table.unwrap_or(lines.len()), format!("{key} = {v}"));
+            }
+        },
         None => lines.retain(|l| !is_key(l)),
     }
     if lines.is_empty() {
         return bom.to_string();
     }
-    format!("{bom}{}\n", lines.join("\n"))
+    format!("{bom}{}{nl}", lines.join(nl))
 }
 
 #[cfg(test)]
@@ -463,9 +544,10 @@ mod tests {
     fn saving_a_value_keeps_the_rest_of_the_file() {
         let theme = |text: &str, name: &str| with_value(text, "theme", Some(&quote(name)));
         assert_eq!(theme("", "A"), "theme = \"A\"\n");
+        // Windows line endings stay, and win over a stray Unix one.
         assert_eq!(
             theme("flash = false\r\n# theme = old\n", "A"),
-            "flash = false\n# theme = old\ntheme = \"A\"\n"
+            "flash = false\r\n# theme = old\r\ntheme = \"A\"\r\n"
         );
         let saved = theme("\u{feff}theme = old\nflash = false", "B C");
         assert_eq!(saved, "\u{feff}theme = \"B C\"\nflash = false\n");
@@ -488,9 +570,293 @@ mod tests {
         );
     }
 
+    /// A folder for one test, gone when the test ends, even if it fails.
+    struct Temp(PathBuf);
+
+    impl Temp {
+        fn new(name: &str) -> Temp {
+            let dir =
+                std::env::temp_dir().join(format!("blitz-config-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Temp(dir)
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn config_missing_file_gives_defaults() {
-        let path = std::env::temp_dir().join("blitz-no-such-config.toml");
+        let t = Temp::new("missing");
+        let path = t.0.join(FILE);
         assert_eq!(Config::read(&path), Config::default());
+        assert_eq!(Config::reload_from(&path), Some(Config::default()));
+    }
+
+    #[test]
+    fn reload_reads_the_file_and_waits_out_what_it_cannot_read() {
+        let t = Temp::new("reload");
+        let path = t.0.join(FILE);
+        std::fs::write(&path, "flash = false\n").unwrap();
+        assert!(!Config::reload_from(&path).expect("readable").flash);
+        // A folder where the file should be is no file: the defaults.
+        let folder = t.0.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        assert_eq!(Config::reload_from(&folder), Some(Config::default()));
+        assert_eq!(Config::read(&folder), Config::default());
+    }
+
+    #[test]
+    fn every_setting_round_trips_a_value_other_than_its_default() {
+        let mut c = Config::default();
+        for (k, v) in [
+            ("theme", "\"Rose Pine\""),
+            ("font_family", "\"Consolas\""),
+            ("font_size", "13.5"),
+            ("shell", r"'C:\x\sh.exe'"),
+            ("shell_integration", "false"),
+            ("scrollback_lines", "0"),
+            ("restore_session", "false"),
+            ("restore_claude", "false"),
+            ("restore_scrollback", "true"),
+            ("flash", "false"),
+            ("bell_attention", "false"),
+            ("check_updates", "false"),
+        ] {
+            assert!(c.set(k, v), "{k} = {v}");
+        }
+        let d = Config::default();
+        for s in SETTINGS {
+            assert_ne!(c.get(s.key), d.get(s.key), "{} kept its default", s.key);
+        }
+        let text: String = (SETTINGS.iter())
+            .map(|s| format!("{} = {}\n", s.key, c.get(s.key)))
+            .collect();
+        assert_eq!(Config::parse(&text), c);
+        // As the settings panel writes them, one at a time.
+        let mut file = String::new();
+        for s in SETTINGS {
+            file = with_value(&file, s.key, Some(&c.get(s.key)));
+        }
+        assert_eq!(Config::parse(&file), c);
+    }
+
+    #[test]
+    fn readme_documents_every_setting() {
+        let readme = include_str!("../../../README.md");
+        let d = Config::default();
+        for s in SETTINGS {
+            let row = format!("| `{}` | `{}` |", s.key, d.get(s.key));
+            assert!(readme.contains(&row), "README.md has no row {row}");
+        }
+        for line in readme.lines().filter(|l| l.starts_with("| `")) {
+            let key = line[3..].split('`').next().unwrap_or_default();
+            let known = SETTINGS.iter().any(|s| s.key == key);
+            assert!(
+                known,
+                "README.md documents {key}, which blitz does not read"
+            );
+        }
+    }
+
+    #[test]
+    fn one_odd_byte_keeps_the_other_settings() {
+        // Notepad's ANSI: not UTF-8.
+        let ansi = b"# R\xe9glages\nflash = false\nfont_family = \"Caf\xe9\"\n";
+        let c = Config::parse(&decode(ansi));
+        assert!(!c.flash);
+        assert_eq!(c.font_family, "Caf\u{fffd}");
+        // Notepad's "Unicode": UTF-16 with a byte order mark.
+        let text = "flash = false\r\ntheme = \"Rose Pine\"\r\n";
+        let le: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let be: Vec<u8> = [0xfe, 0xff]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        for bytes in [le, be] {
+            let c = Config::parse(&decode(&bytes));
+            assert!(!c.flash);
+            assert_eq!(c.theme, "Rose Pine");
+        }
+        // Through the file, at start and on a reload.
+        let t = Temp::new("ansi");
+        let path = t.0.join(FILE);
+        std::fs::write(&path, ansi).unwrap();
+        assert!(!Config::read(&path).flash);
+        assert!(!Config::reload_from(&path).expect("readable").flash);
+    }
+
+    #[test]
+    fn numbers_take_what_toml_writes_and_nothing_out_of_range() {
+        let ok = |k: &str, v: &str| Config::default().set(k, v);
+        for v in ["4", "72", "+12", "1e1", "13.5", "1_1"] {
+            assert!(ok("font_size", v), "font_size = {v}");
+        }
+        for v in [
+            "NaN", "nan", "inf", "-inf", "3.99", "72.01", "-1", "1e308", "", "12pt", "0x10",
+            "\"12\"", "_12", "12_", "1__2", "1_.5",
+        ] {
+            assert!(!ok("font_size", v), "font_size = {v}");
+        }
+        for v in ["0", "100000", "100_000", "1e5", "-0"] {
+            assert!(ok("scrollback_lines", v), "scrollback_lines = {v}");
+        }
+        for v in ["-1", "100001", "1e400", "0.5", "inf", "NaN"] {
+            assert!(!ok("scrollback_lines", v), "scrollback_lines = {v}");
+        }
+        let c = Config::parse("font_size = 1_2\nscrollback_lines = 20_000");
+        assert_eq!((c.font_size, c.scrollback_lines), (12.0, 20_000));
+    }
+
+    #[test]
+    fn names_must_not_be_empty() {
+        let mut c = Config::default();
+        assert!(!c.set("font_family", "\"\""));
+        assert!(!c.set("theme", "''"));
+        assert_eq!(c, Config::default());
+        // An empty shell is the automatic one.
+        assert!(c.set("shell", "\"\""));
+    }
+
+    #[test]
+    fn quote_round_trips_any_name() {
+        for s in [
+            r"C:\a\b",
+            "it's",
+            r#"a"b"#,
+            r#"O'Neil "x""#,
+            r"C:\it's\sh.exe",
+            r#"'"'"#,
+            "plain",
+            "",
+            "No #1",
+        ] {
+            let line = format!("font_family = {} # mine", quote(s));
+            assert_eq!(
+                Config::parse(&line).font_family,
+                if s.is_empty() { "Cascadia Mono" } else { s },
+                "{line}"
+            );
+        }
+        // A hand-written path ending in a backslash reads as before.
+        assert_eq!(Config::parse(r#"shell = "C:\tools\""#).shell, r"C:\tools\");
+    }
+
+    #[test]
+    fn parse_ignores_what_toml_would_not_read() {
+        // Keys and booleans are lower case.
+        let c = Config::parse("Flash = false\nbell_attention = False\n");
+        assert_eq!(c, Config::default());
+        // A later line that does not read keeps the earlier one.
+        assert!(!Config::parse("flash = false\nflash = maybe\n").flash);
+        // A later line that reads wins.
+        assert!(Config::parse("flash = false\nflash = true\n").flash);
+        // Old Mac line endings are lines too.
+        let c = Config::parse("flash = false\rcheck_updates = false\r");
+        assert!(!c.flash && !c.check_updates);
+    }
+
+    #[test]
+    fn saving_keeps_comments_line_endings_and_tables() {
+        let flash = |text: &str| with_value(text, "flash", Some("true"));
+        assert_eq!(flash("flash = false # mine\n"), "flash = true # mine\n");
+        assert_eq!(
+            flash("flash = \"x\"   # quoted\n"),
+            "flash = true # quoted\n"
+        );
+        assert_eq!(flash("flash = false junk\n"), "flash = true\n");
+        assert_eq!(
+            flash("# a\r\nflash = false\r\ntheme = \"A\"\r\n"),
+            "# a\r\nflash = true\r\ntheme = \"A\"\r\n"
+        );
+        assert_eq!(
+            flash("theme = \"A\"\rx = 1\r"),
+            "theme = \"A\"\rx = 1\rflash = true\r"
+        );
+        // TOML puts a key after a [table] in the table.
+        assert_eq!(
+            flash("theme = \"A\"\n[other]\nkey = 1\n"),
+            "theme = \"A\"\nflash = true\n[other]\nkey = 1\n"
+        );
+        assert_eq!(
+            with_value("a = 1\r\nflash = false\r\n", "flash", None),
+            "a = 1\r\n"
+        );
+    }
+
+    #[test]
+    fn save_replaces_the_file_whole() {
+        let t = Temp::new("save");
+        let dir = t.0.join("new");
+        save_in(&dir, "flash", Some("false")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FILE)).unwrap(),
+            "flash = false\n"
+        );
+        save_in(&dir, "theme", Some("\"A\"")).unwrap();
+        save_in(&dir, "flash", None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FILE)).unwrap(),
+            "theme = \"A\"\n"
+        );
+        // Only config.toml is left: no temporary file.
+        let names: Vec<_> = (std::fs::read_dir(&dir).unwrap().flatten())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, [FILE]);
+        // A file in the old encoding comes back as UTF-8, its settings kept.
+        std::fs::write(dir.join(FILE), b"# R\xe9glages\nflash = false\n").unwrap();
+        save_in(&dir, "theme", Some("\"B\"")).unwrap();
+        let c = Config::read(&dir.join(FILE));
+        assert!(!c.flash);
+        assert_eq!(c.theme, "B");
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_temporary_file() {
+        let t = Temp::new("failed");
+        // A folder where config.toml should be: the move fails.
+        std::fs::create_dir(t.0.join(FILE)).unwrap();
+        assert!(save_in(&t.0, "flash", Some("false")).is_err());
+        let names: Vec<_> = (std::fs::read_dir(&t.0).unwrap().flatten())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, [FILE]);
+    }
+
+    #[test]
+    fn save_writes_through_a_linked_file() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as link;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as link;
+        let t = Temp::new("link");
+        let real = t.0.join("dotfiles");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("blitz.toml"), "# mine\n").unwrap();
+        let dir = t.0.join("blitz");
+        std::fs::create_dir(&dir).unwrap();
+        if let Err(e) = link(real.join("blitz.toml"), dir.join(FILE)) {
+            // Windows lets only admins and developer mode make links;
+            // CI's runners are admins.
+            eprintln!("skipped, cannot make a link here: {e}");
+            return;
+        }
+        save_in(&dir, "flash", Some("false")).unwrap();
+        let meta = std::fs::symlink_metadata(dir.join(FILE)).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link stays");
+        let target = std::fs::read_to_string(real.join("blitz.toml")).unwrap();
+        assert_eq!(target, "# mine\nflash = false\n");
+        let left: Vec<_> = (std::fs::read_dir(&real).unwrap().flatten())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, ["blitz.toml"]);
     }
 }

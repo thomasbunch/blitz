@@ -510,10 +510,7 @@ fn watch_settings(proxy: EventLoopProxy<UserEvent>) {
 impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
         let config = Config::load();
-        let mut theme = crate::theme::current(&config.theme);
-        if let Some(a) = config.accent {
-            theme.ui.set_accent(a);
-        }
+        let theme = crate::theme::current(&config.theme);
         let a = &args;
         let persist = !a.new_window
             && a.cmd.is_none()
@@ -740,7 +737,7 @@ impl App {
             },
             None => crate::shell::launch(
                 &self.config.shell,
-                &self.config.shell_args,
+                &[],
                 self.config.shell_integration,
                 &token,
             ),
@@ -986,10 +983,7 @@ impl App {
 
     /// Shows `t` everywhere: panes, chrome, window frame, and what colour
     /// queries report.
-    fn apply_theme(&mut self, mut t: Theme) {
-        if let Some(a) = self.config.accent {
-            t.ui.set_accent(a);
-        }
+    fn apply_theme(&mut self, t: Theme) {
         if t == self.theme {
             return;
         }
