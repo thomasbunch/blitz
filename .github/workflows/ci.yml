@@ -98,3 +98,18 @@ jobs:
       # bundled ConPTY.
       - if: runner.os == 'Windows'
         run: cargo test --release -p blitz --locked
+
+  # The licenses the release's THIRD-PARTY-NOTICES.txt accepts, checked
+  # before a crate under another one is merged rather than at tag time.
+  licenses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-about@0.9.2
+      - run: cargo about generate --locked --fail --config .github/about.toml .github/about.hbs -o /dev/null

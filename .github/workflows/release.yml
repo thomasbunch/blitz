@@ -69,7 +69,7 @@ jobs:
 
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-about
+          tool: cargo-about@0.9.2
 
       - name: Stage files
         env:
@@ -81,21 +81,6 @@ jobs:
           cp conpty/runtimes/win-x64/native/conpty.dll conpty/build/native/runtimes/x64/OpenConsole.exe "$d/"
           cp LICENSE "$d/LICENSE.txt"
 
-          cat > "$RUNNER_TEMP/about.toml" <<'EOF'
-          accepted = ["MIT", "Apache-2.0", "Zlib", "Unicode-3.0"]
-          targets = ["x86_64-pc-windows-msvc"]
-          ignore-build-dependencies = true
-          ignore-dev-dependencies = true
-          EOF
-          cat > "$RUNNER_TEMP/about.hbs" <<'EOF'
-          {{#each licenses}}
-          ================================================================================
-          {{name}}, used by:{{#each used_by}} {{crate.name}} {{crate.version}}{{/each}}
-
-          {{{text}}}
-          {{/each}}
-          EOF
-
           n="$d/THIRD-PARTY-NOTICES.txt"
           {
             echo "blitz includes the following third-party software."
@@ -103,14 +88,15 @@ jobs:
             echo "================================================================================"
             echo "conpty.dll and OpenConsole.exe: Microsoft.Windows.Console.ConPTY $CONPTY_VERSION"
             echo
-            curl -fsSL https://raw.githubusercontent.com/microsoft/terminal/main/LICENSE
+            # The commit that added the license, which has not changed since.
+            curl -fsSL https://raw.githubusercontent.com/microsoft/terminal/d4d59fa3395012ca37ba12665da4ec11c7dcf9cb/LICENSE
             echo
             echo "================================================================================"
             echo "Character width tables derived from the Unicode Character Database"
             echo
             curl -fsSL https://www.unicode.org/license.txt
             echo
-            cargo about generate --config "$RUNNER_TEMP/about.toml" "$RUNNER_TEMP/about.hbs"
+            cargo about generate --locked --fail --config .github/about.toml .github/about.hbs
           } > "$n"
 
       - name: Zip
