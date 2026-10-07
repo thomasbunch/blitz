@@ -60,6 +60,7 @@ features = [
     "Data_Xml_Dom",
     "UI_Notifications",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Power",
 ]
 
 # Shaders are compiled at build time; the app itself never links the

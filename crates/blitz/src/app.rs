@@ -17,7 +17,7 @@ use vt::{
     Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
 };
 use windows::UI::Notifications::ToastNotification;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HANDLE, HWND, POINT};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DwmSetWindowAttribute,
@@ -25,6 +25,12 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows::Win32::System::Power::{
+    PowerClearRequest, PowerCreateRequest, PowerRequestSystemRequired, PowerSetRequest,
+};
+use windows::Win32::System::Threading::{
+    POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, GetKeyboardState, GetLastInputInfo, LASTINPUTINFO,
 };
@@ -37,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR,
     WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PWSTR};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
@@ -1071,6 +1077,11 @@ struct App {
     badge_shows: Option<Attn>,
     /// Ctrl+Alt+J comes to this window from every program.
     jump_key: bool,
+    /// The power request that keeps the PC awake; made the first time it
+    /// is needed.
+    power: Option<HANDLE>,
+    /// The PC is kept awake.
+    awake: bool,
     counters: Counters,
     code: i32,
 }
@@ -1483,6 +1494,8 @@ impl App {
             hooks_hinted: false,
             badge_shows: None,
             jump_key: false,
+            power: None,
+            awake: false,
             counters: Counters::default(),
             code: 0,
         }
@@ -1882,6 +1895,7 @@ impl App {
         self.views.retain(|v| v.pane.id != id);
         self.taskbar_progress();
         self.taskbar_badge();
+        self.keep_awake();
         if self.views.is_empty() {
             // Nothing is left open, so there is nothing to restore.
             if self.persist {
@@ -2355,6 +2369,7 @@ impl App {
         if jump {
             self.global_jump();
         }
+        self.keep_awake();
         if font {
             self.reload_font();
         }
@@ -3915,6 +3930,44 @@ impl App {
         }
     }
 
+    /// While `keep_awake` is on and a session works, keeps the PC from going
+    /// to sleep by itself; `powercfg /requests` says why.
+    fn keep_awake(&mut self) {
+        let states = self.views.iter().map(|v| v.pane.attn.state);
+        let on = stays_awake(self.config.keep_awake, states);
+        if on == self.awake {
+            return;
+        }
+        if self.power.is_none() {
+            let mut why: Vec<u16> = "A session is working".encode_utf16().chain([0]).collect();
+            let context = REASON_CONTEXT {
+                // POWER_REQUEST_CONTEXT_VERSION
+                Version: 0,
+                Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+                Reason: REASON_CONTEXT_0 {
+                    SimpleReasonString: PWSTR(why.as_mut_ptr()),
+                },
+            };
+            // SAFETY: the context and its string outlive the call, which
+            // copies them. The request lives as long as blitz.
+            self.power = unsafe { PowerCreateRequest(&context) }.ok();
+        }
+        let Some(r) = self.power else {
+            return;
+        };
+        // SAFETY: a power request blitz made and never closes.
+        let done = unsafe {
+            if on {
+                PowerSetRequest(r, PowerRequestSystemRequired)
+            } else {
+                PowerClearRequest(r, PowerRequestSystemRequired)
+            }
+        };
+        if done.is_ok() {
+            self.awake = on;
+        }
+    }
+
     /// Feeds a session's attention state; flashes the taskbar button when
     /// it changes to something the user should see while looking away.
     /// Returns true when the state changed.
@@ -3950,6 +4003,7 @@ impl App {
         self.request_redraw();
         if changed {
             self.taskbar_badge();
+            self.keep_awake();
         }
         if let Some(a) = alert {
             self.alert(id, a);
@@ -5650,6 +5704,12 @@ fn alert(state: Attn, c: &Config, last: &mut Option<Instant>, now: Instant) -> O
     }
     *last = Some(now);
     Some(a)
+}
+
+/// Whether blitz keeps the PC awake: `keep_awake` is on and one of
+/// `states` is working.
+fn stays_awake(keep_awake: bool, mut states: impl Iterator<Item = Attn>) -> bool {
+    keep_awake && states.any(|s| s == Attn::Working)
 }
 
 /// The session a jump goes to: the one waiting longest among those that
@@ -8496,6 +8556,17 @@ mod tests {
         assert_eq!(jump_to(sessions(), None, true), Some(a));
         let idle = [(a, attn(Attn::Idle, t0))].into_iter();
         assert_eq!(jump_to(idle, Some(a), false), None, "nothing waits");
+    }
+
+    #[test]
+    fn app_keeps_the_pc_awake_only_while_a_session_works_and_if_asked() {
+        use Attn::*;
+        let awake = |on, s: &[Attn]| stays_awake(on, s.iter().copied());
+        assert!(awake(true, &[Idle, Working, NeedsYou]));
+        assert!(!awake(false, &[Working]), "off by default");
+        assert!(!awake(true, &[]));
+        // Waiting for the user is not working.
+        assert!(!awake(true, &[NeedsYou, DoneUnseen, Error, Idle]));
     }
 
     #[test]

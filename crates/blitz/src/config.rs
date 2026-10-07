@@ -41,6 +41,8 @@ pub struct Config {
     /// Save each pane's recent output and show it again on the next start.
     /// Off by default: old output can hold secrets.
     pub restore_scrollback: bool,
+    /// Keep the PC from going to sleep while a session works.
+    pub keep_awake: bool,
     /// Pixel scenery behind the panes, one of
     /// [`SCENES`](crate::arcade::scenery::SCENES).
     pub scenery: String,
@@ -79,6 +81,7 @@ impl Default for Config {
             restore_session: true,
             restore_claude: true,
             restore_scrollback: false,
+            keep_awake: false,
             scenery: "off".into(),
             mascot: false,
             right_click_paste: true,
@@ -183,6 +186,15 @@ pub const SETTINGS: &[Setting] = &[
                again on the next start. Old output can hold secrets.",
         kind: Kind::Toggle,
         applies: RESTART,
+    },
+    Setting {
+        key: "keep_awake",
+        group: "Sessions",
+        label: "Keep the PC awake",
+        help: "Keep the PC from going to sleep by itself while a session is \
+               working. The screen can still turn off.",
+        kind: Kind::Toggle,
+        applies: NOW,
     },
     Setting {
         key: "shell",
@@ -345,6 +357,7 @@ impl Config {
             "restore_session" => flag(self.restore_session),
             "restore_claude" => flag(self.restore_claude),
             "restore_scrollback" => flag(self.restore_scrollback),
+            "keep_awake" => flag(self.keep_awake),
             "flash" => flag(self.flash),
             "toasts" => quote(&self.toasts),
             "sound" => flag(self.sound),
@@ -425,6 +438,7 @@ impl Config {
             "restore_session" => &mut self.restore_session,
             "restore_claude" => &mut self.restore_claude,
             "restore_scrollback" => &mut self.restore_scrollback,
+            "keep_awake" => &mut self.keep_awake,
             "flash" => &mut self.flash,
             "sound" => &mut self.sound,
             "global_jump" => &mut self.global_jump,
@@ -900,6 +914,7 @@ scenery = stars
             ("restore_session", "false"),
             ("restore_claude", "false"),
             ("restore_scrollback", "true"),
+            ("keep_awake", "true"),
             ("flash", "false"),
             ("toasts", "\"all\""),
             ("sound", "true"),
