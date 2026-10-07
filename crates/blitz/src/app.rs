@@ -1674,7 +1674,7 @@ impl App {
         }
         self.orphan = None;
         self.find = None;
-        self.mouse.drag = None;
+        self.set_drag(None);
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
         self.set_hover(None);
@@ -2422,6 +2422,17 @@ impl App {
     fn send(&self, bytes: impl Into<Vec<u8>>) {
         if let Some(v) = self.current() {
             v.pane.send(bytes);
+        }
+    }
+
+    /// Starts or ends the drag that makes a selection in the focused pane,
+    /// whose view holds still meanwhile, so output does not slide the text
+    /// out from under the pointer.
+    fn set_drag(&mut self, drag: Option<Drag>) {
+        self.mouse.drag = drag;
+        let focus = self.focus_id();
+        for v in &self.views {
+            lock(&v.pane.term).hold(drag.is_some() && Some(v.pane.id) == focus);
         }
     }
 
@@ -3851,7 +3862,7 @@ impl App {
             let extend = shift && self.modes().mouse == MouseMode::Off;
             self.press(&mods, extend);
         } else {
-            self.mouse.drag = None;
+            self.set_drag(None);
             self.mouse.scroll_at = None;
         }
     }
@@ -3876,7 +3887,7 @@ impl App {
         self.orphan = None;
         let held = (self.current()).and_then(|v| Some(v.selection.as_ref()?.drag));
         if let Some(drag) = held.filter(|d| extend && d.epoch == epoch) {
-            self.mouse.drag = Some(drag);
+            self.set_drag(Some(drag));
             self.extend_drag();
             return;
         }
@@ -3891,7 +3902,7 @@ impl App {
             return;
         };
         let drag = Drag::new(&lock(&v.pane.term), &self.theme.pal, here, unit, block);
-        self.mouse.drag = Some(drag);
+        self.set_drag(Some(drag));
         if self
             .current_mut()
             .and_then(|v| v.selection.take())
@@ -3916,7 +3927,7 @@ impl App {
         let term = lock(&v.pane.term);
         if term.line_epoch() != drag.epoch {
             drop(term);
-            self.mouse.drag = None;
+            self.set_drag(None);
             return;
         }
         let head = (term.view_top() + usize::from(row), col);
@@ -5774,6 +5785,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
                     crate::handoff::forget_activating_click();
+                    self.set_drag(None);
                 }
                 // Ctrl may be let go while another window has the keys.
                 self.set_hover(None);
