@@ -81,6 +81,11 @@ fn modify_other_keys_is_not_sgr() {
     // `4` would underline and `2` dim if this were read as SGR.
     assert_eq!(s.cells[1].attrs, 0);
     assert_eq!(t.screen_text().lines().next(), Some("xy"));
+    // Nor is `CSI > m`, which would otherwise reset the rendition.
+    t.feed(b"\x1b[1mz\x1b[>mw");
+    t.snapshot(&mut s, &pal);
+    let bold = vt::snapshot::attr::BOLD;
+    assert_eq!((s.cells[2].attrs, s.cells[3].attrs), (bold, bold));
 }
 
 #[test]
@@ -122,6 +127,24 @@ fn synchronized_output_holds_snapshots() {
     assert!(!t.sync_pending(Instant::now()));
     assert!(t.snapshot(&mut s, &PAL));
     assert_eq!(first_char(&s), b"b");
+}
+
+/// The host wakes at the deadline to show a stalled update.
+#[test]
+fn synchronized_output_has_a_deadline() {
+    let before = Instant::now();
+    let mut t = term("");
+    assert_eq!(t.sync_deadline(), None);
+    t.feed(b"\x1b[?2026h");
+    let d = t.sync_deadline().expect("an update is open");
+    let after = Instant::now();
+    let timeout = Duration::from_millis(150);
+    assert!(before + timeout <= d && d <= after + timeout);
+    // A second begin keeps the first deadline.
+    t.feed(b"\x1b[?2026h");
+    assert_eq!(t.sync_deadline(), Some(d));
+    t.feed(b"\x1b[?2026l");
+    assert_eq!(t.sync_deadline(), None);
 }
 
 #[test]

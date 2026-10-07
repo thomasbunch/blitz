@@ -52,6 +52,23 @@ fn titles_with_bel_or_st() {
     assert_eq!(one("\x1b]0;\x07"), Event::Title(String::new()));
     // Icon name only.
     assert_eq!(events("\x1b]1;icon\x07"), []);
+    // A `;` belongs to the title; bad UTF-8 is replaced, and a long title
+    // is cut at 256 characters.
+    assert_eq!(one("\x1b]2;a;b\x07"), Event::Title("a;b".into()));
+    let Event::Title(t) = one("\x1b]0;a\u{ff}b\x07") else {
+        panic!()
+    };
+    assert_eq!(t, "a\u{ff}b");
+    let mut term = Terminal::new(Options::default());
+    term.feed(b"\x1b]0;a\xffb\x07");
+    let mut ev = Vec::new();
+    term.take_events(&mut ev);
+    assert_eq!(ev, [Event::Title("a\u{fffd}b".into())]);
+    let long = "\u{e9}".repeat(1000);
+    let Event::Title(t) = one(&format!("\x1b]0;{long}\x07")) else {
+        panic!()
+    };
+    assert_eq!(t.chars().count(), 256);
 }
 
 #[test]
