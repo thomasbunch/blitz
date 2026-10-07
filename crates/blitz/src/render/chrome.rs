@@ -117,8 +117,10 @@ pub struct Picker<'a> {
 pub struct Commands<'a> {
     /// What was typed to narrow the list.
     pub filter: &'a str,
-    /// The actions that match it, each with the keys that run it, if any.
+    /// The actions that match it, each with the keys that run it, if any;
+    /// or with `sessions` the sessions, each with its state.
     pub items: Vec<(String, String)>,
+    pub sessions: bool,
     /// The highlighted item.
     pub sel: usize,
     /// What the typed line renames, such as `Rename session`, instead of
@@ -1209,6 +1211,7 @@ fn commands(
     (tw, th): (i32, i32),
     caret: bool,
 ) -> (Rect, Vec<(usize, Rect)>) {
+    let hint;
     let l = match cm.rename {
         Some(title) => List {
             title,
@@ -1221,17 +1224,24 @@ fn commands(
             width: 460.0,
             caret,
         },
-        None => List {
-            title: "Commands",
-            filter: cm.filter,
-            names: cm.items.iter().map(|i| i.0.as_str()).collect(),
-            sel: cm.sel,
-            empty: "no command matches",
-            hint: "\u{2191}\u{2193} choose  \u{b7}  Enter run  \u{b7}  Esc close",
-            prompt: "type to filter",
-            width: 460.0,
-            caret,
-        },
+        None => {
+            let (title, empty, enter) = match cm.sessions {
+                true => ("Sessions", "no session matches", "go"),
+                false => ("Commands", "no command matches", "run"),
+            };
+            hint = format!("\u{2191}\u{2193} choose  \u{b7}  Enter {enter}  \u{b7}  Esc close");
+            List {
+                title,
+                filter: cm.filter,
+                names: cm.items.iter().map(|i| i.0.as_str()).collect(),
+                sel: cm.sel,
+                empty,
+                hint: &hint,
+                prompt: "type to filter",
+                width: 460.0,
+                caret,
+            }
+        }
     };
     list(p, &l, c, a, s, (tw, th), |p, i, row, right| {
         let keys = &cm.items[i].1;
@@ -1591,7 +1601,7 @@ fn ring(x: Option<&Session>) -> f32 {
 /// The state shown on the right of a sidebar row, with how long the turn
 /// has run, how long the last one took, or after a minute how long a
 /// question has waited.
-fn state_word(x: &Session, now: Instant) -> String {
+pub fn state_word(x: &Session, now: Instant) -> String {
     let waited = now.saturating_duration_since(x.since);
     match (x.state, x.exit_code) {
         (Attn::NeedsYou, _) if waited.as_secs() >= 60 => {
@@ -2436,6 +2446,7 @@ mod tests {
             items: vec![("Split right".into(), String::new())],
             sel: 0,
             rename: None,
+            sessions: false,
         });
         let c = build(&m);
         let amber = |p: &Prim| p_color(p) == m.ui.accent;
@@ -2657,6 +2668,7 @@ mod tests {
             items: vec![("Split right".into(), String::new())],
             sel: 0,
             rename: None,
+            sessions: false,
         });
         let c = build(&m);
         assert_eq!(carets(&c), [at(&c, "type to filter").expect("hint")]);
@@ -2736,6 +2748,7 @@ mod tests {
             items: vec![("Split right".into(), String::new())],
             sel: 0,
             rename: None,
+            sessions: false,
         });
         let c = build(&m);
         let a = area(&win, m.size, 1.0, None, 7);
@@ -2792,6 +2805,7 @@ mod tests {
             items,
             sel: 15,
             rename: None,
+            sessions: false,
         });
         let c = build(&m);
         let (panel, rows) = c.commands.clone().expect("palette hits");
@@ -2802,6 +2816,17 @@ mod tests {
         let t = texts(&c);
         assert!(t.contains(&"Commands") && t.contains(&"Ctrl+15"));
         assert!(!t.contains(&"Ctrl+3"), "scrolled out");
+        // The list of sessions says what it is.
+        m.commands = Some(Commands {
+            filter: "zzz",
+            items: Vec::new(),
+            sel: 0,
+            rename: None,
+            sessions: true,
+        });
+        let c = build(&m);
+        let t = texts(&c);
+        assert!(t.contains(&"Sessions") && t.contains(&"no session matches"));
     }
 
     /// Renaming takes the palette's line for the name.
@@ -2814,6 +2839,7 @@ mod tests {
             items: Vec::new(),
             sel: 0,
             rename: Some("Rename tab"),
+            sessions: false,
         });
         let t: Vec<String> = texts(&build(&m)).iter().map(|t| t.to_string()).collect();
         assert!(t.contains(&"Rename tab".into()) && t.contains(&"type a name".into()));
@@ -2822,6 +2848,7 @@ mod tests {
             items: Vec::new(),
             sel: 0,
             rename: Some("Rename tab"),
+            sessions: false,
         });
         let c = build(&m);
         assert!(texts(&c).contains(&"shop api"));

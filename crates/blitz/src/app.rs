@@ -1003,6 +1003,8 @@ impl Picker {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Pick {
     Run(Action),
+    /// Bring this session to the front.
+    Show(PaneId),
     /// Open the settings panel on what was typed.
     Settings,
 }
@@ -1019,6 +1021,9 @@ struct Commands {
     rename: Option<Rename>,
     /// Actions left out, as they have nothing to do now.
     hidden: Vec<Action>,
+    /// Sessions to go to, listed in place of the actions: each with its
+    /// row and its state.
+    sessions: Option<Vec<(PaneId, String, String)>>,
 }
 
 /// What the command palette's line names.
@@ -1030,7 +1035,8 @@ enum Rename {
 }
 
 impl Commands {
-    /// The matching rows, each what it does and its label: actions in
+    /// The matching rows, each what it does and its label: the sessions
+    /// whose row or state holds every typed word, or else actions in
     /// [`keymap::ACTIONS`] order, leaving out the palette itself, going to
     /// a tab by number and the `hidden` actions. When none matches what
     /// was typed, one row searches the settings for it instead.
@@ -1041,13 +1047,20 @@ impl Commands {
         let words: Vec<String> = (self.filter.split_whitespace())
             .map(str::to_lowercase)
             .collect();
+        let hit = |text: String| {
+            let text = text.to_lowercase();
+            words.iter().all(|w| text.contains(w.as_str()))
+        };
+        if let Some(list) = &self.sessions {
+            return (list.iter())
+                .filter(|s| hit(format!("{} {}", s.1, s.2)))
+                .map(|s| (Pick::Show(s.0), s.1.clone()))
+                .collect();
+        }
         let mut rows: Vec<(Pick, String)> = (keymap::ACTIONS.iter())
             .filter(|a| !matches!(a.0, Action::Palette | Action::GoToTab(_) | Action::LastTab))
             .filter(|a| !self.hidden.contains(&a.0))
-            .filter(|a| {
-                let text = format!("{} {}", a.2, a.1).to_lowercase();
-                words.iter().all(|w| text.contains(w.as_str()))
-            })
+            .filter(|a| hit(format!("{} {}", a.2, a.1)))
             .map(|a| (Pick::Run(a.0), a.2.to_string()))
             .collect();
         let typed = self.filter.trim();
@@ -1763,13 +1776,17 @@ impl App {
                 filter: &cm.filter,
                 items: (cm.matches().into_iter())
                     .map(|(pick, label)| {
-                        let keys = match pick {
+                        let side = match pick {
                             Pick::Run(a) => keymap::keys_for(a, &self.config.keys),
+                            Pick::Show(id) => (cm.sessions.iter().flatten())
+                                .find(|s| s.0 == id)
+                                .map(|s| s.2.clone()),
                             Pick::Settings => None,
                         };
-                        (label, keys.unwrap_or_default())
+                        (label, side.unwrap_or_default())
                     })
                     .collect(),
+                sessions: cm.sessions.is_some(),
                 sel: cm.sel,
                 rename: cm.rename.map(|r| match r {
                     Rename::Session(_) => "Rename session",
@@ -2192,6 +2209,7 @@ impl App {
                     self.set_notice(id, text, Some(Instant::now() + NOTHING), true);
                 }
             }
+            Pick::Show(id) => self.show(id),
             Pick::Settings => {
                 self.open_settings();
                 if let Some(p) = &mut self.settings {
@@ -2534,11 +2552,12 @@ impl App {
         // The same for the command palette.
         if self.commands.is_some() && k.down {
             self.eaten.press(k.vk);
-            if keymap::action(k, &self.config.keys) == Some(Action::Palette) {
-                self.commands = None;
-                self.request_redraw();
-            } else {
-                self.commands_key(el, k);
+            match keymap::action(k, &self.config.keys) {
+                Some(Action::Palette | Action::GoToSession) => {
+                    self.commands = None;
+                    self.request_redraw();
+                }
+                _ => self.commands_key(el, k),
             }
             return;
         }
@@ -2956,6 +2975,17 @@ impl App {
             }
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
+            Action::GoToSession => {
+                let now = Instant::now();
+                let list = (self.sessions().iter())
+                    .map(|s| (s.id, session_row(s), chrome::state_word(s, now)))
+                    .collect();
+                self.commands = Some(Commands {
+                    sessions: Some(list),
+                    ..Commands::default()
+                });
+                self.request_redraw();
+            }
             Action::Palette => {
                 // Update without a release would only look for one.
                 let hidden = match self.update {
@@ -5387,6 +5417,20 @@ fn paste_question(text: &str, key: Option<&str>) -> String {
     format!("Paste {lines} line{s} starting \"{start}\"? {again}")
 }
 
+/// A session as the palette lists it: its name, folder and branch.
+fn session_row(s: &chrome::Session) -> String {
+    let mut row = s.name.clone();
+    let folder = (!s.cwd.is_empty()).then(|| chrome::folder_name(&s.cwd));
+    for part in [folder.as_deref(), s.branch.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        row.push_str(" \u{b7} ");
+        row.push_str(part);
+    }
+    row
+}
+
 /// Takes a fresh snapshot of `term` into `snap`. Returns false when that
 /// found output rewrote the text under `sel`; see [`Selection::still`].
 fn refresh(
@@ -7306,6 +7350,54 @@ mod tests {
         c.hidden = vec![Action::Update];
         let search = (Pick::Settings, "Search settings for \"update\"".into());
         assert_eq!(c.matches(), [search]);
+    }
+
+    #[test]
+    fn palette_lists_sessions_to_go_to() {
+        let t0 = Instant::now();
+        let s = |id, name: &str, cwd: &str, branch: Option<&str>| chrome::Session {
+            id: PaneId(id),
+            name: name.into(),
+            cwd: cwd.into(),
+            branch: branch.map(Into::into),
+            state: Attn::Idle,
+            since: t0,
+            msg: String::new(),
+            num: None,
+            turn: None,
+            took: None,
+            seen: false,
+            progress: None,
+            exit_code: None,
+            below: 0,
+        };
+        let a = s(1, "claude 1", r"C:\dev\shop", Some("main"));
+        assert_eq!(session_row(&a), "claude 1 \u{b7} shop \u{b7} main");
+        assert_eq!(
+            session_row(&s(2, "pwsh 2", r"C:\", None)),
+            "pwsh 2 \u{b7} C:\\"
+        );
+        assert_eq!(session_row(&s(3, "cmd 3", "", None)), "cmd 3");
+        let mut c = Commands {
+            sessions: Some(vec![
+                (PaneId(1), session_row(&a), "needs you".into()),
+                (
+                    PaneId(2),
+                    "pwsh 2 \u{b7} api".into(),
+                    "working \u{b7} 5s".into(),
+                ),
+            ]),
+            ..Commands::default()
+        };
+        let picks = |c: &Commands| c.matches().into_iter().map(|m| m.0).collect::<Vec<_>>();
+        assert_eq!(picks(&c), [Pick::Show(PaneId(1)), Pick::Show(PaneId(2))]);
+        // By name, folder, branch or state; never the settings.
+        for (typed, want) in [("shop", 1), ("MAIN", 1), ("needs", 1), ("work", 2)] {
+            c.filter = typed.into();
+            assert_eq!(picks(&c), [Pick::Show(PaneId(want))], "{typed}");
+        }
+        c.filter = "zzz".into();
+        assert!(c.matches().is_empty());
     }
 
     #[test]

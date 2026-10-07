@@ -52,6 +52,8 @@ pub enum Action {
     /// Trade places with the pane in `Dir`.
     Swap(Dir),
     JumpToAttention,
+    /// Open the command palette on the list of sessions, or close it.
+    GoToSession,
     ToggleSidebar,
     /// Install the newer release, or without one look for it now.
     Update,
@@ -123,6 +125,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Focus(Dir::Up), "focus_up", "Focus the pane above"),
     (Action::Focus(Dir::Down), "focus_down", "Focus the pane below"),
     (Action::JumpToAttention, "jump_to_attention", "Jump to the next session that needs you"),
+    (Action::GoToSession, "go_to_session", "Go to a session"),
     (Action::ToggleSidebar, "toggle_sidebar", "Expand or collapse the sidebar"),
     (Action::Update, "update", "Update blitz"),
     (Action::ThemePicker, "theme_picker", "Pick a theme"),
@@ -203,6 +206,7 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | ALT | SHIFT, 0x27, Action::Swap(Dir::Right)),
     (CTRL | ALT | SHIFT, 0x28, Action::Swap(Dir::Down)),
     (CTRL | SHIFT, b'J' as u16, Action::JumpToAttention),
+    (CTRL | SHIFT, b'O' as u16, Action::GoToSession),
     (CTRL | SHIFT, b'B' as u16, Action::ToggleSidebar),
     (CTRL | SHIFT, b'U' as u16, Action::Update),
     (CTRL | SHIFT, b'K' as u16, Action::ThemePicker),
@@ -1112,6 +1116,7 @@ mod msg_to_key_tests {
         assert_eq!(press(0x52, &[LCTRL, LSHIFT]), Some(Action::SplitRight));
         assert_eq!(press(0x44, &[0xa3, LSHIFT]), Some(Action::SplitDown));
         assert_eq!(press(0x42, &[LCTRL, LSHIFT]), Some(Action::ToggleSidebar));
+        assert_eq!(press(0x4f, &[LCTRL, LSHIFT]), Some(Action::GoToSession));
         assert_eq!(press(0x09, &[LCTRL, LSHIFT]), Some(Action::CycleTab(-1)));
         assert_eq!(press(0x21, &[LCTRL, LSHIFT]), Some(Action::MoveTab(-1)));
         assert_eq!(press(0x22, &[LCTRL, LSHIFT]), Some(Action::MoveTab(1)));
