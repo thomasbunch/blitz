@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use crate::attention::PaneAttn;
+use crate::attention::{Command, PaneAttn};
 use crate::layout::PaneId;
 use crate::pty::{Pty, PtyEvent, SpawnOpts};
 
@@ -26,6 +26,8 @@ pub struct Pane {
     pub pty: Pty,
     /// Attention state and when it last changed.
     pub attn: PaneAttn,
+    /// The command its shell is running, from blitz's prompt marks.
+    pub cmd: Command,
     /// Shown in the sidebar and the pane header.
     pub name: String,
     /// The name the user gave the session, which wins over any other.
@@ -172,6 +174,7 @@ impl Pane {
             term,
             pty,
             attn: PaneAttn::new(Instant::now()),
+            cmd: Command::default(),
             name: String::new(),
             named: None,
             title: String::new(),

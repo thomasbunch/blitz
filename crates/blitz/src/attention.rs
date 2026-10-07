@@ -2,6 +2,10 @@
 
 use std::time::{Duration, Instant};
 
+use vt::PromptMark;
+
+use crate::render::chrome::elapsed;
+
 /// Ordered by priority, lowest first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Attn {
@@ -114,6 +118,66 @@ pub fn notify_protocol(title: &str) -> (&str, u32) {
 }
 /// STATUS_CONTROL_C_EXIT: a console program stopped with Ctrl+C.
 pub const CTRL_C_EXIT: u32 = 0xC000_013A;
+
+/// How long a shell command runs before its end is news.
+pub const LONG_COMMAND: Duration = Duration::from_secs(10);
+
+/// The command a shell with blitz's integration is running, as its prompt
+/// marks tell: when it started and how it ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Command {
+    /// From the mark at its start until blitz's next prompt.
+    pub running: Option<Instant>,
+    /// The exit code its end mark gave.
+    code: Option<i32>,
+    /// A hook spoke while it ran: Claude Code says how it went itself.
+    pub hooked: bool,
+}
+
+impl Command {
+    /// Feeds a prompt mark. At blitz's own prompt, which program output
+    /// cannot fake, gives the event and message for a command that ran at
+    /// least [`LONG_COMMAND`] and reported its code: done when it worked or
+    /// was stopped with Ctrl+C, else an error.
+    pub fn mark(&mut self, m: PromptMark, now: Instant) -> Option<(Ev, String)> {
+        match m {
+            PromptMark::C if self.running.is_none() => {
+                *self = Command {
+                    running: Some(now),
+                    ..Command::default()
+                };
+            }
+            PromptMark::D(code) => self.code = code,
+            PromptMark::A { blitz: true } => {
+                let ended = std::mem::take(self);
+                let took = now.saturating_duration_since(ended.running?);
+                if took < LONG_COMMAND || ended.hooked {
+                    return None;
+                }
+                let code = ended.code? as u32;
+                let ev = match code {
+                    0 | 130 | CTRL_C_EXIT => Ev::Done,
+                    _ => Ev::Error { sticky: false },
+                };
+                let msg = format!("{} \u{b7} {}", exit_text(code), elapsed(took));
+                return Some((ev, msg));
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// What closing a session would cut short, if anything: Claude Code
+/// working or waiting for the user, or a command its shell is running.
+pub fn busy(state: Attn, cmd: &Command) -> Option<&'static str> {
+    match state {
+        Attn::Working => Some("working"),
+        Attn::NeedsYou => Some("waiting for you"),
+        _ if cmd.running.is_some() => Some("running a command"),
+        _ => None,
+    }
+}
 
 /// An exit code as people read it: `exit 1` or `exit -1`, a Windows status
 /// code in hex, and the common ways a program dies by name.
@@ -885,6 +949,102 @@ mod tests {
         assert!(events("\x1b]9;build done\x07").is_empty());
         assert!(events("\x07\x1b]0;done\x07").is_empty(), "a bell or title");
         assert_eq!(events(&notify("done")), [Ev::Done]);
+    }
+
+    /// A command as PowerShell marks it: started at `t0`, ended `secs`
+    /// later with `code`.
+    fn command(secs: u64, code: Option<i32>) -> (Command, Option<(Ev, String)>) {
+        let t0 = Instant::now();
+        let mut c = Command::default();
+        assert_eq!(c.mark(PromptMark::C, t0), None);
+        assert_eq!(c.running, Some(t0));
+        assert_eq!(c.mark(PromptMark::D(code), t0), None);
+        let end = c.mark(
+            PromptMark::A { blitz: true },
+            t0 + Duration::from_secs(secs),
+        );
+        (c, end)
+    }
+
+    #[test]
+    fn a_long_command_ends_done_or_error() {
+        assert_eq!(
+            command(134, Some(101)).1,
+            Some((Ev::Error { sticky: false }, "exit 101 \u{b7} 2m 14s".into()))
+        );
+        assert_eq!(
+            command(10, Some(0)).1,
+            Some((Ev::Done, "exit 0 \u{b7} 10s".into()))
+        );
+        // Stopped with Ctrl+C, as Windows and as a POSIX shell say it.
+        assert_eq!(
+            command(60, Some(CTRL_C_EXIT as i32)).1,
+            Some((Ev::Done, "Ctrl+C \u{b7} 1m 0s".into()))
+        );
+        assert_eq!(command(60, Some(130)).1.map(|e| e.0), Some(Ev::Done));
+        // The next prompt ends it either way.
+        assert_eq!(command(60, Some(1)).0, Command::default());
+    }
+
+    #[test]
+    fn a_short_command_or_one_with_no_code_is_not_news() {
+        assert_eq!(command(9, Some(1)), (Command::default(), None));
+        assert_eq!(command(600, None), (Command::default(), None));
+    }
+
+    /// Claude Code's hooks say how its turns went; quitting it after an
+    /// hour is not a finished command.
+    #[test]
+    fn a_command_a_hook_spoke_in_is_not_news() {
+        let t0 = Instant::now();
+        let mut c = Command::default();
+        c.mark(PromptMark::C, t0);
+        c.hooked = true;
+        c.mark(PromptMark::D(Some(0)), t0);
+        let end = c.mark(
+            PromptMark::A { blitz: true },
+            t0 + Duration::from_secs(3600),
+        );
+        assert_eq!(end, None);
+        // The next command starts with a clean slate.
+        c.mark(PromptMark::C, t0);
+        assert!(!c.hooked);
+    }
+
+    /// Program output can print any mark but blitz's own prompt start, so
+    /// only that ends a command, and a second start does not restart it.
+    #[test]
+    fn only_blitz_prompts_end_a_command() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(30);
+        let mut c = Command::default();
+        c.mark(PromptMark::C, t0);
+        c.mark(PromptMark::D(Some(3)), t0);
+        assert_eq!(c.mark(PromptMark::A { blitz: false }, later), None);
+        assert_eq!(c.mark(PromptMark::C, later), None);
+        assert_eq!(c.running, Some(t0));
+        // The shell's own end mark comes last and is the one that counts.
+        c.mark(PromptMark::D(Some(0)), later);
+        let end = c.mark(PromptMark::A { blitz: true }, later);
+        assert_eq!(end, Some((Ev::Done, "exit 0 \u{b7} 30s".into())));
+        // A prompt with no command before it.
+        assert_eq!(c.mark(PromptMark::A { blitz: true }, later), None);
+    }
+
+    #[test]
+    fn busy_is_working_waiting_or_running_a_command() {
+        let idle = Command::default();
+        let running = Command {
+            running: Some(Instant::now()),
+            ..Command::default()
+        };
+        assert_eq!(busy(Attn::Working, &idle), Some("working"));
+        assert_eq!(busy(Attn::NeedsYou, &running), Some("waiting for you"));
+        assert_eq!(busy(Attn::Idle, &running), Some("running a command"));
+        assert_eq!(busy(Attn::DoneUnseen, &running), Some("running a command"));
+        for state in [Attn::Idle, Attn::DoneUnseen, Attn::Error] {
+            assert_eq!(busy(state, &idle), None, "{state:?}");
+        }
     }
 
     #[test]

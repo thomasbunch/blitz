@@ -1306,7 +1306,7 @@ fn state_word(x: &Session, now: Instant) -> String {
 
 /// `45s`, `12m`, `2h 5m`: seconds only in the first minute, so a long
 /// turn wakes blitz once a minute, not every second.
-fn elapsed(d: Duration) -> String {
+pub fn elapsed(d: Duration) -> String {
     let t = d.as_secs();
     match t {
         0..60 => format!("{t}s"),

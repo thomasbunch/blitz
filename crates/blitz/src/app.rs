@@ -723,6 +723,16 @@ struct View {
     hooks_seen: bool,
 }
 
+impl View {
+    /// What closing the session would cut short; see [`crate::attention::busy`].
+    fn busy(&self) -> Option<&'static str> {
+        let p = &self.pane;
+        (p.exit_code.is_none())
+            .then(|| crate::attention::busy(p.attn.state, &p.cmd))
+            .flatten()
+    }
+}
+
 struct App {
     args: Args,
     config: Config,
@@ -2378,12 +2388,7 @@ impl App {
                 let Some(v) = self.current() else {
                     return true;
                 };
-                let id = v.pane.id;
-                let busy = match (v.pane.attn.state, v.pane.exit_code) {
-                    (Attn::Working, None) => Some("working"),
-                    (Attn::NeedsYou, None) => Some("waiting for you"),
-                    _ => None,
-                };
+                let (id, busy) = (v.pane.id, v.busy());
                 let again = (self.close_confirm.take())
                     .is_some_and(|(p, until)| p == id && Instant::now() < until);
                 match busy {
@@ -2508,10 +2513,7 @@ impl App {
                     return true;
                 }
                 // Updating restarts blitz, which ends every session.
-                let busy = (self.views.iter())
-                    .filter(|v| v.pane.exit_code.is_none())
-                    .filter(|v| matches!(v.pane.attn.state, Attn::Working | Attn::NeedsYou))
-                    .count();
+                let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
                 let again = (self.update_confirm.take()).is_some_and(|t| Instant::now() < t);
                 if busy > 0 && !again {
                     let until = Instant::now() + CONFIRM;
@@ -2683,6 +2685,7 @@ impl App {
             }
             Note::Exit(code) => {
                 v.pane.exit_code = Some(code);
+                v.pane.cmd = Default::default();
                 v.progress = None;
                 self.taskbar_progress();
                 self.attention(id, Ev::from_exit(code));
@@ -2761,21 +2764,32 @@ impl App {
                 v.pane.cwd = dir;
                 self.find_branch(id);
             }
-            Event::Prompt(PromptMark::A { blitz: true }) => {
-                match prompt_back(&mut v.prompted, &mut v.resume) {
-                    Prompt::Resume(line) => v.pane.send(line),
-                    Prompt::First => {}
-                    Prompt::Exited => {
-                        v.pane.claude = None;
-                        v.pane.claude_title = None;
-                        v.pane.hooked = false;
-                        self.attention(id, Ev::Exited);
+            Event::Prompt(m) => {
+                let ended = v.pane.cmd.mark(m, Instant::now());
+                if m == (PromptMark::A { blitz: true }) {
+                    match prompt_back(&mut v.prompted, &mut v.resume) {
+                        Prompt::Resume(line) => v.pane.send(line),
+                        Prompt::First => {}
+                        Prompt::Exited => {
+                            v.pane.claude = None;
+                            v.pane.claude_title = None;
+                            v.pane.hooked = false;
+                            self.attention(id, Ev::Exited);
+                        }
                     }
+                }
+                // A long command that ended while the user looked away.
+                if let Some((ev, msg)) = ended
+                    && self.attention(id, ev)
+                    && let Some(v) = self.view_mut(id)
+                {
+                    v.pane.msg = msg;
                 }
             }
             Event::Notify { title, body } => match Ev::from_notify(&title, &v.pane.token) {
                 Some((ev, session)) => {
                     v.hooks_seen = true;
+                    v.pane.cmd.hooked = true;
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
                     v.pane.hooked = ev != Ev::Idle;
                     if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
