@@ -1557,25 +1557,27 @@ impl App {
             return;
         }
         // A repeat of a key blitz took goes where its press went, and only
-        // some keys do anything again; see `keymap::drops_repeat`.
-        let panel = self.picker.is_some() || self.settings.is_some();
+        // some keys do anything again; see `keymap::drops_repeat`. blitz
+        // run takes keys as a panel does, so a held jump keeps jumping.
+        let panel = self.picker.is_some() || self.settings.is_some() || self.game.is_some();
         if held && k.down && keymap::drops_repeat(k, self.eaten.0.contains(&k.vk), panel) {
             return;
         }
-        if let Some((g, _)) = &mut self.game {
+        // Every key pressed while blitz run is open is the game's, and so is
+        // its release; one pressed before it opened is released to the
+        // program, as with the picker.
+        if let Some((g, _)) = self.game.as_mut().filter(|_| k.down) {
             // Every key is the game's, but a shortcut closes it and runs.
             if keymap::action(k).is_some() {
                 self.close_game();
             } else {
-                if k.down {
-                    self.eaten.press(k.vk);
-                    match k.vk {
-                        VK_ESCAPE => self.close_game(),
-                        vk if is_jump(vk) => g.jump(),
-                        _ => {}
-                    }
-                    self.request_redraw();
+                self.eaten.press(k.vk);
+                match k.vk {
+                    VK_ESCAPE => self.close_game(),
+                    vk if is_jump(vk) => g.jump(),
+                    _ => {}
                 }
+                self.request_redraw();
                 return;
             }
         }
