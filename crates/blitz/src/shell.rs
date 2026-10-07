@@ -177,7 +177,10 @@ pub const POWERSHELL_INTEGRATION: &str = r#"if (-not $global:__blitz) {
     $e = [char]27; $b = [char]7; $s = "$e[?1049h$e[?1049l$e[!p$e[?5W"
     if ($global:__blitz.Exec) { $s += "$e]133;D;$code$b"; $global:__blitz.Exec = $false }
     $s += "$e]133;A;blitz=$($global:__blitz.Token)$b"
-    if ($PWD.Provider.Name -eq 'FileSystem') { $s += "$e]7;" + ([Uri]::new($PWD.ProviderPath).AbsoluteUri) + $b }
+    if ($PWD.Provider.Name -eq 'FileSystem') {
+      $p = $PWD.ProviderPath -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
+      try { $s += "$e]7;" + [Uri]::new($p).AbsoluteUri + $b } catch {}
+    }
     if (-not $ok) { Write-Error 'x' -ErrorAction Ignore }
     $s + (& $global:__blitz.Orig) + "$e]133;B$b"
   }
