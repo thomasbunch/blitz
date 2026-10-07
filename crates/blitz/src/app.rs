@@ -6687,23 +6687,45 @@ fn restart_after_reboot() {
     let _ = unsafe { RegisterApplicationRestart(None, flags) };
 }
 
-/// Whether setup made blitz start when the user signs in.
+/// Whether setup made blitz start when the user signs in, and the user has
+/// not since turned that off in Task Manager or Settings.
 fn starts_at_sign_in() -> bool {
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_ANY, RegGetValueW};
-    let run = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
-    // SAFETY: no buffer, so only whether the value is there comes back.
-    let r = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            run,
-            windows::core::w!("blitz"),
-            RRF_RT_ANY,
-            None,
-            None,
-            None,
-        )
+    let value = |sub, buf: Option<&mut [u8; 12]>| {
+        let mut size = 12u32;
+        let (data, size) = match buf {
+            Some(b) => (Some(b.as_mut_ptr().cast()), Some(&mut size as *mut u32)),
+            None => (None, None),
+        };
+        // SAFETY: with a buffer, it holds the `size` bytes given; without
+        // one, only whether the value is there comes back.
+        let r = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                sub,
+                windows::core::w!("blitz"),
+                RRF_RT_ANY,
+                None,
+                data,
+                size,
+            )
+        };
+        r.is_ok()
     };
-    r.is_ok()
+    let run = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let approved = windows::core::w!(
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+    );
+    let mut flags = [0u8; 12];
+    let set = value(approved, Some(&mut flags)).then_some(flags[0]);
+    sign_in_starts(value(run, None), set)
+}
+
+/// Whether a `Run` value starts blitz. Turning it off in Task Manager
+/// leaves the value and sets the first byte of blitz's `StartupApproved`
+/// entry, `approved`, to an odd one.
+fn sign_in_starts(run: bool, approved: Option<u8>) -> bool {
+    run && approved.is_none_or(|b| b & 1 == 0)
 }
 
 /// Whether a session `now` differs from the one last `saved`. The window's
@@ -10196,6 +10218,18 @@ mod tests {
             Some(left("0.0.5", false))
         );
         assert_eq!(kept_at_close(None, true), None);
+    }
+
+    /// Startup apps in Task Manager turn the start off without the value.
+    #[test]
+    fn a_sign_in_start_turned_off_does_not_count() {
+        assert!(sign_in_starts(true, None));
+        assert!(sign_in_starts(true, Some(0x02)));
+        assert!(sign_in_starts(true, Some(0x06)));
+        assert!(!sign_in_starts(true, Some(0x03)));
+        assert!(!sign_in_starts(true, Some(0x07)));
+        assert!(!sign_in_starts(false, None));
+        assert!(!sign_in_starts(false, Some(0x02)));
     }
 
     #[test]
