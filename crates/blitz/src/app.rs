@@ -3145,6 +3145,18 @@ impl App {
     /// downloading or failed to. If Ctrl+Shift+U asked to update now in
     /// the meantime, it runs now.
     fn fetched(&mut self, v: String, got: Result<crate::update::Installer, String>) {
+        // A newer release a look found. Until its installer is here, the
+        // older one stays, and one that fails to come leaves it there,
+        // unsaid: the next look tries again.
+        if replaces(self.at_close.as_ref(), &v) {
+            if let Ok(installer) = got {
+                let keys = keymap::press_for(Action::Update, &self.config.keys);
+                self.update = Some((v.clone(), crate::update::at_close(&v, &keys)));
+                self.at_close = Some((v, Some(installer)));
+                self.request_redraw();
+            }
+            return;
+        }
         // Dropped in the meantime.
         if self.at_close.as_ref().is_none_or(|a| a.0 != v) {
             return;
@@ -3181,6 +3193,11 @@ impl App {
         let keys = keymap::press_for(Action::Update, &self.config.keys);
         self.update = Some((v.clone(), crate::update::at_close(&v, &keys)));
         self.request_redraw();
+        self.fetch(v);
+    }
+
+    /// Downloads the installer of release `v`, which lands in [`Self::fetched`].
+    fn fetch(&self, v: String) {
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             let got = std::panic::catch_unwind(|| crate::update::fetch(&v))
@@ -6876,6 +6893,12 @@ fn arms(at_close: Option<&AtClose>, v: &str) -> bool {
     at_close.is_none_or(|a| a.0 != v)
 }
 
+/// Whether the installer of release `v`, once here, takes the place of the
+/// one `at_close` holds: an older release's, ready to install.
+fn replaces(at_close: Option<&AtClose>, v: &str) -> bool {
+    at_close.is_some_and(|a| a.0 != v && a.1.is_some())
+}
+
 /// Whether Ctrl+Shift+U asks before it updates to release `v`: not when it
 /// answers the question it `asked`, nor once `v` waits in `at_close` for
 /// blitz to close, as its strip then says a press restarts now.
@@ -7664,8 +7687,10 @@ impl ApplicationHandler<UserEvent> for App {
                     && (asked || self.unasked(&v, false))
                 {
                     // A newer release takes the place of one left for when
-                    // blitz closes, rather than show while that one installs.
-                    match &self.at_close {
+                    // blitz closes, rather than show while that one installs;
+                    // a ready one stays until the newer one's installer is here.
+                    match self.at_close.as_ref() {
+                        a if replaces(a, &v) => self.fetch(v),
                         Some(a) if a.0 != v => self.leave_for_close(v),
                         _ => self.offer_update(v, None),
                     }
@@ -10209,6 +10234,12 @@ mod tests {
         assert!(!asks(true, None, "0.0.5"));
         assert!(!asks(false, Some(&left("0.0.5", false)), "0.0.5"));
         assert!(asks(false, Some(&left("0.0.5", true)), "0.0.6"));
+        // A newer release found later replaces a ready installer only once
+        // its own is here; one still on its way is replaced at once.
+        assert!(replaces(Some(&left("0.0.5", true)), "0.0.6"));
+        assert!(!replaces(Some(&left("0.0.5", false)), "0.0.6"));
+        assert!(!replaces(Some(&left("0.0.6", true)), "0.0.6"));
+        assert!(!replaces(None, "0.0.6"));
         // Hiding the banner drops it, but not a restart asked for while it
         // downloads.
         assert_eq!(kept_at_close(Some(left("0.0.5", true)), false), None);
