@@ -112,6 +112,8 @@ const GFX_RETRY: Duration = Duration::from_secs(1);
 /// Time between the steps a drag scrolls while the pointer is held above
 /// or below its pane.
 const AUTOSCROLL: Duration = Duration::from_millis(50);
+/// How long a new window stays hidden waiting for its first frame.
+const FIRST_FRAME: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -863,6 +865,8 @@ struct App {
     persist: bool,
     /// blitz runs as administrator, and its title says so.
     admin: bool,
+    /// The window is hidden until its first frame, or until this time.
+    hidden_until: Option<Instant>,
     /// The session as last saved.
     saved: Option<session::State>,
     /// When a changed layout is saved, unless it changes back first.
@@ -1112,6 +1116,7 @@ impl App {
             capture_then_exit: false,
             persist,
             admin: false,
+            hidden_until: None,
             saved: None,
             save_after: None,
             gfx_retry: None,
@@ -1134,8 +1139,12 @@ impl App {
 
     /// Creates the window and starts the first session.
     fn start(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
+        // Hidden until its first frame, which would otherwise come after a
+        // flash of white or black.
+        self.hidden_until = Some(Instant::now() + FIRST_FRAME);
         let mut attrs = Window::default_attributes()
             .with_title(window_title("", self.admin))
+            .with_visible(false)
             .with_inner_size(LogicalSize::new(980.0, 620.0))
             // Icon group 1, which build.rs links in.
             .with_window_icon(Icon::from_resource(1, Some(small_icon_size())).ok())
@@ -1173,6 +1182,9 @@ impl App {
         self.frame_theme();
         self.window = Some(window);
         self.ensure_gfx();
+        // The background, before sessions start, so the window shows at
+        // once however long they take.
+        self.redraw();
 
         let mut win = layout::Window::default();
         if let Some(s) = &saved {
@@ -3743,6 +3755,7 @@ impl App {
         self.counters.frame_cpu_ms += (started.elapsed() - waited).as_secs_f64() * 1000.0;
         match result {
             Ok(_) => {
+                self.reveal(true);
                 self.counters.frames += 1;
                 if self.counters.first_present_ms.is_none() {
                     self.counters.first_present_ms =
@@ -3778,6 +3791,16 @@ impl App {
             {
                 self.ime_at = Some(at);
                 w.set_ime_cursor_area(PhysicalPosition::new(at.0, at.1), PhysicalSize::new(cw, ch));
+            }
+        }
+    }
+
+    /// Shows the hidden window when [`shows`] says so.
+    fn reveal(&mut self, presented: bool) {
+        if shows(self.hidden_until, presented, Instant::now()) {
+            self.hidden_until = None;
+            if let Some(w) = &self.window {
+                w.set_visible(true);
             }
         }
     }
@@ -3907,6 +3930,7 @@ impl App {
             gfx,
             anim,
             self.mouse.scroll_at,
+            self.hidden_until,
         ]
         .into_iter()
         .flatten()
@@ -4256,6 +4280,13 @@ fn min_window(cell: (u32, u32), scale: f32, expanded: bool) -> PhysicalSize<u32>
     let (w, h) = pane_min(cell, scale, expanded);
     let rail = (chrome::RAIL_W * scale).round() as i32;
     PhysicalSize::new((w + rail) as u32, h as u32)
+}
+
+/// Whether a window kept hidden `until` then shows now: once a frame was
+/// `presented`, or at `until` without one, so a renderer that fails still
+/// leaves a window to see.
+fn shows(until: Option<Instant>, presented: bool, now: Instant) -> bool {
+    until.is_some_and(|t| presented || now >= t)
 }
 
 /// Asks Windows to start blitz again, with its saved session, after it
@@ -4636,6 +4667,7 @@ impl ApplicationHandler<UserEvent> for App {
             if self.mouse.scroll_at.is_some_and(|t| t <= now) {
                 self.autoscroll();
             }
+            self.reveal(false);
             // A synchronized update timed out, a notice expired, or a
             // working timer ticked.
             self.request_redraw();
@@ -5709,6 +5741,18 @@ mod tests {
         assert!(!c.matches().is_empty());
         let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
         assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
+    }
+
+    /// The window shows with its first frame, never blank before it, and
+    /// shows anyway when no frame comes.
+    #[test]
+    fn app_the_window_shows_with_its_first_frame() {
+        let t0 = Instant::now();
+        let until = Some(t0 + FIRST_FRAME);
+        assert!(shows(until, true, t0), "a frame");
+        assert!(!shows(until, false, t0), "nothing to show yet");
+        assert!(shows(until, false, t0 + FIRST_FRAME), "no frame in time");
+        assert!(!shows(None, true, t0), "already shown");
     }
 
     /// Windows ends blitz for an update restart without the save at exit,
