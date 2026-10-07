@@ -259,17 +259,29 @@ mod gpu {
         /// the palette), except that dim text is drawn halfway to its
         /// background.
         pub fn snapshot(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
-            self.grid(snap, pal, x, y, false);
+            self.grid(snap, pal, x, y, false, true);
         }
 
         /// [`Self::snapshot`] for a pane without focus: text at reduced
         /// contrast, each cell's moved a quarter of the way to its
         /// background, and no cursor or selection.
         pub fn dimmed(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
-            self.grid(snap, pal, x, y, true);
+            self.grid(snap, pal, x, y, true, true);
         }
 
-        fn grid(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32, dim: bool) {
+        /// [`Self::snapshot`], or with `dim` as [`Self::dimmed`] draws it,
+        /// without copying the snapshot. Without `clear`, the grid's own
+        /// background is left to what is already drawn under it, such as
+        /// scenery; cells in other colours still cover it.
+        pub fn grid(
+            &mut self,
+            snap: &Snapshot,
+            pal: &Palette,
+            x: i32,
+            y: i32,
+            dim: bool,
+            clear: bool,
+        ) {
             let (cw, ch) = self.cell();
             let (cols, rows) = (usize::from(snap.cols), usize::from(snap.rows));
             let blank = RenderCell {
@@ -295,7 +307,9 @@ mod gpu {
             let py = |r: usize| y + (r as u32 * ch) as i32;
 
             let first = self.quads.len();
-            self.rect(x, y, cols as u32 * cw, rows as u32 * ch, pal.bg);
+            if clear {
+                self.rect(x, y, cols as u32 * cw, rows as u32 * ch, pal.bg);
+            }
             for r in 0..rows {
                 let mut c = 0;
                 while c < cols {
@@ -806,6 +820,8 @@ mod gpu {
             preedit: None,
             picker: None,
             settings: None,
+            spark: None,
+            game: None,
         };
         // One setting changed, to show its mark and a switch that is off.
         let config = crate::config::Config {

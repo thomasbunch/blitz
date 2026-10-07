@@ -48,6 +48,11 @@ pub struct ChromeModel<'a> {
     pub preedit: Option<(u16, u16, &'a str)>,
     pub picker: Option<Picker<'a>>,
     pub settings: Option<Settings<'a>>,
+    /// The spark at the foot of the sidebar, when it is on: seconds into
+    /// its animation.
+    pub spark: Option<f64>,
+    /// blitz run, while it is open.
+    pub game: Option<&'a crate::arcade::run::Run>,
 }
 
 /// The theme picker, drawn over everything.
@@ -504,6 +509,17 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 y += rh + s(2.0);
             }
         }
+        if let Some(t) = m.spark {
+            let busiest = (m.sessions.iter()).map(|x| x.state).max();
+            let free = Rect {
+                x: 0,
+                y,
+                w: side - 1,
+                h: h - y,
+            };
+            let state = busiest.unwrap_or_default();
+            crate::arcade::mascot::draw(p, free, state, t, m.scale, c, (tw, th));
+        }
     } else if fleet {
         let rail = Rect {
             x: 0,
@@ -609,6 +625,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
     }
     if let Some(pk) = &m.picker {
         picker(&mut extra, pk, c, m.size, s, (tw, th));
+    }
+    if let Some(g) = m.game {
+        g.draw(&mut extra, area, m.scale, c, (tw, th));
     }
     out.prims.extend(extra);
     out
@@ -1174,6 +1193,8 @@ mod tests {
             preedit: None,
             picker: None,
             settings: None,
+            spark: None,
+            game: None,
         }
     }
 

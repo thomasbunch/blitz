@@ -34,6 +34,7 @@ use winit::platform::windows::{
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Icon, UserAttentionType, Window, WindowId};
 
+use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev};
 use crate::config::{Config, Kind};
 use crate::debug::Counters;
@@ -59,6 +60,8 @@ const VK_UP: u16 = 0x26;
 const VK_RIGHT: u16 = 0x27;
 const VK_DOWN: u16 = 0x28;
 const VK_DELETE: u16 = 0x2e;
+const VK_SPACE: u16 = 0x20;
+const VK_W: u16 = 0x57;
 const VK_F4: u16 = 0x73;
 
 /// How long a multi-line paste waits for a second Ctrl+V, and closing a
@@ -66,6 +69,10 @@ const VK_F4: u16 = 0x73;
 const CONFIRM: Duration = Duration::from_secs(3);
 /// How long the notice about the system ConPTY stays up.
 const NOTICE: Duration = Duration::from_secs(5);
+/// Frame times for blitz run, and for scenery and the spark, which move
+/// slowly.
+const GAME_FRAME: Duration = Duration::from_millis(16);
+const SCENERY_FRAME: Duration = Duration::from_millis(66);
 /// The first look for a newer release waits until startup is done, then
 /// one runs every few hours.
 const UPDATE_FIRST: Duration = Duration::from_secs(10);
@@ -455,6 +462,12 @@ struct App {
     settings: Option<Panel>,
     /// Where the settings panel was in the last frame, for clicks.
     settings_hits: Option<chrome::SettingsHits>,
+    /// blitz run while it is open, and when it last moved.
+    game: Option<(Run, Instant)>,
+    /// When a session needing the user last closed blitz run.
+    game_ended: Option<Instant>,
+    /// Windows shows animations; scenery and the spark keep still if not.
+    motion: bool,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -618,6 +631,9 @@ impl App {
             picker: None,
             settings: None,
             settings_hits: None,
+            game: None,
+            game_ended: None,
+            motion: animations_on(),
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -1063,6 +1079,43 @@ impl App {
                 top: p.top,
                 error: p.error.as_deref(),
             }),
+            spark: self.config.mascot.then(|| self.anim_time()),
+            game: self.game.as_ref().map(|g| &g.0),
+        }
+    }
+
+    /// Seconds into the scenery and spark animations; always 0 when
+    /// Windows animations are off.
+    fn anim_time(&self) -> f64 {
+        if self.motion {
+            self.started.elapsed().as_secs_f64()
+        } else {
+            0.0
+        }
+    }
+
+    /// Opens blitz run in place of the settings panel.
+    fn open_game(&mut self) {
+        self.settings = None;
+        let seed = (self.started.elapsed().as_nanos() as u64) | 1;
+        self.game = Some((Run::new(seed, run::load_best()), Instant::now()));
+        self.request_redraw();
+    }
+
+    /// Closes blitz run, keeping a new best score.
+    fn close_game(&mut self) {
+        if let Some((g, _)) = self.game.take() {
+            if g.best > run::load_best() {
+                run::save_best(g.best);
+            }
+            // The focused pane is in view again, so whatever landed on it
+            // under the game is seen now.
+            if self.focused
+                && let Some(id) = self.focus_id()
+            {
+                self.attention(id, Ev::Attended);
+            }
+            self.request_redraw();
         }
     }
 
@@ -1259,6 +1312,7 @@ impl App {
         match p.selected().map(|s| s.kind) {
             Some(Kind::Toggle) => self.change_setting(1, true),
             Some(Kind::Theme) => self.open_picker(),
+            Some(Kind::Game) => self.open_game(),
             Some(Kind::Choice) if inside(&control) => {
                 let by = if x < control.x + control.w / 2 { -1 } else { 1 };
                 self.change_setting(by, false);
@@ -1277,9 +1331,10 @@ impl App {
         let Some(s) = p.selected() else {
             return;
         };
-        if s.kind == Kind::Theme {
-            self.open_picker();
-            return;
+        match s.kind {
+            Kind::Theme => return self.open_picker(),
+            Kind::Game => return self.open_game(),
+            _ => {}
         }
         if let Some(v) = p.step(s, &self.config, by, wrap) {
             self.set_setting(s.key, Some(v));
@@ -1338,7 +1393,9 @@ impl App {
     /// Typed text for the filter of the theme picker or the settings
     /// panel. False when neither is open.
     fn filter_text(&mut self, t: &str) -> bool {
-        if let Some(p) = &mut self.picker {
+        if self.game.is_some() {
+            // The game takes keys, not text.
+        } else if let Some(p) = &mut self.picker {
             p.filter.push_str(t);
             p.sel = 0;
             self.preview();
@@ -1508,6 +1565,23 @@ impl App {
         if held && k.down && self.eaten.0.contains(&k.vk) && !keymap::repeats(k, panel) {
             return;
         }
+        if let Some((g, _)) = &mut self.game {
+            // Every key is the game's, but a shortcut closes it and runs.
+            if keymap::action(k).is_some() {
+                self.close_game();
+            } else {
+                if k.down {
+                    self.eaten.press(k.vk);
+                    match k.vk {
+                        VK_ESCAPE => self.close_game(),
+                        vk if is_jump(vk) => g.jump(),
+                        _ => {}
+                    }
+                    self.request_redraw();
+                }
+                return;
+            }
+        }
         // Every key pressed while the picker is open is the picker's, and
         // so is its release. A key pressed before it opened, such as the
         // Ctrl of the shortcut that opened it, is released to the program,
@@ -1543,8 +1617,15 @@ impl App {
         }
         // The program saw neither the press nor the release of a key blitz
         // took, so it gets none of its repeats either, even once they stop
-        // doing anything, such as a swap that reached the edge.
+        // doing anything: a swap that reached the edge, or a jump held when
+        // a needs-you closed blitz run.
         if held && k.down && self.eaten.0.contains(&k.vk) {
+            return;
+        }
+        // Nor do jumps already on their way when it closed.
+        let since = self.game_ended.map(|t| t.elapsed());
+        if k.down && late_jump(k.vk, since) {
+            self.eaten.press(k.vk);
             return;
         }
         let Some(v) = self.current() else {
@@ -1949,12 +2030,24 @@ impl App {
     /// it changes to something the user should see while looking away.
     /// Returns true when the state changed.
     fn attention(&mut self, id: PaneId, ev: Ev) -> bool {
-        let attended = self.focused && self.focus_id() == Some(id);
+        // Back to work: blitz run ends when a session starts needing the
+        // user. It closes first, so the focused pane is in view again for
+        // the event, as if the game had never been open.
+        let now = Instant::now();
+        if self.game.is_some()
+            && self
+                .view(id)
+                .is_some_and(|v| ends_game(v.pane.attn, ev, now))
+        {
+            self.close_game();
+            self.game_ended = Some(now);
+        }
+        // While it is open, it covers the panes: the focused one is not in view.
+        let attended = self.focused && self.game.is_none() && self.focus_id() == Some(id);
         let away = !self.focused && self.config.flash;
         let Some(v) = self.view_mut(id) else {
             return false;
         };
-        let now = Instant::now();
         let changed = v.pane.attn.apply(ev, attended, now);
         let kind = (changed && away)
             .then(|| flash_kind(v.pane.attn.state, &mut v.flashed, now))
@@ -2086,6 +2179,10 @@ impl App {
             }
             return;
         }
+        // blitz run covers the panes and keeps the sidebar where it is.
+        if pressed && self.game.is_some() {
+            return;
+        }
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
         let on_banner = (self.banner)
             .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
@@ -2167,6 +2264,10 @@ impl App {
                 });
             }
         }
+        // blitz run covers the panes, so programs see no motion under it.
+        if self.game.is_some() {
+            return;
+        }
         let mods = mods_now();
         // A drag goes where its press went, like the release will.
         let held = (0..3).find_map(|b| Some((b, self.mouse.reported[b]?)));
@@ -2193,6 +2294,9 @@ impl App {
         if let Some(p) = self.settings.as_mut().filter(|_| self.picker.is_none()) {
             p.move_by(-steps as isize);
             self.request_redraw();
+            return;
+        }
+        if self.game.is_some() {
             return;
         }
         // Over another pane, the wheel scrolls that pane's history without
@@ -2248,6 +2352,19 @@ impl App {
         g.chain.wait(100);
         let started = Instant::now();
         let mut waited = Duration::ZERO;
+        if let Some((g, at)) = &mut self.game {
+            // The game waits while the window is in the background, and a
+            // long frame counts as one short step rather than a jump.
+            let dt = if self.focused {
+                (started.saturating_duration_since(*at)).min(Duration::from_millis(50))
+            } else {
+                Duration::ZERO
+            };
+            *at = started;
+            if g.step(dt.as_secs_f32()) && g.best > run::load_best() {
+                run::save_best(g.best);
+            }
+        }
         let (cw, ch) = self.cell();
         let focus = self.focus_id();
         let cursor = self.current().map(|v| lock(&v.pane.term).cursor());
@@ -2294,6 +2411,21 @@ impl App {
         }
 
         let pal = self.theme.pal;
+        let scenery = (self.config.scenery != "off").then(|| {
+            let mut prims = Vec::new();
+            let all = Rect {
+                x: 0,
+                y: 0,
+                w: size.width as i32,
+                h: size.height as i32,
+            };
+            let (scene, t) = (&self.config.scenery, self.anim_time());
+            crate::arcade::scenery::draw(&mut prims, scene, all, t, self.scale as f32, &pal);
+            chrome::Chrome {
+                prims,
+                ..Default::default()
+            }
+        });
         let Some(g) = &mut self.gfx else {
             return;
         };
@@ -2301,18 +2433,17 @@ impl App {
             g.chain.resize(&g.r.gpu, size.width, size.height)?;
             for _ in 0..2 {
                 g.r.begin();
+                if let Some(s) = &scenery {
+                    g.r.chrome(s);
+                }
                 for v in &self.views {
                     // A pane with no room for a cell shows nothing, rather
                     // than its 1x1 grid drawn over its neighbour.
                     let Some(at) = v.rect.filter(|r| r.w >= cw as i32 && r.h >= ch as i32) else {
                         continue;
                     };
-                    let id = v.pane.id;
-                    if dimmed.contains(&id) {
-                        g.r.dimmed(&v.snap, &pal, at.x, at.y);
-                    } else {
-                        g.r.snapshot(&v.snap, &pal, at.x, at.y);
-                    }
+                    let dim = dimmed.contains(&v.pane.id);
+                    g.r.grid(&v.snap, &pal, at.x, at.y, dim, scenery.is_none());
                     if let Some(n) = &v.notice {
                         draw_notice(&mut g.r, &pal, at, v.grid, n);
                     }
@@ -2489,7 +2620,15 @@ impl App {
         let shown = (self.window.as_ref())
             .is_some_and(|w| w.inner_size().width > 0 && w.inner_size().height > 0);
         let gfx = self.gfx_retry.filter(|_| self.gfx.is_none() && shown);
-        [sync, notice, timer, resume, self.save_after, gfx]
+        // Only a window in use animates.
+        let still =
+            !self.motion || (self.config.scenery == "off" && !(self.config.mascot && sidebar));
+        let anim = match (self.focused, self.game.is_some(), still) {
+            (true, true, _) => Some(now + GAME_FRAME),
+            (true, false, false) => Some(now + SCENERY_FRAME),
+            _ => None,
+        };
+        [sync, notice, timer, resume, self.save_after, gfx, anim]
             .into_iter()
             .flatten()
             .min()
@@ -2540,6 +2679,47 @@ fn route_button(
     } else {
         reported[b].take()
     }
+}
+
+/// Whether Windows shows animations; off under Accessibility, Visual
+/// effects. Read once at start.
+fn animations_on() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut on = windows::core::BOOL(1);
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&raw mut on).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    read.is_err() || on.as_bool()
+}
+
+/// How long after a session needing the user closes blitz run a jump key
+/// is still taken for the game, and kept from the pane.
+const LATE_JUMP: Duration = Duration::from_millis(400);
+
+/// The keys that jump in blitz run.
+fn is_jump(vk: u16) -> bool {
+    matches!(vk, VK_SPACE | VK_UP | VK_W)
+}
+
+/// Whether `ev` closes blitz run: it starts the session needing the user.
+/// A repeat of a needs-you already showing does not.
+fn ends_game(attn: crate::attention::PaneAttn, ev: Ev, now: Instant) -> bool {
+    let mut seen = attn;
+    seen.apply(ev, false, now) && seen.state == Attn::NeedsYou
+}
+
+/// Whether a press of `vk` is a jump meant for blitz run that arrived
+/// after a session closed it, `since` ago.
+fn late_jump(vk: u16, since: Option<Duration>) -> bool {
+    is_jump(vk) && since.is_some_and(|d| d < LATE_JUMP)
 }
 
 /// Whether a notification replaces the session's sidebar message. It is
@@ -2839,7 +3019,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
-                // Releases and the end of a drag now go to another window.
+                // A key still held goes up in the other window, so its
+                // release never comes back to clear `eaten`; so does the
+                // button ending a drag.
                 if !f {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
@@ -3665,6 +3847,42 @@ mod tests {
         // the end of the session still clears the message.
         assert!(feed(Ev::Done, true));
         assert!(feed(Ev::Idle, true));
+    }
+
+    #[test]
+    fn a_session_starting_to_need_you_ends_the_game() {
+        let t0 = Instant::now();
+        let mut a = crate::attention::PaneAttn::new(t0);
+        a.apply(Ev::Working, true, t0);
+        assert!(ends_game(a, Ev::NeedsYou, t0));
+        assert!(!ends_game(a, Ev::Done, t0));
+        assert!(!ends_game(a, Ev::Error { sticky: false }, t0));
+        assert!(!ends_game(a, Ev::Attended, t0));
+        // Asking leaves the state as it was.
+        assert_eq!(a.state, Attn::Working);
+        a.apply(Ev::NeedsYou, false, t0);
+        assert!(!ends_game(a, Ev::NeedsYou, t0), "a repeat");
+        // The rule `attention()` relies on by closing the game first: a
+        // needs-you on a pane in view is seen and does not relabel it.
+        // This pins `PaneAttn` only; the order inside `attention()` is
+        // not covered here.
+        let mut b = crate::attention::PaneAttn::new(t0);
+        b.apply(Ev::Working, true, t0);
+        assert!(!relabels(Ev::NeedsYou, b.apply(Ev::NeedsYou, true, t0)));
+        assert_eq!(b.state, Attn::Working);
+    }
+
+    #[test]
+    fn jumps_just_after_the_game_closes_stay_out_of_the_pane() {
+        let ms = |n| Some(Duration::from_millis(n));
+        for vk in [VK_SPACE, VK_UP, VK_W] {
+            assert!(late_jump(vk, ms(0)));
+            assert!(late_jump(vk, ms(399)));
+            assert!(!late_jump(vk, ms(400)));
+            assert!(!late_jump(vk, None), "the game never closed itself");
+        }
+        assert!(!late_jump(VK_RETURN, ms(0)), "Enter answers the prompt");
+        assert!(!late_jump(VK_DOWN, ms(0)));
     }
 
     #[test]

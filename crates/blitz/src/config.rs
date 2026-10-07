@@ -28,6 +28,11 @@ pub struct Config {
     /// Save each pane's recent output and show it again on the next start.
     /// Off by default: old output can hold secrets.
     pub restore_scrollback: bool,
+    /// Pixel scenery behind the panes, one of
+    /// [`SCENES`](crate::arcade::scenery::SCENES).
+    pub scenery: String,
+    /// The spark at the foot of the sidebar.
+    pub mascot: bool,
 }
 
 impl Default for Config {
@@ -45,6 +50,8 @@ impl Default for Config {
             restore_session: true,
             restore_claude: true,
             restore_scrollback: false,
+            scenery: "off".into(),
+            mascot: false,
         }
     }
 }
@@ -58,6 +65,8 @@ pub enum Kind {
     Choice,
     /// Picked in the theme picker.
     Theme,
+    /// Starts blitz run; not a value in `config.toml`.
+    Game,
 }
 
 /// A setting the settings panel shows. `key` is its name in `config.toml`.
@@ -181,6 +190,33 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Toggle,
         applies: RESTART,
     },
+    Setting {
+        key: "scenery",
+        group: "Easter eggs",
+        label: "Scenery",
+        help: "Pixel stars, hills or snow drifting behind the panes, faint \
+               enough to read over. Still when Windows animations are off.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
+        key: "mascot",
+        group: "Easter eggs",
+        label: "Spark",
+        help: "A little critter at the foot of the sidebar that naps, runs \
+               and waves along with your sessions.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
+        key: "game",
+        group: "Easter eggs",
+        label: "blitz run",
+        help: "A one-button runner for while agents work. Enter starts it, \
+               Space jumps, Esc quits; it closes when a session needs you.",
+        kind: Kind::Game,
+        applies: NOW,
+    },
 ];
 
 impl Config {
@@ -215,6 +251,8 @@ impl Config {
             "flash" => flag(self.flash),
             "bell_attention" => flag(self.bell_attention),
             "check_updates" => flag(self.check_updates),
+            "scenery" => quote(&self.scenery),
+            "mascot" => flag(self.mascot),
             _ => String::new(),
         }
     }
@@ -232,6 +270,10 @@ impl Config {
             "theme" => self.theme = text,
             "font_family" => self.font_family = text,
             "shell" => self.shell = text,
+            "scenery" => match text.to_lowercase() {
+                s if crate::arcade::scenery::SCENES.contains(&s.as_str()) => self.scenery = s,
+                _ => return false,
+            },
             "font_size" => match num.filter(|n| (4.0..=72.0).contains(n)) {
                 Some(n) => self.font_size = n as f32,
                 None => return false,
@@ -257,6 +299,7 @@ impl Config {
             "flash" => &mut self.flash,
             "bell_attention" => &mut self.bell_attention,
             "check_updates" => &mut self.check_updates,
+            "mascot" => &mut self.mascot,
             _ => return None,
         })
     }
@@ -528,7 +571,7 @@ mod tests {
     #[test]
     fn every_setting_reads_back_what_it_writes() {
         let mut c = Config::default();
-        for s in SETTINGS {
+        for s in SETTINGS.iter().filter(|s| s.kind != Kind::Game) {
             let v = c.get(s.key);
             assert!(!v.is_empty(), "{} has no value", s.key);
             assert!(c.set(s.key, &v), "{} = {v} does not read back", s.key);
@@ -538,6 +581,14 @@ mod tests {
         let v = c.get("shell");
         assert!(Config::default().set("shell", &v));
         assert_eq!(Config::parse(&format!("shell = {v}")).shell, c.shell);
+    }
+
+    #[test]
+    fn help_text_has_single_spaces() {
+        // The settings search matches the help as written.
+        for s in SETTINGS {
+            assert!(!s.help.contains("  "), "{}: {:?}", s.key, s.help);
+        }
     }
 
     #[test]
@@ -590,6 +641,23 @@ mod tests {
     }
 
     #[test]
+    fn config_reads_easter_eggs() {
+        let c = Config::parse(
+            "scenery = \"Hills\"
+mascot = true
+",
+        );
+        assert_eq!((c.scenery.as_str(), c.mascot), ("hills", true));
+        let c = Config::parse(
+            "scenery = \"lava\"
+scenery = stars
+",
+        );
+        assert_eq!(c.scenery, "stars", "an unknown scene is skipped");
+        assert_eq!(Config::default().scenery, "off");
+    }
+
+    #[test]
     fn config_missing_file_gives_defaults() {
         let t = Temp::new("missing");
         let path = t.0.join(FILE);
@@ -610,6 +678,11 @@ mod tests {
         assert_eq!(Config::read(&folder), Config::default());
     }
 
+    /// The panel's rows that are settings in the file, not blitz run.
+    fn values() -> impl Iterator<Item = &'static Setting> {
+        SETTINGS.iter().filter(|s| s.kind != Kind::Game)
+    }
+
     #[test]
     fn every_setting_round_trips_a_value_other_than_its_default() {
         let mut c = Config::default();
@@ -626,20 +699,22 @@ mod tests {
             ("flash", "false"),
             ("bell_attention", "false"),
             ("check_updates", "false"),
+            ("scenery", "\"snow\""),
+            ("mascot", "true"),
         ] {
             assert!(c.set(k, v), "{k} = {v}");
         }
         let d = Config::default();
-        for s in SETTINGS {
+        for s in values() {
             assert_ne!(c.get(s.key), d.get(s.key), "{} kept its default", s.key);
         }
-        let text: String = (SETTINGS.iter())
+        let text: String = values()
             .map(|s| format!("{} = {}\n", s.key, c.get(s.key)))
             .collect();
         assert_eq!(Config::parse(&text), c);
         // As the settings panel writes them, one at a time.
         let mut file = String::new();
-        for s in SETTINGS {
+        for s in values() {
             file = with_value(&file, s.key, Some(&c.get(s.key)));
         }
         assert_eq!(Config::parse(&file), c);
@@ -649,7 +724,7 @@ mod tests {
     fn readme_documents_every_setting() {
         let readme = include_str!("../../../README.md");
         let d = Config::default();
-        for s in SETTINGS {
+        for s in values() {
             let row = format!("| `{}` | `{}` |", s.key, d.get(s.key));
             assert!(readme.contains(&row), "README.md has no row {row}");
         }

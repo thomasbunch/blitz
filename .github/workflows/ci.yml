@@ -55,7 +55,7 @@ jobs:
       - name: Only expected kinds of files are tracked
         run: |
           ok='\.gitignore|\.gitattributes|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|LICENSE|README\.md'
-          ok="$ok|\.cargo/config\.toml|\.github/workflows/[a-z0-9-]+\.yml|\.github/(blitz\.iss|about\.toml|about\.hbs)"
+          ok="$ok|\.cargo/config\.toml|\.github/workflows/[a-z0-9-]+\.yml|\.github/(blitz\.iss|about\.toml|about\.hbs|dependabot\.yml)"
           ok="$ok|crates/[a-z0-9-]+/(Cargo\.toml|build\.rs)|crates/[a-z0-9-]+/(src|tests|examples)/.+\.rs"
           ok="$ok|crates/[a-z0-9-]+/tests/.+\.vt|crates/blitz/src/render/[a-z0-9_]+\.hlsl"
           ok="$ok|crates/blitz/icon/blitz\.(ico|svg)|crates/blitz/themes/[a-z0-9-]+"
@@ -82,6 +82,29 @@ jobs:
           fi
       - run: rustup toolchain install
       - run: cargo fmt --all --check
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.20.2
+      # Releases only accept these licenses (cargo-about with
+      # .github/about.toml, whose list this one must match).
+      # Checking here fails the pull request that brings in a crate under
+      # another license, or from anywhere but crates.io, instead of the
+      # next release. Unlike cargo-about this also checks build
+      # dependencies, which cargo-deny cannot leave out.
+      - name: Licenses and sources
+        run: |
+          cat > "$RUNNER_TEMP/deny.toml" <<'EOF'
+          [licenses]
+          allow = ["MIT", "Apache-2.0", "Zlib", "Unicode-3.0"]
+
+          [sources]
+          unknown-registry = "deny"
+          unknown-git = "deny"
+          EOF
+          # Licenses cover what ships: Windows, no dev dependencies.
+          cargo deny --config "$RUNNER_TEMP/deny.toml" --locked --target x86_64-pc-windows-msvc --exclude-dev check licenses
+          # Sources cover every crate CI builds, on every target.
+          cargo deny --config "$RUNNER_TEMP/deny.toml" --locked check sources
 
   test:
     name: test (${{ matrix.os }})
@@ -136,21 +159,6 @@ jobs:
       - if: runner.os == 'Windows'
         run: cargo test --release -p blitz --locked
         timeout-minutes: 15
-
-  # The licenses the release's THIRD-PARTY-NOTICES.txt accepts, checked
-  # before a crate under another one is merged rather than at tag time.
-  licenses:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
-        with:
-          tool: cargo-about@0.9.2
-      - run: cargo about generate --locked --fail --config .github/about.toml .github/about.hbs -o /dev/null
 
   # The width tables must be exactly what the generator makes of the
   # Unicode release they claim.
