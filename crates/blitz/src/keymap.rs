@@ -23,6 +23,9 @@ pub enum Action {
     ScrollEnd(i8),
     /// Drop the scrollback, and what the console host keeps of it.
     ClearScrollback,
+    /// Undo the modes a crashed program left on, such as mouse reports or
+    /// a hidden cursor.
+    Reset,
     NewTab,
     ClosePane,
     /// Close every pane of the active tab.
@@ -94,6 +97,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::ScrollEnd(1), "scroll_to_top", "Scroll to the top"),
     (Action::ScrollEnd(-1), "scroll_to_bottom", "Scroll to the bottom"),
     (Action::ClearScrollback, "clear_scrollback", "Clear the scrollback and screen"),
+    (Action::Reset, "reset_terminal", "Reset the terminal"),
     (Action::NewTab, "new_tab", "New tab"),
     (Action::ClosePane, "close_pane", "Close pane"),
     (Action::CloseTab, "close_tab", "Close tab"),

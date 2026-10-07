@@ -2794,6 +2794,13 @@ impl App {
                 }
                 self.scroll(if dir > 0 { isize::MAX } else { isize::MIN });
             }
+            Action::Reset => {
+                let Some(v) = self.current() else {
+                    return false;
+                };
+                lock(&v.pane.term).reset_modes();
+                self.request_redraw();
+            }
             // A full-screen program's screen would be cleared under it.
             Action::ClearScrollback => {
                 let Some(v) = self.current().filter(|_| !self.modes().alt_screen) else {
@@ -7225,6 +7232,14 @@ mod tests {
         assert_eq!(c.matches(), [(Action::FontSize(1), "Bigger font")]);
         c.filter = "claude".into();
         assert_eq!(c.matches(), [(Action::ClaudeSetup, "Claude Code setup")]);
+        // Actions with no keys are here too.
+        c.filter = "reset term".into();
+        assert_eq!(c.matches(), [(Action::Reset, "Reset the terminal")]);
+        c.filter = "clear".into();
+        assert_eq!(
+            c.matches(),
+            [(Action::ClearScrollback, "Clear the scrollback and screen")]
+        );
         c.move_by(5);
         assert_eq!(c.sel, 0, "one match");
         c.filter = "zzz".into();
