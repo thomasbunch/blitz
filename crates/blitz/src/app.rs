@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -970,6 +971,8 @@ struct App {
     /// What was last searched for, which the find bar opens with when no
     /// text is selected.
     find_last: String,
+    /// Quick select's labels, while they show.
+    quick: Option<Quick>,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -1256,6 +1259,92 @@ impl Find {
     }
 }
 
+/// Quick select: a label on each URL, path and commit hash in view in the
+/// focused pane. Typing a label copies what it marks; with Shift it opens
+/// it.
+struct Quick {
+    pane: PaneId,
+    /// The line epoch the matches are numbered in.
+    epoch: u32,
+    /// The matches from the bottom of the view up, labelled `a` to `z`:
+    /// their cells, their text, and what opening them does. A hash opens
+    /// nothing.
+    items: Vec<QuickItem>,
+}
+
+type QuickItem = (Found, String, Option<Target>);
+
+/// The URLs, paths and commit hashes in the `rows` high view of `term`, at
+/// most one for each letter, from the bottom up: as [`Quick::items`]. A
+/// path counts when `resolve` finds the file.
+fn quick_items(
+    term: &vt::Terminal,
+    pal: &Palette,
+    rows: u16,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> Vec<QuickItem> {
+    let top = term.view_top();
+    let shown = top..top + usize::from(rows);
+    let mut out = Vec::new();
+    let mut n = top;
+    while shown.contains(&n) {
+        let l = Logical::new(term, pal, n);
+        let mut found: Vec<(Range<usize>, Option<Target>)> = Vec::new();
+        for (range, link) in crate::links::scan(&l.text) {
+            let target = match link {
+                Link::Url(u) => Target::Uri(u),
+                Link::Path(p, at) => match resolve(&p) {
+                    Some(full) => Target::Path(full, at),
+                    None => continue,
+                },
+            };
+            found.push((range, Some(target)));
+        }
+        for range in hashes(&l.text) {
+            if !found
+                .iter()
+                .any(|(r, _)| r.start < range.end && range.start < r.end)
+            {
+                found.push((range, None));
+            }
+        }
+        found.sort_by_key(|f| f.0.start);
+        for (range, target) in found {
+            let (start, end) = l.span(range.clone());
+            if shown.contains(&start.0) {
+                out.push((Found { start, end }, l.text[range].to_owned(), target));
+            }
+        }
+        n = l.cells.last().map_or(n, |c| c.1.0.max(n)) + 1;
+    }
+    out.reverse();
+    out.truncate(26);
+    out
+}
+
+/// Where `text` holds a commit hash: 7 to 40 hex digits with a letter and
+/// a digit among them, a word of its own.
+fn hashes(text: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let len = b[i..].iter().take_while(|c| c.is_ascii_hexdigit()).count();
+        let word = &b[i..i + len];
+        let alone = |j: Option<&u8>| j.is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_');
+        if (7..=40).contains(&len)
+            && word.iter().any(u8::is_ascii_digit)
+            && word.iter().any(u8::is_ascii_alphabetic)
+            && alone(i.checked_sub(1).and_then(|j| b.get(j)))
+            && alone(b.get(i + len))
+        {
+            out.push(i..i + len);
+        }
+        i += len.max(1);
+    }
+    out
+}
+
 /// Sends [`UserEvent::Settings`] whenever a file in `%APPDATA%\blitz`, or
 /// its themes folder, is written. Creates the themes folder, so there is
 /// a place to drop theme files.
@@ -1325,6 +1414,7 @@ impl App {
             font_zoom: 0.0,
             find: None,
             find_last: String::new(),
+            quick: None,
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -1778,6 +1868,7 @@ impl App {
         }
         self.orphan = None;
         self.find = None;
+        self.quick = None;
         self.set_drag(None);
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
@@ -2361,6 +2452,44 @@ impl App {
         }
     }
 
+    /// A key while quick select's labels show: a label copies what it
+    /// marks, and with Shift opens it; any other key puts them away.
+    fn quick_key(&mut self, k: &KeyInput) {
+        if matches!(
+            k.key,
+            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
+        ) {
+            return;
+        }
+        let Some(q) = self.quick.take() else {
+            return;
+        };
+        self.request_redraw();
+        let m = &k.mods;
+        let mut chars = k.text.chars();
+        let (Some(c), None, false) = (chars.next(), chars.next(), m.lctrl || m.rctrl) else {
+            return;
+        };
+        let label = c.to_ascii_lowercase();
+        let i = (label.is_ascii_lowercase()).then(|| usize::from(label as u8 - b'a'));
+        let Some((_, text, target)) = i.and_then(|i| q.items.get(i)) else {
+            return;
+        };
+        if c.is_ascii_uppercase()
+            && let Some(t) = target
+        {
+            self.open_link(t);
+            return;
+        }
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        let said = if crate::clipboard::set_text(Some(hwnd), text) {
+            format!("Copied {text}")
+        } else {
+            "Could not copy to the clipboard".into()
+        };
+        self.set_notice(q.pane, said, Some(Instant::now() + NOTICE), true);
+    }
+
     /// A key while the find bar is open: typing searches as it goes, Enter
     /// or F3 goes to the next match up, with Shift the next one down, and
     /// Esc closes the bar, leaving the view where it is and the current
@@ -2470,6 +2599,8 @@ impl App {
         } else if let Some(f) = &mut self.find {
             f.type_text(t);
             self.find_go(true, 0);
+        } else if self.quick.take().is_some() {
+            self.request_redraw();
         } else {
             return false;
         }
@@ -2788,6 +2919,17 @@ impl App {
             }
             return;
         }
+        // And for quick select.
+        if self.quick.is_some() && k.down {
+            self.eaten.press(k.vk);
+            if keymap::action(k, &self.config.keys) == Some(Action::QuickSelect) {
+                self.quick = None;
+                self.request_redraw();
+            } else {
+                self.quick_key(k);
+            }
+            return;
+        }
         // And for the find bar, but another shortcut runs, and closes it
         // unless it scrolls.
         if self.find.is_some() && k.down {
@@ -3034,6 +3176,29 @@ impl App {
                     },
                 };
                 self.paste(id, &text, false);
+            }
+            Action::QuickSelect => {
+                let Some(v) = self.current() else {
+                    return false;
+                };
+                let term = lock(&v.pane.term);
+                let cwd = &v.pane.cwd;
+                let resolve = |p: &str| crate::links::resolve(p, cwd);
+                let items = quick_items(&term, &self.theme.pal, v.grid.1, resolve);
+                let (id, epoch) = (v.pane.id, term.line_epoch());
+                drop(term);
+                if items.is_empty() {
+                    let until = Some(Instant::now() + NOTICE);
+                    self.set_notice(id, "No links, paths or hashes in view", until, true);
+                    return true;
+                }
+                self.find = None;
+                self.quick = Some(Quick {
+                    pane: id,
+                    epoch,
+                    items,
+                });
+                self.request_redraw();
             }
             Action::SelectAll | Action::SelectOutput => {
                 let pal = self.theme.pal;
@@ -3924,6 +4089,9 @@ impl App {
             return;
         }
         let mods = mods_now();
+        if pressed && self.quick.take().is_some() {
+            self.request_redraw();
+        }
         // Presses go to the command palette or the settings panel; a
         // release still goes wherever its press went.
         if pressed && self.commands.is_some() {
@@ -4543,6 +4711,11 @@ impl App {
                 }
                 v.snap.highlight(&f.found, f.cur);
             }
+            if let Some(q) = self.quick.as_ref().filter(|q| q.pane == id) {
+                let mut found: Vec<Found> = q.items.iter().map(|i| i.0).collect();
+                found.sort();
+                v.snap.highlight(&found, None);
+            }
             // Only the focused pane has a link under the pointer.
             let hover = (self.hover)
                 .filter(|h| Some(id) == focus && h.0 == term.line_epoch())
@@ -4551,6 +4724,39 @@ impl App {
             if Some(id) != focus && chrome::dims(split, v.pane.attn.state) {
                 dimmed.push(id);
             }
+        }
+
+        // Output that numbered the lines anew leaves the labels on nothing.
+        let shown = (self.quick.as_ref()).and_then(|q| {
+            let v = self.view(q.pane)?;
+            let term = lock(&v.pane.term);
+            let view = term.view_top()..term.view_top() + usize::from(v.grid.1);
+            (term.line_epoch() == q.epoch).then_some((q, v.rect, view))
+        });
+        match shown {
+            Some((q, Some(r), view)) => {
+                let ui = &self.theme.ui;
+                for (i, (m, _, _)) in q.items.iter().enumerate() {
+                    let ((line, col), (cw, ch)) = (m.start, (cw as i32, ch as i32));
+                    if !view.contains(&line) {
+                        continue;
+                    }
+                    let x = r.x + i32::from(col) * cw;
+                    let y = r.y + (line - view.start) as i32 * ch;
+                    let cell = Rect { x, y, w: cw, h: ch };
+                    chrome.prims.push(chrome::Prim::Rect(cell, ui.name));
+                    chrome.prims.push(chrome::Prim::Text {
+                        x,
+                        y,
+                        text: char::from(b'a' + i as u8).to_string(),
+                        color: ui.side_bg,
+                        bold: true,
+                        term: true,
+                    });
+                }
+            }
+            Some(_) => {}
+            None => self.quick = None,
         }
 
         let pal = self.theme.pal;
@@ -6904,6 +7110,40 @@ mod tests {
         let (range, found) = crate::links::scan(&l.text).remove(0);
         assert_eq!(found, Link::Url("https://e.com/abc".into()));
         assert_eq!(l.span(range), ((0, 3), (1, 9)), "across the wrap");
+    }
+
+    #[test]
+    fn app_quick_select_labels_urls_paths_and_hashes_from_the_bottom() {
+        let pal = crate::theme::dark();
+        let t = fed(
+            30,
+            4,
+            "see https://x.com/a\r\nat src/a.rs:3 and b/none.rs\r\ncommit 1a2b3c4d done\r\n",
+        );
+        let found = |p: &str| (p == "src/a.rs").then(|| PathBuf::from(r"C:\x\src\a.rs"));
+        let items = quick_items(&t, &pal, 4, found);
+        let texts: Vec<&str> = items.iter().map(|i| i.1.as_str()).collect();
+        assert_eq!(texts, ["1a2b3c4d", "src/a.rs:3", "https://x.com/a"]);
+        assert_eq!(
+            items[0].0,
+            Found {
+                start: (2, 7),
+                end: (2, 14)
+            }
+        );
+        assert_eq!(items[0].2, None, "a hash opens nothing");
+        let path = Target::Path(PathBuf::from(r"C:\x\src\a.rs"), Some((3, 1)));
+        assert_eq!(items[1].2, Some(path));
+        assert_eq!(items[2].2, Some(Target::Uri("https://x.com/a".into())));
+        // Only what is in view.
+        assert_eq!(quick_items(&t, &pal, 1, found).len(), 1);
+    }
+
+    #[test]
+    fn app_hashes_are_hex_words_with_letters_and_digits() {
+        let text = "abc1234 deadbeefcafe 1234567 abcdefa x1a2b3c4 1a2b3c4_ 9f8e7d6c5b.";
+        let found: Vec<&str> = hashes(text).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(found, ["abc1234", "9f8e7d6c5b"]);
     }
 
     #[test]

@@ -97,6 +97,9 @@ pub enum Action {
     ///
     /// [`Config::texts`]: crate::config::Config::texts
     SendText(u16),
+    /// Label the URLs, paths and commit hashes in view, to copy or open
+    /// one by its label.
+    QuickSelect,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -158,6 +161,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Find, "find", "Find in the scrollback"),
     (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
     (Action::SystemMenu, "system_menu", "Window menu"),
+    (Action::QuickSelect, "quick_select", "Quick select a link, path or hash"),
     (Action::GoToTab(0), "go_to_tab_1", "Go to tab 1"),
     (Action::GoToTab(1), "go_to_tab_2", "Go to tab 2"),
     (Action::GoToTab(2), "go_to_tab_3", "Go to tab 3"),
@@ -238,6 +242,7 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, 0x28, Action::JumpToPrompt(-1)),
     (CTRL | SHIFT, b'F' as u16, Action::Find),
     (ALT, 0x20, Action::SystemMenu),
+    (CTRL | SHIFT, 0x20, Action::QuickSelect),
 ];
 
 /// Key names for chords, matched ignoring case. The first name of each
