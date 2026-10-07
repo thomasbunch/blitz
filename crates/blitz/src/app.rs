@@ -3061,6 +3061,20 @@ impl App {
         }
     }
 
+    /// Leaves release `v` to install when blitz closes, and downloads it.
+    fn leave_for_close(&mut self, v: String) {
+        self.at_close = Some((v.clone(), None));
+        let keys = keymap::press_for(Action::Update, &self.config.keys);
+        self.update = Some((v.clone(), crate::update::at_close(&v, &keys)));
+        self.request_redraw();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let got = std::panic::catch_unwind(|| crate::update::fetch(&v))
+                .unwrap_or_else(|_| Err(INTERNAL.into()));
+            let _ = proxy.send_event(UserEvent::Fetched(v, got));
+        });
+    }
+
     /// Shows the banner for release `v`, or for the update to it that
     /// failed and wrote `log`.
     fn offer_update(&mut self, v: String, log: Option<PathBuf>) {
@@ -3826,15 +3840,7 @@ impl App {
                     self.banner_note = Some((text, Ask::Update));
                     self.request_redraw();
                     if later {
-                        self.at_close = Some((v.clone(), None));
-                        let keys = keymap::press_for(Action::Update, &self.config.keys);
-                        self.update = Some((v.clone(), crate::update::at_close(&v, &keys)));
-                        let proxy = self.proxy.clone();
-                        std::thread::spawn(move || {
-                            let got = std::panic::catch_unwind(|| crate::update::fetch(&v))
-                                .unwrap_or_else(|_| Err(INTERNAL.into()));
-                            let _ = proxy.send_event(UserEvent::Fetched(v, got));
-                        });
+                        self.leave_for_close(v);
                     }
                     return true;
                 }
@@ -7319,7 +7325,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Ok(Some(v)) = found
                     && (asked || self.unasked(&v, false))
                 {
-                    self.offer_update(v, None);
+                    // A newer release takes the place of one left for when
+                    // blitz closes, rather than show while that one installs.
+                    match &self.at_close {
+                        Some(a) if a.0 != v => self.leave_for_close(v),
+                        _ => self.offer_update(v, None),
+                    }
                 }
                 // A look nobody asked for leaves an update under way alone.
                 let id = if asked { self.updating.take() } else { None };
