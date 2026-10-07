@@ -5741,7 +5741,7 @@ impl App {
         self.save_after = saved(ok, s, now, &mut self.saved, &mut self.save_fails);
         if let Err(e) = written {
             eprintln!("blitz: saving the session: {e}");
-            if self.save_fails == SAVE_WARN
+            if save_warns(self.save_fails)
                 && let Some(id) = self.focus_id()
             {
                 self.error(
@@ -5840,6 +5840,12 @@ impl App {
 /// before the next try: twice as long each time, up to about a minute.
 fn save_retry(fails: u32) -> Duration {
     SAVE_DELAY * 2u32.pow(fails.min(7))
+}
+
+/// Whether the window says it cannot save after `fails` failures in a
+/// row: once, at the [`SAVE_WARN`]th, not at every retry after it.
+fn save_warns(fails: u32) -> bool {
+    fails == SAVE_WARN
 }
 
 /// Takes in whether `s`, the session, was `written` at `now`. Once it is,
@@ -8927,6 +8933,15 @@ mod tests {
             saved(false, "newer", t0, &mut kept, &mut fails),
             Some(at(500))
         );
+        // Failing on, it is said once, and again only after a save worked.
+        let (mut kept, mut fails, mut said) = (None, 0, Vec::new());
+        for (i, ok) in [0, 0, 0, 0, 0, 1, 0, 0, 0, 0].into_iter().enumerate() {
+            saved(ok == 1, i, t0, &mut kept, &mut fails);
+            if ok == 0 && save_warns(fails) {
+                said.push(i);
+            }
+        }
+        assert_eq!(said, [2, 8]);
     }
 
     fn input(vk: u16, down: bool, key: vt::Key, text: &'static str) -> KeyInput<'static> {
