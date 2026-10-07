@@ -1682,6 +1682,24 @@ fn foot_lines(msg: &str, side: i32, scale: f32, tw: i32) -> Option<Vec<String>> 
     (words(&lines.join(" ")) == words(msg)).then_some(lines)
 }
 
+/// `t` broken into rows of at most `max` cells by width alone, every char
+/// kept, spaces included: a file name a question shows reads exactly as
+/// it will be pasted.
+pub fn cell_rows(t: &str, max: i32) -> Vec<String> {
+    let (mut rows, mut line, mut w) = (Vec::new(), String::new(), 0);
+    for c in t.chars() {
+        let cells = char_cells(c);
+        if w + cells > max && !line.is_empty() {
+            rows.push(std::mem::take(&mut line));
+            w = 0;
+        }
+        line.push(c);
+        w += cells;
+    }
+    rows.push(line);
+    rows
+}
+
 /// `t` broken at spaces into at most `n` lines of `max` pixels, a word
 /// wider than a line going on over the next; the last ends in an ellipsis
 /// when the text goes on.

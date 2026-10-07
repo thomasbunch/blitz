@@ -6653,9 +6653,10 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
 /// onto as many as it needs, so its end, which often names the key to
 /// press, is not cut off in a narrow pane. Each further line of it, such
 /// as a file name a question is about, starts a row of its own after
-/// that, as many as fit whole, then a row says how many more there are.
-/// The first such line shows whole if it fits at all, and else as much
-/// as fits, with a row that says it is cut.
+/// that, broken by width alone so every char of it shows, as many as fit
+/// whole while a row is kept for how many more there are. The first such
+/// line shows whole if it fits so, and else as much as fits, with a row
+/// that says it is cut.
 fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
     let (max, n) = (i32::from(cols) - 1, usize::from(rows.max(1)));
     let mut lines = text.split('\n');
@@ -6664,12 +6665,8 @@ fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
     for (i, item) in items.iter().enumerate() {
         let left = n - out.len();
         let more = items.len() - i - 1;
-        let room = if i == 0 {
-            left
-        } else {
-            left.saturating_sub(usize::from(more > 0))
-        };
-        let rows = chrome::wrap(item, max, 1, usize::MAX);
+        let room = left.saturating_sub(usize::from(more > 0));
+        let rows = chrome::cell_rows(item, max);
         if rows.len() <= room {
             out.extend(rows);
             continue;
@@ -6680,7 +6677,7 @@ fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
             (_, m) => format!("and {} more", m + 1),
         };
         if i == 0 && left > 1 {
-            out.extend(chrome::wrap(item, max, 1, left - 1));
+            out.extend(rows.into_iter().take(left - 1));
         }
         if out.len() < n {
             out.extend(chrome::wrap(&tail, max, 1, 1));
@@ -11428,7 +11425,8 @@ mod tests {
         let shown = rows(&pics, (80, 6));
         assert_eq!(shown.len(), 6, "{shown:?}");
         assert_eq!(shown[0], head);
-        assert_eq!(shown[1..3].concat(), format!(r#" "{risky}""#));
+        let name = |r: &[String]| r.iter().map(|l| &l[1..]).collect::<String>();
+        assert_eq!(name(&shown[1..3]), format!(r#""{risky}""#));
         assert_eq!(shown[3], r" C:\Users\me\Pictures\IMG_0001.jpg");
         assert_eq!(shown[4], r" C:\Users\me\Pictures\IMG_0002.jpg");
         assert_eq!(shown[5], " and 27 more");
@@ -11441,7 +11439,7 @@ mod tests {
             " Paste this file name? A shell may run part of a file name. Press Ctrl+V again"
         );
         assert!(shown[1].starts_with(r#" "C:\deep\deep\"#), "{shown:?}");
-        assert!(shown[4].ends_with('\u{2026}'), "{shown:?}");
+        assert!(format!(r#""{huge}""#).starts_with(&name(&shown[1..5])));
         assert_eq!(shown[5], " name cut to fit the pane");
         let two = [PathBuf::from(&huge), PathBuf::from(r"C:\a.txt")];
         let shown = rows(&two, (80, 6));
@@ -11449,6 +11447,21 @@ mod tests {
             shown[5], " name cut to fit the pane, and 1 more",
             "{shown:?}"
         );
+        // A row stays for the names after the first, even when the first
+        // would just fill the pane.
+        let head3 = " Paste 3 file names? A shell may run part of a file name. Press Ctrl+V again";
+        let three = |first: &str| [first, r"C:\c.txt", r"C:\d.txt"].map(PathBuf::from);
+        let shown = rows(&three(r"C:\a&b.txt"), (80, 2));
+        assert_eq!(shown, [head3, " name cut to fit the pane, and 2 more"]);
+        let five_rows = format!(r"C:\{}x&y.txt", "d".repeat(330));
+        let shown = rows(&three(&five_rows), (80, 6));
+        assert_eq!(shown.len(), 6, "{shown:?}");
+        assert!(format!(r#""{five_rows}""#).starts_with(&name(&shown[1..5])));
+        assert_eq!(shown[5], " name cut to fit the pane, and 2 more");
+        // Every char of a name shows, a run of spaces too.
+        let spaced = r"C:\dl\a  b&c.txt";
+        let shown = rows(&[PathBuf::from(spaced)], (80, 4));
+        assert_eq!(shown[1], format!(r#" "{spaced}""#), "{shown:?}");
     }
 
     #[test]
