@@ -2306,6 +2306,8 @@ impl App {
             match input {
                 Input::Text(t) => {
                     if !self.filter_text(&t) {
+                        // As any other key, it takes questions away.
+                        self.dismiss(None);
                         self.typed(t.into_bytes());
                     }
                 }
@@ -2409,7 +2411,7 @@ impl App {
             vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
         );
         let a = keymap::action(k, &self.config.keys);
-        if k.down && !modifier {
+        if k.down && !modifier && !lock_key(k.vk) {
             self.dismiss(a);
         }
         if let Some(a) = a
@@ -4125,6 +4127,12 @@ fn alt_f4_passes(down: bool, lparam: isize) -> bool {
     !down || !keymap::held_before(lparam)
 }
 
+/// Caps Lock, Num Lock and Scroll Lock, which like a modifier change how
+/// keys type and answer no question.
+fn lock_key(vk: u16) -> bool {
+    matches!(vk, 0x14 | 0x90 | 0x91)
+}
+
 /// How to confirm action `a`: its first key again, or with none, the
 /// palette.
 fn again(a: Action, keys: &[keymap::Binding]) -> String {
@@ -4585,6 +4593,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // that could run or escape anything.
                 text.retain(|c| !c.is_control());
                 if !self.filter_text(&text) {
+                    self.dismiss(None);
                     self.typed(text.into_bytes());
                 }
             }
@@ -5950,6 +5959,16 @@ mod tests {
             Some(("n".into(), false))
         );
         assert_eq!(notice_line(None, None), None);
+    }
+
+    #[test]
+    fn lock_keys_leave_questions() {
+        for vk in [0x14, 0x90, 0x91] {
+            assert!(lock_key(vk), "{vk:#x}");
+        }
+        for vk in [0x41, VK_RETURN, VK_ESCAPE, 0x10] {
+            assert!(!lock_key(vk), "{vk:#x}");
+        }
     }
 
     #[test]
