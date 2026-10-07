@@ -201,6 +201,13 @@ pub fn cmd_prompt(token: &str) -> String {
     )
 }
 
+/// Whether `prompt` is a [`cmd_prompt`], which blitz started from a blitz
+/// pane inherits. It carries the other pane's token, so it is not the
+/// user's own and is not passed on.
+pub fn is_blitz_prompt(prompt: &std::ffi::OsStr) -> bool {
+    prompt.to_string_lossy().contains("]133;A;blitz=")
+}
+
 /// A command line ready for `CreateProcessW`, plus variables to add to the
 /// child's environment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -235,7 +242,7 @@ pub fn launch(program: &str, args: &[String], integrate: bool, token: &str) -> L
                 out.cmdline += " -NoLogo -NoExit -EncodedCommand ";
                 out.cmdline += &base64(&utf16);
             }
-            Kind::Cmd if std::env::var_os("PROMPT").is_none() => {
+            Kind::Cmd if std::env::var_os("PROMPT").is_none_or(|p| is_blitz_prompt(&p)) => {
                 out.env.push(("PROMPT".into(), cmd_prompt(token)));
             }
             _ => {}
@@ -308,6 +315,15 @@ mod tests {
         assert_eq!(quote(r"C:\Program Files\x"), r#""C:\Program Files\x""#);
         assert_eq!(quote(r#"a"b"#), r#""a\"b""#);
         assert_eq!(quote(r"dir with\ trailing\"), r#""dir with\ trailing\\""#);
+    }
+
+    #[test]
+    fn only_blitz_prompts_are_its_own() {
+        use std::ffi::OsStr;
+        assert!(is_blitz_prompt(OsStr::new(&cmd_prompt("5eed"))));
+        assert!(!is_blitz_prompt(OsStr::new("$P$G")));
+        // Another terminal's marks are the user's business.
+        assert!(!is_blitz_prompt(OsStr::new(r"$e]133;A$e\$P$G")));
     }
 
     #[test]

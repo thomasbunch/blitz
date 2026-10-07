@@ -626,9 +626,11 @@ pub fn child_env(
     let upper = |k: &OsString| k.to_string_lossy().to_ascii_uppercase();
     let mut env: Vec<(OsString, OsString)> = parent
         .into_iter()
-        .filter(|(k, _)| {
+        .filter(|(k, v)| {
             let k = upper(k);
-            !STRIP.contains(&k.as_str()) && !STRIP_PREFIXES.iter().any(|p| k.starts_with(p))
+            !STRIP.contains(&k.as_str())
+                && !STRIP_PREFIXES.iter().any(|p| k.starts_with(p))
+                && !(k == "PROMPT" && crate::shell::is_blitz_prompt(v))
         })
         .collect();
     let id = pane_id.to_string();
@@ -683,6 +685,10 @@ mod tests {
             ("ANTHROPIC_MODEL", "m"),
             ("=C:", r"C:\work"),
             ("Path", r"C:\bin"),
+            // From the blitz pane this blitz was started in: its token is
+            // that pane's, and the token is a secret.
+            ("BLITZ_PANE_TOKEN", "0f1e"),
+            ("PROMPT", crate::shell::cmd_prompt("0f1e").as_str()),
         ]
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         let extra = [("Path".to_owned(), r"C:\other".to_owned())];
@@ -712,6 +718,19 @@ mod tests {
 
         let block = env_block(&env[..1]);
         assert_eq!(String::from_utf16(&block).unwrap(), "=C:=C:\\work\0\0");
+
+        // The user's own prompt is theirs to keep; blitz's own for a pane
+        // replaces any.
+        let prompt = |parent: &str, extra: &[(String, String)]| {
+            let env = child_env([("prompt".into(), parent.into())], 1, extra);
+            (env.iter())
+                .find(|(k, _)| k.eq_ignore_ascii_case("PROMPT"))
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(prompt("$P$G$_", &[]).as_deref(), Some("$P$G$_"));
+        let ours = crate::shell::cmd_prompt("5eed");
+        let set = [("PROMPT".to_owned(), ours.clone())];
+        assert_eq!(prompt(&crate::shell::cmd_prompt("0f1e"), &set), Some(ours));
     }
 
     #[test]
