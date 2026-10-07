@@ -532,6 +532,19 @@ impl Terminal {
         self.modes.paste_confirmed = self.modes.input.bracketed;
     }
 
+    /// A program that reads every paste as text, such as Claude Code, says
+    /// whether it is `listening`. Yes confirms pastes as the user would;
+    /// while bracketed paste is off, for the next time it is turned on
+    /// and that time only, since the program may turn it on after saying
+    /// so. No forgets such a yes.
+    pub fn vouch_paste(&mut self, listening: bool) {
+        let on = self.modes.input.bracketed;
+        if listening && on {
+            self.modes.paste_confirmed = true;
+        }
+        self.modes.paste_vouched = listening && !on;
+    }
+
     /// Bracketed paste is on and the user has confirmed a paste under it;
     /// see [`crate::keys::needs_paste_confirm`].
     pub fn paste_trusted(&self) -> bool {

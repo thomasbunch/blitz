@@ -6307,13 +6307,12 @@ fn eats_copy_key(k: &KeyInput, m: &InputModes) -> bool {
 
 /// What a hook notification `ev` from Claude Code does to pastes into
 /// `term`: Claude Code reads every paste under bracketed paste as text, so
-/// one confirms bracketed paste as the user would. Like theirs, it lasts
-/// until bracketed paste is turned on anew, as by a shell left behind
-/// when Claude Code dies without saying so.
+/// one confirms bracketed paste as the user would, or, before Claude Code
+/// turned it on, the next time it does. Like theirs, it lasts until
+/// bracketed paste is turned on anew, as by a shell left behind when
+/// Claude Code dies without saying so. The session's end forgets it.
 fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
-    if ev != Ev::Idle {
-        term.confirm_paste();
-    }
+    term.vouch_paste(ev != Ev::Idle);
 }
 
 /// Paths as a paste types them into a pane that runs `shell`: joined by
@@ -9330,9 +9329,14 @@ mod tests {
     #[test]
     fn app_claude_code_takes_bracketed_pastes_without_asking() {
         let mut t = fed(10, 2, "");
+        // Claude Code's start-up hook reports before it turns bracketed
+        // paste on.
         hook_confirms_paste(&mut t, Ev::Ready);
         assert!(!t.paste_trusted(), "no bracketed paste");
         t.feed(b"\x1b[?2004h");
+        assert!(t.paste_trusted(), "Claude Code turned it on");
+        // A shell turns it on with no hook since: it asks once first.
+        t.feed(b"\x1b[?2004l\x1b[?2004h");
         assert!(!t.paste_trusted(), "a shell asks once first");
         hook_confirms_paste(&mut t, Ev::Busy);
         assert!(t.paste_trusted());
@@ -9341,6 +9345,13 @@ mod tests {
         assert!(!t.paste_trusted(), "asks again");
         hook_confirms_paste(&mut t, Ev::Idle);
         assert!(!t.paste_trusted(), "Claude Code quit");
+        // A session that ends before it turns bracketed paste on leaves
+        // nothing for the next program that does.
+        t.feed(b"\x1b[?2004l");
+        hook_confirms_paste(&mut t, Ev::Ready);
+        hook_confirms_paste(&mut t, Ev::Idle);
+        t.feed(b"\x1b[?2004h");
+        assert!(!t.paste_trusted(), "ended first");
     }
 
     #[test]

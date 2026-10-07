@@ -1125,3 +1125,32 @@ fn bracketed_paste_is_trusted_once_confirmed() {
         assert!(!t.paste_trusted(), "{reset:?}");
     }
 }
+
+/// A program that says it reads pastes as text before it turns bracketed
+/// paste on is trusted when it does, and only that once.
+#[test]
+fn a_vouched_paste_holds_for_the_next_turn_on_only() {
+    let mut t = vt::Terminal::new(vt::Options::default());
+    t.vouch_paste(true);
+    assert!(!t.paste_trusted(), "off");
+    t.feed(b"\x1b[?2004h");
+    assert!(t.paste_trusted());
+    t.feed(b"\x1b[?2004l\x1b[?2004h");
+    assert!(!t.paste_trusted(), "the next one asks");
+    // A shell's prompt, a reset or a no in between forget it.
+    for reset in ["\x1b]133;A;blitz=1\x07", "\x1bc"] {
+        t.feed(b"\x1b[?2004l");
+        t.vouch_paste(true);
+        t.feed(reset.as_bytes());
+        t.feed(b"\x1b[?2004h");
+        assert!(!t.paste_trusted(), "{reset:?}");
+    }
+    t.feed(b"\x1b[?2004l");
+    t.vouch_paste(true);
+    t.vouch_paste(false);
+    t.feed(b"\x1b[?2004h");
+    assert!(!t.paste_trusted(), "no");
+    // While on, a yes confirms at once, as the user would.
+    t.vouch_paste(true);
+    assert!(t.paste_trusted());
+}
