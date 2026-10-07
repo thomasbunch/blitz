@@ -17,8 +17,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChangeWindowMessageFilterEx, CreateIcon, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, HICON,
-    MSGFLT_ALLOW, RegisterWindowMessageW, WM_HOTKEY,
+    ChangeWindowMessageFilterEx, CreateIcon, FLASHW_TRAY, FLASHWINFO, FindWindowExW, FlashWindowEx,
+    HICON, MSGFLT_ALLOW, RegisterWindowMessageW, WM_HOTKEY,
 };
 use windows::core::{HSTRING, w};
 use winit::event_loop::EventLoopProxy;
@@ -154,6 +154,26 @@ pub fn global_jump(hwnd: isize, on: bool) -> bool {
             true
         }
     }
+}
+
+/// Whether a main blitz window other than `hwnd` is open, which then
+/// has the key [`global_jump`] takes.
+pub fn other_main(hwnd: isize) -> bool {
+    other_window(&HSTRING::from(crate::handoff::CLASS), hwnd)
+}
+
+/// Whether a top-level window of `class` other than `hwnd` is open.
+fn other_window(class: &HSTRING, hwnd: isize) -> bool {
+    let mut after = None;
+    // SAFETY: a class name and no window name; a window closed meanwhile
+    // only ends the search.
+    while let Ok(w) = unsafe { FindWindowExW(None, after, class, None) } {
+        if w.0 as isize != hwnd {
+            return true;
+        }
+        after = Some(w);
+    }
+    false
 }
 
 /// The app id notifications show under. blitz gives it a name and icon
@@ -312,6 +332,35 @@ mod tests {
         ));
         // Ids below 0 are Windows' own, such as IDHOT_SNAPWINDOW.
         assert!(event(WM_HOTKEY, -1isize as usize, button).is_none());
+    }
+
+    #[test]
+    fn other_windows_are_found_by_class() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+        };
+        assert!(!other_window(&HSTRING::from("blitz.no-such-class"), 0));
+        // SAFETY: a plain hidden top-level window of a system class.
+        let w = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                8,
+                8,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("window");
+        assert!(other_window(&HSTRING::from("STATIC"), 0));
+        // SAFETY: the window was made on this thread.
+        unsafe { DestroyWindow(w) }.expect("destroy");
     }
 
     #[test]

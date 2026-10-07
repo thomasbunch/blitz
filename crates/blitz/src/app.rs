@@ -4079,7 +4079,10 @@ impl App {
         }
         let ok = crate::notify::global_jump(self.hwnd, on);
         self.jump_key = on && ok;
-        if !ok && let Some(id) = self.focus_id() {
+        // Another main blitz window has it then, and answers it.
+        if jump_key_lost(ok, || crate::notify::other_main(self.hwnd))
+            && let Some(id) = self.focus_id()
+        {
             let text = "Another program has Ctrl+Alt+J, so it cannot bring you to blitz";
             self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
         }
@@ -5735,6 +5738,13 @@ fn jump_to(
 ) -> Option<PaneId> {
     let skip = focus.filter(|_| front);
     crate::attention::jump_target(sessions.filter(|s| Some(s.0) != skip))
+}
+
+/// Whether the user should hear that the jump key could not be had:
+/// not when it was `got`, nor when another main blitz window is open,
+/// which then has it and brings the user to blitz just the same.
+fn jump_key_lost(got: bool, other_blitz: impl FnOnce() -> bool) -> bool {
+    !got && !other_blitz()
 }
 
 /// Whether a session's notification comes down: the user is looking at
@@ -8572,6 +8582,13 @@ mod tests {
         assert_eq!(jump_to(sessions(), None, true), Some(a));
         let idle = [(a, attn(Attn::Idle, t0))].into_iter();
         assert_eq!(jump_to(idle, Some(a), false), None, "nothing waits");
+    }
+
+    #[test]
+    fn app_says_the_jump_key_is_taken_only_by_another_program() {
+        assert!(!jump_key_lost(true, || unreachable!()));
+        assert!(jump_key_lost(false, || false));
+        assert!(!jump_key_lost(false, || true), "another blitz has it");
     }
 
     #[test]
