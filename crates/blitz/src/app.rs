@@ -74,10 +74,7 @@ const VK_W: u16 = 0x57;
 const VK_F3: u16 = 0x72;
 const VK_F4: u16 = 0x73;
 
-/// How long a multi-line paste waits for a second Ctrl+V, and closing a
-/// busy session for a second Ctrl+Shift+W.
-const CONFIRM: Duration = Duration::from_secs(3);
-/// How long the notice about the system ConPTY stays up.
+/// How long a notice that is neither a question nor an error stays up.
 const NOTICE: Duration = Duration::from_secs(5);
 /// How long a hint about setting something up stays up.
 const HINT: Duration = Duration::from_secs(10);
@@ -418,6 +415,37 @@ struct Notice {
     /// Removed at this time; `None` keeps it until something replaces it.
     until: Option<Instant>,
     dim: bool,
+    ask: Ask,
+}
+
+/// What a notice waits for. One that asks to confirm stays armed while
+/// it shows, with no deadline to read it by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Ask {
+    Nothing,
+    /// An error: the next key in its pane takes it away, read by then.
+    Key,
+    /// The action that showed it, run again in its pane, confirms. Any
+    /// other key takes it away and goes on to do what it does.
+    Paste(String),
+    ClosePane,
+    Update,
+}
+
+impl Ask {
+    /// Whether a key that runs `a`, if any, takes the notice away. `here`
+    /// when the key goes to the notice's pane. Opening the palette does
+    /// not, since an action run from it confirms too.
+    fn gone(&self, a: Option<Action>, here: bool) -> bool {
+        let by = match self {
+            Ask::Nothing => return false,
+            Ask::Key => return here,
+            Ask::Paste(_) => Action::Paste,
+            Ask::ClosePane => Action::ClosePane,
+            Ask::Update => Action::Update,
+        };
+        a != Some(by) && a != Some(Action::Palette)
+    }
 }
 
 /// The renderer and the window's swap chain, rebuilt together after the
@@ -781,15 +809,8 @@ struct App {
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
-    /// A multi-line paste waiting for its confirming Ctrl+V in the pane
-    /// that asked.
-    paste: Option<(PaneId, String, Instant)>,
-    /// A busy session waiting for a second Ctrl+Shift+W.
-    close_confirm: Option<(PaneId, Instant)>,
     /// A newer release: its version and the banner text.
     update: Option<(String, String)>,
-    /// Busy sessions, waiting for a second Ctrl+Shift+U.
-    update_confirm: Option<Instant>,
     /// The installer is downloading, or Ctrl+Shift+U is looking for a
     /// release; this pane shows that.
     updating: Option<PaneId>,
@@ -1049,10 +1070,7 @@ impl App {
             hover: None,
             mouse: Mouse::default(),
             preedit: String::new(),
-            paste: None,
-            close_confirm: None,
             update: None,
-            update_confirm: None,
             updating: None,
             banner: None,
             eaten: Eaten::default(),
@@ -1367,7 +1385,7 @@ impl App {
         if let Err(e) = self.open(win, id, None, cwd)
             && let Some(id) = self.focus_id()
         {
-            self.set_notice(id, e, Some(Instant::now() + NOTICE), false);
+            self.error(id, e);
         }
     }
 
@@ -1666,9 +1684,7 @@ impl App {
                             let focus = self.focus_id();
                             match (&mut self.settings, focus) {
                                 (Some(p), _) => p.error = Some(text),
-                                (None, Some(id)) => {
-                                    self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
-                                }
+                                (None, Some(id)) => self.error(id, text),
                                 (None, None) => {}
                             }
                         }
@@ -2139,9 +2155,55 @@ impl App {
                 text: text.into(),
                 until,
                 dim,
+                ask: Ask::Nothing,
             });
         }
         self.request_redraw();
+    }
+
+    /// Shows `text` in pane `id` until `ask` is answered or a key takes it
+    /// away.
+    fn ask(&mut self, id: PaneId, text: impl Into<String>, ask: Ask) {
+        if let Some(v) = self.view_mut(id) {
+            v.notice = Some(Notice {
+                text: text.into(),
+                until: None,
+                dim: false,
+                ask,
+            });
+        }
+        self.request_redraw();
+    }
+
+    /// Says what went wrong in pane `id`, until the next key there.
+    fn error(&mut self, id: PaneId, text: impl Into<String>) {
+        self.ask(id, text, Ask::Key);
+    }
+
+    /// Whether pane `id` asks `ask`, which a second run of its action
+    /// answers. Takes the question away if so.
+    fn answered(&mut self, id: PaneId, ask: &Ask) -> bool {
+        let yes = (self.view_mut(id))
+            .and_then(|v| v.notice.take_if(|n| n.ask == *ask))
+            .is_some();
+        if yes {
+            self.request_redraw();
+        }
+        yes
+    }
+
+    /// A key that runs `a`, if anything, takes away the questions it does
+    /// not answer, and the focused pane's error.
+    fn dismiss(&mut self, a: Option<Action>) {
+        let focus = self.focus_id();
+        let mut gone = false;
+        for v in &mut self.views {
+            let here = Some(v.pane.id) == focus;
+            gone |= v.notice.take_if(|n| n.ask.gone(a, here)).is_some();
+        }
+        if gone {
+            self.request_redraw();
+        }
     }
 
     /// Handles queued key input.
@@ -2246,7 +2308,15 @@ impl App {
             }
             return;
         }
-        if let Some(a) = keymap::action(k, &self.config.keys)
+        let modifier = matches!(
+            k.key,
+            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
+        );
+        let a = keymap::action(k, &self.config.keys);
+        if k.down && !modifier {
+            self.dismiss(a);
+        }
+        if let Some(a) = a
             && self.act(el, a)
         {
             self.eaten.press(k.vk);
@@ -2279,10 +2349,6 @@ impl App {
         }
         let mut out = Vec::new();
         vt::encode_key(k, &self.modes(), &mut out);
-        let modifier = matches!(
-            k.key,
-            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
-        );
         if k.down && !modifier && !out.is_empty() {
             self.typed(out);
         } else {
@@ -2351,23 +2417,13 @@ impl App {
                     let Some(id) = before else {
                         return false;
                     };
-                    let confirmed = self.paste.take().is_some_and(|(p, t, until)| {
-                        p == id && t == text && Instant::now() < until
-                    });
-                    if !confirmed {
+                    if !self.answered(id, &Ask::Paste(text.clone())) {
                         let lines = text.lines().count();
-                        let until = Instant::now() + CONFIRM;
-                        self.paste = Some((id, text, until));
-                        self.set_notice(
-                            id,
-                            format!("Paste {lines} lines? Press Ctrl+V again within 3 s"),
-                            Some(until),
-                            false,
-                        );
+                        let asked = format!("Paste {lines} lines? Press Ctrl+V again");
+                        self.ask(id, asked, Ask::Paste(text));
                         return true;
                     }
-                    if let Some(v) = self.view_mut(id) {
-                        v.notice = None;
+                    if let Some(v) = self.view(id) {
                         lock(&v.pane.term).confirm_paste();
                     }
                 }
@@ -2389,16 +2445,11 @@ impl App {
                     return true;
                 };
                 let (id, busy) = (v.pane.id, v.busy());
-                let again = (self.close_confirm.take())
-                    .is_some_and(|(p, until)| p == id && Instant::now() < until);
                 match busy {
-                    Some(what) if !again => {
-                        let until = Instant::now() + CONFIRM;
-                        self.close_confirm = Some((id, until));
-                        let text = format!(
-                            "This session is {what}. Press Ctrl+Shift+W again within 3 s to close it"
-                        );
-                        self.set_notice(id, text, Some(until), false);
+                    Some(what) if !self.answered(id, &Ask::ClosePane) => {
+                        let again = again(a, &self.config.keys);
+                        let text = format!("This session is {what}. {again} to close it");
+                        self.ask(id, text, Ask::ClosePane);
                     }
                     _ => self.close(el, id),
                 }
@@ -2508,25 +2559,21 @@ impl App {
                             "Could not open a browser; get it at {}",
                             crate::update::PAGE
                         );
-                        self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                        self.error(id, text);
                     }
                     return true;
                 }
                 // Updating restarts blitz, which ends every session.
                 let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
-                let again = (self.update_confirm.take()).is_some_and(|t| Instant::now() < t);
-                if busy > 0 && !again {
-                    let until = Instant::now() + CONFIRM;
-                    self.update_confirm = Some(until);
+                if busy > 0 && !self.answered(id, &Ask::Update) {
                     let what = if busy == 1 {
                         "A session is"
                     } else {
                         "Sessions are"
                     };
-                    let text = format!(
-                        "{what} busy, and updating restarts blitz. Press Ctrl+Shift+U again within 3 s"
-                    );
-                    self.set_notice(id, text, Some(until), false);
+                    let again = again(a, &self.config.keys);
+                    let text = format!("{what} busy, and updating restarts blitz. {again}");
+                    self.ask(id, text, Ask::Update);
                     return true;
                 }
                 self.updating = Some(id);
@@ -3282,7 +3329,7 @@ impl App {
         if let Err(e) = crate::links::open(target)
             && let Some(id) = self.focus_id()
         {
-            self.set_notice(id, e, Some(Instant::now() + NOTICE), false);
+            self.error(id, e);
         }
     }
 
@@ -3952,6 +3999,20 @@ fn rings(bell_attention: bool, hooked: bool) -> bool {
     bell_attention && !hooked
 }
 
+/// How to confirm action `a`: its first key again, or with none, the
+/// palette.
+fn again(a: Action, keys: &[keymap::Binding]) -> String {
+    match keymap::keys_for(a, keys) {
+        Some(k) => format!("Press {k} again"),
+        None => {
+            let label = (keymap::ACTIONS.iter())
+                .find(|x| x.0 == a)
+                .map_or("it", |x| x.2);
+            format!("Run {label} again")
+        }
+    }
+}
+
 /// How to flash the taskbar for a session that just changed to `state`
 /// while the window is in the background: urgently when it needs the
 /// user or failed, gently when it finished, and at most once per session
@@ -4348,12 +4409,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Update(v, log) => self.offer_update(v, log),
             UserEvent::Checked(found) => {
-                let text = crate::update::found(&found);
+                let (text, failed) = (crate::update::found(&found), found.is_err());
                 if let Ok(Some(v)) = found {
                     self.offer_update(v, None);
                 }
-                if let Some(id) = self.updating.take() {
-                    self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                match self.updating.take() {
+                    Some(id) if failed => self.error(id, text),
+                    Some(id) => self.set_notice(id, text, Some(Instant::now() + NOTICE), false),
+                    None => {}
                 }
             }
             UserEvent::Settings => match Config::reload() {
@@ -4366,8 +4429,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Installed(Err(e)) => {
                 eprintln!("blitz: update: {e}");
                 if let Some(id) = self.updating.take() {
-                    let text = format!("Update failed: {e}");
-                    self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+                    self.error(id, format!("Update failed: {e}"));
                 }
             }
             UserEvent::OpenHere(dir) => {
@@ -5540,6 +5602,44 @@ mod tests {
         ] {
             assert_eq!(resume_line(true, Some(bad)), None, "{bad:?}");
         }
+    }
+
+    /// A question stays until it is answered or another key is pressed,
+    /// which then does what it always does; an error goes at the next key
+    /// in its pane; other notices stay.
+    #[test]
+    fn notices_go_at_the_next_key_that_does_not_answer_them() {
+        let close = Some(Action::ClosePane);
+        for here in [true, false] {
+            let ask = Ask::ClosePane;
+            assert!(!ask.gone(close, here), "answered");
+            assert!(
+                !ask.gone(Some(Action::Palette), here),
+                "answered from the palette"
+            );
+            assert!(ask.gone(None, here), "typing");
+            assert!(ask.gone(Some(Action::Update), here), "another shortcut");
+            let paste = Ask::Paste("a\nb".into());
+            assert!(!paste.gone(Some(Action::Paste), here));
+            assert!(paste.gone(close, here));
+            assert!(!Ask::Update.gone(Some(Action::Update), here));
+            assert!(Ask::Update.gone(Some(Action::Copy), here));
+            assert_eq!(Ask::Key.gone(None, here), here, "an error, read");
+            assert_eq!(Ask::Key.gone(close, here), here);
+            assert!(!Ask::Nothing.gone(None, here));
+        }
+    }
+
+    #[test]
+    fn a_question_names_the_key_that_answers_it() {
+        assert_eq!(again(Action::ClosePane, &[]), "Press Ctrl+Shift+W again");
+        let moved = ["ctrl+shift+w=none", "alt+w=close_pane"].map(keymap::binding);
+        let moved: Vec<_> = moved.into_iter().flatten().collect();
+        assert_eq!(again(Action::ClosePane, &moved), "Press Alt+W again");
+        assert_eq!(
+            again(Action::Equalize, &[]),
+            "Run Give the panes equal space again"
+        );
     }
 
     #[test]
