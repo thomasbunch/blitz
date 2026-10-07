@@ -2583,6 +2583,33 @@ impl App {
                 }
                 self.request_redraw();
             }
+            // The file is the user's to edit, so the hooks go on the
+            // clipboard.
+            Action::ClaudeSetup => {
+                let Some(id) = before else {
+                    return false;
+                };
+                let text = match crate::hook::hook_exe() {
+                    Ok(hook) => crate::hook::claude_settings(&hook.to_string_lossy()),
+                    Err(e) => {
+                        self.set_notice(
+                            id,
+                            format!("blitz cannot find itself: {e}"),
+                            Some(Instant::now() + HINT),
+                            false,
+                        );
+                        return true;
+                    }
+                };
+                let copied =
+                    crate::clipboard::set_text(Some(HWND(self.hwnd as *mut c_void)), &text);
+                let text = if copied {
+                    "Copied hooks for Claude Code's settings.json; Claude Code 2.1.280 and later need none"
+                } else {
+                    "Could not copy to the clipboard"
+                };
+                self.set_notice(id, text, Some(Instant::now() + HINT), copied);
+            }
             Action::Find => {
                 let Some(id) = before else {
                     return false;
@@ -5476,6 +5503,8 @@ mod tests {
         assert_eq!(c.matches(), [(Action::SplitRight, "Split right")]);
         c.filter = "font_size_up".into();
         assert_eq!(c.matches(), [(Action::FontSize(1), "Bigger font")]);
+        c.filter = "claude".into();
+        assert_eq!(c.matches(), [(Action::ClaudeSetup, "Claude Code setup")]);
         c.move_by(5);
         assert_eq!(c.sel, 0, "one match");
         c.filter = "zzz".into();

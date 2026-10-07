@@ -58,6 +58,9 @@ pub enum Action {
     RenameSession,
     /// The same for the focused session's tab.
     RenameTab,
+    /// Copy the hooks for Claude Code's settings, for a Claude Code that
+    /// does not load blitz's own.
+    ClaudeSetup,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -103,6 +106,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::JumpToPrompt(1), "previous_prompt", "Scroll to the previous prompt"),
     (Action::JumpToPrompt(-1), "next_prompt", "Scroll to the next prompt"),
     (Action::Find, "find", "Find in the scrollback"),
+    (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
