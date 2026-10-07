@@ -123,7 +123,6 @@ it waits for you if its settings have
 cannot show: a question waiting for you, the prompt and the reply under
 the session's name, and the conversation to resume.
 
-
 ### Session marks
 
 | Mark | State | Set when | Cleared when |
