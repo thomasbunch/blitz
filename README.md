@@ -309,17 +309,19 @@ selection: Shift+drag selects, and Ctrl+Shift+click opens a link.
 ## Paste and drop
 
 Ctrl+V pastes text. One line copied with its line break comes without
-it, so it is not run. More lines, or over 5 KiB into a program that
-does not take pastes as such (bracketed paste), first show what they
-are and wait for a second Ctrl+V; Claude Code never asks. Nothing is
-pasted into a pane whose program has exited.
+it, so it is not run. More lines first show what they are and wait for
+a second Ctrl+V, until you confirm one while the program takes pastes
+as such (bracketed paste); so does a paste over 5 KiB into a program
+that does not. Claude Code never asks once its hooks have reported.
+Nothing is pasted into a pane whose program has exited.
 
 Files copied in Explorer paste as their paths, in quotes when they hold
 a space, and so do files dropped on a pane. A folder dropped on the
 sidebar opens in a new tab. Windows does not let you drop from Explorer
 onto blitz running as administrator. With an image on the clipboard and
-no text, such as a screenshot, Ctrl+V in a Claude Code pane sends Alt+V,
-which pastes the image; other programs get Ctrl+V.
+no text, such as a screenshot, Ctrl+V in a Claude Code pane whose hooks
+have reported sends Alt+V, which pastes the image; other programs get
+Ctrl+V.
 
 In the find bar, the command palette, the theme picker and the settings
 panel, a paste adds the first line of the clipboard and Ctrl+Backspace
