@@ -751,6 +751,9 @@ struct App {
     /// The link under the pointer while Ctrl is held, drawn underlined:
     /// the line epoch and its first and last cell.
     hover: Option<(u32, Pos, Pos)>,
+    /// The last path word looked for while Ctrl is held, the pane's folder
+    /// and what was found; see [`Self::resolve`].
+    resolved: RefCell<Option<(String, String, Option<PathBuf>)>>,
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
@@ -1002,6 +1005,7 @@ impl App {
             focused: false,
             selection: None,
             hover: None,
+            resolved: RefCell::new(None),
             mouse: Mouse::default(),
             preedit: String::new(),
             paste: None,
@@ -3038,14 +3042,25 @@ impl App {
             return Some((Target::Uri(uri.to_owned()), (a, b)));
         }
         let l = Logical::new(&t, &self.theme.pal, at.0);
+        // Output goes on while the line is scanned and the disk looked at.
+        drop(t);
         let here = l.cells[l.index(at)?].0;
         let (range, found) =
             (crate::links::scan(&l.text).into_iter()).find(|(r, _)| r.contains(&here))?;
         let target = match found {
             Link::Url(u) => Target::Uri(u),
-            Link::Path(p) => Target::Path(crate::links::resolve(&p, &v.pane.cwd)?),
+            Link::Path(p) => Target::Path(self.resolve(&p, &v.pane.cwd)?),
         };
         Some((target, l.span(range)))
+    }
+
+    /// [`crate::links::resolve`], answered again without looking at the
+    /// disk while Ctrl stays held over one path: each move of the pointer
+    /// and each repeat of a held key asks, and a slow drive would make
+    /// every one of them wait.
+    fn resolve(&self, word: &str, cwd: &str) -> Option<PathBuf> {
+        let last = &mut self.resolved.borrow_mut();
+        resolve_again(last, word, cwd, crate::links::resolve)
     }
 
     /// Underlines the link under the pointer, and shows the hand, while
@@ -3053,6 +3068,10 @@ impl App {
     fn update_hover(&mut self) {
         let mods = mods_now();
         let ctrl = (mods.lctrl || mods.rctrl) && self.mouse_to_program(&mods).is_none();
+        // A file made since Ctrl was last held counts.
+        if !ctrl {
+            *self.resolved.get_mut() = None;
+        }
         let hover = (ctrl && self.mouse.drag.is_none())
             .then(|| self.link_under(self.mouse.pos))
             .flatten()
@@ -3652,6 +3671,24 @@ fn flash_kind(state: Attn, last: &mut Option<Instant>, now: Instant) -> Option<U
     }
     *last = Some(now);
     Some(kind)
+}
+
+/// `look` at path `word` in folder `cwd`, unless `last` was the same
+/// question; then its answer.
+fn resolve_again(
+    last: &mut Option<(String, String, Option<PathBuf>)>,
+    word: &str,
+    cwd: &str,
+    look: impl FnOnce(&str, &str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some((w, c, found)) = last
+        && (w.as_str(), c.as_str()) == (word, cwd)
+    {
+        return found.clone();
+    }
+    let found = look(word, cwd);
+    *last = Some((word.to_owned(), cwd.to_owned(), found.clone()));
+    found
 }
 
 /// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
@@ -4624,6 +4661,22 @@ mod tests {
         let t = fed(3, 2, "abcdef");
         let block = drag(&t, (0, 0), (1, 1), 1, true);
         assert_eq!(selection_text(&t, &pal, &block, 0), "ab\r\nde");
+    }
+
+    #[test]
+    fn app_a_held_ctrl_looks_at_a_path_once() {
+        let mut looks = 0;
+        let mut last = None;
+        for word in ["a.txt", "a.txt", "b.txt"] {
+            resolve_again(&mut last, word, "C:/x", |w, _| {
+                looks += 1;
+                Some(PathBuf::from(w))
+            });
+        }
+        assert_eq!(looks, 2);
+        let again = resolve_again(&mut last, "b.txt", "C:/x", |_, _| None);
+        assert_eq!(again, Some(PathBuf::from("b.txt")));
+        assert_eq!(resolve_again(&mut last, "b.txt", "C:/y", |_, _| None), None);
     }
 
     #[test]

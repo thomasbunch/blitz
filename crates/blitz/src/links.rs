@@ -172,8 +172,6 @@ fn trim_end(s: &str) -> usize {
 /// drive, else in the pane's folder `cwd`. Only a path that exists counts,
 /// and one that would reach another machine is never looked at, nor is
 /// one through a link; see [`plain`].
-// ponytail: looks at the disk on the UI thread for each move over a path
-// while Ctrl is held; keep the last answer if a slow drive makes that lag.
 pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
     let (full, from) = if vt::osc::local_dir(word) {
         (PathBuf::from(word), 3)
