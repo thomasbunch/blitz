@@ -51,6 +51,10 @@ pub mod rf {
     pub const WRAPPED: u8 = 1 << 0;
     /// A prompt of blitz's own shell integration starts on this row.
     pub const PROMPT: u8 = 1 << 1;
+    /// A command's output starts on this row, as OSC 133;C marks it.
+    pub const OUTPUT: u8 = 1 << 2;
+    /// The marks a reflow keeps on the first row of their line.
+    pub const MARKS: u8 = PROMPT | OUTPUT;
 }
 
 /// Longest grapheme tail kept per cell, in bytes, so that with its first
@@ -572,7 +576,8 @@ impl Grid {
         let mut line = Vec::new();
         let mut graphemes = Vec::new();
         let mut cursor = None;
-        // A prompt mark anywhere in a line goes to its first new row.
+        // A prompt or output mark anywhere in a line goes to its first
+        // new row.
         let mut prompt = 0;
         for (i, mut row) in old.into_iter().enumerate() {
             let wrapped = row.flags & rf::WRAPPED != 0 && i < last;
@@ -582,7 +587,7 @@ impl Grid {
                         *m = (base + out.len(), m.1.min(cols - 1));
                     }
                 }
-                row.flags &= rf::PROMPT;
+                row.flags &= rf::MARKS;
                 row.set_width(cols);
                 out.push_back(row);
                 continue;
@@ -592,7 +597,8 @@ impl Grid {
             let mut tails = row.extra.take().map(|e| e.graphemes).unwrap_or_default();
             tails.sort_unstable_by_key(|g| g.0);
             let mut tails = tails.into_iter().peekable();
-            prompt |= row.flags & rf::PROMPT;
+            prompt |= row.flags & rf::MARKS;
+
             for (x, c) in row.cells.iter().enumerate() {
                 if i == cy && x == usize::from(cur.0) {
                     cursor = Some(line.len());
@@ -955,17 +961,18 @@ mod tests {
     fn rewrapping_keeps_prompt_marks_on_the_first_row_of_a_line() {
         let mut g = grid_with(&["$ ab", "cd", "x", ""]);
         g.row_mut(0).flags = rf::WRAPPED | rf::PROMPT;
-        g.row_mut(2).flags = rf::PROMPT;
+        g.row_mut(2).flags = rf::OUTPUT;
         g.reflow(8, (0, 3, false), &mut []);
         assert_eq!(text(&g), ["$ abcd", "x", "", ""]);
         let flags: Vec<u8> = (0..4).map(|i| g.line(i).unwrap().flags).collect();
-        assert_eq!(flags, [rf::PROMPT, rf::PROMPT, 0, 0]);
+        assert_eq!(flags, [rf::PROMPT, rf::OUTPUT, 0, 0]);
         g.reflow(2, (0, 3, false), &mut []);
         assert_eq!(text(&g), ["$", "ab", "cd", "x", "", ""]);
         assert_eq!(g.line(0).unwrap().flags, rf::WRAPPED | rf::PROMPT);
         assert_eq!(g.line(1).unwrap().flags, rf::WRAPPED);
-        assert_eq!(g.line(3).unwrap().flags, rf::PROMPT);
+        assert_eq!(g.line(3).unwrap().flags, rf::OUTPUT);
     }
+
 
     #[test]
     fn find_covers_both_halves_of_a_wide_character() {

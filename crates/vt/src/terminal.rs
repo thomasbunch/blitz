@@ -635,6 +635,11 @@ impl Terminal {
         self.line(n).is_some_and(|r| r.flags & rf::PROMPT != 0)
     }
 
+    /// Whether a command's output starts on line `n`, as OSC 133;C marks.
+    pub fn starts_output(&self, n: usize) -> bool {
+        self.line(n).is_some_and(|r| r.flags & rf::OUTPUT != 0)
+    }
+
     /// The OSC 8 hyperlink in column `col` of line `n`: its URI, and the
     /// first and last cell it covers, following soft wraps.
     pub fn link_at(&self, n: usize, col: u16) -> Option<(&str, LineCol, LineCol)> {
@@ -1707,6 +1712,11 @@ impl Handler for Terminal {
                 }
                 Some(m) => {
                     self.at_prompt = false;
+                    // Where the last command's output starts, below a
+                    // prompt or command of more than one line.
+                    if m == PromptMark::C {
+                        self.row().flags |= rf::OUTPUT;
+                    }
                     Event::Prompt(m)
                 }
                 None => return,
