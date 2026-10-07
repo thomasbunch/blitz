@@ -301,8 +301,10 @@ pub fn notify_json(token: &str, state: &str, session: Option<&str>, msg: &str) -
     out
 }
 
-/// Drops control characters (which could end the OSC early), folds runs of
-/// whitespace into one space, and caps the length at `MAX_MSG` chars.
+/// Drops control characters (which could end the OSC early) and format
+/// characters (bidi overrides, invisible ones), as titles lose them too,
+/// folds runs of whitespace into one space, and caps the length at
+/// `MAX_MSG` chars.
 pub fn one_line(s: &str) -> String {
     one_line_max(s, MAX_MSG)
 }
@@ -311,7 +313,7 @@ pub fn one_line(s: &str) -> String {
 fn one_line_max(s: &str, max: usize) -> String {
     let words: Vec<String> = s
         .split_whitespace()
-        .map(|w| w.replace(char::is_control, ""))
+        .map(|w| vt::osc::clean(w, usize::MAX))
         .filter(|w| !w.is_empty())
         .collect();
     let line = words.join(" ");
@@ -1437,6 +1439,7 @@ mod tests {
         assert_eq!(one_line(evil), "a]0;pwnedbc d ef");
         assert_eq!(one_line("  lots   of\n\n space  "), "lots of space");
         assert_eq!(one_line(" \x1b \x07 "), "");
+        assert_eq!(one_line("a\u{202e}b\u{200b}c \u{2066}"), "abc");
     }
 
     /// The count of background tasks survives a long reply.
