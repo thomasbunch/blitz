@@ -788,14 +788,22 @@ fn char_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
     }
 }
 
-/// The word around `at`, following soft wraps: a run of word characters
-/// or of blanks, or any other character alone.
+/// The word around `at`, following soft wraps: a URL or path the link
+/// scanner finds there, else a run of word characters without the
+/// punctuation that ends a sentence, or of blanks, or any other character
+/// alone.
 fn word_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
     let l = Logical::new(term, pal, at.0);
     let Some(i) = l.index(at) else {
         return (at, at);
     };
-    let class = |k: usize| match l.text[l.cells[k].0..].chars().next() {
+    let here = l.cells[i].0;
+    let mut links = crate::links::scan(&l.text).into_iter();
+    if let Some((range, _)) = links.find(|(r, _)| r.contains(&here)) {
+        return l.span(range);
+    }
+    let char_at = |k: usize| l.text[l.cells[k].0..].chars().next();
+    let class = |k: usize| match char_at(k) {
         Some(c) if c.is_alphanumeric() || WORD.contains(c) => 1,
         Some(' ') => 2,
         _ => 0,
@@ -806,6 +814,9 @@ fn word_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
     }
     while me != 0 && b + 1 < l.cells.len() && class(b + 1) == me {
         b += 1;
+    }
+    while b > i && char_at(b).is_some_and(|c| ".,:;?!".contains(c)) {
+        b -= 1;
     }
     l.span(l.cells[a].0..l.cells[b].0 + 1)
 }
@@ -6505,6 +6516,20 @@ mod tests {
         let t = fed(10, 1, "\u{4e2d}\u{6587} x");
         let word = |at| Drag::new(&t, &pal, at, 2, false).anchor;
         assert_eq!(word((0, 1)), ((0, 0), (0, 3)), "wide characters");
+    }
+
+    #[test]
+    fn app_double_click_takes_a_whole_url_or_path_without_the_full_stop() {
+        let t = fed(40, 3, "at https://x.com/a_(b), see a.rs(3,4). Done.");
+        let pal = crate::theme::dark();
+        let words = |at| {
+            let s = drag(&t, at, at, 2, false);
+            selection_text(&t, &pal, &s, 0)
+        };
+        assert_eq!(words((0, 10)), "https://x.com/a_(b)");
+        assert_eq!(words((0, 29)), "a.rs(3,4)");
+        assert_eq!(words((1, 1)), "Done");
+        assert_eq!(words((1, 3)), "Done.", "a click on the full stop keeps it");
     }
 
     #[test]
