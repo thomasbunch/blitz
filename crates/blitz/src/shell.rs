@@ -54,22 +54,66 @@ pub fn fresh_path(
 }
 
 /// The system's (`machine`) or the user's Path in the registry, with the
-/// variables in it expanded.
+/// variables in it expanded as a new sign-in would: from the user's and
+/// the system's variables as the registry holds them now, else blitz's
+/// own. A variable added since blitz started, as `%NVM_HOME%` by an
+/// installer, would otherwise stay as written.
 #[cfg(windows)]
 fn registry_path(machine: bool) -> Option<String> {
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-    use windows::core::w;
+    use windows::core::{HSTRING, PCWSTR, w};
 
+    let system = w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment");
     let (key, sub) = if machine {
-        let sub = w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment");
-        (HKEY_LOCAL_MACHINE, sub)
+        (HKEY_LOCAL_MACHINE, system)
     } else {
         (HKEY_CURRENT_USER, w!("Environment"))
     };
-    registry_string(key, sub, w!("Path"))
+    let own = |k: &str| std::env::var(k).ok();
+    let var = |k: &str| {
+        let name = HSTRING::from(k);
+        let name = PCWSTR(name.as_ptr());
+        (registry_string(HKEY_CURRENT_USER, w!("Environment"), name))
+            .or_else(|| registry_string(HKEY_LOCAL_MACHINE, system, name))
+            .map(|v| expand(&v, own))
+            .or_else(|| own(k))
+    };
+    Some(expand(&registry_string(key, sub, w!("Path"))?, var))
 }
 
-/// A string value in the registry, with the variables in it expanded.
+/// `s` with each `%NAME%` that `var` knows replaced by its value, as
+/// Windows expands a variable in the registry. One it does not know stays
+/// as written.
+#[cfg(any(windows, test))]
+fn expand(s: &str, var: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let Some(j) = after.find('%') else {
+            out.push_str(&rest[i..]);
+            return out;
+        };
+        match var(&after[..j]).filter(|_| j > 0) {
+            Some(v) => {
+                out.push_str(&v);
+                rest = &after[j + 1..];
+            }
+            // The closing `%` may open the next name.
+            None => {
+                out.push('%');
+                out.push_str(&after[..j]);
+                rest = &after[j..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A string value in the registry, as it is stored: variables in a
+/// REG_EXPAND_SZ value are left for the caller to expand.
 #[cfg(windows)]
 fn registry_string(
     key: windows::Win32::System::Registry::HKEY,
@@ -77,20 +121,21 @@ fn registry_string(
     value: windows::core::PCWSTR,
 ) -> Option<String> {
     use windows::Win32::Foundation::ERROR_MORE_DATA;
-    use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
+    use windows::Win32::System::Registry::{
+        RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+    };
 
     let mut buf = vec![0u16; 2048];
     // The value can grow between the size query and the read.
     for _ in 0..4 {
         let mut size = (buf.len() * 2) as u32;
-        // SAFETY: `buf` holds `size` bytes; both outlive the call. A
-        // REG_EXPAND_SZ value comes back expanded.
+        // SAFETY: `buf` holds `size` bytes; both outlive the call.
         let r = unsafe {
             RegGetValueW(
                 key,
                 sub,
                 value,
-                RRF_RT_REG_SZ,
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
                 None,
                 Some(buf.as_mut_ptr().cast()),
                 Some(&mut size),
@@ -824,6 +869,24 @@ mod tests {
         assert_eq!(fresh_path(None, None, s("a;b")), s("a;b"));
         assert_eq!(fresh_path(None, s("u"), None), s("u"));
         assert_eq!(fresh_path(None, None, None), None);
+    }
+
+    /// As a sign-in would, from variables blitz's own environment may not
+    /// have yet.
+    #[test]
+    fn registry_variables_are_expanded_by_the_caller() {
+        let var = |k: &str| match k {
+            "NVM_HOME" => Some(r"C:\nvm".to_string()),
+            "A" => Some("a".into()),
+            _ => None,
+        };
+        assert_eq!(
+            expand(r"%NVM_HOME%;%nope%;C:\x", var),
+            r"C:\nvm;%nope%;C:\x"
+        );
+        assert_eq!(expand("100%%A%%", var), "100%a%");
+        assert_eq!(expand("%A", var), "%A");
+        assert_eq!(expand("%%%", var), "%%%");
     }
 
     #[test]
