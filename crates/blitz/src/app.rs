@@ -991,6 +991,13 @@ impl App {
             if g.best > run::load_best() {
                 run::save_best(g.best);
             }
+            // The focused pane is in view again, so whatever landed on it
+            // under the game is seen now.
+            if self.focused
+                && let Some(id) = self.focus_id()
+            {
+                self.attention(id, Ev::Attended);
+            }
             self.request_redraw();
         }
     }
