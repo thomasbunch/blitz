@@ -342,30 +342,56 @@ mod tests {
     #[test]
     fn other_windows_are_found_by_class() {
         use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE,
+            WNDCLASSW, WS_POPUP,
         };
-        assert!(!other_window(&HSTRING::from("blitz.no-such-class"), 0));
-        // SAFETY: a plain hidden top-level window of a system class.
-        let w = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("STATIC"),
-                w!(""),
-                WS_POPUP,
-                0,
-                0,
-                8,
-                8,
-                None,
-                None,
-                None,
-                None,
-            )
+        // A class of this test's own, so no window of another process
+        // counts.
+        let class = HSTRING::from(format!("blitz.test-{}", std::process::id()));
+        assert!(!other_window(&class, 0));
+        unsafe extern "system" fn plain(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            // SAFETY: the arguments Windows passed this window's procedure.
+            unsafe { DefWindowProcW(h, m, w, l) }
         }
-        .expect("window");
-        assert!(other_window(&HSTRING::from("STATIC"), 0));
-        // SAFETY: the window was made on this thread.
-        unsafe { DestroyWindow(w) }.expect("destroy");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(plain),
+            lpszClassName: windows::core::PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        // SAFETY: the class name outlives the class, which this process
+        // drops at exit.
+        assert_ne!(unsafe { RegisterClassW(&wc) }, 0, "class");
+        // SAFETY: a plain hidden top-level window of that class.
+        let make = || {
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    &class,
+                    w!(""),
+                    WS_POPUP,
+                    0,
+                    0,
+                    8,
+                    8,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("window")
+        };
+        let own = make();
+        // Its own window is no other.
+        assert!(!other_window(&class, own.0 as isize));
+        assert!(other_window(&class, 0));
+        let second = make();
+        assert!(other_window(&class, own.0 as isize));
+        // SAFETY: both windows were made on this thread.
+        unsafe {
+            DestroyWindow(second).expect("destroy");
+            DestroyWindow(own).expect("destroy");
+        }
     }
 
     #[test]
