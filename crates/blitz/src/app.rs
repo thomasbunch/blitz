@@ -1895,6 +1895,8 @@ impl App {
     /// came since the last search, moves `by` matches, and scrolls the
     /// current one into view.
     fn find_go(&mut self, search: bool, by: isize) {
+        let text_h = self.gfx.as_ref().map_or(12, |g| g.r.small_cell().1);
+        let covered = bar_rows(text_h, self.scale, self.cell().1);
         let Some(f) = &mut self.find else {
             return;
         };
@@ -1908,7 +1910,7 @@ impl App {
         f.step(by);
         let shown = f.cur.map(|i| f.found[i]);
         if let Some(m) = shown {
-            reveal(&mut term, m, v.grid.1);
+            reveal(&mut term, m, v.grid.1, covered);
         }
         drop(term);
         self.request_redraw();
@@ -3674,6 +3676,14 @@ fn flash_kind(state: Attn, last: &mut Option<Instant>, now: Instant) -> Option<U
     Some(kind)
 }
 
+/// How many rows of `cell_h` pixels the find bar covers at the top of a
+/// pane, as the chrome draws it: a line of `text_h` pixel text, with 5
+/// pixels at `scale` above and below.
+fn bar_rows(text_h: u32, scale: f64, cell_h: u32) -> u16 {
+    let bar = f64::from(text_h) + (10.0 * scale).round();
+    (bar / f64::from(cell_h.max(1))).ceil() as u16
+}
+
 /// `look` at path `word` in folder `cwd`, unless `last` was the same
 /// question; then its answer.
 fn resolve_again(
@@ -3693,10 +3703,11 @@ fn resolve_again(
 }
 
 /// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
-/// unless it shows already. Returns whether the view moved.
-fn reveal(term: &mut vt::Terminal, m: Found, rows: u16) -> bool {
+/// unless it shows already below the `covered` rows at its top, which the
+/// find bar hides. Returns whether the view moved.
+fn reveal(term: &mut vt::Terminal, m: Found, rows: u16, covered: u16) -> bool {
     let (top, rows) = (term.view_top(), usize::from(rows));
-    if (top..top + rows).contains(&m.start.0) {
+    if (top + usize::from(covered)..top + rows).contains(&m.start.0) {
         return false;
     }
     term.scroll_to(m.start.0.saturating_sub(rows / 2));
@@ -5005,9 +5016,14 @@ mod tests {
         f.step(-1);
         assert_eq!(f.cur, Some(11));
         // A match out of view comes into the middle of it.
-        assert!(reveal(&mut t, f.found[2], 3));
+        assert!(reveal(&mut t, f.found[2], 3, 0));
         assert_eq!(t.view_top(), 1);
-        assert!(!reveal(&mut t, f.found[2], 3), "already in view");
+        assert!(!reveal(&mut t, f.found[2], 3, 1), "already in view");
+        // Not under the find bar, which covers the top row.
+        assert!(reveal(&mut t, f.found[1], 3, 1));
+        assert_eq!(t.view_top(), 0);
+        assert_eq!(bar_rows(17, 1.0, 20), 2);
+        assert_eq!(bar_rows(17, 1.0, 27), 1);
 
         f.query = "zzz".into();
         f.search(&t, 3);
