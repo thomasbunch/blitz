@@ -157,6 +157,8 @@ struct Args {
     exit_after: Option<Duration>,
     /// Open a window of its own, even if blitz is already running.
     new_window: bool,
+    /// blitz runs as administrator, and its title says so.
+    admin: bool,
 }
 
 impl Args {
@@ -197,6 +199,21 @@ impl Args {
             || self.capture.is_some()
     }
 
+    /// A window of its own, which takes no launches. Run as administrator,
+    /// blitz is one too: it would otherwise take launches from programs
+    /// that are not, and resume the saved session's Claude Code sessions
+    /// elevated.
+    fn separate(&self) -> bool {
+        self.new_window || self.admin
+    }
+
+    /// The main window: this launch goes to a blitz already running first,
+    /// and the window restores and saves the session. Scripted and test
+    /// runs never are.
+    fn main(&self) -> bool {
+        !self.separate() && !self.scripted()
+    }
+
     /// Takes what the blitz already running made of this launch, `None`
     /// when none runs. True when it took the launch, which is then done.
     /// One that runs but did not take it (it hung, or refused the folder)
@@ -218,15 +235,10 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    // Run as administrator, blitz is a window of its own: it takes no
-    // launches, gives none away, and leaves the saved session to the
-    // normal one, whose Claude Code sessions it would resume elevated.
-    let admin = elevated();
-    args.new_window |= admin;
+    args.admin = elevated();
     // A launch brings the blitz already running to the front, and a folder
-    // opens as a tab there. Scripted and test launches always get a window
-    // of their own.
-    if !args.new_window && !args.scripted() {
+    // opens as a tab there.
+    if args.main() {
         let sent = crate::handoff::send(args.cwd.as_deref());
         if args.handed_off(sent) {
             return 0;
@@ -252,7 +264,6 @@ pub fn run(args: &[String]) -> i32 {
     };
     let mut app = App::new(args, keys, event_loop.create_proxy());
     app.gpu = Some(gpu);
-    app.admin = admin;
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("blitz: {e}");
         return 1;
@@ -898,8 +909,6 @@ struct App {
     /// This is the main window, whose layout is saved for the next start.
     /// Separate windows and scripted runs leave the saved one alone.
     persist: bool,
-    /// blitz runs as administrator, and its title says so.
-    admin: bool,
     /// The window is hidden until its first frame, or until this time.
     hidden_until: Option<Instant>,
     /// The session as last saved.
@@ -1111,7 +1120,7 @@ impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
         let config = Config::load();
         let theme = crate::theme::current(&config.theme);
-        let persist = !args.new_window && !args.scripted();
+        let persist = args.main();
         App {
             args,
             config,
@@ -1154,7 +1163,6 @@ impl App {
             checked_conpty: false,
             capture_then_exit: false,
             persist,
-            admin: false,
             hidden_until: None,
             saved: None,
             save_after: None,
@@ -1186,14 +1194,14 @@ impl App {
         // flash of white or black.
         self.hidden_until = Some(Instant::now() + FIRST_FRAME);
         let mut attrs = Window::default_attributes()
-            .with_title(window_title(0, "", self.admin))
+            .with_title(window_title(0, "", self.args.admin))
             .with_visible(false)
             .with_inner_size(LogicalSize::new(980.0, 620.0))
             // Icon group 1, which build.rs links in.
             .with_window_icon(Icon::from_resource(1, Some(small_icon_size())).ok())
             .with_taskbar_icon(Icon::from_resource(1, None).ok());
         // Only the main window takes folders from other launches.
-        if !self.args.new_window {
+        if !self.args.separate() {
             attrs = attrs.with_class_name(crate::handoff::CLASS);
         }
         let saved = (self.persist && self.config.restore_session)
@@ -1219,7 +1227,7 @@ impl App {
         {
             self.hwnd = h.hwnd.get();
         }
-        crate::handoff::install(self.hwnd, self.proxy.clone(), !self.args.new_window);
+        crate::handoff::install(self.hwnd, self.proxy.clone(), !self.args.separate());
         watch_settings(self.proxy.clone());
         self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
         self.frame_theme();
@@ -1630,7 +1638,7 @@ impl App {
             .filter(|v| v.pane.attn.state == Attn::NeedsYou)
             .count();
         let pane = self.current().map_or("", |v| v.pane.title.as_str());
-        let title = window_title(waiting, pane, self.admin);
+        let title = window_title(waiting, pane, self.args.admin);
         if title != self.title
             && let Some(w) = &self.window
         {
@@ -6599,7 +6607,20 @@ mod tests {
         assert!(!a.new_window, "the main window");
         assert!(a.handed_off(Some(true)), "taken");
         assert!(!a.handed_off(Some(false)), "hung or refused");
-        assert!(a.new_window, "a window of its own");
+        assert!(a.separate() && !a.main(), "a window of its own");
+    }
+
+    /// Run as administrator, blitz hands nothing off, takes no launches
+    /// and leaves the saved session alone.
+    #[test]
+    fn an_elevated_blitz_is_a_window_of_its_own() {
+        let a = Args::default();
+        assert!(a.main() && !a.separate());
+        let a = Args {
+            admin: true,
+            ..Args::default()
+        };
+        assert!(!a.main() && a.separate());
     }
 
     #[test]
