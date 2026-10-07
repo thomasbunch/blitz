@@ -381,8 +381,9 @@ impl Grid {
         if n == 0 {
             return out;
         }
-        // The line so far: its text, the column each character came from,
-        // and where in the text each of its rows starts.
+        // The line so far, from where a match could still start: its text,
+        // the column each character came from, and where in the text each
+        // of its rows starts.
         let mut text: Vec<char> = Vec::new();
         let mut cols: Vec<u16> = Vec::new();
         let mut starts: Vec<(usize, usize)> = Vec::new();
@@ -412,9 +413,6 @@ impl Grid {
                     }
                 }
             }
-            if wrapped {
-                continue;
-            }
             let cell = |k: usize| {
                 let r = starts[starts.partition_point(|s| s.0 <= k) - 1].1;
                 (r, cols[k])
@@ -434,6 +432,17 @@ impl Grid {
                     end: (self.dropped + r, x),
                 });
                 k += n;
+            }
+            if wrapped {
+                // Only the end of the row can start a match that runs on
+                // into the next, so a long line is never held whole.
+                text.drain(..k);
+                cols.drain(..k);
+                starts.drain(..starts.partition_point(|s| s.0 <= k) - 1);
+                for s in &mut starts {
+                    s.0 = s.0.saturating_sub(k);
+                }
+                continue;
             }
             text.clear();
             cols.clear();

@@ -53,6 +53,18 @@ fn a_match_can_run_across_a_soft_wrap() {
 }
 
 #[test]
+fn a_match_can_run_across_many_soft_wraps() {
+    let mut t = term(4, 2, 100);
+    t.feed(b"abcdefghij abcdefghij");
+    // "abcd" "efgh" "ij a" "bcde" "fghi" "j".
+    assert_eq!(
+        t.find("cdefghi"),
+        [found((0, 2), (2, 0)), found((3, 1), (4, 3))]
+    );
+    assert_eq!(t.find("j"), [found((2, 1), (2, 1)), found((5, 0), (5, 0))]);
+}
+
+#[test]
 fn case_is_ignored_unless_the_query_has_a_capital() {
     let mut t = term(40, 2, 0);
     t.feed("Error error ERROR Straße".as_bytes());
