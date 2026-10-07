@@ -2520,6 +2520,9 @@ impl App {
             vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
         );
         let action = keymap::action(k, &self.config.keys);
+        // A copy key with no selection in view goes to the program.
+        let hidden = action == Some(Action::Copy) && !copy_key_copies(k, self.selection_shown());
+        let action = action.filter(|_| !hidden);
         if k.down && !modifier {
             self.dismiss(action);
         }
@@ -2644,6 +2647,15 @@ impl App {
         let keys = alt_v(&lock(&v.pane.term).input_modes());
         self.typed(keys);
         true
+    }
+
+    /// Whether the selection shows in the focused pane's view, when there
+    /// is one.
+    fn selection_shown(&self) -> Option<bool> {
+        let s = self.selection.as_ref()?;
+        let v = self.current()?;
+        let top = lock(&v.pane.term).view_top();
+        Some(in_view(s.start, s.end, s.drag.block, top, v.grid).is_some())
     }
 
     /// Copies the selection in the focused pane. False when there is none,
@@ -4951,6 +4963,13 @@ fn copy_notice(text: &str, copied: bool) -> String {
     format!("Copied {lines} line{s}")
 }
 
+/// Whether copy key `k` copies a selection that `shown` says is in view or
+/// not, when there is one. Plain Ctrl+C is the interrupt too, so it copies
+/// only what the user can see; the other copy keys always copy.
+fn copy_key_copies(k: &KeyInput, shown: Option<bool>) -> bool {
+    shown != Some(false) || !vt::keys::is_interrupt(k)
+}
+
 /// Whether a copy key that found nothing to copy is kept from the program.
 /// Ctrl+Shift+C would reach it as Ctrl+C and interrupt it, unless kitty
 /// flags make it a key of its own; plain Ctrl+C is meant to interrupt.
@@ -6980,6 +6999,14 @@ mod tests {
         for m in [legacy, w32im, kitty] {
             assert!(!eats_copy_key(&ctrl_c, &m), "the interrupt");
             assert!(!eats_copy_key(&ctrl_insert, &m));
+        }
+        // Ctrl+C copies only a selection in view; scrolled out of view it
+        // interrupts, and the other copy keys still copy it.
+        assert!(copy_key_copies(&ctrl_c, Some(true)));
+        assert!(!copy_key_copies(&ctrl_c, Some(false)));
+        assert!(copy_key_copies(&ctrl_c, None), "nothing selected");
+        for k in [ctrl_shift_c, ctrl_insert] {
+            assert!(copy_key_copies(&k, Some(false)));
         }
     }
 
