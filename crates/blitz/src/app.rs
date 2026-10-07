@@ -79,6 +79,12 @@ const VK_F4: u16 = 0x73;
 const CONFIRM: Duration = Duration::from_secs(3);
 /// How long the notice about the system ConPTY stays up.
 const NOTICE: Duration = Duration::from_secs(5);
+/// How long a hint about setting something up stays up.
+const HINT: Duration = Duration::from_secs(10);
+/// How long Claude Code may show it is working with no word from its
+/// hooks before blitz says they are not reporting. A turn's first hook
+/// lands within a second of it starting.
+const HOOKS_QUIET: Duration = Duration::from_secs(45);
 /// Frame times for blitz run, and for scenery and the spark, which move
 /// slowly.
 const GAME_FRAME: Duration = Duration::from_millis(16);
@@ -711,6 +717,10 @@ struct View {
     key: String,
     /// The progress the program last reported, and when.
     progress: Option<(chrome::Progress, Instant)>,
+    /// When the title first showed Claude Code working.
+    claude_working: Option<Instant>,
+    /// A hook notification came, so Claude Code's hooks report.
+    hooks_seen: bool,
 }
 
 struct App {
@@ -806,6 +816,8 @@ struct App {
     /// blitz's Claude Code plugin, which every pane loads; `None` when it
     /// could not be written.
     plugin: Option<String>,
+    /// A hint about Claude Code's hooks was shown; one per run is enough.
+    hooks_hinted: bool,
     counters: Counters,
     code: i32,
 }
@@ -1048,6 +1060,7 @@ impl App {
             taskbar: None,
             taskbar_shows: None,
             plugin: None,
+            hooks_hinted: false,
             counters: Counters::default(),
             code: 0,
         }
@@ -1310,6 +1323,8 @@ impl App {
             sync_until: None,
             key,
             progress: None,
+            claude_working: None,
+            hooks_seen: false,
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
@@ -2090,6 +2105,14 @@ impl App {
         }
     }
 
+    /// Shows `text` in pane `id` dimly for a while, unless a hint about
+    /// Claude Code's hooks was shown already.
+    fn hooks_hint(&mut self, id: PaneId, text: impl Into<String>) {
+        if !std::mem::replace(&mut self.hooks_hinted, true) {
+            self.set_notice(id, text, Some(Instant::now() + HINT), true);
+        }
+    }
+
     fn set_notice(
         &mut self,
         id: PaneId,
@@ -2669,6 +2692,10 @@ impl App {
         };
         match e {
             Event::Title(t) => {
+                if claude_working_title(&t) {
+                    v.claude_working.get_or_insert(Instant::now());
+                }
+                let silent = hooks_silent(v.claude_working, v.hooks_seen, Instant::now());
                 let (was, now) = (v.pane.claude_title, claude_title(&t).map(|c| c.0));
                 let asked = v.pane.attn.state == Attn::NeedsYou;
                 v.pane.claude_title = now;
@@ -2695,6 +2722,14 @@ impl App {
                     }
                     _ => {}
                 }
+                if silent {
+                    let palette = keymap::keys_for(Action::Palette, &self.config.keys)
+                        .map_or_else(|| "the command palette".into(), |k| k + ",");
+                    let text = format!(
+                        "Claude Code's hooks are not reporting to blitz \u{b7} {palette} Claude Code setup"
+                    );
+                    self.hooks_hint(id, text);
+                }
             }
             Event::Cwd(dir) => {
                 v.pane.cwd = dir;
@@ -2714,8 +2749,15 @@ impl App {
             }
             Event::Notify { title, body } => match Ev::from_notify(&title, &v.pane.token) {
                 Some((ev, session)) => {
+                    v.hooks_seen = true;
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
                     v.pane.hooked = ev != Ev::Idle;
+                    if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
+                        self.hooks_hint(
+                            id,
+                            "Claude Code runs an older blitz-hook from its settings \u{b7} blitz setup claude says more",
+                        );
+                    }
                     self.attention(id, ev);
                     if turn_ends(ev) {
                         self.find_branch(id);
@@ -3741,6 +3783,21 @@ fn ends_game(attn: crate::attention::PaneAttn, ev: Ev, now: Instant) -> bool {
     seen.apply(ev, false, now) && seen.state == Attn::NeedsYou
 }
 
+/// Whether a pane title shows Claude Code working: it puts a half-filled
+/// circle in front, which turns as it works.
+fn claude_working_title(title: &str) -> bool {
+    title
+        .chars()
+        .next()
+        .is_some_and(|c| ('\u{25d0}'..='\u{25d3}').contains(&c))
+}
+
+/// Whether Claude Code's hooks are not reporting: it has shown it is
+/// working, at `working` first, for a while, and no hook has said a word.
+fn hooks_silent(working: Option<Instant>, hooks_seen: bool, now: Instant) -> bool {
+    !hooks_seen && working.is_some_and(|t| now.saturating_duration_since(t) >= HOOKS_QUIET)
+}
+
 /// Whether a press of `vk` is a jump meant for blitz run that arrived
 /// after a session closed it, `since` ago.
 fn late_jump(vk: u16, since: Option<Duration>) -> bool {
@@ -3750,9 +3807,9 @@ fn late_jump(vk: u16, since: Option<Duration>) -> bool {
 /// What a hook's notification says besides the state. Its text replaces
 /// the session's message, even when the state stays: the title may have
 /// ended the turn before the hook with the reply came, and `idle`, sent
-/// with none, clears it. It names the Claude Code session, which `idle`
-/// (SessionEnd: the user quit Claude) ends, so there is nothing left to
-/// resume.
+/// with none, clears it; `ready` keeps what the last turn said. It names
+/// the Claude Code session, which `idle` (SessionEnd: the user quit
+/// Claude) ends, so there is nothing left to resume.
 fn note_hook(
     msg: &mut String,
     claude: &mut Option<String>,
@@ -3765,7 +3822,9 @@ fn note_hook(
     } else if let Some(id) = session {
         *claude = Some(id.to_owned());
     }
-    *msg = body;
+    if ev != Ev::Ready {
+        *msg = body;
+    }
 }
 
 /// What blitz's own prompt coming back in a pane means.
@@ -5232,6 +5291,9 @@ mod tests {
         assert_eq!((msg.as_str(), claude.as_deref()), ("Fixed.", Some(id)));
         note_hook(&mut msg, &mut claude, Ev::Done, Some(id), "Again.".into());
         assert_eq!(msg, "Again.");
+        // Ready keeps what the last turn said.
+        note_hook(&mut msg, &mut claude, Ev::Ready, Some(id), String::new());
+        assert_eq!(msg, "Again.");
         // The session ended: nothing to show or resume.
         note_hook(&mut msg, &mut claude, Ev::Idle, Some(id), String::new());
         assert_eq!((msg.as_str(), claude), ("", None));
@@ -5289,6 +5351,34 @@ mod tests {
             .filter(|e| matches!(e, Event::Notify { title, .. } if Ev::from_notify(title, "0f1e").is_none()))
             .count();
         assert_eq!(untokened, 2);
+    }
+
+    #[test]
+    fn app_titles_that_show_claude_working() {
+        for t in ["\u{25d0} Fix the tests", "\u{25d1} x", "\u{25d3}"] {
+            assert!(claude_working_title(t), "{t}");
+        }
+        for t in ["\u{2733} Fix the tests", "", "pwsh", "x \u{25d0}"] {
+            assert!(!claude_working_title(t), "{t}");
+        }
+    }
+
+    /// Working for a while with no hook heard means the hooks are not
+    /// reporting; a first hook, or no sign of Claude Code, means nothing.
+    #[test]
+    fn app_hooks_silent_after_working_quietly() {
+        let t0 = Instant::now();
+        let later = t0 + HOOKS_QUIET;
+        assert!(!hooks_silent(None, false, later));
+        assert!(!hooks_silent(
+            Some(t0),
+            false,
+            later - Duration::from_secs(1)
+        ));
+        assert!(hooks_silent(Some(t0), false, later));
+        assert!(!hooks_silent(Some(t0), true, later));
+        // A clock that steps back is not a long wait.
+        assert!(!hooks_silent(Some(later), false, t0));
     }
 
     #[test]
