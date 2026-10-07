@@ -1,18 +1,24 @@
 //! Bringing the user back to a session while blitz is in the background:
-//! the taskbar button's flash and badge.
+//! the taskbar button's flash and badge, and Windows notifications.
 
 use std::ffi::c_void;
+use std::sync::Once;
 
+use windows::Data::Xml::Dom::XmlDocument;
+use windows::Foundation::TypedEventHandler;
+use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateIcon, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, HICON,
     MSGFLT_ALLOW, RegisterWindowMessageW,
 };
-use windows::core::w;
+use windows::core::{HSTRING, w};
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::UserEvent;
+use crate::layout::PaneId;
 
 /// The id of blitz's own subclass of its window; the hand-off's is 1.
 const SUBCLASS: usize = 2;
@@ -118,6 +124,132 @@ pub fn badge_icon(size: u32, fg: u32, bg: u32, ring: bool) -> Option<HICON> {
     unsafe { CreateIcon(None, n, n, 1, 32, mask.as_ptr(), px.as_ptr().cast()) }.ok()
 }
 
+/// The app id notifications show under. blitz gives it a name and icon
+/// for this user when it first needs it, and leaves the process its own,
+/// so taskbar pins made before still match the window. Debug builds have
+/// their own.
+const AUMID: &str = if cfg!(debug_assertions) {
+    "blitz.terminal.dev"
+} else {
+    "blitz.terminal"
+};
+
+/// Notifications take their icon from a file.
+const ICON: &[u8] = include_bytes!("../icon/blitz.ico");
+
+/// Done before the first notification, which is how [`untoast_all`] knows
+/// there may be some.
+static REGISTERED: Once = Once::new();
+
+/// Names the app id and gives it the icon, under this user's settings.
+fn register() {
+    let key = HSTRING::from(format!(r"Software\Classes\AppUserModelId\{AUMID}"));
+    let name = if cfg!(debug_assertions) {
+        "blitz dev"
+    } else {
+        "blitz"
+    };
+    let mut values = vec![("DisplayName", name.to_string())];
+    if let Some(dir) = crate::session::dir() {
+        let ico = dir.join("blitz.ico");
+        if std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&ico, ICON))
+            .is_ok()
+        {
+            values.push(("IconUri", ico.to_string_lossy().into_owned()));
+        }
+    }
+    for (name, value) in values {
+        let data: Vec<u16> = value.encode_utf16().chain([0]).collect();
+        // SAFETY: NUL-terminated strings that outlive the call; the size
+        // in bytes counts the NUL.
+        let _ = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                &key,
+                &HSTRING::from(name),
+                REG_SZ.0,
+                Some(data.as_ptr().cast()),
+                (data.len() * 2) as u32,
+            )
+        };
+    }
+}
+
+/// The notification's XML: `lines`, the first in bold, and no sound when
+/// `silent`. Empty lines are left out.
+pub fn toast_xml(lines: &[&str], silent: bool) -> String {
+    let mut xml = String::from(r#"<toast><visual><binding template="ToastGeneric">"#);
+    for l in lines.iter().filter(|l| !l.is_empty()) {
+        xml.push_str("<text>");
+        for c in l.chars() {
+            match c {
+                '&' => xml.push_str("&amp;"),
+                '<' => xml.push_str("&lt;"),
+                '>' => xml.push_str("&gt;"),
+                // XML has no place for most of them.
+                c if c.is_control() => xml.push(' '),
+                c => xml.push(c),
+            }
+        }
+        xml.push_str("</text>");
+    }
+    xml.push_str("</binding></visual>");
+    if silent {
+        xml.push_str(r#"<audio silent="true"/>"#);
+    }
+    xml.push_str("</toast>");
+    xml
+}
+
+/// Tells apart the notifications of two blitz processes, whose panes may
+/// have the same ids.
+fn group() -> HSTRING {
+    HSTRING::from(std::process::id().to_string())
+}
+
+/// Shows notification `xml` about pane `id`, in place of the one before
+/// about it. Clicking it sends [`UserEvent::ShowPane`]. Keep what it
+/// returns while it is up, so the click still has somewhere to go.
+pub fn toast(
+    id: PaneId,
+    xml: &str,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> windows::core::Result<ToastNotification> {
+    REGISTERED.call_once(register);
+    let doc = XmlDocument::new()?;
+    doc.LoadXml(&HSTRING::from(xml))?;
+    let t = ToastNotification::CreateToastNotification(&doc)?;
+    t.SetTag(&HSTRING::from(id.0.to_string()))?;
+    t.SetGroup(&group())?;
+    let proxy = proxy.clone();
+    t.Activated(&TypedEventHandler::new(move |_, _| {
+        let _ = proxy.send_event(UserEvent::ShowPane(id));
+        Ok(())
+    }))?;
+    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))?.Show(&t)?;
+    Ok(t)
+}
+
+/// Takes the notification about pane `id` off the screen and out of the
+/// notification centre.
+pub fn untoast(id: PaneId) {
+    if let Ok(h) = ToastNotificationManager::History() {
+        let tag = HSTRING::from(id.0.to_string());
+        let _ = h.RemoveGroupedTagWithId(&tag, &group(), &HSTRING::from(AUMID));
+    }
+}
+
+/// Takes down every notification this blitz showed, as nothing will
+/// answer a click on one once it exits.
+pub fn untoast_all() {
+    if REGISTERED.is_completed()
+        && let Ok(h) = ToastNotificationManager::History()
+    {
+        let _ = h.RemoveGroupWithId(&group(), &HSTRING::from(AUMID));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +292,22 @@ mod tests {
         assert_eq!(at(&dot, 8, 8), 0xff << 24 | fg, "a full dot");
         assert_eq!(at(&ring, 8, 8), 0xff << 24 | bg, "an open ring");
         assert_eq!(at(&ring, 8, 2), 0xff << 24 | fg, "the ring itself");
+    }
+
+    #[test]
+    fn notifications_carry_their_text_safely() {
+        let xml = toast_xml(&["pwsh 3 needs you", "", "Bash: a <b> & \"c\"\x07"], true);
+        assert_eq!(
+            xml,
+            "<toast><visual><binding template=\"ToastGeneric\">\
+             <text>pwsh 3 needs you</text>\
+             <text>Bash: a &lt;b&gt; &amp; \"c\" </text>\
+             </binding></visual><audio silent=\"true\"/></toast>"
+        );
+        // Windows reads it; nothing is shown.
+        let doc = XmlDocument::new().expect("an XML document");
+        doc.LoadXml(&HSTRING::from(xml)).expect("well-formed");
+        // Windows' own sound, unless the user turned it off there.
+        assert!(!toast_xml(&["x"], false).contains("audio"));
     }
 }

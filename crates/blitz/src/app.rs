@@ -16,6 +16,7 @@ use vt::grid::Found;
 use vt::{
     Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
 };
+use windows::UI::Notifications::ToastNotification;
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -152,6 +153,8 @@ pub enum UserEvent {
     Sized,
     /// Explorer made the window's taskbar button, which starts out blank.
     TaskbarButton,
+    /// The user clicked the notification about this session.
+    ShowPane(PaneId),
 }
 
 /// Command-line options of the GUI.
@@ -899,6 +902,8 @@ struct View {
     notice: Option<Notice>,
     /// When blitz last alerted the user about this session.
     alerted: Option<Instant>,
+    /// The notification about this session, while it is up.
+    toast: Option<ToastNotification>,
     /// A thread is reading the git branch of the session's directory.
     finding_branch: bool,
     /// A line to type at the shell's first prompt, and when to type it
@@ -1576,8 +1581,7 @@ impl App {
                 let _ = proxy.send_event(UserEvent::Finish(0));
             });
         }
-        let scripted = self.args.selftest.is_some() || self.args.exit_after.is_some();
-        if !scripted && !cfg!(debug_assertions) {
+        if !self.scripted() && !cfg!(debug_assertions) {
             let proxy = self.proxy.clone();
             let look = self.config.check_updates;
             std::thread::spawn(move || {
@@ -1800,6 +1804,7 @@ impl App {
             rect: None,
             notice: None,
             alerted: None,
+            toast: None,
             finding_branch: false,
             resume: None,
             prompted: false,
@@ -1863,6 +1868,9 @@ impl App {
         self.win.close_pane(id);
         // The divider being dragged may be gone, even when focus stays.
         self.mouse.divider = None;
+        if self.view_mut(id).is_some_and(|v| v.toast.take().is_some()) {
+            crate::notify::untoast(id);
+        }
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
         self.taskbar_progress();
@@ -3940,22 +3948,64 @@ impl App {
         let alert = (changed && away)
             .then(|| alert(v.pane.attn.state, &self.config, &mut v.alerted, now))
             .flatten();
+        if untoasts(attended || ev == Ev::Attended, v.pane.attn.state) && v.toast.take().is_some() {
+            crate::notify::untoast(id);
+        }
         // The sidebar shows the new state, and the taskbar button its dot.
         self.request_redraw();
         if changed {
             self.taskbar_badge();
         }
         if let Some(a) = alert {
-            self.alert(a);
+            self.alert(id, a);
         }
         changed
     }
 
-    /// Tells the user, who is in another program, about a session.
-    fn alert(&mut self, a: Alert) {
+    /// Tells the user, who is in another program, about session `id`.
+    fn alert(&mut self, id: PaneId, a: Alert) {
         if a.flashes > 0 {
             crate::notify::flash(self.hwnd, a.flashes);
         }
+        // Never from a test run.
+        if a.toast && !self.scripted() {
+            self.toast(id);
+        }
+    }
+
+    /// Shows a Windows notification about session `id`.
+    fn toast(&mut self, id: PaneId) {
+        let Some(s) = self.sessions().into_iter().find(|s| s.id == id) else {
+            return;
+        };
+        let lines = toast_text(&s);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        // blitz makes no sound unless asked to.
+        let xml = crate::notify::toast_xml(&lines, true);
+        match crate::notify::toast(id, &xml, &self.proxy) {
+            Ok(t) => {
+                if let Some(v) = self.view_mut(id) {
+                    v.toast = Some(t);
+                }
+            }
+            Err(e) => eprintln!("blitz: notification: {e}"),
+        }
+    }
+
+    /// A run driven by a script or timed to exit, rather than by a user.
+    fn scripted(&self) -> bool {
+        self.args.selftest.is_some() || self.args.exit_after.is_some()
+    }
+
+    /// Brings the window to the front, out of the taskbar if minimized.
+    /// Windows lets it when the user just asked for blitz.
+    fn to_front(&self) {
+        // First, since a minimized window has no room for a pane.
+        if let Some(w) = &self.window {
+            w.set_minimized(false);
+        }
+        // SAFETY: our own window.
+        let _ = unsafe { SetForegroundWindow(HWND(self.hwnd as *mut c_void)) };
     }
 
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> (u16, u16) {
@@ -5536,26 +5586,47 @@ fn badge_state(states: impl Iterator<Item = Attn>) -> Option<Attn> {
 struct Alert {
     /// Times to flash the taskbar button.
     flashes: u32,
+    /// Show a Windows notification.
+    toast: bool,
 }
 
 /// How to tell the user about a session that just changed to `state`
 /// while the window is in the background: three flashes when it needs
-/// the user or failed, one when it finished, and at most once per session
-/// every `ALERT_GAP`. `last` is when this session last alerted.
+/// the user or failed, one when it finished, a notification as `toasts`
+/// says, and at most once per session every `ALERT_GAP`. `last` is when
+/// this session last alerted.
 fn alert(state: Attn, c: &Config, last: &mut Option<Instant>, now: Instant) -> Option<Alert> {
-    let flashes = match state {
-        Attn::NeedsYou | Attn::Error => 3,
-        Attn::DoneUnseen => 1,
+    let (flashes, urgent) = match state {
+        Attn::NeedsYou | Attn::Error => (3, true),
+        Attn::DoneUnseen => (1, false),
         Attn::Working | Attn::Idle => return None,
     };
     let a = Alert {
         flashes: if c.flash { flashes } else { 0 },
+        toast: c.toasts == "all" || urgent && c.toasts == "needs-you",
     };
     if a == Alert::default() || last.is_some_and(|t| now.saturating_duration_since(t) < ALERT_GAP) {
         return None;
     }
     *last = Some(now);
     Some(a)
+}
+
+/// Whether a session's notification comes down: the user is looking at
+/// the session, or it no longer wants them.
+fn untoasts(attended: bool, state: Attn) -> bool {
+    attended || state < Attn::DoneUnseen
+}
+
+/// The lines of a notification about session `s`: its name and what it
+/// wants, its last message, and its folder.
+fn toast_text(s: &chrome::Session) -> [String; 3] {
+    let what = match s.state {
+        Attn::NeedsYou => "needs you",
+        Attn::Error => "failed",
+        _ => "finished",
+    };
+    [format!("{} {what}", s.name), s.msg.clone(), s.cwd.clone()]
 }
 
 /// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
@@ -6536,19 +6607,18 @@ impl ApplicationHandler<UserEvent> for App {
                 self.taskbar_badge();
             }
             UserEvent::Handoff(ask) => {
-                let hwnd = HWND(self.hwnd as *mut c_void);
-                crate::handoff::to_current_desktop(hwnd);
-
-                // First, since a minimized window has no room for a pane.
-                if let Some(w) = &self.window {
-                    w.set_minimized(false);
-                }
-                // SAFETY: our own window; the launch that sent this allowed
-                // this process to take the foreground.
-                let _ = unsafe { SetForegroundWindow(hwnd) };
+                crate::handoff::to_current_desktop(HWND(self.hwnd as *mut c_void));
+                // The launch that sent this let this process take the
+                // foreground.
+                self.to_front();
                 if let crate::handoff::Ask::Open(dir) = ask {
                     self.add(Some(dir), new_tab);
                 }
+            }
+            // So does a click on a notification.
+            UserEvent::ShowPane(id) => {
+                self.to_front();
+                self.show(id);
             }
         }
     }
@@ -6570,6 +6640,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         // Closing the window, Alt+F4 and an update all keep the layout.
         self.save_session(true);
+        crate::notify::untoast_all();
         if let Err(e) = self.counters.write_trace() {
             eprintln!("blitz: BLITZ_TRACE: {e}");
         }
@@ -8236,13 +8307,19 @@ mod tests {
         assert_eq!(alert(Attn::Working, &mut last, 0), None);
         assert_eq!(alert(Attn::Idle, &mut last, 0), None);
         assert_eq!(last, None, "only alerts count");
-        let urgent = Some(Alert { flashes: 3 });
+        let urgent = Some(Alert {
+            flashes: 3,
+            toast: true,
+        });
         assert_eq!(alert(Attn::NeedsYou, &mut last, 0), urgent);
         assert_eq!(alert(Attn::Error, &mut last, 9), None);
         assert_eq!(alert(Attn::Error, &mut last, 10), urgent);
         assert_eq!(
             alert(Attn::DoneUnseen, &mut last, 20),
-            Some(Alert { flashes: 1 })
+            Some(Alert {
+                flashes: 1,
+                toast: false,
+            })
         );
         // Another session has its own limit.
         assert_eq!(alert(Attn::NeedsYou, &mut None, 21), urgent);
@@ -8270,11 +8347,75 @@ mod tests {
         }
         let off = Config {
             flash: false,
+            toasts: "off".into(),
             ..Config::default()
         };
         let mut last = None;
         assert_eq!(alert(Attn::NeedsYou, &off, &mut last, now), None);
         assert_eq!(last, None, "nothing happened, so nothing to space out");
+    }
+
+    #[test]
+    fn app_notifies_of_sessions_that_need_you_and_of_finished_ones_if_asked() {
+        let now = Instant::now();
+        let toast = |toasts: &str, state| {
+            let c = Config {
+                toasts: toasts.into(),
+                ..Config::default()
+            };
+            alert(state, &c, &mut None, now).is_some_and(|a| a.toast)
+        };
+        for state in [Attn::NeedsYou, Attn::Error] {
+            assert!(toast("needs-you", state), "{state:?}");
+            assert!(toast("all", state), "{state:?}");
+            assert!(!toast("off", state), "{state:?}");
+        }
+        assert!(!toast("needs-you", Attn::DoneUnseen));
+        assert!(toast("all", Attn::DoneUnseen));
+        // With the flash off too, a notification is still news.
+        let quiet = Config {
+            flash: false,
+            ..Config::default()
+        };
+        let a = alert(Attn::NeedsYou, &quiet, &mut None, now);
+        assert_eq!(a.map(|a| (a.flashes, a.toast)), Some((0, true)));
+    }
+
+    #[test]
+    fn app_notifications_come_down_once_seen_or_no_longer_wanted() {
+        use Attn::*;
+        for state in [NeedsYou, Error, DoneUnseen] {
+            assert!(!untoasts(false, state), "{state:?} still wants you");
+            assert!(untoasts(true, state), "{state:?} seen");
+        }
+        assert!(untoasts(false, Working), "answered elsewhere");
+        assert!(untoasts(false, Idle));
+    }
+
+    #[test]
+    fn app_notifications_name_the_session_and_say_what_it_wants() {
+        let s = |state| chrome::Session {
+            id: crate::layout::PaneId(3),
+            name: "pwsh 3".into(),
+            cwd: r"C:\dev\blitz".into(),
+            branch: None,
+            state,
+            since: Instant::now(),
+            num: None,
+            turn: None,
+            took: None,
+            seen: false,
+            msg: "Bash: cargo test".into(),
+            progress: None,
+            exit_code: None,
+            below: 0,
+        };
+        assert_eq!(
+            toast_text(&s(Attn::NeedsYou)),
+            ["pwsh 3 needs you", "Bash: cargo test", r"C:\dev\blitz"]
+        );
+        assert_eq!(toast_text(&s(Attn::Error))[0], "pwsh 3 failed");
+        assert_eq!(toast_text(&s(Attn::DoneUnseen))[0], "pwsh 3 finished");
     }
 
     #[test]

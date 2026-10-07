@@ -21,6 +21,9 @@ pub struct Config {
     pub scrollback_lines: usize,
     /// Flash the taskbar button when a session needs attention.
     pub flash: bool,
+    /// Which sessions get a Windows notification while blitz is in the
+    /// background; one of [`TOASTS`].
+    pub toasts: String,
     /// Whether BEL, or a notification without the pane's token, in an
     /// unfocused pane asks for attention.
     pub bell_attention: bool,
@@ -63,6 +66,7 @@ impl Default for Config {
             shell_integration: true,
             scrollback_lines: 10_000,
             flash: true,
+            toasts: "needs-you".into(),
             bell_attention: true,
             check_updates: true,
             restore_session: true,
@@ -102,6 +106,10 @@ pub struct Setting {
     /// When a change takes effect.
     pub applies: &'static str,
 }
+
+/// The values of `toasts`: none, sessions that need the user or failed,
+/// and finished ones too.
+pub const TOASTS: &[&str] = &["off", "needs-you", "all"];
 
 const NOW: &str = "Applies now";
 const NEW_PANES: &str = "Applies to new panes";
@@ -224,6 +232,16 @@ pub const SETTINGS: &[Setting] = &[
         applies: NOW,
     },
     Setting {
+        key: "toasts",
+        group: "Notifications",
+        label: "Windows notifications",
+        help: "Show a notification when a session needs you or fails while \
+               blitz is in the background; All adds finished ones. Clicking it \
+               takes you to the session.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
         key: "bell_attention",
         group: "Notifications",
         label: "Bell needs you",
@@ -301,6 +319,7 @@ impl Config {
             "restore_claude" => flag(self.restore_claude),
             "restore_scrollback" => flag(self.restore_scrollback),
             "flash" => flag(self.flash),
+            "toasts" => quote(&self.toasts),
             "bell_attention" => flag(self.bell_attention),
             "check_updates" => flag(self.check_updates),
             "scenery" => quote(&self.scenery),
@@ -345,6 +364,10 @@ impl Config {
             "editor_uri" => self.editor_uri = text,
             "scenery" => match text.to_lowercase() {
                 s if crate::arcade::scenery::SCENES.contains(&s.as_str()) => self.scenery = s,
+                _ => return false,
+            },
+            "toasts" => match text.to_lowercase() {
+                s if TOASTS.contains(&s.as_str()) => self.toasts = s,
                 _ => return false,
             },
             "font_size" => match num.filter(|n| (4.0..=72.0).contains(n)) {
@@ -798,6 +821,15 @@ scenery = stars
     }
 
     #[test]
+    fn config_reads_which_sessions_get_notifications() {
+        assert_eq!(Config::default().toasts, "needs-you");
+        assert_eq!(Config::parse("toasts = \"All\"").toasts, "all");
+        assert_eq!(Config::parse("toasts = off").toasts, "off");
+        let c = Config::parse("toasts = \"all\"\ntoasts = \"done\"\n");
+        assert_eq!(c.toasts, "all", "an unknown value is skipped");
+    }
+
+    #[test]
     fn config_missing_file_gives_defaults() {
         let t = Temp::new("missing");
         let path = t.0.join(FILE);
@@ -838,6 +870,7 @@ scenery = stars
             ("restore_claude", "false"),
             ("restore_scrollback", "true"),
             ("flash", "false"),
+            ("toasts", "\"all\""),
             ("bell_attention", "false"),
             ("check_updates", "false"),
             ("scenery", "\"snow\""),

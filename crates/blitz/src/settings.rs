@@ -1,7 +1,7 @@
 //! The settings panel: which settings match what was typed, what each one
 //! shows, and the value the arrow keys move it to.
 
-use crate::config::{Config, Kind, SETTINGS, Setting, quote};
+use crate::config::{Config, Kind, SETTINGS, Setting, TOASTS, quote};
 use crate::render::chrome::SettingRow;
 
 /// Font sizes offered, in points.
@@ -88,6 +88,9 @@ impl Panel {
                 .collect(),
             "scenery" => (crate::arcade::scenery::SCENES.iter())
                 .map(|v| (title(v), quote(v)))
+                .collect(),
+            "toasts" => (TOASTS.iter())
+                .map(|v| (title(&v.replace('-', " ")), quote(v)))
                 .collect(),
             "shell" => (self.shells.iter())
                 .map(|(name, path)| (name.clone(), quote(path)))
@@ -379,6 +382,18 @@ mod tests {
             p.step(editor, &c, -1, false).as_deref(),
             Some("\"cursor://file/{path}:{line}:{col}\"")
         );
+    }
+
+    #[test]
+    fn notifications_step_from_none_to_all() {
+        let (p, mut c) = (panel(), Config::default());
+        let toasts = setting("toasts");
+        assert_eq!(p.shown(toasts, &c), "Needs you");
+        assert_eq!(p.step(toasts, &c, -1, false).as_deref(), Some("\"off\""));
+        let next = p.step(toasts, &c, 1, false).expect("all");
+        assert!(c.set("toasts", &next));
+        assert_eq!(p.shown(toasts, &c), "All");
+        assert_eq!(p.step(toasts, &c, 1, false), None);
     }
 
     #[test]
