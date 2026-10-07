@@ -1635,6 +1635,11 @@ impl App {
         self.gfx.as_ref().map_or((8, 16), |g| g.r.cell())
     }
 
+    /// Cell size of the sidebar font.
+    fn text_cell(&self) -> (u32, u32) {
+        self.gfx.as_ref().map_or((6, 12), |g| g.r.small_cell())
+    }
+
     /// What the chrome needs to lay out `win` in the window as it is now.
     fn model<'a>(
         &'a self,
@@ -1652,7 +1657,7 @@ impl App {
             ui: self.theme.ui,
             size: (size.width as i32, size.height as i32),
             scale: self.scale as f32,
-            text_cell: self.gfx.as_ref().map_or((6, 12), |g| g.r.small_cell()),
+            text_cell: self.text_cell(),
             term_cell: self.cell(),
             now: Instant::now(),
             banner: self.update.as_ref().map(|u| u.1.as_str()),
@@ -3190,7 +3195,14 @@ impl App {
             .as_ref()
             .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
         let size = (size.width as i32, size.height as i32);
-        chrome::area(&self.win, size, self.scale as f32, self.update.is_some())
+        let tw = self.text_cell().0 as i32;
+        chrome::area(
+            &self.win,
+            size,
+            self.scale as f32,
+            self.update.is_some(),
+            tw,
+        )
     }
 
     /// The session under a point in the window: a pane of the active tab,

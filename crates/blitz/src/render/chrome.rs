@@ -209,25 +209,35 @@ pub struct Chrome {
     pub commands: Option<(Rect, Vec<(usize, Rect)>)>,
 }
 
-/// Width of the expanded sidebar and of the collapsed rail at 96 DPI,
-/// each including its 1 px border.
+/// Least width of the expanded sidebar, and width of the collapsed rail,
+/// at 96 DPI, each including its 1 px border.
 pub const SIDEBAR_W: f32 = 240.0;
 pub const RAIL_W: f32 = 15.0;
+/// Characters of the sidebar font that fit across the expanded sidebar.
+const SIDEBAR_CELLS: i32 = 34;
 /// Height of the banner strip at 96 DPI.
 pub const BANNER_H: f32 = 22.0;
 
 /// Height of a pane's header strip at 96 DPI.
 const HEADER_H: f32 = 22.0;
 
+/// Width of the expanded sidebar in a window `width` px wide, its border
+/// included: room for `SIDEBAR_CELLS` characters `tw` px wide, and at
+/// least `SIDEBAR_W`, but never over 40% of the window.
+pub fn sidebar_w(width: i32, scale: f32, tw: i32) -> i32 {
+    let least = (SIDEBAR_W * scale).round() as i32;
+    (SIDEBAR_CELLS * tw).max(least).min(width * 2 / 5)
+}
+
 /// The part of a `size` window that the active tab's panes share: all of
 /// it but the sidebar or rail, shown once there are two sessions, and the
-/// banner strip.
-pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: bool) -> Rect {
+/// banner strip. `tw` is the width of a sidebar character.
+pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: bool, tw: i32) -> Rect {
     let s = |v: f32| (v * scale).round() as i32;
     let fleet = win.has_sidebar();
     let side = match (fleet, win.sidebar_expanded) {
         (false, _) => 0,
-        (true, true) => s(SIDEBAR_W),
+        (true, true) => sidebar_w(size.0, scale, tw),
         (true, false) => s(RAIL_W),
     };
     let bh = if banner { s(BANNER_H) } else { 0 };
@@ -261,7 +271,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
     };
     let fleet = m.win.has_sidebar();
     let expanded = m.win.sidebar_expanded;
-    let area = area(m.win, m.size, m.scale, m.banner.is_some());
+    let area = area(m.win, m.size, m.scale, m.banner.is_some(), tw);
     let (side, bh) = (area.x, m.banner.map_or(0, |_| s(BANNER_H)));
     let session = |id: PaneId| m.sessions.iter().find(|x| x.id == id);
     // A tab's sessions in reading order, as its panes sit.
@@ -469,7 +479,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             let rule = Rect {
                 x: rx,
                 y: y + gh / 2,
-                w: cx - s(8.0) - rx,
+                w: (cx - s(8.0) - rx).max(0),
                 h: 1,
             };
             p.push(Prim::Rect(rule, c.rule));
@@ -490,7 +500,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 let row = Rect {
                     x: s(8.0),
                     y,
-                    w: s(222.0),
+                    w: (side - s(18.0)).max(0),
                     h: rh,
                 };
                 out.rows.push((x.id, row));
@@ -1716,6 +1726,23 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_width_follows_its_font() {
+        assert_eq!(sidebar_w(1440, 1.0, 7), 240);
+        assert_eq!(sidebar_w(1440, 1.5, 7), 360);
+        // A bigger font: room for 34 characters.
+        assert_eq!(sidebar_w(1440, 1.0, 10), 340);
+        // Never over 40% of the window.
+        assert_eq!(sidebar_w(500, 1.0, 10), 200);
+
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.text_cell = (10, 18);
+        let c = build(&m);
+        assert!(c.panes.iter().all(|(_, r)| r.x >= 340));
+        assert!(c.rows.iter().all(|(_, r)| r.right() <= 340 && r.w > 300));
+    }
+
+    #[test]
     fn sidebar_rows_keep_their_height() {
         let (win, mut sessions, now) = fleet(true);
         sessions[2].msg = "title".into();
@@ -2111,7 +2138,7 @@ mod tests {
             let c = build(&m);
             let side = (SIDEBAR_W * scale).round() as i32;
             let strip = c.banner.expect("banner");
-            let a = area(&win, m.size, scale, true);
+            let a = area(&win, m.size, scale, true, 7);
             assert_eq!(
                 (a.x, a.right(), a.bottom()),
                 (side, AREA.w, strip.y),
@@ -2140,7 +2167,7 @@ mod tests {
             let mut m = model(&win, &sessions, now);
             m.size = size;
             let c = build(&m);
-            let tiles = win.tabs[0].rects(area(&win, size, 1.0, false));
+            let tiles = win.tabs[0].rects(area(&win, size, 1.0, false, 7));
             for ((_, p), (_, t)) in c.panes.iter().zip(&tiles) {
                 assert!(p.w >= 0 && p.h >= 0, "{size:?} {p:?}");
                 assert!(
