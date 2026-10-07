@@ -451,8 +451,9 @@ pub fn edit_plan(path: &Path, associated: bool, root: &Path) -> (String, String)
 
 /// Opens the text file `path` for editing, as [`edit_plan`] says.
 pub fn edit(path: &Path) -> Result<(), &'static str> {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    let (file, args) = edit_plan(path, opens(path), Path::new(&root));
+    // A relative SystemRoot would run a planted notepad.exe.
+    let root = crate::shell::system_root(|k| std::env::var_os(k));
+    let (file, args) = edit_plan(path, opens(path), &root);
     shell_open(&file, &args).ok_or("Windows could not open the file")
 }
 
