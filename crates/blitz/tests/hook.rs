@@ -223,10 +223,13 @@ fn hook_reads_payloads_that_are_not_utf8() {
 /// nothing; the hook still exits at once with 0.
 #[test]
 fn hook_drops_a_payload_over_the_cap() {
-    let reply = "x".repeat(64 << 20);
+    // Past the cap by more than a pipe buffer holds.
+    let reply = "x".repeat(65 << 20);
     let payload = format!(r#"{{"hook_event_name":"Stop","last_assistant_message":"{reply}"}}"#);
-    let (out, code, _) = run_hook(payload.as_bytes(), Some(TOKEN));
+    let (out, code, wrote) = run_hook(payload.as_bytes(), Some(TOKEN));
     assert_eq!((out, code), (String::new(), 0));
+    // All of it is read, so Claude Code's write does not fail.
+    wrote.expect("the whole payload is taken");
 }
 
 #[test]

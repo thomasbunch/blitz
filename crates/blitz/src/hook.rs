@@ -29,10 +29,12 @@ pub fn run() -> i32 {
     // It goes into the sequence as is, so nothing in it may end the title.
     let in_pane = !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric());
     if claude {
-        // Read even outside a pane: Claude Code writes the whole payload,
-        // and exiting first would break the pipe under it.
+        // Read all of it, even outside a pane or past the cap: Claude Code
+        // writes the whole payload, and exiting first would break the pipe
+        // under it.
         let mut input = Vec::new();
         let _ = std::io::stdin().take(MAX_INPUT).read_to_end(&mut input);
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
         if !in_pane {
             return 0;
         }
