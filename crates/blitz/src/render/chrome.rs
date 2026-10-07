@@ -1250,11 +1250,13 @@ fn name_parts(x: &Session, max: i32, cw: i32) -> (String, String) {
 }
 
 /// Numbers the sessions that share a name with another, so the sidebar
-/// can tell them apart; the rest go without.
+/// can tell them apart: by the number each keeps across restarts, or else
+/// its id. The rest go without.
 pub fn number_twins(sessions: &mut [Session]) {
     for i in 0..sessions.len() {
         let twin = (sessions.iter().enumerate()).any(|(j, x)| j != i && x.name == sessions[i].name);
-        sessions[i].num = twin.then_some(sessions[i].id.0);
+        let x = &mut sessions[i];
+        x.num = twin.then(|| x.num.unwrap_or(x.id.0));
     }
 }
 
@@ -1620,6 +1622,12 @@ mod tests {
         s[2].name = "Fix the login".into();
         number_twins(&mut s);
         assert!(s.iter().all(|x| x.num.is_none()));
+        // A number kept across restarts is the one shown.
+        s[2].name = "Claude Code".into();
+        s[2].num = Some(7);
+        number_twins(&mut s);
+        let nums: Vec<_> = s.iter().map(|x| x.num).collect();
+        assert_eq!(nums, [Some(1), None, Some(7)]);
 
         let (win, mut sessions, now) = fleet(true);
         sessions[1].name = "api".into();

@@ -68,6 +68,8 @@ pub struct PaneMeta {
     pub done: Option<String>,
     /// The name the user gave the session.
     pub name: Option<String>,
+    /// The number after the session's name in the sidebar; 0 for none.
+    pub num: u32,
 }
 
 impl NodeState {
@@ -161,6 +163,23 @@ fn build<'a>(n: &'a NodeState, first: u32, panes: &mut Vec<(PaneId, &'a PaneMeta
             b: build(b, first, panes),
         })),
     }
+}
+
+/// The number each of the panes `saved` shows: its saved one, or for a
+/// pane saved without one, one after all of them. Also returns the number
+/// the next new pane gets.
+pub fn numbers(saved: &[u32]) -> (Vec<u32>, u32) {
+    let mut next = saved.iter().max().map_or(1, |m| m.saturating_add(1));
+    let nums = (saved.iter())
+        .map(|&n| {
+            if n > 0 {
+                return n;
+            }
+            next = next.saturating_add(1);
+            next - 1
+        })
+        .collect();
+    (nums, next)
 }
 
 /// `%LOCALAPPDATA%\blitz`. It is created on the first save. Debug builds
@@ -304,7 +323,7 @@ fn node_json(n: &NodeState, out: &mut String) {
                 }
                 None => out.push_str("null"),
             }
-            out.push_str(",\"key\":\"");
+            let _ = write!(out, ",\"num\":{},\"key\":\"", m.num);
             escape_json(&m.key, out);
             out.push('"');
             if let Some(d) = &m.done {
@@ -414,12 +433,15 @@ fn node(j: &Json) -> Option<NodeState> {
         let name = (p.get("name").and_then(Json::as_str))
             .map(crate::hook::one_line)
             .filter(|n| !n.is_empty());
+        // Sessions saved before numbers have none.
+        let num = int(p.get("num")).unwrap_or(0);
         return Some(NodeState::Pane(PaneMeta {
             cwd,
             claude,
             key,
             done,
             name,
+            num,
         }));
     }
     let axis = match j.get("split")?.as_str()? {
@@ -509,6 +531,7 @@ mod tests {
             key: String::new(),
             done: None,
             name: None,
+            num: 0,
         })
     }
 
@@ -786,6 +809,7 @@ mod tests {
             key: format!("{:032x}", p.0),
             done: None,
             name: None,
+            num: p.0 + 10,
         });
         let s = from_json(&to_json(&s)).expect("reads back");
         // Leaf order is 1, 2, 4, 3: the left split put 4 before 3.
@@ -793,12 +817,11 @@ mod tests {
         let (back, panes) = s.layout(1);
         let cwds: Vec<&str> = panes.iter().map(|p| p.1.cwd.as_str()).collect();
         assert_eq!(cwds, ["d1", "d2", "d4", "d3"]);
-        // Each key stays with its pane, whatever the new numbering.
+        // Each key and number stays with its pane, whatever the new ids.
         for (_, p) in &panes {
-            assert_eq!(
-                p.key,
-                format!("{:032x}", p.cwd[1..].parse::<u32>().unwrap())
-            );
+            let id = p.cwd[1..].parse::<u32>().unwrap();
+            assert_eq!(p.key, format!("{id:032x}"));
+            assert_eq!(p.num, id + 10);
         }
         // Same shape and ratios, renumbered in tree order.
         let t = &back.tabs[0];
@@ -806,6 +829,20 @@ mod tests {
         let mut renamed = win.tabs[0].clone();
         renamed.root = t.root.clone();
         assert_eq!(renamed.dividers(AREA), win.tabs[0].dividers(AREA));
+    }
+
+    #[test]
+    fn numbers_come_back_and_new_ones_follow_them() {
+        assert_eq!(numbers(&[4, 2, 7]), (vec![4, 2, 7], 8));
+        // Saved before numbers: counted from 1.
+        assert_eq!(numbers(&[0, 0]), (vec![1, 2], 3));
+        assert_eq!(numbers(&[3, 0]), (vec![3, 4], 5));
+        assert_eq!(numbers(&[]), (vec![], 1));
+        let (_, next) = numbers(&[u32::MAX, 0]);
+        assert_eq!(next, u32::MAX);
+        // An old session file reads back with none.
+        let old = to_json(&sample()).replace("\"num\":0,", "");
+        assert_eq!(from_json(&old), Some(sample()));
     }
 
     #[test]

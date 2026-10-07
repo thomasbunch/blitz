@@ -798,6 +798,9 @@ struct View {
     key: String,
     /// The command line it runs in place of the shell.
     cmd: Option<String>,
+    /// The number after the session's name, which tells look-alike
+    /// sessions apart; kept across restarts.
+    num: u32,
     /// The progress the program last reported, and when.
     progress: Option<(chrome::Progress, Instant)>,
     /// When the title first showed Claude Code working.
@@ -1304,7 +1307,8 @@ impl App {
     fn restore(&mut self, s: &session::State) -> Result<(), String> {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
-        for (id, meta) in panes {
+        let (nums, next) = session::numbers(&panes.iter().map(|p| p.1.num).collect::<Vec<_>>());
+        for ((id, meta), num) in panes.into_iter().zip(nums) {
             let old = (self.config.restore_scrollback)
                 .then(|| session::load_output(&meta.key))
                 .flatten();
@@ -1314,10 +1318,11 @@ impl App {
                 self.views.clear();
                 return Err(e);
             }
-            if let Some(v) = self.views.last_mut()
-                && session::is_key(&meta.key)
-            {
-                v.key = meta.key.clone();
+            if let Some(v) = self.views.last_mut() {
+                v.num = num;
+                if session::is_key(&meta.key) {
+                    v.key = meta.key.clone();
+                }
             }
             // A result the user had not seen before blitz closed.
             if let Some(msg) = &meta.done
@@ -1331,6 +1336,8 @@ impl App {
             }
             self.resume(id, meta.claude.clone());
         }
+        // New sessions take their numbers after the restored ones.
+        self.next_id = self.next_id.max(next);
         self.install(win);
         Ok(())
     }
@@ -1472,6 +1479,7 @@ impl App {
             sync_until: None,
             key,
             cmd: cmd.map(str::to_owned),
+            num: id.0,
             progress: None,
             claude_working: None,
             hooks_seen: false,
@@ -2172,7 +2180,7 @@ impl App {
                 chrome::Session {
                     id: p.id,
                     name,
-                    num: None,
+                    num: Some(v.num),
                     cwd: p.cwd.clone(),
                     branch: p.branch.clone(),
                     state: p.attn.state,
@@ -3909,6 +3917,7 @@ impl App {
                 done: (v.filter(|v| v.pane.attn.state == Attn::DoneUnseen))
                     .map(|v| v.pane.msg.clone()),
                 name: v.and_then(|v| v.pane.named.clone()),
+                num: v.map_or(0, |v| v.num),
             }
         };
         let s = session::State::capture(&self.win, self.placed, meta);
