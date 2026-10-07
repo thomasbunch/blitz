@@ -387,12 +387,15 @@ The command palette lists every action with its keys. Typing narrows
 the list, the arrow keys choose, and Enter or a click runs the action;
 Esc closes it. Giving the panes equal space, closing a whole tab,
 reopening the last closed pane, renaming a session or a tab, copying
-without indent, clearing the scrollback and Claude Code setup have no
-keys by default, so they are only in the palette; renaming takes the
-name on the palette's line. Double-clicking the line between panes also
-gives them equal space. Clearing the scrollback also clears the screen
-above the line the cursor is on, which moves to the top, so nothing
-cleared comes back when the pane is resized.
+without indent, clearing the scrollback, resetting the terminal and
+Claude Code setup have no keys by default, so they are only in the
+palette; renaming takes the name on the palette's line. Double-clicking
+the line between panes also gives them equal space. Clearing the
+scrollback also clears the screen above the line the cursor is on, which
+moves to the top, so nothing cleared comes back when the pane is
+resized. Resetting the terminal turns off what a program that crashed
+can leave on, such as mouse reports, a hidden cursor or keys sent as
+escape codes; the text stays.
 
 ## Key bindings
 
@@ -421,17 +424,18 @@ Lines blitz cannot read are skipped.
 
 The actions are `copy`, `copy_without_indent`, `paste`,
 `scroll_page_up`, `scroll_page_down`, `scroll_to_top`,
-`scroll_to_bottom`, `clear_scrollback`, `new_tab`, `close_pane`,
-`close_tab`, `reopen_closed`, `rename_session`, `rename_tab`,
-`next_tab`, `previous_tab`, `split_right`, `split_down`, `focus_left`,
-`focus_right`, `focus_up`, `focus_down`, `jump_to_attention`,
-`toggle_sidebar`, `update`, `theme_picker`, `settings`, `zoom`,
-`resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
-`swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
-`font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
-`find`, `previous_prompt`, `next_prompt`, `system_menu`, `claude_setup`,
-`go_to_tab_1` to `go_to_tab_8` and `last_tab`. Typing a name in the
-command palette finds its action.
+`scroll_to_bottom`, `clear_scrollback`, `reset_terminal`, `new_tab`,
+`close_pane`, `close_tab`, `reopen_closed`, `rename_session`,
+`rename_tab`, `next_tab`, `previous_tab`, `split_right`, `split_down`,
+`focus_left`, `focus_right`, `focus_up`, `focus_down`,
+`jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
+`settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
+`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
+`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
+`fullscreen`, `command_palette`, `find`, `previous_prompt`,
+`next_prompt`, `system_menu`, `claude_setup`, `go_to_tab_1` to
+`go_to_tab_8` and `last_tab`. Typing a name in the command palette finds
+its action.
 
 A binding can also type text into the focused pane: `text:` and the
 text, with `\e` for Esc, `\r` for Enter, `\n`, `\t`, `\s` for a space,
