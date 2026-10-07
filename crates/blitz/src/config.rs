@@ -388,9 +388,10 @@ fn entry(line: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// Where the string that starts `s` with quote `q` ends. In a `"` string
-/// `\"` is a quote and `\\` a backslash, unless that leaves the string
-/// open: then the first `"` ends it, so a path ending in `\` reads as it
-/// always did.
+/// `\"` is a quote and `\\` a backslash, counted in pairs, when only a
+/// comment or nothing follows the end that gives. Otherwise the first `"`
+/// ends it, so a hand-written path ending in `\` reads as it always did,
+/// whatever its comment holds.
 fn closing(s: &str, q: char) -> Option<usize> {
     let first = s[1..].find(q)? + 1;
     if q == '\'' {
@@ -398,14 +399,17 @@ fn closing(s: &str, q: char) -> Option<usize> {
     }
     let b = s.as_bytes();
     let mut i = 1;
-    while i < b.len() {
-        match b[i] {
-            b'\\' => i += 2,
-            b'"' => return Some(i),
-            _ => i += 1,
-        }
+    while i < b.len() && b[i] != b'"' {
+        i += if b[i] == b'\\' { 2 } else { 1 };
     }
-    Some(first)
+    let after = s.get(i + 1..).unwrap_or("").trim_start();
+    Some(
+        if i < b.len() && (after.is_empty() || after.starts_with('#')) {
+            i
+        } else {
+            first
+        },
+    )
 }
 
 /// The text of a quoted value; `None` when it is not quoted. In a `"`
@@ -859,6 +863,17 @@ scenery = stars
             Config::parse(r#"shell = "C:\x\sh.exe""#).shell,
             r"C:\x\sh.exe"
         );
+        // Nor does a quote in a comment after it, and saving keeps that
+        // comment.
+        let fast = r#"shell = "C:\tools\" # the "fast" one"#;
+        assert_eq!(Config::parse(fast).shell, r"C:\tools\");
+        assert_eq!(
+            with_value(fast, "shell", Some("'x'")),
+            "shell = 'x' # the \"fast\" one\n"
+        );
+        // An escaped quote still ends a string when only a comment follows.
+        let name = r#"font_family = "a\"b" # "x""#;
+        assert_eq!(Config::parse(name).font_family, r#"a"b"#);
     }
 
     #[test]
