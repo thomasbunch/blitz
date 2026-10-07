@@ -4308,34 +4308,23 @@ impl App {
             }
             return;
         }
-        // Over another pane, the wheel scrolls that pane's history without
-        // moving focus.
-        // Programs in unfocused panes never get wheel reports;
-        // route them by pane if a full-screen app needs them.
+        // The pane under the pointer takes the wheel without taking focus:
+        // its history scrolls, or a full-screen program there gets the
+        // reports at its own cell. Outside the panes it is the focused one's.
         let (under, side) = self.hit(self.mouse.pos);
         if side {
             return;
         }
-        if let Some(v) = under
-            .filter(|&id| Some(id) != self.focus_id())
-            .and_then(|id| self.view(id))
-        {
-            let mut t = lock(&v.pane.term);
-            if !t.input_modes().alt_screen {
-                t.scroll_viewport(steps as isize * wheel_lines(scroll_lines(), v.grid.1));
-                self.request_redraw();
-            }
-            return;
-        }
-        let Some(v) = self.current() else {
+        let Some(v) = under.or(self.focus_id()).and_then(|id| self.view(id)) else {
             return;
         };
+        let id = v.pane.id;
+        let focused = Some(id) == self.focus_id();
         let m = lock(&v.pane.term).input_modes();
         let lines = steps as isize * wheel_lines(scroll_lines(), v.grid.1);
         let shift = mods.lshift || mods.rshift;
-        match wheel_does(&m, shift, v.pane.claude.is_some()) {
+        match wheel_does(&m, shift, v.pane.claude.is_some(), focused) {
             Wheel::Report => {
-                let id = v.pane.id;
                 let kind = if steps > 0.0 {
                     MouseKind::WheelUp
                 } else {
@@ -4346,7 +4335,11 @@ impl App {
                 }
             }
             Wheel::Arrows => self.send(wheel_keys(lines, &m)),
-            Wheel::Scroll => self.scroll(lines),
+            Wheel::Scroll if focused => self.scroll(lines),
+            Wheel::Scroll => {
+                lock(&v.pane.term).scroll_viewport(lines);
+                self.request_redraw();
+            }
             Wheel::Nothing => {}
         }
     }
@@ -5170,14 +5163,15 @@ enum Wheel {
 
 /// What the wheel does over a pane in modes `m`; `shift` keeps it from a
 /// program that takes the mouse. Arrows go only to a program that asked
-/// for them, and never to Claude Code (`claude`), where they walk its
-/// prompt history and replace what was typed.
-fn wheel_does(m: &InputModes, shift: bool, claude: bool) -> Wheel {
+/// for them in the `focused` pane, where the user types, and never to
+/// Claude Code (`claude`), where they walk its prompt history and replace
+/// what was typed.
+fn wheel_does(m: &InputModes, shift: bool, claude: bool, focused: bool) -> Wheel {
     if m.mouse != MouseMode::Off && !shift {
         Wheel::Report
     } else if !m.alt_screen {
         Wheel::Scroll
-    } else if m.alt_scroll && !claude {
+    } else if m.alt_scroll && !claude && focused {
         Wheel::Arrows
     } else {
         Wheel::Nothing
@@ -6845,29 +6839,41 @@ mod tests {
             mouse: MouseMode::Click,
             ..asked
         };
+        let does = |m: &InputModes, shift, claude| wheel_does(m, shift, claude, true);
+        assert_eq!(does(&InputModes::default(), false, false), Wheel::Scroll);
+        assert_eq!(does(&alt, false, false), Wheel::Nothing, "not asked");
+        assert_eq!(does(&asked, false, false), Wheel::Arrows);
+        assert_eq!(does(&asked, false, true), Wheel::Nothing, "Claude Code");
+        assert_eq!(does(&mouse, false, true), Wheel::Report);
         assert_eq!(
-            wheel_does(&InputModes::default(), false, false),
-            Wheel::Scroll
-        );
-        assert_eq!(wheel_does(&alt, false, false), Wheel::Nothing, "not asked");
-        assert_eq!(wheel_does(&asked, false, false), Wheel::Arrows);
-        assert_eq!(
-            wheel_does(&asked, false, true),
-            Wheel::Nothing,
-            "Claude Code"
-        );
-        assert_eq!(wheel_does(&mouse, false, true), Wheel::Report);
-        assert_eq!(
-            wheel_does(&mouse, true, true),
+            does(&mouse, true, true),
             Wheel::Nothing,
             "Shift over Claude"
         );
-        assert_eq!(wheel_does(&mouse, true, false), Wheel::Arrows, "Shift");
+        assert_eq!(does(&mouse, true, false), Wheel::Arrows, "Shift");
         let main = InputModes {
             mouse: MouseMode::Any,
             ..InputModes::default()
         };
-        assert_eq!(wheel_does(&main, true, true), Wheel::Scroll);
+        assert_eq!(does(&main, true, true), Wheel::Scroll);
+    }
+
+    #[test]
+    fn app_wheel_over_another_pane_reports_or_scrolls_but_sends_no_keys() {
+        let asked = InputModes {
+            alt_screen: true,
+            alt_scroll: true,
+            ..InputModes::default()
+        };
+        let mouse = InputModes {
+            mouse: MouseMode::Drag,
+            ..asked
+        };
+        assert_eq!(wheel_does(&mouse, false, true, false), Wheel::Report);
+        assert_eq!(wheel_does(&asked, false, false, false), Wheel::Nothing);
+        assert_eq!(wheel_does(&mouse, true, false, false), Wheel::Nothing);
+        let main = InputModes::default();
+        assert_eq!(wheel_does(&main, false, false, false), Wheel::Scroll);
     }
 
     #[test]
