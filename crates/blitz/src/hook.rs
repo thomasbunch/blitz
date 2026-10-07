@@ -10,10 +10,9 @@ use std::io::{Read, Write};
 const MAX_INPUT: u64 = 64 << 20;
 /// Longest message carried in a notification, in chars.
 const MAX_MSG: usize = 120;
-/// Notification types that mean Claude Code is waiting on the user.
-/// `idle_prompt` is left out: it fires a minute after every finished turn.
-const NOTIFY_TYPES: &str =
-    "permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input";
+/// What blitz shows for a claude.ai usage limit. The turn is over until
+/// the limit resets, which is not a failure.
+const USAGE_LIMIT: &str = "usage limit";
 
 /// Entry point of `blitz-hook`. Always returns 0, so a hook can never block
 /// Claude Code.
@@ -102,13 +101,21 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
             ("needs-you", msg.to_owned())
         }
         "PreToolUse" if tool == "ExitPlanMode" => ("needs-you", "Plan ready".to_owned()),
-        "Notification" => {
-            let kind = field(ev, "notification_type");
-            if !kind.is_empty() && !NOTIFY_TYPES.split('|').any(|t| t == kind) {
-                return None;
-            }
-            ("needs-you", field(ev, "message").to_owned())
-        }
+        // The hook runs for every type, so a type Claude Code adds later is
+        // sorted here, in what ships with blitz, not in pasted settings.
+        // `idle_prompt` is left out: it fires a minute after every turn.
+        "Notification" => match field(ev, "notification_type") {
+            "permission_prompt"
+            | "elicitation_dialog"
+            | "elicitation_url_dialog"
+            | "agent_needs_input"
+            // A usage limit reset while the computer slept; Claude waits
+            // for Enter.
+            | "quota_auto_resume_stale" => ("needs-you", field(ev, "message").to_owned()),
+            "quota_auto_resume_fired" => ("working", String::new()),
+            "quota_auto_resume_disabled" => ("done", USAGE_LIMIT.to_owned()),
+            _ => return None,
+        },
         "Stop" => {
             // A Stop hook made Claude continue; the turn is not over.
             if ev.get("stop_hook_active") == Some(&Json::Bool(true)) {
@@ -139,7 +146,10 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
             };
             ("done", msg)
         }
-        "StopFailure" => ("error", field(ev, "error").to_owned()),
+        "StopFailure" => match field(ev, "error") {
+            "rate_limit" => ("done", USAGE_LIMIT.to_owned()),
+            e => ("error", e.to_owned()),
+        },
         "SessionEnd" => ("idle", String::new()),
         _ => return None,
     })
@@ -188,7 +198,7 @@ const CLAUDE_HOOKS: [(&str, &str); 7] = [
     ("UserPromptSubmit", ""),
     ("PermissionRequest", ""),
     ("PreToolUse", "^(AskUserQuestion|ExitPlanMode)$"),
-    ("Notification", NOTIFY_TYPES),
+    ("Notification", ""),
     ("Stop", ""),
     ("StopFailure", ""),
     ("SessionEnd", ""),
@@ -684,15 +694,34 @@ mod tests {
                 r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting"}"#,
                 None,
             ),
-            // The settings only run the hook for the types it reports; a
-            // notification without a type must have matched one.
-            (
-                r#"{"hook_event_name":"Notification","message":"m"}"#,
-                Some(("needs-you", "m")),
-            ),
+            // The hook runs for every notification, so one it cannot place
+            // says nothing.
+            (r#"{"hook_event_name":"Notification","message":"m"}"#, None),
             (
                 r#"{"hook_event_name":"Notification","notification_type":"auth_success","message":"m"}"#,
                 None,
+            ),
+            (
+                r#"{"hook_event_name":"Notification","notification_type":"elicitation_complete","message":"m"}"#,
+                None,
+            ),
+            (
+                r#"{"hook_event_name":"Notification","notification_type":"agent_completed","message":"m"}"#,
+                None,
+            ),
+            // Waiting out a usage limit: over when Claude continues, done
+            // when it gives up, and Enter after a long sleep.
+            (
+                r#"{"hook_event_name":"Notification","notification_type":"quota_auto_resume_fired","message":"Continuing"}"#,
+                Some(("working", "")),
+            ),
+            (
+                r#"{"hook_event_name":"Notification","notification_type":"quota_auto_resume_disabled","message":"m"}"#,
+                Some(("done", "usage limit")),
+            ),
+            (
+                r#"{"hook_event_name":"Notification","notification_type":"quota_auto_resume_stale","message":"Press Enter to continue"}"#,
+                Some(("needs-you", "Press Enter to continue")),
             ),
             (
                 r#"{"hook_event_name":"Stop","last_assistant_message":"\n  Done: tests pass.\nMore detail."}"#,
@@ -725,9 +754,14 @@ mod tests {
                 r#"{"hook_event_name":"Stop","background_tasks":[],"last_assistant_message":"ok"}"#,
                 Some(("done", "ok")),
             ),
+            // A usage limit ends the turn until it resets; nothing failed.
             (
-                r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#,
-                Some(("error", "rate_limit")),
+                r#"{"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"API Error: Rate limit reached"}"#,
+                Some(("done", "usage limit")),
+            ),
+            (
+                r#"{"hook_event_name":"StopFailure","error":"overloaded"}"#,
+                Some(("error", "overloaded")),
             ),
             // Not a string: still an error, without a message.
             (
@@ -777,6 +811,11 @@ mod tests {
             );
             assert_eq!(cmd.get("timeout"), Some(&Json::Num(5.0)));
         }
+        // Every notification reaches the hook, which sorts them.
+        let Some(Json::Arr(groups)) = hooks.get("Notification") else {
+            panic!("Notification missing");
+        };
+        assert_eq!(groups[0].get("matcher"), None);
     }
 
     #[test]

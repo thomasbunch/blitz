@@ -107,6 +107,10 @@ fn hook_prints_each_event() {
             notify("error", "overloaded"),
         ),
         (
+            r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#,
+            notify("done", "usage limit"),
+        ),
+        (
             r#"{"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}"#,
             notify("idle", ""),
         ),
