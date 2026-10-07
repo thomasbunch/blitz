@@ -1191,6 +1191,13 @@ impl App {
             {
                 v.key = meta.key.clone();
             }
+            // A result the user had not seen before blitz closed.
+            if let Some(msg) = &meta.done
+                && let Some(v) = self.views.last_mut()
+            {
+                v.pane.attn.apply(Ev::Done, false, Instant::now());
+                v.pane.msg.clone_from(msg);
+            }
             if let Some(line) = resume_line(self.config.restore_claude, meta.claude.as_deref())
                 && let Some(v) = self.views.last_mut()
             {
@@ -3468,6 +3475,8 @@ impl App {
                 cwd: v.map(|v| v.pane.cwd.clone()).unwrap_or_default(),
                 claude: v.and_then(|v| v.pane.claude.clone()),
                 key: v.map(|v| v.key.clone()).unwrap_or_default(),
+                done: (v.filter(|v| v.pane.attn.state == Attn::DoneUnseen))
+                    .map(|v| v.pane.msg.clone()),
             }
         };
         let mut s = session::State::capture(&self.win, self.placed, meta);
