@@ -340,9 +340,9 @@ pub const SETTINGS: &[Setting] = &[
 
 impl Config {
     /// The defaults with the settings from a `config.toml` applied: one
-    /// `key = value` per line, `#` after a space starts a comment. Lines it doesn't
-    /// understand are skipped, so a typo never stops blitz from starting,
-    /// and listed in `ignored`.
+    /// `key = value` per line, `#` after a space starts a comment. Lines it
+    /// doesn't understand are skipped, so a typo never stops blitz from
+    /// starting, and listed in `ignored`.
     pub fn parse(text: &str) -> Config {
         let mut c = Config::default();
         // Notepad may save with a byte order mark.
@@ -360,12 +360,15 @@ impl Config {
     }
 
     /// One line that tells the user which lines of `config.toml` were
-    /// skipped; `None` when none were.
+    /// skipped; `None` when none were. It names the first one's key, not
+    /// its value, which may be a token the screen must not show.
     pub fn ignored_notice(&self) -> Option<String> {
         let ((n, line), more) = self.ignored.split_first()?;
+        let key = line.split_once('=').map(|(k, _)| k.trim());
+        let key = key.map_or_else(String::new, |k| format!(" ({k})"));
         Some(match more.len() {
-            0 => format!("config.toml line {n} was skipped: {line}"),
-            k => format!("config.toml line {n} and {k} more were skipped: {line}"),
+            0 => format!("config.toml line {n}{key} was skipped"),
+            k => format!("config.toml line {n}{key} and {k} more were skipped"),
         })
     }
 
@@ -843,7 +846,7 @@ mod tests {
         // Each line but the comment, by number.
         let lines: Vec<usize> = c.ignored.iter().map(|l| l.0).collect();
         assert_eq!(lines, [1, 2, 3, 4, 5, 6, 7, 9, 10]);
-        let notice = "config.toml line 1 and 8 more were skipped: font_size = 300";
+        let notice = "config.toml line 1 (font_size) and 8 more were skipped";
         assert_eq!(c.ignored_notice().as_deref(), Some(notice));
         assert_eq!(
             Config {
@@ -854,8 +857,12 @@ mod tests {
         );
         assert_eq!(Config::parse(""), Config::default());
         let one = Config::parse("\u{feff}\n  # x = 1\nflash = false # ok\r\n  flash = maybe  \r\n");
-        let notice = "config.toml line 4 was skipped: flash = maybe";
+        let notice = "config.toml line 4 (flash) was skipped";
         assert_eq!(one.ignored_notice().as_deref(), Some(notice));
+        // A mistyped key's value stays off the screen.
+        let typo = Config::parse("evn = GITHUB_TOKEN=ghp_x\nghp_y\n");
+        let notice = "config.toml line 1 (evn) and 1 more were skipped";
+        assert_eq!(typo.ignored_notice().as_deref(), Some(notice));
         assert_eq!(Config::parse("flash = false # ok\n").ignored_notice(), None);
     }
 
