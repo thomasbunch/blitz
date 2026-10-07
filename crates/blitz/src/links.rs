@@ -53,13 +53,17 @@ const OPENS: &[&str] = &[
 pub fn scan(text: &str) -> Vec<(Range<usize>, Link)> {
     let mut out = Vec::new();
     let mut i = 0;
+    // The char before `i`, or the one the marks and joiners after it build
+    // on: no word starts inside a character, so a run of letters that each
+    // carry a mark is walked once, not once per letter.
+    let mut before = None;
     while let Some(c) = text[i..].chars().next() {
-        let before = text[..i].chars().next_back();
-        if before.is_none_or(|b| !b.is_alphanumeric())
+        if before.is_none_or(|b: char| !b.is_alphanumeric())
             && let Some(n) = url_len(&text[i..])
         {
             out.push((i..i + n, Link::Url(text[i..i + n].to_owned())));
             i += n;
+            before = text[..i].chars().next_back();
             continue;
         }
         if before.is_none_or(|b| !path_char(b))
@@ -68,7 +72,11 @@ pub fn scan(text: &str) -> Vec<(Range<usize>, Link)> {
             let found = Link::Path(text[i + path.start..i + path.end].to_owned());
             out.push((i + path.start..i + end, found));
             i += end;
+            before = text[..i].chars().next_back();
             continue;
+        }
+        if !text[..i].chars().next_back().is_some_and(|p| joins(p, c)) {
+            before = Some(c);
         }
         i += c.len_utf8();
     }
@@ -408,7 +416,12 @@ mod tests {
             let text = format!("{word}{}", ")]".repeat(50_000));
             assert_eq!(found(&text).len(), 1, "{word}");
         }
-        // One pass takes milliseconds and the old quadratic trim took over
+        // Every letter carries a mark or joiner, so none starts a word.
+        for mark in ['\u{300}', '\u{200D}'] {
+            let text = format!("a{mark}").repeat(100_000);
+            assert_eq!(found(&text), [], "{mark:?}");
+        }
+        // One pass takes milliseconds and the old quadratic walks took over
         // half a minute, so a slow, busy runner still has room.
         assert!(t0.elapsed().as_secs() < 5, "{:?}", t0.elapsed());
     }
