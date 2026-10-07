@@ -1199,6 +1199,11 @@ impl App {
             self.open(win, id, cmd.as_deref(), cwd)?;
         }
 
+        // A dev build is left alone; a scripted run and a separate window
+        // have nothing to come back to.
+        if self.persist && !cfg!(debug_assertions) {
+            restart_after_reboot();
+        }
         if let Some(script) = self.args.selftest.clone() {
             self.start_selftest(script);
         }
@@ -3798,9 +3803,8 @@ impl App {
         self.placed = placement(self.placed, now, min, full);
     }
 
-    /// Saves the session when its tabs, splits or folders changed since
-    /// the last save, or always with `force`. The window's place alone
-    /// does not count, so dragging the window writes nothing until exit.
+    /// Saves the session when it [`changed`] since the last save, or always
+    /// with `force`.
     fn save_session(&mut self, force: bool) {
         if !self.persist || self.views.is_empty() {
             return;
@@ -3817,11 +3821,9 @@ impl App {
             }
         };
         let s = session::State::capture(&self.win, self.placed, meta);
-        let same = self.saved.as_ref().is_some_and(|old| {
-            (old.sidebar_expanded, old.active, &old.tabs) == (s.sidebar_expanded, s.active, &s.tabs)
-        });
+        let changed = changed(self.saved.as_ref(), &s);
         let dragging = self.mouse.divider.is_some();
-        if !force && !save_now(!same, dragging, Instant::now(), &mut self.save_after) {
+        if !force && !save_now(changed, dragging, Instant::now(), &mut self.save_after) {
             return;
         }
         self.save_after = None;
@@ -4254,6 +4256,24 @@ fn min_window(cell: (u32, u32), scale: f32, expanded: bool) -> PhysicalSize<u32>
     let (w, h) = pane_min(cell, scale, expanded);
     let rail = (chrome::RAIL_W * scale).round() as i32;
     PhysicalSize::new((w + rail) as u32, h as u32)
+}
+
+/// Asks Windows to start blitz again, with its saved session, after it
+/// restarts for an update or the user signs back in with "restart apps"
+/// on. Not after a crash or a hang, which could happen again at once.
+fn restart_after_reboot() {
+    use windows::Win32::System::Recovery::{
+        RESTART_NO_CRASH, RESTART_NO_HANG, RegisterApplicationRestart,
+    };
+    // SAFETY: no command line, so blitz starts with none.
+    let _ = unsafe { RegisterApplicationRestart(None, RESTART_NO_CRASH | RESTART_NO_HANG) };
+}
+
+/// Whether a session `now` differs from the one last `saved`. The window's
+/// place counts: Windows ends blitz for an update restart without the
+/// save at exit.
+fn changed(saved: Option<&session::State>, now: &session::State) -> bool {
+    saved != Some(now)
 }
 
 /// Where the window goes back to next time, after it moved or changed size
@@ -5687,6 +5707,42 @@ mod tests {
         assert!(!c.matches().is_empty());
         let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
         assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
+    }
+
+    /// Windows ends blitz for an update restart without the save at exit,
+    /// so a moved window is saved like a new split, and blitz asks to be
+    /// started again.
+    #[test]
+    fn app_a_restart_for_an_update_finds_the_window_where_it_was() {
+        use windows::Win32::System::Recovery::{
+            GetApplicationRestartSettings, RESTART_NO_CRASH, RESTART_NO_HANG,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let win = layout::Window {
+            tabs: vec![Tab::new("a".into(), PaneId(1))],
+            ..Default::default()
+        };
+        let s = session::State::capture(&win, Geometry::default(), |_| PaneMeta::default());
+        assert!(changed(None, &s));
+        assert!(!changed(Some(&s), &s));
+        let mut moved = s.clone();
+        moved.window.x = 40;
+        assert!(changed(Some(&s), &moved), "the place alone");
+        restart_after_reboot();
+        let mut buf = [0u16; 64];
+        let (mut len, mut flags) = (buf.len() as u32, 0);
+        let line = windows::core::PWSTR(buf.as_mut_ptr());
+        // SAFETY: a buffer the call is told the length of, and a u32.
+        unsafe {
+            GetApplicationRestartSettings(
+                GetCurrentProcess(),
+                Some(line),
+                &mut len,
+                Some(&mut flags),
+            )
+        }
+        .expect("registered");
+        assert_eq!(flags, (RESTART_NO_CRASH | RESTART_NO_HANG).0);
     }
 
     /// A window moved to another monitor and maximized there opens
