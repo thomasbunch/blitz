@@ -361,10 +361,14 @@ impl Config {
 
     /// One line that tells the user which lines of `config.toml` were
     /// skipped; `None` when none were. It names the first one's key, not
-    /// its value, which may be a token the screen must not show.
+    /// its value, which may be a token the screen must not show. Nor is
+    /// what only looks like a key shown, such as a padded base64 secret
+    /// on a line of its own: keys are short, lowercase and snake_case.
     pub fn ignored_notice(&self) -> Option<String> {
         let ((n, line), more) = self.ignored.split_first()?;
-        let key = line.split_once('=').map(|(k, _)| k.trim());
+        let key = (line.split_once('=').map(|(k, _)| k.trim())).filter(|k| {
+            k.len() <= 32 && (k.bytes()).all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+        });
         let key = key.map_or_else(String::new, |k| format!(" ({k})"));
         Some(match more.len() {
             0 => format!("config.toml line {n}{key} was skipped"),
@@ -863,6 +867,13 @@ mod tests {
         let typo = Config::parse("evn = GITHUB_TOKEN=ghp_x\nghp_y\n");
         let notice = "config.toml line 1 (evn) and 1 more were skipped";
         assert_eq!(typo.ignored_notice().as_deref(), Some(notice));
+        let secret = Config::parse(
+            "env = API_KEY=
+dGhpcyBpcyBhIHNlY3JldA==
+",
+        );
+        let notice = "config.toml line 2 was skipped";
+        assert_eq!(secret.ignored_notice().as_deref(), Some(notice));
         assert_eq!(Config::parse("flash = false # ok\n").ignored_notice(), None);
     }
 
