@@ -23,6 +23,10 @@ pub enum Action {
     SplitRight,
     SplitDown,
     Focus(Dir),
+    /// Move the nearest divider of the focused pane toward `Dir`.
+    Resize(Dir),
+    /// Trade places with the pane in `Dir`.
+    Swap(Dir),
     JumpToAttention,
     ToggleSidebar,
     /// Install the newer release. Without one the key goes to the program.
@@ -60,6 +64,14 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | ALT, 0x26, Action::Focus(Dir::Up)),
     (CTRL | ALT, 0x27, Action::Focus(Dir::Right)),
     (CTRL | ALT, 0x28, Action::Focus(Dir::Down)),
+    (ALT | SHIFT, 0x25, Action::Resize(Dir::Left)),
+    (ALT | SHIFT, 0x26, Action::Resize(Dir::Up)),
+    (ALT | SHIFT, 0x27, Action::Resize(Dir::Right)),
+    (ALT | SHIFT, 0x28, Action::Resize(Dir::Down)),
+    (CTRL | ALT | SHIFT, 0x25, Action::Swap(Dir::Left)),
+    (CTRL | ALT | SHIFT, 0x26, Action::Swap(Dir::Up)),
+    (CTRL | ALT | SHIFT, 0x27, Action::Swap(Dir::Right)),
+    (CTRL | ALT | SHIFT, 0x28, Action::Swap(Dir::Down)),
     (CTRL | SHIFT, b'J' as u16, Action::JumpToAttention),
     (CTRL | SHIFT, b'B' as u16, Action::ToggleSidebar),
     (CTRL | SHIFT, b'U' as u16, Action::Update),
@@ -586,6 +598,11 @@ mod msg_to_key_tests {
         assert_eq!(press(0x09, &[LCTRL, LSHIFT]), Some(Action::CycleTab(-1)));
         assert_eq!(press(0x33, &[LCTRL]), Some(Action::GoToTab(2)));
         assert_eq!(press(0x25, &[LCTRL, LALT]), Some(Action::Focus(Dir::Left)));
+        assert_eq!(press(0x26, &[LALT, LSHIFT]), Some(Action::Resize(Dir::Up)));
+        assert_eq!(
+            press(0x27, &[LCTRL, LALT, LSHIFT]),
+            Some(Action::Swap(Dir::Right))
+        );
         // Modifiers match exactly.
         assert_eq!(press(0x52, &[LCTRL]), None);
         assert_eq!(press(0x43, &[LCTRL, LALT]), None, "AltGr is not Ctrl");
