@@ -1682,8 +1682,9 @@ fn foot_lines(msg: &str, side: i32, scale: f32, tw: i32) -> Option<Vec<String>> 
     (words(&lines.join(" ")) == words(msg)).then_some(lines)
 }
 
-/// `t` broken at spaces into at most `n` lines of `max` pixels; the last
-/// ends in an ellipsis when the text goes on.
+/// `t` broken at spaces into at most `n` lines of `max` pixels, a word
+/// wider than a line going on over the next; the last ends in an ellipsis
+/// when the text goes on.
 pub fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for word in t.split_whitespace() {
@@ -1692,7 +1693,19 @@ pub fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
                 l.push(' ');
                 l.push_str(word);
             }
-            _ => lines.push(word.to_string()),
+            _ => {
+                let (mut line, mut w) = (String::new(), 0);
+                for c in word.chars() {
+                    let cells = char_cells(c) * cw;
+                    if w + cells > max && !line.is_empty() {
+                        lines.push(std::mem::take(&mut line));
+                        w = 0;
+                    }
+                    line.push(c);
+                    w += cells;
+                }
+                lines.push(line);
+            }
         }
     }
     if lines.len() > n {
@@ -3171,6 +3184,10 @@ mod tests {
         assert_eq!(wrap("aa bb cc", 35, 7, 2), ["aa bb", "cc"]);
         assert_eq!(wrap("aa bb cc dd ee", 35, 7, 2), ["aa bb", "cc d\u{2026}"]);
         assert!(wrap("", 35, 7, 2).is_empty());
+        // A word wider than a line, such as a long path, goes on over
+        // the next rather than losing its end.
+        assert_eq!(wrap("a bcdefghijk", 35, 7, 3), ["a", "bcdef", "ghijk"]);
+        assert_eq!(wrap("abcdefghijk", 35, 7, 2), ["abcde", "fghi\u{2026}"]);
     }
 
     #[test]
