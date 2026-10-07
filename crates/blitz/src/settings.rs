@@ -74,6 +74,9 @@ impl Panel {
             "scrollback_lines" => (SCROLLBACK.iter())
                 .map(|&n| (format!("{} lines", thousands(n)), n.to_string()))
                 .collect(),
+            "scenery" => (crate::arcade::scenery::SCENES.iter())
+                .map(|v| (title(v), quote(v)))
+                .collect(),
             "shell" => (self.shells.iter())
                 .map(|(name, path)| (name.clone(), quote(path)))
                 .collect(),
@@ -109,6 +112,7 @@ impl Panel {
             Kind::Theme => {
                 crate::theme::choose(&c.theme, crate::theme::system_is_light()).to_string()
             }
+            Kind::Game => "play".into(),
             Kind::Choice => {
                 let now = c.get(s.key);
                 (self.choices(s, c).into_iter())
@@ -128,7 +132,7 @@ impl Panel {
         let next = match s.kind {
             Kind::Toggle if wrap => (now != "true").to_string(),
             Kind::Toggle => (by > 0).to_string(),
-            Kind::Theme => return None,
+            Kind::Theme | Kind::Game => return None,
             Kind::Choice => {
                 let list = self.choices(s, c);
                 let i = list
@@ -164,6 +168,14 @@ impl Panel {
             })
             .collect()
     }
+}
+
+/// `stars` as `Stars`.
+fn title(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 /// `10000` as `10,000`.
@@ -268,6 +280,20 @@ mod tests {
         assert_eq!(p.shown(setting("font_family"), &c), "Consolas");
         assert_eq!(thousands(100_000), "100,000");
         assert_eq!(thousands(999), "999");
+    }
+
+    #[test]
+    fn easter_eggs_step_through_scenes_and_offer_the_game() {
+        let (p, mut c) = (panel(), Config::default());
+        let scenery = setting("scenery");
+        assert_eq!(p.shown(scenery, &c), "Off");
+        assert_eq!(p.step(scenery, &c, -1, false), None);
+        let next = p.step(scenery, &c, 1, false).expect("a scene");
+        assert!(c.set("scenery", &next));
+        assert_eq!(p.shown(scenery, &c), "Stars");
+        let game = setting("game");
+        assert_eq!(p.shown(game, &c), "play");
+        assert_eq!(p.step(game, &c, 1, true), None);
     }
 
     #[test]

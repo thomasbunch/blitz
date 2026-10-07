@@ -34,6 +34,7 @@ use winit::platform::windows::{
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Icon, UserAttentionType, Window, WindowId};
 
+use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev};
 use crate::config::{Config, Kind};
 use crate::debug::Counters;
@@ -59,6 +60,8 @@ const VK_UP: u16 = 0x26;
 const VK_RIGHT: u16 = 0x27;
 const VK_DOWN: u16 = 0x28;
 const VK_DELETE: u16 = 0x2e;
+const VK_SPACE: u16 = 0x20;
+const VK_W: u16 = 0x57;
 const VK_F4: u16 = 0x73;
 
 /// How long a multi-line paste waits for a second Ctrl+V, and closing a
@@ -66,6 +69,10 @@ const VK_F4: u16 = 0x73;
 const CONFIRM: Duration = Duration::from_secs(3);
 /// How long the notice about the system ConPTY stays up.
 const NOTICE: Duration = Duration::from_secs(5);
+/// Frame times for blitz run, and for scenery and the spark, which move
+/// slowly.
+const GAME_FRAME: Duration = Duration::from_millis(16);
+const SCENERY_FRAME: Duration = Duration::from_millis(66);
 /// The first look for a newer release waits until startup is done, then
 /// one runs every few hours.
 const UPDATE_FIRST: Duration = Duration::from_secs(10);
@@ -393,6 +400,10 @@ struct App {
     settings: Option<Panel>,
     /// Where the settings panel was in the last frame, for clicks.
     settings_hits: Option<chrome::SettingsHits>,
+    /// blitz run while it is open, and when it last moved.
+    game: Option<(Run, Instant)>,
+    /// Windows shows animations; scenery and the spark keep still if not.
+    motion: bool,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -530,6 +541,8 @@ impl App {
             picker: None,
             settings: None,
             settings_hits: None,
+            game: None,
+            motion: animations_on(),
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -949,6 +962,36 @@ impl App {
                 top: p.top,
                 error: p.error.as_deref(),
             }),
+            spark: self.config.mascot.then(|| self.anim_time()),
+            game: self.game.as_ref().map(|g| &g.0),
+        }
+    }
+
+    /// Seconds into the scenery and spark animations; always 0 when
+    /// Windows animations are off.
+    fn anim_time(&self) -> f32 {
+        if self.motion {
+            self.started.elapsed().as_secs_f32()
+        } else {
+            0.0
+        }
+    }
+
+    /// Opens blitz run in place of the settings panel.
+    fn open_game(&mut self) {
+        self.settings = None;
+        let seed = (self.started.elapsed().as_nanos() as u64) | 1;
+        self.game = Some((Run::new(seed, run::load_best()), Instant::now()));
+        self.request_redraw();
+    }
+
+    /// Closes blitz run, keeping a new best score.
+    fn close_game(&mut self) {
+        if let Some((g, _)) = self.game.take() {
+            if g.best > run::load_best() {
+                run::save_best(g.best);
+            }
+            self.request_redraw();
         }
     }
 
@@ -1169,6 +1212,7 @@ impl App {
         match p.selected().map(|s| s.kind) {
             Some(Kind::Toggle) => self.change_setting(1, true),
             Some(Kind::Theme) => self.open_picker(),
+            Some(Kind::Game) => self.open_game(),
             Some(Kind::Choice) if inside(&control) => {
                 let by = if x < control.x + control.w / 2 { -1 } else { 1 };
                 self.change_setting(by, false);
@@ -1187,9 +1231,10 @@ impl App {
         let Some(s) = p.selected() else {
             return;
         };
-        if s.kind == Kind::Theme {
-            self.open_picker();
-            return;
+        match s.kind {
+            Kind::Theme => return self.open_picker(),
+            Kind::Game => return self.open_game(),
+            _ => {}
         }
         if let Some(v) = p.step(s, &self.config, by, wrap) {
             self.set_setting(s.key, Some(v));
@@ -1248,7 +1293,9 @@ impl App {
     /// Typed text for the filter of the theme picker or the settings
     /// panel. False when neither is open.
     fn filter_text(&mut self, t: &str) -> bool {
-        if let Some(p) = &mut self.picker {
+        if self.game.is_some() {
+            // The game takes keys, not text.
+        } else if let Some(p) = &mut self.picker {
             p.filter.push_str(t);
             p.sel = 0;
             self.preview();
@@ -1418,6 +1465,23 @@ impl App {
         if !k.down && self.eaten == Some(k.vk) {
             self.eaten = None;
             return;
+        }
+        if let Some((g, _)) = &mut self.game {
+            // Every key is the game's, but a shortcut closes it and runs.
+            if keymap::action(k).is_some() {
+                self.close_game();
+            } else {
+                if k.down {
+                    self.eaten = Some(k.vk);
+                    match k.vk {
+                        VK_ESCAPE => self.close_game(),
+                        VK_SPACE | VK_UP | VK_W => g.jump(),
+                        _ => {}
+                    }
+                    self.request_redraw();
+                }
+                return;
+            }
         }
         if self.picker.is_some() {
             // Every key is the picker's; so is the release of the last.
@@ -1853,9 +1917,14 @@ impl App {
         };
         let now = Instant::now();
         let changed = v.pane.attn.apply(ev, attended, now);
+        let needs_you = changed && v.pane.attn.state == Attn::NeedsYou;
         let kind = (changed && away)
             .then(|| flash_kind(v.pane.attn.state, &mut v.flashed, now))
             .flatten();
+        // Back to work: the game ends when a session needs the user.
+        if needs_you {
+            self.close_game();
+        }
         // The sidebar shows the new state.
         self.request_redraw();
         if let (Some(kind), Some(w)) = (kind, &self.window) {
@@ -2149,6 +2218,17 @@ impl App {
         g.chain.wait(100);
         let started = Instant::now();
         let mut waited = Duration::ZERO;
+        if let Some((g, at)) = &mut self.game {
+            // A long gap, as while the window was in the background,
+            // counts as one short step: the game waits rather than jumps.
+            let dt = started
+                .saturating_duration_since(*at)
+                .min(Duration::from_millis(50));
+            *at = started;
+            if g.step(dt.as_secs_f32()) && g.best > run::load_best() {
+                run::save_best(g.best);
+            }
+        }
         let (cw, ch) = self.cell();
         let focus = self.focus_id();
         let cursor = self.current().map(|v| lock(&v.pane.term).cursor());
@@ -2195,6 +2275,21 @@ impl App {
         }
 
         let pal = self.theme.pal;
+        let scenery = (self.config.scenery != "off").then(|| {
+            let mut prims = Vec::new();
+            let all = Rect {
+                x: 0,
+                y: 0,
+                w: size.width as i32,
+                h: size.height as i32,
+            };
+            let (scene, t) = (&self.config.scenery, self.anim_time());
+            crate::arcade::scenery::draw(&mut prims, scene, all, t, self.scale as f32, &pal);
+            chrome::Chrome {
+                prims,
+                ..Default::default()
+            }
+        });
         let Some(g) = &mut self.gfx else {
             return;
         };
@@ -2202,16 +2297,15 @@ impl App {
             g.chain.resize(&g.r.gpu, size.width, size.height)?;
             for _ in 0..2 {
                 g.r.begin();
+                if let Some(s) = &scenery {
+                    g.r.chrome(s);
+                }
                 for v in &self.views {
                     let Some(at) = v.rect else {
                         continue;
                     };
-                    let id = v.pane.id;
-                    if dimmed.contains(&id) {
-                        g.r.dimmed(&v.snap, &pal, at.x, at.y);
-                    } else {
-                        g.r.snapshot(&v.snap, &pal, at.x, at.y);
-                    }
+                    let dim = dimmed.contains(&v.pane.id);
+                    g.r.grid(&v.snap, &pal, at.x, at.y, dim, scenery.is_none());
                     if let Some(n) = &v.notice {
                         draw_notice(&mut g.r, &pal, at, v.grid, n);
                     }
@@ -2381,8 +2475,38 @@ impl App {
         let resume = (self.views.iter())
             .filter_map(|v| Some(v.resume.as_ref()?.1))
             .min();
-        [sync, notice, timer, resume].into_iter().flatten().min()
+        // Only a window in use animates.
+        let still =
+            !self.motion || (self.config.scenery == "off" && !(self.config.mascot && sidebar));
+        let anim = match (self.focused, self.game.is_some(), still) {
+            (true, true, _) => Some(now + GAME_FRAME),
+            (true, false, false) => Some(now + SCENERY_FRAME),
+            _ => None,
+        };
+        [sync, notice, timer, resume, anim]
+            .into_iter()
+            .flatten()
+            .min()
     }
+}
+
+/// Whether Windows shows animations; off under Accessibility, Visual
+/// effects. Read once at start.
+fn animations_on() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut on = windows::core::BOOL(1);
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&raw mut on).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    read.is_err() || on.as_bool()
 }
 
 /// Whether a notification replaces the session's sidebar message. It is
