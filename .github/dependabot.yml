@@ -1,0 +1,26 @@
+# Weekly update PRs for the SHA-pinned actions and the `=` pinned crates.
+# A release must be a week old before it is offered, so a hijacked
+# version has time to be caught and yanked first. Security updates skip
+# the wait.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: deps
