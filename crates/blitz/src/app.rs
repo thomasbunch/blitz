@@ -3271,8 +3271,8 @@ impl App {
     }
 
     /// Says `text` dimly in pane `id`, which nobody asked for, until
-    /// `until`, unless a question, an error or a notice that stays up
-    /// waits there. Whether it did.
+    /// `until`, unless a question, an error, a plain notice or a notice
+    /// that stays up waits there. Whether it did.
     fn hint(&mut self, id: PaneId, text: impl Into<String>, until: Instant) -> bool {
         let shown =
             (self.view_mut(id)).is_some_and(|v| hint_into(&mut v.notice, text.into(), until));
@@ -3619,14 +3619,19 @@ impl App {
         }
         drop(term);
         if !confirmed && vt::keys::needs_paste_confirm(text, bracketed, trusted) {
-            let key = keymap::keys_for(Action::Paste, &self.config.keys);
-            let asked = paste_question(text, key.as_deref());
-            self.ask(id, asked, ask(text.to_owned()));
+            self.ask_paste(id, text, ask);
             return;
         }
         let mut out = Vec::new();
         vt::encode_paste(text, bracketed, &mut out);
         self.typed(out);
+    }
+
+    /// Asks before pasting `text` into pane `id`; the paste key confirms.
+    fn ask_paste(&mut self, id: PaneId, text: &str, ask: fn(String) -> Ask) {
+        let key = keymap::keys_for(Action::Paste, &self.config.keys);
+        let asked = paste_question(text, key.as_deref());
+        self.ask(id, asked, ask(text.to_owned()));
     }
 
     /// The kind of shell pane `id` started, which pasted paths are quoted
@@ -3716,10 +3721,12 @@ impl App {
                     return false;
                 };
                 // Files copied in Explorer paste as their paths.
-                let text = (crate::clipboard::get_text().filter(|t| !t.is_empty())).or_else(|| {
-                    let shell = self.shell_of(id);
-                    crate::clipboard::get_files().map(|f| quote_paths(&f, shell))
-                });
+                let text = (crate::clipboard::get_text().filter(|t| !t.is_empty()))
+                    .map(|t| (t, false))
+                    .or_else(|| {
+                        let shell = self.shell_of(id);
+                        crate::clipboard::get_files().map(|f| quote_paths(&f, shell))
+                    });
                 // The answer to a question pastes what it asked about; a
                 // clipboard that changed since asks again.
                 let asked = (self.view_mut(id)).and_then(|v| {
@@ -3729,14 +3736,16 @@ impl App {
                 if asked.is_some() {
                     self.request_redraw();
                 }
-                if let Some(answer) = asked.and_then(|n| answers(n.ask, text.as_deref())) {
+                let now = text.as_ref().map(|t| t.0.as_str());
+                if let Some(answer) = asked.and_then(|n| answers(n.ask, now)) {
                     self.paste(id, &answer, true, Ask::Paste);
                     return true;
                 }
-                let Some(text) = text else {
-                    return self.paste_image(id);
-                };
-                self.paste(id, &text, false, Ask::Paste);
+                match text {
+                    Some((text, true)) => self.ask_paste(id, &text, Ask::Paste),
+                    Some((text, false)) => self.paste(id, &text, false, Ask::Paste),
+                    None => return self.paste_image(id),
+                }
             }
             Action::QuickSelect => {
                 let Some(v) = self.current() else {
@@ -4723,9 +4732,7 @@ impl App {
             .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
         let size = (size.width as i32, size.height as i32);
         let tw = self.text_cell().0 as i32;
-        let note = self.banner_note.as_ref().map(|n| n.0.as_str());
-        let update = self.update.as_ref();
-        panes_area(&self.win, size, self.scale as f32, update, note, tw)
+        chrome::area(&self.win, size, self.scale as f32, self.banner(), tw)
     }
 
     /// The text of the update strip or cue, which also decides whether
@@ -4781,8 +4788,10 @@ impl App {
         match dropped(paths, self.hit(pos)) {
             Some(Dropped::Paste(id, paths)) => {
                 self.show(id);
-                let text = quote_paths(&paths, self.shell_of(id));
-                self.paste(id, &text, false, Ask::Drop);
+                match quote_paths(&paths, self.shell_of(id)) {
+                    (text, true) => self.ask_paste(id, &text, Ask::Drop),
+                    (text, false) => self.paste(id, &text, false, Ask::Drop),
+                }
             }
             Some(Dropped::Open(dirs)) if dirs.is_empty() => {
                 if let Some(id) = self.focus_id() {
@@ -6373,21 +6382,6 @@ fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) 
     update.map(|u| note.unwrap_or(&u.1))
 }
 
-/// The part of a `size` window that the active tab's panes share, with
-/// the banner strip as the frame draws it: from the note on the update in
-/// hand while there is one, which may need the strip where the offer fit
-/// the sidebar's foot.
-fn panes_area(
-    win: &layout::Window,
-    size: (i32, i32),
-    scale: f32,
-    update: Option<&(String, String)>,
-    note: Option<&str>,
-    tw: i32,
-) -> Rect {
-    chrome::area(win, size, scale, banner_text(update, note), tw)
-}
-
 /// The state whose dot badges the taskbar button: the one of `states`
 /// that most wants the user, if any does.
 fn badge_state(states: impl Iterator<Item = Attn>) -> Option<Attn> {
@@ -6661,10 +6655,12 @@ fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
 /// Puts a hint nobody asked for in a pane's notice `slot`, dim until
 /// `until`, unless a question or an error waits there, which it would
 /// take the place of, or a notice that stays up ([`hides_lasting`]).
-/// Whether it did.
+/// Whether it did. Only another dim hint gives way: a plain notice may
+/// be the one word that a session was lost.
 fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
     let old = slot.as_ref();
-    let fits = old.is_none_or(|n| n.ask == Ask::Nothing) && !hides_lasting(old, Some(until), true);
+    let fits = old.is_none_or(|n| n.ask == Ask::Nothing && n.dim)
+        && !hides_lasting(old, Some(until), true);
     if fits {
         *slot = Some(Notice {
             text,
@@ -7357,34 +7353,53 @@ fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
     term.vouch_paste(ev != Ev::Idle);
 }
 
-/// Paths as a paste types them into a pane that runs `shell`: joined by
-/// spaces, each in double quotes when it holds anything but letters,
-/// digits and `_.-:\/`, so no shell reads a name such as `a&calc.txt` as
-/// syntax. In cmd only `"`, which no Windows name holds, ends them, and
-/// `%VAR%` still expands: its prompt has no way to quote that. A name
-/// PowerShell would expand or end inside them, with `$`, a backtick or a
-/// typographic double quote, gets single quotes in any other shell, with
-/// each of PowerShell's single quote marks doubled, typographic ones too.
-fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> String {
-    let plain = |c: char| c.is_alphanumeric() || "_.-:\\/".contains(c);
-    let single = shell != crate::shell::Kind::Cmd;
+/// Paths as a paste types them into a pane that started `shell`, joined
+/// by spaces, and whether to ask before pasting them. A name with anything
+/// but letters, digits and `_.-:\/` is quoted, so no shell reads one such
+/// as `a&calc.txt` as syntax. cmd gets double quotes, which only `"` ends
+/// and no Windows name holds; `%VAR%` still expands, as its prompt has no
+/// way to quote that. PowerShell expands `$` and a backtick inside them
+/// and ends them at a typographic double quote, so there such a name gets
+/// single quotes, with each of its single quote marks doubled. The shell
+/// reading the line may be one started inside the pane, cmd in PowerShell
+/// or the reverse, so cmd gets single quotes too for a name PowerShell
+/// would run inside double ones, and a name that also holds `&`, which cmd
+/// runs inside single ones, asks first. Any other shell is taken for bash,
+/// where `\` needs quoting too and only `'` ends single quotes.
+fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, bool) {
+    use crate::shell::Kind::{Cmd, Other, PowerShell};
+    let plain =
+        |c: char| c.is_alphanumeric() || "_.-:/".contains(c) || (c == '\\' && shell != Other);
+    let mut asks = false;
     let quoted: Vec<String> = (paths.iter())
-        .map(|p| match p.to_string_lossy() {
-            s if s.chars().all(plain) => s.into_owned(),
-            s if single && s.contains(['$', '`', '\u{201c}', '\u{201d}', '\u{201e}']) => {
-                let mut q = String::from('\'');
-                for c in s.chars() {
-                    if "'\u{2018}\u{2019}\u{201a}\u{201b}".contains(c) {
-                        q.push(c);
-                    }
-                    q.push(c);
-                }
-                q + "'"
+        .map(|p| {
+            let s = p.to_string_lossy();
+            if s.chars().all(plain) {
+                return s.into_owned();
             }
-            s => format!("\"{s}\""),
+            // What PowerShell runs, or ends at, inside double quotes.
+            let runs = s.contains("$(") || s.contains(['\u{201c}', '\u{201d}', '\u{201e}']);
+            let single = match shell {
+                Cmd => runs && !s.contains('&'),
+                PowerShell => runs || s.contains(['$', '`']),
+                Other => true,
+            };
+            asks |= shell != Other && s.contains('&') && (single || runs);
+            if !single {
+                return format!("\"{s}\"");
+            }
+            let mut q = String::from('\'');
+            for c in s.chars() {
+                match c {
+                    '\'' if shell == Other => q.push_str(r"'\''"),
+                    '\'' | '\u{2018}'..='\u{201b}' if shell != Other => q.extend([c, c]),
+                    _ => q.push(c),
+                }
+            }
+            q + "'"
         })
         .collect();
-    quoted.join(" ")
+    (quoted.join(" "), asks)
 }
 
 /// What files dropped on the window do.
@@ -8307,8 +8322,8 @@ mod tests {
         let offer = crate::update::banner(None, "0.2.0", None, true, "Ctrl+Alt+Shift+F12");
         let offer = offer.expect("an offer");
         let update = ("0.2.0".to_string(), offer);
-        let note = "Sessions are busy, and updating restarts blitz.                     Press Ctrl+Alt+Shift+F12 again";
-        let area = |note| panes_area(&win, (1440, 900), 1.0, Some(&update), note, 7);
+        let note = "Sessions are busy, and updating restarts blitz. Press Ctrl+Alt+Shift+F12 again";
+        let area = |note| chrome::area(&win, (1440, 900), 1.0, banner_text(Some(&update), note), 7);
         assert_eq!(area(None).h, 900, "the offer sits at the sidebar's foot");
         assert!(area(Some(note)).h < 900, "the note needs the strip");
     }
@@ -10597,9 +10612,9 @@ mod tests {
         }
     }
 
-    /// A passing hint leaves a question or an error where it is, and says
-    /// so, to be tried again; an exited program's line comes back once a
-    /// notice over it goes.
+    /// A passing hint leaves a question, an error or a plain notice where
+    /// it is, and says so, to be tried again; an exited program's line
+    /// comes back once a notice over it goes.
     #[test]
     fn notices_over_questions_and_exits() {
         let notice = |ask, dim| Notice {
@@ -10624,7 +10639,7 @@ mod tests {
                 ("hint", Some(until), true)
             );
         }
-        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit] {
+        for ask in [Ask::ClosePane, Ask::Key, Ask::Quit, Ask::Nothing] {
             let mut slot = Some(notice(ask.clone(), false));
             assert!(!hint_into(&mut slot, "hint".into(), until));
             assert!(slot.is_some_and(|n| n.ask == ask && n.text == "n"));
@@ -11117,33 +11132,56 @@ mod tests {
         use crate::shell::Kind::{Cmd, Other, PowerShell};
         let paths = [r"C:\some dir\shot.png", r"D:\b.txt"].map(PathBuf::from);
         let both = r#""C:\some dir\shot.png" D:\b.txt"#;
-        assert_eq!(quote_paths(&paths, PowerShell), both);
-        assert_eq!(quote_paths(&paths[1..], Cmd), r"D:\b.txt");
-        let one = |p: &str, shell| quote_paths(&[PathBuf::from(p)], shell);
+        assert_eq!(quote_paths(&paths, PowerShell), (both.into(), false));
+        assert_eq!(quote_paths(&paths[1..], Cmd).0, r"D:\b.txt");
+        let bash = r"'C:\some dir\shot.png' 'D:\b.txt'";
+        assert_eq!(quote_paths(&paths, Other).0, bash, "bash reads `\\`");
+        let one = |p: &str, shell| quote_paths(&[PathBuf::from(p)], shell).0;
+        let asks = |p: &str, shell| quote_paths(&[PathBuf::from(p)], shell).1;
         // Double quotes, which cmd and PowerShell alike read as one word.
-        for shell in [Cmd, PowerShell, Other] {
+        for shell in [Cmd, PowerShell] {
             assert_eq!(one(r"C:\x&calc&.txt", shell), r#""C:\x&calc&.txt""#);
             assert_eq!(one(r"C:\x(1);y.txt", shell), r#""C:\x(1);y.txt""#);
             assert_eq!(one(r"C:\%PATH%^.txt", shell), r#""C:\%PATH%^.txt""#);
             assert_eq!(one(r"C:\a‘;b’.txt", shell), r#""C:\a‘;b’.txt""#);
             assert_eq!(one(r"C:\café_1-2.txt", shell), r"C:\café_1-2.txt");
+            assert!(!asks(r"C:\x&calc&.txt", shell));
         }
-        // cmd reads `'` as text and nothing in these as syntax.
+        // cmd reads `'` as text and nothing in these as syntax, nor would
+        // PowerShell started inside it.
         assert_eq!(one(r"\\srv\c$\a.txt", Cmd), r#""\\srv\c$\a.txt""#);
         assert_eq!(one(r"C:\x$&calc&.txt", Cmd), r#""C:\x$&calc&.txt""#);
-        assert_eq!(one(r"C:\a”;calc;”.txt", Cmd), r#""C:\a”;calc;”.txt""#);
+        assert!(!asks(r"C:\x$&calc&.txt", Cmd));
+        // What PowerShell would run inside double quotes gets single ones,
+        // which cmd reads as text too.
+        assert_eq!(one(r"C:\$(calc).txt", Cmd), r"'C:\$(calc).txt'");
+        assert_eq!(one(r"C:\a”;calc;”.txt", Cmd), r"'C:\a”;calc;”.txt'");
         // PowerShell expands `$` and ends a string at a typographic quote
         // inside double quotes, but nothing ends single ones but a single
         // quote mark, doubled.
         assert_eq!(one(r"\\srv\c$\a.txt", PowerShell), r"'\\srv\c$\a.txt'");
         assert_eq!(one(r"C:\$(calc).txt", PowerShell), r"'C:\$(calc).txt'");
-        assert_eq!(one(r"C:\it's $x.txt", Other), r"'C:\it''s $x.txt'");
         assert_eq!(one(r"C:\a”;calc;”.txt", PowerShell), r"'C:\a”;calc;”.txt'");
         assert_eq!(
             one(r"C:\x$’;calc;’.txt", PowerShell),
             r"'C:\x$’’;calc;’’.txt'"
         );
         assert_eq!(one("C:\\a`b‚‛.txt", PowerShell), "'C:\\a`b‚‚‛‛.txt'");
+        assert_eq!(one(r"C:\it's $(x).txt", Cmd), r"'C:\it''s $(x).txt'");
+        // No quoting suits both cmd and PowerShell: asked first, quoted for
+        // the shell the pane started.
+        assert_eq!(one(r"C:\x$&calc&.txt", PowerShell), r"'C:\x$&calc&.txt'");
+        assert!(asks(r"C:\x$&calc&.txt", PowerShell));
+        assert_eq!(one(r"C:\a”&calc&”.txt", Cmd), r#""C:\a”&calc&”.txt""#);
+        assert!(asks(r"C:\a”&calc&”.txt", Cmd));
+        assert!(asks(r"C:\$(calc)&.txt", Cmd));
+        // bash: only `'` ends single quotes, and `'\''` puts one in.
+        assert_eq!(one(r"C:\it's $x.txt", Other), r"'C:\it'\''s $x.txt'");
+        assert_eq!(one(r"C:\a b\x!y.txt", Other), r"'C:\a b\x!y.txt'");
+        assert_eq!(one(r"C:\a‘;b’.txt", Other), r"'C:\a‘;b’.txt'");
+        assert_eq!(one(r"C:\x$&calc&.txt", Other), r"'C:\x$&calc&.txt'");
+        assert_eq!(one("C:/café_1-2.txt", Other), "C:/café_1-2.txt");
+        assert!(!asks(r"C:\x$&calc&.txt", Other));
     }
 
     #[test]

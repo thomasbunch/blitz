@@ -150,6 +150,9 @@ pub struct Terminal {
     /// Counts the times line numbers started over on both screens; see
     /// [`Self::line_epoch`].
     line_epoch: u32,
+    /// Counts the times the alternate screen's own rows moved under their
+    /// numbers, which leaves the main screen's numbers alone.
+    alt_epoch: u32,
     changed: bool,
     modes: Modes,
     /// Dark or light system theme, for `CSI ? 996 n`.
@@ -231,6 +234,7 @@ impl Terminal {
             other_viewport: 0,
             hold: false,
             line_epoch: 0,
+            alt_epoch: 0,
             changed: true,
             modes: Modes::default(),
             dark: true,
@@ -551,11 +555,11 @@ impl Terminal {
     /// whether it is `listening`. Yes confirms pastes as the user would;
     /// while bracketed paste is off, for the next time it is turned on
     /// and that time only, since the program may turn it on after saying
-    /// so. No forgets such a yes.
+    /// so. No forgets such a yes, and what it has already confirmed.
     pub fn vouch_paste(&mut self, listening: bool) {
         let on = self.modes.input.bracketed;
-        if listening && on {
-            self.modes.paste_confirmed = true;
+        if on || !listening {
+            self.modes.paste_confirmed = listening;
         }
         self.modes.paste_vouched = listening && !on;
     }
@@ -615,12 +619,14 @@ impl Terminal {
 
     /// Changes whenever line numbers start over and name other text: the
     /// width changed and the lines were wrapped again, the other screen is
-    /// shown, the whole screen scrolled under scrollback that stayed put,
-    /// or the terminal was reset. Coming back from the alternate screen
-    /// gives the main screen's numbers back, as its lines are still where
-    /// they were: blitz's own prompt goes there and back each time.
+    /// shown, the whole screen scrolled up under scrollback that stayed put
+    /// or scrolled down, or the terminal was reset. Coming back from the
+    /// alternate screen gives the main screen's numbers back, as its lines
+    /// are still where they were: blitz's own prompt goes there and back
+    /// each time.
     pub fn line_epoch(&self) -> u32 {
-        self.line_epoch.wrapping_mul(2) | u32::from(self.alt)
+        let alt = if self.alt { self.alt_epoch } else { 0 };
+        (self.line_epoch.wrapping_add(alt)).wrapping_mul(2) | u32::from(self.alt)
     }
 
     /// Line `n` of the screen being shown, scrollback included, as
@@ -1024,7 +1030,7 @@ impl Terminal {
     fn scroll_up(&mut self, top: u16, n: u16, keep: bool) {
         let blank = self.blank();
         if (self.screen.grid).scroll_up(top, self.bottom, n, blank, keep) {
-            self.line_epoch = self.line_epoch.wrapping_add(1);
+            self.rows_moved();
         }
     }
 
@@ -1033,8 +1039,20 @@ impl Terminal {
     fn scroll_down(&mut self, top: u16, n: u16) {
         let blank = self.blank();
         if (self.screen.grid).scroll_down(top, self.bottom, n, blank) {
-            self.line_epoch = self.line_epoch.wrapping_add(1);
+            self.rows_moved();
         }
+    }
+
+    /// Starts the shown screen's line numbers over after its rows moved
+    /// under them. The alternate screen counts its own, so the main
+    /// screen's numbers come back with it.
+    fn rows_moved(&mut self) {
+        let n = if self.alt {
+            &mut self.alt_epoch
+        } else {
+            &mut self.line_epoch
+        };
+        *n = n.wrapping_add(1);
     }
 
     /// IL (`down`) or DL: shifts the rows from the cursor to the bottom
@@ -1079,6 +1097,7 @@ impl Terminal {
         std::mem::swap(&mut t.events, &mut self.events);
         std::mem::swap(&mut t.prompt_token, &mut self.prompt_token);
         t.line_epoch = self.line_epoch.wrapping_add(1);
+        t.alt_epoch = self.alt_epoch;
         t.dark = self.dark;
         t.focused = self.focused;
         t.cell_px = self.cell_px;

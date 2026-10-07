@@ -1153,4 +1153,13 @@ fn a_vouched_paste_holds_for_the_next_turn_on_only() {
     // While on, a yes confirms at once, as the user would.
     t.vouch_paste(true);
     assert!(t.paste_trusted());
+    // A no after the turn-on took the yes forgets it too, so a prompt
+    // that is not blitz's does not keep it.
+    t.feed(b"[?2004l");
+    t.vouch_paste(true);
+    t.feed(b"[?2004h");
+    t.vouch_paste(false);
+    assert!(!t.paste_trusted(), "no after the turn-on");
+    t.feed(b"]133;A");
+    assert!(!t.paste_trusted(), "another prompt");
 }
