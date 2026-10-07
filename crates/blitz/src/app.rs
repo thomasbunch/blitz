@@ -921,6 +921,8 @@ struct App {
     banner: Option<Rect>,
     /// The chips on panes scrolled back in the last frame, for clicks.
     below: Vec<(PaneId, Rect)>,
+    /// The find bar in the last frame, for clicks.
+    find_bar: Option<Rect>,
     /// Keys whose releases belong to a shortcut or a panel and are not sent.
     eaten: Eaten,
     /// Where the IME was last told typing goes, in client pixels.
@@ -1209,6 +1211,7 @@ impl App {
             banner_note: None,
             banner: None,
             below: Vec::new(),
+            find_bar: None,
             eaten: Eaten::default(),
             ime_at: None,
             title: "blitz".into(),
@@ -3726,6 +3729,12 @@ impl App {
             self.request_redraw();
             return;
         }
+        // A click on the find bar keeps it, where one below it closes it.
+        let on_find = (self.find_bar)
+            .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        if pressed && on_find && self.find.is_some() {
+            return;
+        }
         if b == 0 && !pressed && self.mouse.divider.take().is_some() {
             self.settle();
             return;
@@ -4153,6 +4162,8 @@ impl App {
         self.side = std::mem::take(&mut chrome.side);
         self.banner = chrome.banner;
         self.below = std::mem::take(&mut chrome.below);
+        self.find_bar = chrome.find;
+
         self.settings_hits = chrome.settings.take();
         self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {

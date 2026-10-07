@@ -217,6 +217,8 @@ pub struct Chrome {
     /// The chip on each pane scrolled back, which a click takes to the
     /// bottom.
     pub below: Vec<(PaneId, Rect)>,
+    /// The find bar, for clicks.
+    pub find: Option<Rect>,
     pub settings: Option<SettingsHits>,
     /// The command palette and each row it shows, by index, for clicks.
     pub commands: Option<(Rect, Vec<(usize, Rect)>)>,
@@ -967,7 +969,8 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let to_settings = to_picker && m.picker.is_none();
     let to_find = to_settings && m.settings.is_none();
     if let (Some(f), Some(r)) = (&m.find, pane(tab.focus)) {
-        let at = find_bar(&mut extra, f, c, r, s, (tw, th), to_find);
+        let (bar, at) = find_bar(&mut extra, f, c, r, s, (tw, th), to_find);
+        out.find = Some(bar);
         out.field = out.field.or(to_find.then_some(at));
     }
     if let Some(st) = &m.settings {
@@ -1030,8 +1033,8 @@ fn composition(
 }
 
 /// The find bar: one line at the top right of pane `r` with the query and
-/// which match is current, or that nothing matches. Returns where typed
-/// text goes.
+/// which match is current, or that nothing matches. Returns the bar and
+/// where typed text goes.
 fn find_bar(
     p: &mut Vec<Prim>,
     f: &FindBar,
@@ -1040,7 +1043,7 @@ fn find_bar(
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
     caret: bool,
-) -> Rect {
+) -> (Rect, Rect) {
     let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
         p.push(Prim::Text {
             x,
@@ -1082,7 +1085,7 @@ fn find_bar(
     if !count.is_empty() {
         text(p, cx, ty, count, color, false);
     }
-    field
+    (panel, field)
 }
 
 /// What the theme picker and the command palette have in common.
@@ -2681,6 +2684,10 @@ mod tests {
                 if *c == border && r.right() == focus.right() && r.y == focus.y && r.w < focus.w)
         };
         assert!(c.prims.iter().any(corner));
+        // The bar is reported for clicks, and only while it is open.
+        let bar = c.find.expect("the bar");
+        assert!(corner(&Prim::Rect(bar, border)));
+        assert_eq!(build(&model(&win, &sessions, now)).find, None);
 
         m.find = Some(FindBar {
             query: "zzz",
