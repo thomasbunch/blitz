@@ -15,11 +15,12 @@ use vt::grid::Found;
 use vt::{
     Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
 };
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DwmSetWindowAttribute,
 };
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, GetKeyboardState, GetLastInputInfo, LASTINPUTINFO,
@@ -29,8 +30,9 @@ use windows::Win32::UI::Shell::{
     TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage, WM_CHAR,
-    WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetCursorPos, GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage,
+    WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -872,6 +874,9 @@ struct App {
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
+    /// Files dropped on the window, one event each, handled together when
+    /// the event loop has nothing more to deliver.
+    dropped: Vec<PathBuf>,
     /// A newer release: its version and the banner text.
     update: Option<(String, String)>,
     /// The installer is downloading, or Ctrl+Shift+U is looking for a
@@ -1143,6 +1148,7 @@ impl App {
             hover: None,
             mouse: Mouse::default(),
             preedit: String::new(),
+            dropped: Vec::new(),
             update: None,
             updating: None,
             closed: None,
@@ -3317,6 +3323,46 @@ impl App {
         (id, side)
     }
 
+    /// Where the pointer is now, in client pixels. A drag from another
+    /// program moves it without telling the window, so `mouse.pos` is old.
+    fn pointer(&self) -> Option<PhysicalPosition<f64>> {
+        let mut pt = POINT::default();
+        // SAFETY: plain queries that write one POINT; a stale window only
+        // fails the second.
+        unsafe {
+            GetCursorPos(&mut pt).ok()?;
+            ScreenToClient(HWND(self.hwnd as *mut c_void), &mut pt)
+                .ok()
+                .ok()?;
+        }
+        Some(PhysicalPosition::new(f64::from(pt.x), f64::from(pt.y)))
+    }
+
+    /// Handles the files dropped since the last turn of the event loop,
+    /// where the pointer let go of them. blitz run covers the panes, so
+    /// nothing is dropped on them while it is open.
+    fn on_drop(&mut self) {
+        let paths = std::mem::take(&mut self.dropped);
+        if paths.is_empty() || self.game.is_some() {
+            return;
+        }
+        let Some(pos) = self.pointer() else {
+            return;
+        };
+        match dropped(paths, self.hit(pos)) {
+            Some(Dropped::Paste(id, text)) => {
+                self.show(id);
+                self.paste(id, &text, false);
+            }
+            Some(Dropped::Open(dirs)) => {
+                for dir in dirs {
+                    self.add(Some(dir), new_tab);
+                }
+            }
+            None => {}
+        }
+    }
+
     /// The divider of the active tab under a point, if the settings panel
     /// is not over it. Dividers are 1 px wide, so a few px either side count.
     fn divider_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, Axis)> {
@@ -4888,6 +4934,28 @@ fn quote_paths(paths: &[PathBuf]) -> String {
     quoted.join(" ")
 }
 
+/// What files dropped on the window do.
+#[derive(Debug, PartialEq)]
+enum Dropped {
+    /// Pasted into this pane as their paths, the way [`quote_paths`] types
+    /// them.
+    Paste(PaneId, String),
+    /// The folders among them, dropped on the sidebar, each opened in a
+    /// new tab.
+    Open(Vec<PathBuf>),
+}
+
+/// What `paths` dropped where [`App::hit`] found `hit` do.
+fn dropped(paths: Vec<PathBuf>, hit: (Option<PaneId>, bool)) -> Option<Dropped> {
+    match hit {
+        (_, true) => Some(Dropped::Open(
+            paths.into_iter().filter(|p| p.is_dir()).collect(),
+        )),
+        (Some(id), false) => Some(Dropped::Paste(id, quote_paths(&paths))),
+        (None, false) => None,
+    }
+}
+
 /// Alt+V pressed and released, as the program asked keys to be sent:
 /// the key Claude Code pastes an image on.
 fn alt_v(m: &InputModes) -> Vec<u8> {
@@ -5199,6 +5267,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.on_mouse_button(el, state, button);
             }
             WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
+            WindowEvent::DroppedFile(path) => self.dropped.push(path),
             // Windows switched between light and dark mode.
             WindowEvent::ThemeChanged(_) => {
                 // winit has just set the frame to the system's mode.
@@ -5269,6 +5338,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.drain_keys(el);
+        self.on_drop();
         self.save_session(false);
         // Here, after every batch of events, rather than at each change:
         // a minimized window is not drawn.
@@ -6869,6 +6939,23 @@ mod tests {
         let paths = [r"C:\some dir\shot.png", r"D:\b.txt"].map(PathBuf::from);
         assert_eq!(quote_paths(&paths), r#""C:\some dir\shot.png" D:\b.txt"#);
         assert_eq!(quote_paths(&paths[1..]), r"D:\b.txt");
+    }
+
+    #[test]
+    fn app_drops_paste_into_a_pane_or_open_folders_from_the_sidebar() {
+        let dir = std::env::temp_dir().join(format!("blitz drop {}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("shot.png");
+        std::fs::write(&file, "").expect("file");
+        let paths = vec![file.clone(), dir.clone()];
+        let pane = dropped(paths.clone(), (Some(PaneId(2)), false));
+        let side = dropped(paths.clone(), (Some(PaneId(1)), true));
+        let nowhere = dropped(paths, (None, false));
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = format!("\"{}\" \"{}\"", file.display(), dir.display());
+        assert_eq!(pane, Some(Dropped::Paste(PaneId(2), text)));
+        assert_eq!(side, Some(Dropped::Open(vec![dir])), "folders only");
+        assert_eq!(nowhere, None);
     }
 
     #[test]
