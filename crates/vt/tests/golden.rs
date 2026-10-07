@@ -565,6 +565,36 @@ fn resize_rewraps_wide_characters_whole() {
     assert_eq!(t.cursor(), (2, 1, true));
 }
 
+/// 47 and 1047 save no cursor for the main screen, and DECSTR forgets the
+/// one 1049 saved, so the main screen's last row of text stands in for it.
+#[test]
+fn resize_under_a_bare_alternate_screen_keeps_the_main_bottom() {
+    let main = "aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc";
+    for (enter, leave) in [
+        ("\x1b[?47h", "\x1b[?47l"),
+        ("\x1b[?1047h", "\x1b[?1047l"),
+        ("\x1b[?1049h\x1b[!p", "\x1b[?1049l"),
+    ] {
+        let mut t = run(10, 3, &format!("{main}{enter}"));
+        t.resize(5, 3);
+        feed(&mut t, leave);
+        assert_eq!(t.screen_text(), "bbbbb\nccccc\nccccc", "{enter:?}");
+        assert_eq!(t.scrollback_text(), "aaaaa\naaaaa\nbbbbb", "{enter:?}");
+
+        // Fewer rows only: the top goes to scrollback, not the bottom.
+        let mut t = run(10, 3, &format!("{main}{enter}"));
+        t.resize(10, 2);
+        feed(&mut t, leave);
+        assert_eq!(t.screen_text(), "bbbbbbbbbb\ncccccccccc", "{enter:?}");
+        assert_eq!(t.scrollback_text(), "aaaaaaaaaa", "{enter:?}");
+    }
+    // A main screen with blank rows under its text loses those first.
+    let mut t = run(10, 4, "top\r\ntext\x1b[1;1H\x1b[?47h\x1b[4;1H");
+    t.resize(10, 2);
+    feed(&mut t, "\x1b[?47l");
+    assert_eq!(t.screen_text(), "top\ntext");
+}
+
 #[test]
 fn resize_rewraps_the_main_screen_under_the_alternate_one() {
     let mut t = run(5, 3, "abcdefg\x1b[?1049hALT-SCREEN");

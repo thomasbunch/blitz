@@ -243,25 +243,30 @@ impl Terminal {
         // the alternate screen redraw it themselves. The bundled ConPTY
         // leaves this to the terminal and repaints nothing.
         let reflow = cols != self.cols() && cols >= 2;
+        // The screen not shown keeps its place by its saved cursor. 47 and
+        // 1047 save none, and DECSTR drops it, so then the end of its text
+        // stands in, and nothing below that is lost.
+        let o = &self.other;
+        let mut other_at = o.saved.map_or_else(
+            || {
+                let (x, y) = o.grid.text_end();
+                (x, y, false)
+            },
+            |c| (c.x, c.y, c.pending_wrap),
+        );
         if reflow {
-            let (grid, cur) = if self.alt {
-                (&mut self.other.grid, self.other.saved.as_mut())
+            if self.alt {
+                other_at = self.other.grid.reflow(cols, other_at);
             } else {
-                (&mut self.screen.grid, Some(&mut self.cur))
-            };
-            let at = cur
-                .as_ref()
-                .map_or((0, 0, false), |c| (c.x, c.y, c.pending_wrap));
-            let (x, y, pending) = grid.reflow(cols, at);
-            if let Some(c) = cur {
-                (c.x, c.y, c.pending_wrap) = (x, y, pending);
+                let c = &mut self.cur;
+                (c.x, c.y, c.pending_wrap) =
+                    (self.screen.grid).reflow(cols, (c.x, c.y, c.pending_wrap));
             }
         }
         self.cur.y = self.screen.grid.resize(cols, rows, self.cur.y);
-        let other_y = self.other.saved.map_or(0, |c| c.y);
-        let other_y = self.other.grid.resize(cols, rows, other_y);
+        other_at.1 = self.other.grid.resize(cols, rows, other_at.1);
         if let Some(c) = &mut self.other.saved {
-            c.y = other_y;
+            (c.x, c.y, c.pending_wrap) = other_at;
         }
         if cols != self.cols() {
             self.cur.pending_wrap &= reflow && !self.alt;

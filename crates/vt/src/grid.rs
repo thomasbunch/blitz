@@ -330,6 +330,19 @@ impl Grid {
         self.rows.get(i)
     }
 
+    /// Column and screen row of the last cell with anything in it, or the
+    /// top-left corner of an empty screen.
+    pub fn text_end(&self) -> (u16, u16) {
+        (0..self.lines)
+            .rev()
+            .find_map(|y| {
+                let cells = &self.row(y).cells;
+                let x = cells.iter().rposition(|c| c.cp != 0 || c.flags != 0)?;
+                Some((x as u16, y))
+            })
+            .unwrap_or((0, 0))
+    }
+
     /// Every cell, scrollback included.
     pub fn cells(&self) -> impl Iterator<Item = &Cell> {
         self.rows.iter().flat_map(|r| &r.cells)
