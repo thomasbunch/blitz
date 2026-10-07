@@ -80,8 +80,11 @@ fn url_len(s: &str) -> Option<usize> {
     let scheme = ["https://", "http://"]
         .into_iter()
         .find(|p| s.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)))?;
+    // Letters and digits of any script, as in `https://bücher.de`, but not
+    // the quotes and punctuation of the text around it.
     let url_char = |c: char| {
         c.is_ascii_graphic() && !matches!(c, '<' | '>' | '"' | '`' | '{' | '}' | '|' | '\\' | '^')
+            || !c.is_ascii() && c.is_alphanumeric()
     };
     let n = trim_end(&s[..s.find(|c| !url_char(c)).unwrap_or(s.len())]);
     (n > scheme.len()).then_some(n)
@@ -315,6 +318,9 @@ mod tests {
         one("<https://x.com/>", "https://x.com/");
         one("'http://x.com/a#top'!", "http://x.com/a#top");
         one("HTTPS://X.COM/A", "HTTPS://X.COM/A");
+        one("see https://bücher.de/x.", "https://bücher.de/x");
+        one("“https://example.com/café”", "https://example.com/café");
+        one("https://例え.jp/パス。", "https://例え.jp/パス");
         one(
             "https://example.com/a/b.html",
             "https://example.com/a/b.html",
