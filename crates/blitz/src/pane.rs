@@ -11,6 +11,11 @@ use crate::attention::PaneAttn;
 use crate::layout::PaneId;
 use crate::pty::{Pty, PtyEvent, SpawnOpts};
 
+// A panic in vt must end one pane, not every session in the window, so the
+// reader catches it below. Under panic = "abort" nothing could.
+#[cfg(not(panic = "unwind"))]
+compile_error!("blitz must be built with panic = \"unwind\"");
+
 /// The most output parsed per hold of the terminal lock, so the UI thread
 /// never waits long for a snapshot.
 const FEED_BYTES: usize = 64 * 1024;

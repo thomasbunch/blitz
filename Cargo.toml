@@ -18,6 +18,8 @@ todo = "warn"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+# A pane catches a panic in vt and closes itself; blitz will not build with
+# "abort".
 panic = "unwind"
 debug = "line-tables-only"
 
