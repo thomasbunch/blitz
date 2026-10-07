@@ -329,10 +329,14 @@ pub fn plugin_dirs(inherited: Option<&str>, ours: &str) -> String {
 /// that does not load them. It never edits the settings file itself; that
 /// file belongs to the user.
 pub fn setup(args: &[String]) -> i32 {
-    if args != ["claude"] {
-        eprintln!("usage: blitz setup claude");
-        return 2;
-    }
+    let wsl = match args {
+        [app] if app == "claude" => false,
+        [app, flag] if app == "claude" && flag == "--wsl" => true,
+        _ => {
+            eprintln!("usage: blitz setup claude [--wsl]");
+            return 2;
+        }
+    };
     let hook = match hook_exe() {
         Ok(hook) => hook,
         Err(e) => {
@@ -359,6 +363,20 @@ pub fn setup(args: &[String]) -> i32 {
             hook.display()
         );
     }
+    // Claude Code in WSL runs the Windows exe; blitz passes the pane's
+    // token into WSL and back.
+    if wsl {
+        let Some(path) = wsl_path(&hook.to_string_lossy()) else {
+            eprintln!("blitz setup: WSL cannot reach {}", hook.display());
+            return 1;
+        };
+        eprintln!(
+            "Merge the \"hooks\" below into ~/.claude/settings.json inside WSL.\n\
+             Claude Code picks the change up without a restart.\n"
+        );
+        print!("{}", claude_settings(&path));
+        return 0;
+    }
     let settings = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::home_dir().map(|h| h.join(".claude")))
@@ -380,6 +398,16 @@ pub fn setup(args: &[String]) -> i32 {
     }
     print!("{}", claude_settings(&hook.to_string_lossy()));
     0
+}
+
+/// `C:\x\y` where WSL mounts it, `/mnt/c/x/y`; `None` for a path not on a
+/// drive letter.
+fn wsl_path(path: &str) -> Option<String> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let drive = path.chars().next().filter(char::is_ascii_alphabetic)?;
+    let rest = path.get(1..)?.strip_prefix(r":\")?;
+    let drive = drive.to_ascii_lowercase();
+    Some(format!("/mnt/{drive}/{}", rest.replace('\\', "/")))
 }
 
 /// Whether the Claude Code settings file at `path` runs blitz-hook.
@@ -1081,6 +1109,24 @@ mod tests {
     fn setup_needs_an_app() {
         assert_eq!(setup(&[]), 2);
         assert_eq!(setup(&["vim".into()]), 2);
+        assert_eq!(setup(&["claude".into(), "--wls".into()]), 2);
+    }
+
+    #[test]
+    fn paths_as_wsl_sees_them() {
+        for (path, want) in [
+            (
+                r"C:\Program Files\blitz\blitz-hook.exe",
+                Some("/mnt/c/Program Files/blitz/blitz-hook.exe"),
+            ),
+            (r"\\?\D:\b\blitz-hook.exe", Some("/mnt/d/b/blitz-hook.exe")),
+            (r"\\server\share\blitz-hook.exe", None),
+            ("relative", None),
+            (r"é:\x", None),
+            ("C:", None),
+        ] {
+            assert_eq!(wsl_path(path).as_deref(), want, "{path}");
+        }
     }
 
     /// As long as a real pane token: 128 bits in hex.

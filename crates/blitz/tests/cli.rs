@@ -48,6 +48,7 @@ fn cli_prints_usage() {
         &["bogus"][..],
         &["setup"],
         &["setup", "vim"],
+        &["setup", "claude", "--linux"],
         &["debug"],
         &["debug", "frob"],
     ] {
@@ -88,6 +89,30 @@ fn cli_setup_claude_prints_the_hooks() {
     assert!(!err.contains("is missing"), "{err}");
     assert!(err.contains("nothing to set up"), "{err}");
     assert!(!err.contains("runs blitz-hook already"), "{err}");
+}
+
+/// Claude Code inside WSL runs the same blitz-hook, by its WSL path.
+#[test]
+fn cli_setup_claude_for_wsl() {
+    let out = blitz(Path::new(BLITZ), &["setup", "claude", "--wsl"], &tmp("cli"));
+    assert_eq!(out.status.code(), Some(0));
+    let v = Json::parse(&text(&out.stdout)).expect("settings JSON");
+    let Some(Json::Arr(groups)) = v.get("hooks").and_then(|h| h.get("Stop")) else {
+        panic!("{v:?}")
+    };
+    let Some(Json::Arr(cmds)) = groups[0].get("hooks") else {
+        panic!("{v:?}")
+    };
+    let cmd = cmds[0].get("command").and_then(Json::as_str).unwrap();
+    let hook = Path::new(BLITZ).with_file_name("blitz-hook.exe");
+    let hook = hook.to_str().expect("UTF-8 path");
+    let want = format!(
+        "/mnt/{}/{}",
+        hook[..1].to_ascii_lowercase(),
+        hook[3..].replace('\\', "/")
+    );
+    assert_eq!(cmd, want);
+    assert!(text(&out.stderr).contains("inside WSL"));
 }
 
 /// Hooks pasted before blitz loaded its own are pointed out: with both,
