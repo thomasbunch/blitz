@@ -923,8 +923,8 @@ struct App {
     below: Vec<(PaneId, Rect)>,
     /// Keys whose releases belong to a shortcut or a panel and are not sent.
     eaten: Eaten,
-    /// Where the IME was last told the cursor is, in client pixels.
-    ime_at: Option<(i32, i32)>,
+    /// Where the IME was last told typing goes, in client pixels.
+    ime_at: Option<Rect>,
     /// What the title bar shows.
     title: String,
     /// Checked once the first output shows which ConPTY is running.
@@ -4136,11 +4136,19 @@ impl App {
         }
         let (cw, ch) = self.cell();
         let focus = self.focus_id();
-        let cursor = self.current().map(|v| lock(&v.pane.term).cursor());
+        // Where the cursor is drawn, as of the last frame, else where it
+        // is: a program may hide it, or the view may be scrolled.
+        let cursor = self.current().map(|v| match v.snap.cursor {
+            Some((col, row, _)) => (col, row),
+            None => {
+                let (col, row, _) = lock(&v.pane.term).cursor();
+                (col, row)
+            }
+        });
         let sessions = self.sessions();
         let preedit = cursor
             .filter(|_| !self.preedit.is_empty())
-            .map(|(c, r, _)| (c, r, self.preedit.as_str()));
+            .map(|(c, r)| (c, r, self.preedit.as_str()));
         let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
         self.side = std::mem::take(&mut chrome.side);
         self.banner = chrome.banner;
@@ -4301,18 +4309,15 @@ impl App {
             }
         }
 
-        let at = self.current().and_then(|v| v.rect).zip(cursor);
-        if let Some((r, (col, row, _))) = at {
-            let at = (
-                r.x + i32::from(col) * cw as i32,
-                r.y + i32::from(row) * ch as i32,
-            );
-            if self.ime_at != Some(at)
-                && let Some(w) = &self.window
-            {
-                self.ime_at = Some(at);
-                w.set_ime_cursor_area(PhysicalPosition::new(at.0, at.1), PhysicalSize::new(cw, ch));
-            }
+        let pane = self.current().and_then(|v| v.rect);
+        let cell = (cw as i32, ch as i32);
+        if let Some(at) = ime_area(chrome.field, pane, cursor, cell)
+            && self.ime_at != Some(at)
+            && let Some(w) = &self.window
+        {
+            self.ime_at = Some(at);
+            let size = PhysicalSize::new(at.w.max(1) as u32, at.h.max(1) as u32);
+            w.set_ime_cursor_area(PhysicalPosition::new(at.x, at.y), size);
         }
     }
 
@@ -4595,6 +4600,28 @@ const FONT_WHEEL: Duration = Duration::from_millis(100);
 fn wheel_font(steps: f64, last: Option<Instant>, now: Instant) -> Option<i8> {
     let ready = last.is_none_or(|t| now.saturating_duration_since(t) >= FONT_WHEEL);
     (ready && steps != 0.0).then_some(if steps > 0.0 { 1 } else { -1 })
+}
+
+/// Where the IME composes, which its candidates stay clear of: the field
+/// of the panel or bar that takes typing, else the cell of the cursor in
+/// the focused pane at `pane`, kept inside the pane.
+fn ime_area(
+    field: Option<Rect>,
+    pane: Option<Rect>,
+    cursor: Option<(u16, u16)>,
+    (cw, ch): (i32, i32),
+) -> Option<Rect> {
+    if field.is_some() {
+        return field;
+    }
+    let (r, (col, row)) = pane.zip(cursor)?;
+    let x = (r.x + i32::from(col) * cw).min(r.right() - cw).max(r.x);
+    Some(Rect {
+        x,
+        y: r.y + i32::from(row) * ch,
+        w: cw,
+        h: ch,
+    })
 }
 
 /// Whether a shortcut pressed while the find bar is open runs, which
@@ -6685,6 +6712,38 @@ mod tests {
         assert_eq!(wheel_font(1.0, Some(t0), ms(99)), None, "a fast spin");
         assert_eq!(wheel_font(1.0, Some(t0), ms(100)), Some(1));
         assert_eq!(wheel_font(0.0, None, t0), None);
+    }
+
+    #[test]
+    fn app_ime_composes_in_the_field_or_at_the_cursor() {
+        let pane = Rect {
+            x: 100,
+            y: 50,
+            w: 90,
+            h: 200,
+        };
+        let cell = (9, 20);
+        let at = |x, y| Rect { x, y, w: 9, h: 20 };
+        assert_eq!(
+            ime_area(None, Some(pane), Some((2, 1)), cell),
+            Some(at(118, 70))
+        );
+        // A cursor past the last whole cell stays in the pane.
+        assert_eq!(
+            ime_area(None, Some(pane), Some((10, 0)), cell),
+            Some(at(181, 50))
+        );
+        let field = Rect {
+            x: 400,
+            y: 60,
+            w: 200,
+            h: 15,
+        };
+        assert_eq!(
+            ime_area(Some(field), Some(pane), Some((2, 1)), cell),
+            Some(field)
+        );
+        assert_eq!(ime_area(None, None, Some((2, 1)), cell), None);
     }
 
     #[test]
