@@ -374,11 +374,17 @@ pub fn claude_settings(hook_exe: &str) -> String {
             "" => String::new(),
             m => format!("\"matcher\": \"{m}\", "),
         };
+        // A timeout on SessionEnd would raise the time every Claude Code
+        // session may take to exit, from 1.5 s to that.
+        let timeout = match *event {
+            "SessionEnd" => "",
+            _ => ", \"timeout\": 5",
+        };
         let comma = if i + 1 < CLAUDE_HOOKS.len() { "," } else { "" };
         let _ = writeln!(
             out,
             "    \"{event}\": [{{ {matcher}\"hooks\": [{{ \"type\": \"command\", \
-             \"command\": \"{cmd}\", \"args\": [\"claude\"], \"timeout\": 5 }}] }}]{comma}"
+             \"command\": \"{cmd}\", \"args\": [\"claude\"]{timeout} }}] }}]{comma}"
         );
     }
     out.push_str("  }\n}\n");
@@ -809,7 +815,8 @@ mod tests {
                 cmd.get("args"),
                 Some(&Json::Arr(vec![Json::Str("claude".into())]))
             );
-            assert_eq!(cmd.get("timeout"), Some(&Json::Num(5.0)));
+            let timeout = (event != "SessionEnd").then_some(Json::Num(5.0));
+            assert_eq!(cmd.get("timeout"), timeout.as_ref(), "{event}");
         }
         // Every notification reaches the hook, which sorts them.
         let Some(Json::Arr(groups)) = hooks.get("Notification") else {
