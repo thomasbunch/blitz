@@ -1209,6 +1209,9 @@ struct Find {
     /// The query was put there when the bar opened and is drawn selected:
     /// typing replaces it.
     fresh: bool,
+    /// The view's top line when the bar opened, and whether it showed the
+    /// bottom, until the bar searches or moves to another match.
+    back: Option<(usize, bool)>,
 }
 
 impl Find {
@@ -1221,7 +1224,25 @@ impl Find {
             stale: false,
             searched: None,
             fresh: false,
+            back: None,
         }
+    }
+
+    /// What closing the bar with Esc leaves selected in `term`, whose view
+    /// is `rows` high: the current match, or nothing when the bar did
+    /// nothing since it opened, which puts the view back where it was.
+    fn close(&mut self, term: &mut vt::Terminal, rows: u16) -> Option<Found> {
+        if let Some((top, bottom)) = self.back {
+            match bottom {
+                true => term.scroll_viewport(isize::MIN),
+                false => term.scroll_to(top),
+            }
+            return None;
+        }
+        if self.stale {
+            self.search(term, rows);
+        }
+        self.cur.map(|i| self.found[i])
     }
 
     /// Types `t` into the query, in place of a fresh one.
@@ -2556,11 +2577,8 @@ impl App {
                 if let Some(mut f) = self.find.take()
                     && let Some(v) = self.views.iter_mut().find(|v| v.pane.id == f.pane)
                 {
-                    let term = lock(&v.pane.term);
-                    if f.stale {
-                        f.search(&term, v.grid.1);
-                    }
-                    let found = f.cur.map(|i| f.found[i]);
+                    let mut term = lock(&v.pane.term);
+                    let found = f.close(&mut term, v.grid.1);
                     let sel = found.map(|m| selection_of(&term, &pal, m.start, m.end));
                     drop(term);
                     v.selection = sel.or(v.selection.take());
@@ -2594,7 +2612,9 @@ impl App {
         self.find = Some(f);
         let v = self.views.iter().find(|v| v.pane.id == id);
         if let (Some(f), Some(v)) = (&mut self.find, v) {
-            f.search(&lock(&v.pane.term), v.grid.1);
+            let term = lock(&v.pane.term);
+            f.back = Some((term.view_top(), term.viewport() == 0));
+            f.search(&term, v.grid.1);
             let picked = f.found.iter().position(|m| Some(m.start) == at);
             f.cur = picked.or(f.cur);
         }
@@ -2612,9 +2632,13 @@ impl App {
             return;
         };
         let mut term = lock(&v.pane.term);
+        if search || by != 0 {
+            f.back = None;
+        }
         if search || f.stale {
             f.search(&term, v.grid.1);
         }
+
         if search {
             self.find_last.clone_from(&f.query);
         }
@@ -7817,6 +7841,31 @@ mod tests {
         assert!(!e.release(0x41), "once");
         // Ctrl was down before the picker opened: its release goes on.
         assert!(!e.release(0x11));
+    }
+
+    #[test]
+    fn app_find_closed_before_doing_anything_selects_nothing_and_goes_back() {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 20,
+            rows: 3,
+            scrollback_lines: 100,
+            ..vt::Options::default()
+        });
+        t.feed(b"error\r\n");
+        for i in 0..10 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let bottom = t.view_top();
+        let mut f = Find::new(PaneId(1));
+        f.query = "error".into();
+        f.back = Some((bottom, true));
+        f.search(&t, 3);
+        assert!(reveal(&mut t, f.found[0], 3));
+        assert_eq!(f.close(&mut t, 3), None, "the last query, untouched");
+        assert_eq!(t.view_top(), bottom);
+        // Once it moves or searches, Esc leaves the match selected.
+        f.back = None;
+        assert_eq!(f.close(&mut t, 3), Some(f.found[0]));
     }
 
     #[test]
