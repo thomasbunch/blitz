@@ -50,7 +50,7 @@ use crate::keymap::{self, Action};
 use crate::layout::{self, Axis, Dir, PaneId, Rect, Tab};
 use crate::links::{Link, Target};
 use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
-use crate::render::chrome::{self, ChromeModel};
+use crate::render::chrome::{self, ChromeModel, Side};
 use crate::render::d3d11::{Gpu, Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
 use crate::session::{self, Geometry, PaneMeta};
@@ -855,8 +855,8 @@ struct App {
     win: layout::Window,
     /// Every session, oldest first, which is the order the sidebar lists.
     views: Vec<View>,
-    /// Each session's sidebar row in the last frame, for clicks.
-    rows: Vec<(PaneId, Rect)>,
+    /// What a click in the sidebar acted on in the last frame.
+    side: chrome::SideHits,
     next_id: u32,
     focused: bool,
     /// A selection in the focused pane.
@@ -1123,7 +1123,7 @@ impl App {
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
-            rows: Vec::new(),
+            side: chrome::SideHits::default(),
             next_id: 1,
             focused: false,
             selection: None,
@@ -3212,7 +3212,7 @@ impl App {
         let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
         let area = self.tab_area();
         let (rects, side) = match self.win.tabs.get(self.win.active) {
-            Some(_) if x < area.x => (self.rows.clone(), true),
+            Some(_) if x < area.x => (self.side.rows.clone(), true),
             Some(t) => (t.rects(area), false),
             None => (Vec::new(), false),
         };
@@ -3259,6 +3259,20 @@ impl App {
             self.win.tabs[i].focus(id);
         }
         self.focus_moved(before);
+    }
+
+    /// Shows the one of `ids`, sessions the sidebar has no room for, that
+    /// has waited longest for the user, else the first.
+    fn show_hidden(&mut self, ids: &[PaneId]) {
+        let others: Vec<PaneId> = (ids.iter().copied())
+            .filter(|&id| Some(id) != self.focus_id())
+            .collect();
+        let states = (others.iter()).filter_map(|&id| self.view(id));
+        let waiting = states.map(|v| (v.pane.id, v.pane.attn.state, v.pane.attn.since));
+        let id = crate::attention::jump_target(waiting).or(others.first().copied());
+        if let Some(id) = id {
+            self.show(id);
+        }
     }
 
     /// Whether mouse events go to the program rather than to selection.
@@ -3349,6 +3363,15 @@ impl App {
                 self.act(el, Action::Equalize);
             } else {
                 self.mouse.divider = Some((i, self.min_pane()));
+            }
+            return;
+        }
+        // A click in the sidebar goes to what it is on.
+        if pressed && x < self.tab_area().x {
+            match self.side.at(x, y) {
+                Some(Side::Session(id)) => self.show(id),
+                Some(Side::More(ids)) => self.show_hidden(&ids),
+                None => {}
             }
             return;
         }
@@ -3711,7 +3734,7 @@ impl App {
             .filter(|_| !self.preedit.is_empty())
             .map(|(c, r, _)| (c, r, self.preedit.as_str()));
         let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
-        self.rows = std::mem::take(&mut chrome.rows);
+        self.side = std::mem::take(&mut chrome.side);
         self.banner = chrome.banner;
         self.settings_hits = chrome.settings.take();
         self.commands_hits = chrome.commands.take();

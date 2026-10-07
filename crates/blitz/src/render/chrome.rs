@@ -200,13 +200,41 @@ pub struct Chrome {
     pub prims: Vec<Prim>,
     /// Where each visible pane's terminal grid goes.
     pub panes: Vec<(PaneId, Rect)>,
-    /// Each session's row in the sidebar or rail, for clicks.
-    pub rows: Vec<(PaneId, Rect)>,
+    /// What a click in the sidebar or rail acts on.
+    pub side: SideHits,
     /// The banner strip, for clicks.
     pub banner: Option<Rect>,
     pub settings: Option<SettingsHits>,
     /// The command palette and each row it shows, by index, for clicks.
     pub commands: Option<(Rect, Vec<(usize, Rect)>)>,
+}
+
+/// Where the sidebar or rail put what a click there acts on.
+#[derive(Clone, Debug, Default)]
+pub struct SideHits {
+    /// Each session's row.
+    pub rows: Vec<(PaneId, Rect)>,
+    /// The "+N more" footer and the sessions it stands for.
+    pub more: Option<(Rect, Vec<PaneId>)>,
+}
+
+/// What the sidebar or rail has under a point.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Side {
+    Session(PaneId),
+    /// The "+N more" footer, with the sessions it stands for.
+    More(Vec<PaneId>),
+}
+
+impl SideHits {
+    pub fn at(&self, x: i32, y: i32) -> Option<Side> {
+        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        if let Some(&(id, _)) = self.rows.iter().find(|r| inside(&r.1)) {
+            return Some(Side::Session(id));
+        }
+        let (_, ids) = self.more.as_ref().filter(|m| inside(&m.0))?;
+        Some(Side::More(ids.clone()))
+    }
 }
 
 /// Least width of the expanded sidebar, and width of the collapsed rail,
@@ -482,17 +510,47 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 text(p, s(16.0), ly, l, c.dim, false);
             }
         }
+        let (gh, gap) = (s(26.0), s(2.0));
+        let (l1, l2, l3) = (s(18.0).max(th), s(16.0).max(th), s(17.0).max(th));
+        // Every row has room for a message and a progress bar, so output
+        // that changes a title or state cannot move the rows below it
+        // under the pointer. When they do not all fit, every row drops its
+        // message, and the sessions that still do not fit are counted in
+        // a footer.
+        let groups: Vec<Vec<&Session>> = m.win.tabs.iter().map(members).collect();
+        let need = |rh: i32| {
+            let n = groups.len() as i32;
+            let rows = groups.iter().map(Vec::len).sum::<usize>() as i32;
+            s(10.0) + (n - 1).max(0) * s(14.0) + n * gh + rows * (rh + gap)
+        };
+        let full = s(7.0) + l1 + gap + l2 + gap + l3 + gap + s(5.0) + s(2.0) + s(1.0) + s(8.0);
+        let short = s(5.0) + l1 + gap + l2 + s(3.0) + s(2.0) + s(3.0);
+        let compact = need(full) > bottom;
+        let (rh, top) = if compact {
+            (short, s(5.0))
+        } else {
+            (full, s(7.0))
+        };
+        let more_h = s(26.0);
+        let limit = if need(short) > bottom {
+            bottom - gap - more_h
+        } else {
+            bottom
+        };
+        let mut hidden: Vec<&Session> = Vec::new();
         let mut y = s(10.0);
-        for (ti, t) in m.win.tabs.iter().enumerate() {
-            let list = members(t);
-            if ti > 0 {
-                y += s(14.0);
+        for (ti, (t, list)) in m.win.tabs.iter().zip(&groups).enumerate() {
+            let skip = if ti > 0 { s(14.0) } else { 0 };
+            // A heading goes only with room for a row under it.
+            if y + skip + gh + rh > limit {
+                hidden.extend(list);
+                continue;
             }
+            y += skip;
             // Group heading: the tab's number for Ctrl+1 to 9, in line
             // with the rows' marks, then its name, a hairline and the
             // session count.
             let (gx, gr) = (s(32.0), side - s(19.0));
-            let gh = s(26.0);
             let gy = y + (gh - th) / 2;
             if ti < 9 {
                 let num = (ti + 1).to_string();
@@ -519,25 +577,20 @@ pub fn build(m: &ChromeModel) -> Chrome {
             p.push(Prim::Rect(rule, c.rule));
             y += gh;
 
-            for x in list {
-                if y >= h {
-                    break;
+            for &x in list {
+                if y + rh > limit {
+                    hidden.push(x);
+                    continue;
                 }
                 let focused = ti == m.win.active && x.id == t.focus;
-                let (l1, l2, l3, gap) = (s(18.0).max(th), s(16.0).max(th), s(17.0).max(th), s(2.0));
                 let bar = x.state == Attn::Working || x.progress.is_some();
-                // Every row has room for a message and a progress bar, so
-                // output that changes a title or state cannot move the
-                // rows below it under the pointer.
-                let rh =
-                    s(7.0) + l1 + gap + l2 + gap + l3 + gap + s(5.0) + s(2.0) + s(1.0) + s(8.0);
                 let row = Rect {
                     x: s(8.0),
                     y,
                     w: (side - s(18.0)).max(0),
                     h: rh,
                 };
-                out.rows.push((x.id, row));
+                out.side.rows.push((x.id, row));
                 if focused {
                     p.push(Prim::Shape {
                         r: row,
@@ -546,7 +599,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                         color: c.row_focus,
                     });
                 }
-                let (mx, my) = (row.x + s(12.0), y + s(7.0) + s(5.0) + s(4.0));
+                let (mx, my) = (row.x + s(12.0), y + top + s(5.0) + s(4.0));
                 match x.state {
                     Attn::NeedsYou => mark(p, mx, my, 8.0, ring(Some(x)), c.accent),
                     Attn::DoneUnseen => mark(p, mx, my, 8.0, 1.5, c.name),
@@ -555,7 +608,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
 
                 let (left, right) = (row.x + s(24.0), row.right() - s(10.0));
-                let mut ly = y + s(7.0);
+                let mut ly = y + top;
                 // Line 1: name, and the state on the right.
                 let word = state_word(x, m.now);
                 let ty = ly + (l1 - th) / 2;
@@ -610,24 +663,50 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     text(p, bx, ty, &fit(b, right - bx, tw), c.dim, false);
                 }
                 ly += l2;
-                // Line 3: the last message.
-                ly += gap;
-                if !x.msg.is_empty() {
-                    let msg = fit(&x.msg, right - left, tw);
-                    text(p, left, ly + (l3 - th) / 2, &msg, c.msg, false);
+                if compact {
+                    ly += s(3.0);
+                } else {
+                    // Line 3: the last message.
+                    ly += gap;
+                    if !x.msg.is_empty() {
+                        let msg = fit(&x.msg, right - left, tw);
+                        text(p, left, ly + (l3 - th) / 2, &msg, c.msg, false);
+                    }
+                    ly += l3 + gap + s(5.0);
                 }
-                ly += l3;
                 if bar {
                     let line = Rect {
                         x: left,
-                        y: ly + gap + s(5.0),
+                        y: ly,
                         w: right - left,
                         h: s(2.0),
                     };
                     progress(p, line, x.progress, Some(c.track), c.fill);
                 }
-                y += rh + s(2.0);
+                y += rh + gap;
             }
+        }
+        if !hidden.is_empty() {
+            // Accent when a session out of sight needs you.
+            let urgent = (hidden.iter()).any(|x| matches!(x.state, Attn::NeedsYou | Attn::Error));
+            let r = Rect {
+                x: s(8.0),
+                y,
+                w: (side - s(18.0)).max(0),
+                h: more_h,
+            };
+            let label = format!("+{} more", hidden.len());
+            let color = if urgent { c.accent } else { c.dim };
+            text(
+                p,
+                r.x + s(24.0),
+                y + (more_h - th) / 2,
+                &label,
+                color,
+                urgent,
+            );
+            out.side.more = Some((r, hidden.iter().map(|x| x.id).collect()));
+            y += more_h;
         }
         if let Some(t) = m.spark {
             let busiest = (m.sessions.iter()).map(|x| x.state).max();
@@ -668,7 +747,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     w: side - 1,
                     h: s(20.0),
                 };
-                out.rows.push((x.id, row));
+                out.side.rows.push((x.id, row));
                 if ti == m.win.active && x.id == t.focus {
                     p.push(Prim::Rect(row, c.rail_focus));
                 }
@@ -1596,7 +1675,7 @@ mod tests {
         };
         let sessions = [session(1, "a", Attn::NeedsYou, now)];
         let c = build(&model(&win, &sessions, now));
-        assert!(c.prims.is_empty() && c.rows.is_empty());
+        assert!(c.prims.is_empty() && c.side.rows.is_empty());
         assert_eq!(c.panes.len(), 1);
         assert_eq!(c.panes[0].1.x, 14);
     }
@@ -1607,10 +1686,10 @@ mod tests {
         let c = build(&model(&win, &sessions, now));
         assert!(c.panes.iter().all(|(_, r)| r.x >= 240));
         // One clickable row per session, in the sidebar, top to bottom.
-        let rows: Vec<_> = c.rows.iter().map(|(id, _)| id.0).collect();
+        let rows: Vec<_> = c.side.rows.iter().map(|(id, _)| id.0).collect();
         assert_eq!(rows, [1, 2, 3]);
-        assert!(c.rows.windows(2).all(|w| w[0].1.bottom() <= w[1].1.y));
-        assert!(c.rows.iter().all(|(_, r)| r.right() <= 240));
+        assert!(c.side.rows.windows(2).all(|w| w[0].1.bottom() <= w[1].1.y));
+        assert!(c.side.rows.iter().all(|(_, r)| r.right() <= 240));
         // Panes start below their 22 px header strips.
         assert_eq!(c.panes[0].1.y, 22 + 8);
         let t = texts(&c);
@@ -1757,7 +1836,7 @@ mod tests {
         for expanded in [true, false] {
             win.sidebar_expanded = expanded;
             let c = build(&model(&win, &sessions, now));
-            let rows: Vec<_> = c.rows.iter().map(|(id, _)| id.0).collect();
+            let rows: Vec<_> = c.side.rows.iter().map(|(id, _)| id.0).collect();
             assert_eq!(rows, [2, 1, 3]);
         }
     }
@@ -1791,7 +1870,76 @@ mod tests {
         m.text_cell = (10, 18);
         let c = build(&m);
         assert!(c.panes.iter().all(|(_, r)| r.x >= 340));
-        assert!(c.rows.iter().all(|(_, r)| r.right() <= 340 && r.w > 300));
+        assert!(
+            c.side
+                .rows
+                .iter()
+                .all(|(_, r)| r.right() <= 340 && r.w > 300)
+        );
+    }
+
+    /// `n` sessions in one tab, the last of them needing you.
+    fn crowd(n: u32) -> (Window, Vec<Session>, Instant) {
+        let now = Instant::now();
+        let mut t = Tab::new("many".into(), PaneId(1));
+        for i in 2..=n {
+            let dir = if i % 2 == 0 { Dir::Right } else { Dir::Down };
+            assert!(t.split(dir, PaneId(i), AREA, (1, 1)));
+        }
+        let mut sessions: Vec<_> = (1..=n)
+            .map(|i| session(i, &format!("s{i}"), Attn::Idle, now))
+            .collect();
+        sessions[n as usize - 1].state = Attn::NeedsYou;
+        let win = Window {
+            tabs: vec![t],
+            ..Window::default()
+        };
+        (win, sessions, now)
+    }
+
+    #[test]
+    fn sessions_that_do_not_fit_squeeze_then_are_counted() {
+        // Ten full rows fit; eleven go compact, and all of them show.
+        let (win, sessions, now) = crowd(10);
+        let full = build(&model(&win, &sessions, now));
+        assert_eq!(full.side.rows.len(), 10);
+        let (win, mut sessions, now) = crowd(11);
+        sessions[0].msg = "hello".into();
+        let c = build(&model(&win, &sessions, now));
+        assert_eq!(c.side.rows.len(), 11);
+        assert!(c.side.more.is_none());
+        assert!(c.side.rows[0].1.h < full.side.rows[0].1.h);
+        assert!(c.side.rows.iter().all(|(_, r)| r.bottom() <= AREA.h));
+        assert!(!texts(&c).contains(&"hello"), "no message line");
+
+        // At 150%, twelve do not fit even so: the rest are counted in a
+        // footer, which knows them, and is accent as one needs you.
+        let (win, sessions, now) = crowd(12);
+        let mut m = model(&win, &sessions, now);
+        m.scale = 1.5;
+        let c = build(&m);
+        let (foot, hidden) = c.side.more.clone().expect("footer");
+        let mut all: Vec<PaneId> = c.side.rows.iter().map(|r| r.0).collect();
+        assert!(foot.y >= c.side.rows.last().expect("rows").1.bottom() && foot.bottom() <= AREA.h);
+        all.extend(&hidden);
+        assert_eq!(all, win.tabs[0].panes());
+        // A click on the footer is for the sessions it counts.
+        assert_eq!(
+            c.side.at(foot.x + 1, foot.y + 1),
+            Some(Side::More(hidden.clone()))
+        );
+        let row = c.side.rows[1];
+        assert_eq!(c.side.at(row.1.x, row.1.y), Some(Side::Session(row.0)));
+        assert_eq!(c.side.at(foot.x + 1, foot.bottom()), None);
+        let label = format!("+{} more", hidden.len());
+        let ui = crate::theme::blitz(false).ui;
+        assert!(
+            c.prims.iter().any(
+                |p| matches!(p, Prim::Text { text, color, .. } if *text == label && *color == ui.accent)
+            ),
+            "{:?}",
+            texts(&c)
+        );
     }
 
     #[test]
@@ -1800,7 +1948,7 @@ mod tests {
         sessions[2].msg = "title".into();
         let c = build(&model(&win, &sessions, now));
         // Needs you, working with no message, idle with one.
-        assert!(c.rows.windows(2).all(|w| w[0].1.h == w[1].1.h));
+        assert!(c.side.rows.windows(2).all(|w| w[0].1.h == w[1].1.h));
     }
 
     #[test]
@@ -1866,7 +2014,7 @@ mod tests {
             })
             .expect("pane label");
         assert!(label_y > 0 && label_y + 15 <= c.panes[0].1.y, "{label_y}");
-        assert!(c.rows.iter().all(|(_, r)| r.right() <= 15) && c.rows.len() == 3);
+        assert!(c.side.rows.iter().all(|(_, r)| r.right() <= 15) && c.side.rows.len() == 3);
         let t = texts(&c);
         assert_eq!(t, ["api", "web"], "only the pane labels");
         // The needs-you pane gets a 2 px accent ring.
@@ -1887,7 +2035,7 @@ mod tests {
         // The active tab's two rows have a line down the left edge, over
         // the focused row's tint.
         let ui = crate::theme::blitz(false).ui;
-        let (first, last) = (c.rows[0].1, c.rows[1].1);
+        let (first, last) = (c.side.rows[0].1, c.side.rows[1].1);
         let line = Prim::Rect(
             Rect {
                 x: 0,
@@ -1898,9 +2046,7 @@ mod tests {
             ui.idle,
         );
         let at = |want: &Prim| c.prims.iter().position(|p| p == want);
-        let focus = c
-            .rows
-            .iter()
+        let focus = (c.side.rows.iter())
             .find(|r| r.0 == win.tabs[0].focus)
             .expect("row")
             .1;
@@ -1957,7 +2103,7 @@ mod tests {
         let t = texts(&c);
         assert!(t.contains(&"blitz 0.0.2 is available \u{b7}"), "{t:?}");
         assert!(t.contains(&"Ctrl+Shift+U to update and") && t.contains(&"restart"));
-        assert!(c.rows.iter().all(|(_, r)| r.bottom() <= foot.y));
+        assert!(c.side.rows.iter().all(|(_, r)| r.bottom() <= foot.y));
     }
 
     #[test]
@@ -2262,8 +2408,11 @@ mod tests {
                     (t.x + fw / 2, t.y + fh, t.w - fw, t.h - fh)
                 );
             }
-            assert!(c.rows.iter().all(|(_, r)| r.right() <= side), "{scale}");
-            assert!(c.rows.windows(2).all(|w| w[0].1.bottom() <= w[1].1.y));
+            assert!(
+                c.side.rows.iter().all(|(_, r)| r.right() <= side),
+                "{scale}"
+            );
+            assert!(c.side.rows.windows(2).all(|w| w[0].1.bottom() <= w[1].1.y));
         }
     }
 
