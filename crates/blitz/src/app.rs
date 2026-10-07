@@ -1939,6 +1939,8 @@ impl App {
                     branch: p.branch.clone(),
                     state: p.attn.state,
                     since: p.attn.since,
+                    turn: p.attn.turn,
+                    took: p.attn.took,
                     seen: p.attn.seen,
                     msg: if p.msg.is_empty() {
                         // Without the mark Claude Code puts in front.
@@ -3532,11 +3534,12 @@ impl App {
             .iter()
             .filter_map(|v| v.notice.as_ref()?.until)
             .min();
-        // The sidebar counts how long each session has been working.
+        // The sidebar counts how long each session has been working, and
+        // how long a question has waited.
         let sidebar = self.views.len() >= 2 && self.win.sidebar_expanded;
         let timer = (self.views.iter())
-            .filter(|v| sidebar && v.pane.attn.state == Attn::Working)
-            .map(|v| chrome::next_tick(v.pane.attn.since, now))
+            .filter(|_| sidebar)
+            .filter_map(|v| chrome::row_tick(&v.pane.attn, now))
             .min();
         let resume = (self.views.iter())
             .filter_map(|v| Some(v.resume.as_ref()?.1))

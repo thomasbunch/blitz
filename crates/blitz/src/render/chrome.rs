@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::attention::Attn;
+use crate::attention::{Attn, PaneAttn};
 use crate::layout::{PaneId, Rect, Tab, Window};
 use crate::theme::{Theme, Ui};
 
@@ -20,6 +20,9 @@ pub struct Session {
     pub state: Attn,
     /// When `state` last changed.
     pub since: Instant,
+    /// When the turn under way began, and how long the last one took.
+    pub turn: Option<Instant>,
+    pub took: Option<Duration>,
     /// The user has looked at `state`; a question they saw is drawn
     /// outlined until they answer it.
     pub seen: bool,
@@ -1216,12 +1219,27 @@ fn ring(x: Option<&Session>) -> f32 {
     if x.is_some_and(|x| x.seen) { 1.5 } else { 0.0 }
 }
 
-/// The state shown on the right of a sidebar row.
+/// The state shown on the right of a sidebar row, with how long the turn
+/// has run, how long the last one took, or after a minute how long a
+/// question has waited.
 fn state_word(x: &Session, now: Instant) -> String {
+    let waited = now.saturating_duration_since(x.since);
     match (x.state, x.exit_code) {
+        (Attn::NeedsYou, _) if waited.as_secs() >= 60 => {
+            format!("needs you \u{b7} {}", elapsed(waited))
+        }
         (Attn::NeedsYou, _) => "needs you".into(),
-        (Attn::Working, _) => format!("working \u{b7} {}", elapsed(now - x.since)),
-        (Attn::DoneUnseen, _) => "done".into(),
+        (Attn::Working, _) => {
+            let start = x.turn.unwrap_or(x.since);
+            format!(
+                "working \u{b7} {}",
+                elapsed(now.saturating_duration_since(start))
+            )
+        }
+        (Attn::DoneUnseen, _) => match x.took {
+            Some(d) => format!("done \u{b7} {}", elapsed(d)),
+            None => "done".into(),
+        },
         (_, Some(n)) => format!("exited {}", n as i32),
         (Attn::Error, None) => "error".into(),
         (Attn::Idle, None) => "idle".into(),
@@ -1240,11 +1258,26 @@ fn elapsed(d: Duration) -> String {
 }
 
 /// When the time [`elapsed`] shows for something that began at `start`
-/// next changes, as of `now`.
-pub fn next_tick(start: Instant, now: Instant) -> Instant {
+/// next changes, as of `now`; with `seconds` false, as if the first minute
+/// showed no time at all.
+pub fn next_tick(start: Instant, now: Instant, seconds: bool) -> Instant {
     let t = now.saturating_duration_since(start).as_secs();
-    let next = if t < 60 { t + 1 } else { (t / 60 + 1) * 60 };
+    let next = if t < 60 && seconds {
+        t + 1
+    } else {
+        (t / 60 + 1) * 60
+    };
     start + Duration::from_secs(next)
+}
+
+/// When the time the sidebar shows for a session in `a` next changes, if
+/// it shows one.
+pub fn row_tick(a: &PaneAttn, now: Instant) -> Option<Instant> {
+    match a.state {
+        Attn::Working => Some(next_tick(a.turn.unwrap_or(a.since), now, true)),
+        Attn::NeedsYou => Some(next_tick(a.since, now, false)),
+        _ => None,
+    }
 }
 
 /// Width of `t` in pixels in a font whose cells are `cw` wide.
@@ -1382,6 +1415,8 @@ mod tests {
             branch: Some("main".into()),
             state,
             since: now - Duration::from_secs(72),
+            turn: None,
+            took: None,
             seen: false,
             msg: String::new(),
             progress: None,
@@ -1465,7 +1500,14 @@ mod tests {
         // Panes start below their 22 px header strips.
         assert_eq!(c.panes[0].1.y, 22 + 8);
         let t = texts(&c);
-        for want in ["shop", "db", "api", "web", "needs you", "working \u{b7} 1m"] {
+        for want in [
+            "shop",
+            "db",
+            "api",
+            "web",
+            "needs you \u{b7} 1m",
+            "working \u{b7} 1m",
+        ] {
             assert!(t.contains(&want), "missing {want:?} in {t:?}");
         }
         assert!(t.contains(&"idle"));
@@ -1496,7 +1538,7 @@ mod tests {
         sessions[0].seen = true;
         assert_eq!(strokes(&sessions), [1.5; 3]);
         let c = build(&model(&win, &sessions, now));
-        assert!(texts(&c).contains(&"needs you"));
+        assert!(texts(&c).contains(&"needs you \u{b7} 1m"));
     }
 
     #[test]
@@ -1796,17 +1838,53 @@ mod tests {
         let t0 = Instant::now();
         let at = |s| t0 + Duration::from_secs(s);
         let ms = |m| t0 + Duration::from_millis(m);
-        assert_eq!(next_tick(t0, t0), at(1));
-        assert_eq!(next_tick(t0, ms(59_500)), at(60));
-        assert_eq!(next_tick(t0, at(60)), at(120));
-        assert_eq!(next_tick(t0, ms(119_999)), at(120));
-        assert_eq!(next_tick(t0, at(3601)), at(3660));
+        assert_eq!(next_tick(t0, t0, true), at(1));
+        assert_eq!(next_tick(t0, ms(59_500), true), at(60));
+        assert_eq!(next_tick(t0, at(60), true), at(120));
+        assert_eq!(next_tick(t0, ms(119_999), true), at(120));
+        assert_eq!(next_tick(t0, at(3601), true), at(3660));
+        assert_eq!(next_tick(t0, t0, false), at(60));
+        assert_eq!(next_tick(t0, at(61), false), at(120));
         // Each tick is where the text changes.
         for s in [0, 59, 60, 61, 119, 3599, 3600] {
             let d = |t: Instant| elapsed(t - t0);
-            let next = next_tick(t0, at(s));
+            let next = next_tick(t0, at(s), true);
             assert_ne!(d(next), d(next - Duration::from_millis(1)), "{s}");
         }
+    }
+
+    /// A turn's time runs across its questions; a question shows how long
+    /// it has waited once that is a minute; a result shows how long its
+    /// turn took.
+    #[test]
+    fn rows_show_turn_and_waiting_times() {
+        let now = Instant::now();
+        let ago = |s| now - Duration::from_secs(s);
+        let mut x = session(1, "a", Attn::Working, now);
+        x.since = ago(5);
+        x.turn = Some(ago(600));
+        assert_eq!(state_word(&x, now), "working \u{b7} 10m");
+        x.state = Attn::NeedsYou;
+        assert_eq!(state_word(&x, now), "needs you");
+        x.since = ago(185);
+        assert_eq!(state_word(&x, now), "needs you \u{b7} 3m");
+        x.state = Attn::DoneUnseen;
+        assert_eq!(state_word(&x, now), "done");
+        x.took = Some(Duration::from_secs(750));
+        assert_eq!(state_word(&x, now), "done \u{b7} 12m");
+
+        // The sidebar wakes when those change: each second of a turn's
+        // first minute, then each minute, and a question's each minute.
+        let mut a = PaneAttn::new(ago(5));
+        a.state = Attn::Working;
+        a.turn = Some(ago(600));
+        assert_eq!(row_tick(&a, now), Some(ago(600) + Duration::from_secs(660)));
+        a.turn = None;
+        assert_eq!(row_tick(&a, now), Some(ago(5) + Duration::from_secs(6)));
+        a.state = Attn::NeedsYou;
+        assert_eq!(row_tick(&a, now), Some(ago(5) + Duration::from_secs(60)));
+        a.state = Attn::DoneUnseen;
+        assert_eq!(row_tick(&a, now), None);
     }
 
     #[test]

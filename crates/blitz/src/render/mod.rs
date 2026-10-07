@@ -812,6 +812,8 @@ mod gpu {
             branch: Some(branch.into()),
             state,
             since: ago(72),
+            turn: None,
+            took: None,
             seen: false,
             msg: msg.into(),
             progress: None,

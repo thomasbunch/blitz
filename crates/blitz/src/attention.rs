@@ -1,6 +1,6 @@
 //! Per-session attention state: whether a session needs the user.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Ordered by priority, lowest first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,8 +20,9 @@ pub enum Ev {
     NeedsYou,
     /// A bell: it needs the user until they look at the pane.
     Bell,
+    /// The user sent Claude Code a prompt, which starts a turn.
     Working,
-    /// Claude Code's title shows it working.
+    /// Claude Code's title shows it working: on with the turn it is in.
     Busy,
     Done,
     /// Claude Code's title stopped showing work. That ends a turn, but a
@@ -105,6 +106,11 @@ pub struct PaneAttn {
     /// The user has looked at `state` since it changed. A needs-you can
     /// stay seen but unanswered, and so can an error that sticks.
     pub seen: bool,
+    /// When the turn under way began. A question in the middle of it
+    /// leaves it open.
+    pub turn: Option<Instant>,
+    /// How long the last turn took.
+    pub took: Option<Duration>,
     /// What to go back to once a needs-you is answered.
     prev: Attn,
     /// The needs-you came from a bell, which looking at the pane answers.
@@ -119,6 +125,8 @@ impl PaneAttn {
             state: Attn::Idle,
             since: now,
             seen: false,
+            turn: None,
+            took: None,
             prev: Attn::Idle,
             bell: false,
             sticky: false,
@@ -135,15 +143,30 @@ impl PaneAttn {
         // restored state can clear it too (needs-you over done-unseen ends
         // at idle), so repeat until nothing moves. This settles within
         // three steps.
-        let mut ev = ev;
-        while self.step(ev, attended) && attended {
-            ev = Ev::Attended;
+        let mut step = ev;
+        while self.step(step, attended) && attended {
+            step = Ev::Attended;
+        }
+        match ev {
+            Ev::Working => self.turn = Some(now),
+            Ev::Busy => {
+                self.turn.get_or_insert(now);
+            }
+            Ev::Done | Ev::Idle | Ev::Error { .. } | Ev::Exited => self.end_turn(now),
+            Ev::Quiet if before == Attn::Working => self.end_turn(now),
+            _ => {}
         }
         if self.state == before {
             return false;
         }
         self.since = now;
         true
+    }
+
+    fn end_turn(&mut self, now: Instant) {
+        if let Some(t) = self.turn.take() {
+            self.took = Some(now.saturating_duration_since(t));
+        }
     }
 
     fn step(&mut self, ev: Ev, attended: bool) -> bool {
@@ -425,6 +448,47 @@ mod tests {
         p.apply(Ev::Bell, AWAY, Instant::now());
         assert!(!p.apply(Ev::Exited, AWAY, Instant::now()));
         assert_eq!(p.state, Attn::NeedsYou);
+    }
+
+    /// A turn runs from the prompt to the result, questions and all.
+    #[test]
+    fn a_turn_spans_its_questions() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut p = PaneAttn::new(t0);
+        p.apply(Ev::Working, AWAY, at(0));
+        p.apply(Ev::Busy, AWAY, at(1));
+        p.apply(Ev::NeedsYou, AWAY, at(10));
+        // The title stops while the question waits.
+        p.apply(Ev::Quiet, AWAY, at(10));
+        p.apply(Ev::Answered, HERE, at(20));
+        p.apply(Ev::Busy, HERE, at(21));
+        assert_eq!((p.state, p.turn), (Attn::Working, Some(at(0))));
+        p.apply(Ev::Done, AWAY, at(90));
+        assert_eq!((p.turn, p.took), (None, Some(Duration::from_secs(90))));
+        // The hook's done after the title's adds nothing.
+        p.apply(Ev::Done, AWAY, at(95));
+        assert_eq!(p.took, Some(Duration::from_secs(90)));
+
+        // A new prompt starts a new turn, even with one left open by a
+        // question the user turned down with Esc.
+        p.apply(Ev::Working, AWAY, at(100));
+        p.apply(Ev::NeedsYou, AWAY, at(110));
+        p.apply(Ev::Answered, HERE, at(120));
+        p.apply(Ev::Quiet, HERE, at(120));
+        p.apply(Ev::Working, HERE, at(200));
+        assert_eq!(p.turn, Some(at(200)));
+
+        // With only the title to go by, each spell of work is a turn.
+        let mut p = PaneAttn::new(t0);
+        p.apply(Ev::Busy, AWAY, at(0));
+        p.apply(Ev::Quiet, AWAY, at(30));
+        assert_eq!(
+            (p.state, p.took),
+            (Attn::DoneUnseen, Some(Duration::from_secs(30)))
+        );
+        p.apply(Ev::Busy, AWAY, at(40));
+        assert_eq!(p.turn, Some(at(40)));
     }
 
     #[test]
