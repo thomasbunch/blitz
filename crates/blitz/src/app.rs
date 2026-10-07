@@ -2612,9 +2612,8 @@ impl App {
                     return false;
                 };
                 let bracketed = self.modes().bracketed;
-                let trusted = self
-                    .current()
-                    .is_some_and(|v| lock(&v.pane.term).paste_trusted());
+                let trusted = (self.current())
+                    .is_some_and(|v| paste_trusted(&lock(&v.pane.term), v.pane.claude.is_some()));
                 if vt::keys::needs_paste_confirm(&text, bracketed, trusted) {
                     let Some(id) = before else {
                         return false;
@@ -4820,6 +4819,14 @@ fn label(
     (name.to_owned(), msg.to_owned())
 }
 
+/// Whether a paste into `term` goes in without asking; see
+/// [`vt::keys::needs_paste_confirm`]. Claude Code, known by its hook
+/// notifications (`claude`), reads every paste under bracketed paste as
+/// text, so there it needs no confirmed paste first.
+fn paste_trusted(term: &vt::Terminal, claude: bool) -> bool {
+    term.paste_trusted() || claude && term.input_modes().bracketed
+}
+
 /// Takes a fresh snapshot of `term` into `snap`. Returns false when that
 /// found output rewrote the text under `sel`; see [`Selection::still`].
 fn refresh(
@@ -6694,6 +6701,17 @@ mod tests {
         );
         assert!(text.ends_with(r"blitz\config.toml"), "{text}");
         assert_eq!(start_failed("x", None), "blitz could not start: x");
+    }
+
+    #[test]
+    fn app_claude_code_takes_bracketed_pastes_without_asking() {
+        let mut t = fed(10, 2, "");
+        assert!(!paste_trusted(&t, true), "no bracketed paste");
+        t.feed(b"\x1b[?2004h");
+        assert!(paste_trusted(&t, true));
+        assert!(!paste_trusted(&t, false), "a shell asks once first");
+        t.confirm_paste();
+        assert!(paste_trusted(&t, false));
     }
 
     #[test]
