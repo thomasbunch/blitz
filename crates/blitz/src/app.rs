@@ -7424,10 +7424,13 @@ mod tests {
         c.filter = "font_size_up".into();
         assert_eq!(c.matches(), [run(Action::FontSize(1))]);
         c.filter = "claude".into();
-        assert_eq!(c.matches(), [run(Action::ClaudeSetup)]);
+        assert_eq!(
+            c.matches(),
+            [run(Action::NewClaude), run(Action::ClaudeSetup)]
+        );
         // Actions with no keys are here too.
-        c.filter = "claude".into();
-        assert_eq!(c.matches(), [run(Action::NewClaude)]);
+        c.filter = "claude setup".into();
+        assert_eq!(c.matches(), [run(Action::ClaudeSetup)]);
         c.filter = "reset term".into();
         assert_eq!(c.matches(), [run(Action::Reset)]);
         c.filter = "clear".into();
