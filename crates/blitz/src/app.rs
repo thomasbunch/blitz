@@ -1707,14 +1707,14 @@ impl App {
             });
         }
         // Once ever, a few keys worth knowing.
-        if !self.scripted()
+        if !self.args.scripted()
             && let Some(id) = self.focus_id()
             && session::dir().is_some_and(|d| session::first_time_in(&d, "keys"))
         {
             let text = first_hint(&self.config.keys);
             self.set_notice(id, text, Some(Instant::now() + HINT), true);
         }
-        if !self.scripted() && !cfg!(debug_assertions) {
+        if !self.args.scripted() && !cfg!(debug_assertions) {
             let proxy = self.proxy.clone();
             let look = self.config.check_updates;
             std::thread::spawn(move || {
@@ -4364,7 +4364,7 @@ impl App {
             crate::notify::flash(self.hwnd, a.flashes);
         }
         // Never from a test run.
-        if self.scripted() {
+        if self.args.scripted() {
             return;
         }
         let shown = a.toast && self.toast(id);
@@ -4433,11 +4433,6 @@ impl App {
             let text = "Another program has Ctrl+Alt+J, so it cannot bring you to blitz";
             self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
         }
-    }
-
-    /// A run driven by a script or timed to exit, rather than by a user.
-    fn scripted(&self) -> bool {
-        self.args.selftest.is_some() || self.args.exit_after.is_some()
     }
 
     /// Brings the window to the front, out of the taskbar if minimized.
