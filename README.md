@@ -281,12 +281,20 @@ good place to start.
 | Shift+click | Extend the selection |
 | Ctrl+click | Open a link |
 | Right-click | Copy the selection, or paste when nothing is selected |
-| Wheel | Scroll; in less, man and other full-screen programs, press the arrow keys |
+| Wheel | Scroll the pane under the pointer, by as many lines as Windows is set to |
 
 A selection can reach into scrollback and stays on its text while
-output scrolls; it ends when output rewrites the text. A double click
-takes a path or URL whole, and dragging after a double or triple click
-selects by words or lines.
+output scrolls, or when the pane's width changes; it ends when output
+rewrites the text. Each pane keeps its own selection while another has
+focus, and the view holds still while you drag. A double click takes a
+path or URL whole, without the full stop after it, and dragging after
+a double or triple click selects by words or lines. The command palette
+can also select all of a pane's text, or the last command's output
+between two of blitz's prompts.
+
+Ctrl+Shift+Space labels each URL, file path and commit hash in view
+with a letter. Type the letter to copy what it marks, or Shift and the
+letter to open it; any other key puts the labels away.
 
 Ctrl+C copies the selection while it is in view; scrolled out of view,
 Ctrl+C goes to the program as usual. Ctrl+Shift+C and Ctrl+Insert copy
@@ -314,8 +322,12 @@ the line and column after its path, as in `src/app.rs:12:5` or
 other clicks go to Claude Code.
 
 When a program takes the mouse itself, as Claude Code does in
-fullscreen, clicks go to it. Hold Shift as well to use blitz's
-selection: Shift+drag selects, and Ctrl+Shift+click opens a link.
+fullscreen, clicks and the wheel go to it, and the pointer is an arrow
+rather than an I-beam. Hold Shift as well to use blitz's: Shift+drag
+selects, Ctrl+Shift+click opens a link, and Shift+right-click copies or
+pastes. Over a full-screen program, such as less or man, the wheel
+presses the arrow keys when the program asks for that, but never in
+Claude Code, where they would bring back an earlier prompt.
 
 ## Paste and drop
 
@@ -343,15 +355,17 @@ over SSH, and the pane says so. They cannot read it.
 
 ## Find and prompts
 
-Ctrl+Shift+F opens a find bar at the top right of the focused pane. It
-searches the pane's scrollback and screen as you type, ignoring case
-unless what you type has a capital letter, and shows every match in
-view in the selection colour, the current one outlined. Enter or F3 goes
-to the next match up, Shift+Enter or Shift+F3 to the next one down, and
-Esc closes the bar, leaving the view where it is. Any other shortcut
-does what it does and closes the bar, unless it scrolls, and a click in
-the pane closes it too. A full-screen program is searched on its screen
-only.
+Ctrl+Shift+F opens a find bar at the top right of the focused pane,
+holding the selected text or else what you last looked for, ready to
+type over. It searches the pane's scrollback and screen as you type,
+ignoring case unless what you type has a capital letter, and shows every
+match in view in the selection colour, the current one outlined. Enter
+or F3 goes to the next match up, Shift+Enter or Shift+F3 to the next one
+down, and Esc closes the bar, leaving the view where it is and the match
+selected, so Ctrl+C copies it. Any other shortcut does what it does and
+closes the bar, unless it scrolls, and a click in the pane closes it
+too. A full-screen program is searched on its screen only, as the bar
+says.
 
 With shell integration on, Ctrl+Shift+Up and Ctrl+Shift+Down scroll to
 the previous and next prompt; down from the last one goes back to the
@@ -393,6 +407,7 @@ that, or typing, goes back to the bottom.
 | Shift+PgUp, Shift+PgDn | Scroll |
 | Ctrl+Shift+Home, Ctrl+Shift+End | Scroll to the top, to the bottom |
 | Ctrl+Shift+F | Find in the scrollback |
+| Ctrl+Shift+Space | Quick select a link, path or hash to copy or open |
 | Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
 A zoomed pane stays zoomed until you zoom again, move focus to another
@@ -404,15 +419,16 @@ Esc closes it. When no action matches, Enter looks for what you typed in
 the settings instead. Starting a new Claude Code session in a split,
 giving the panes equal space, closing a whole tab, reopening the last
 closed pane, moving a pane to a new tab, renaming a session or a tab,
-copying without indent, clearing the scrollback, resetting the terminal
-and Claude Code setup have no keys by default, so they are only in the
-palette; renaming takes the name on the palette's line. Double-clicking
-the line between panes also gives them equal space. Clearing the
-scrollback also clears the screen above the line the cursor is on, which
-moves to the top, so nothing cleared comes back when the pane is
-resized. Resetting the terminal turns off what a program that crashed
-can leave on, such as mouse reports, a hidden cursor or keys sent as
-escape codes; the text stays.
+copying without indent, selecting all, selecting the last command's
+output, clearing the scrollback, resetting the terminal and Claude Code
+setup have no keys by default, so they are only in the palette; renaming
+takes the name on the palette's line. Double-clicking the line between
+panes also gives them equal space. Clearing the scrollback also clears
+the screen above the line the cursor is on, which moves to the top, so
+nothing cleared comes back when the pane is resized. Resetting the
+terminal turns off what a program that crashed can leave on, such as
+mouse reports, a hidden cursor or keys sent as escape codes; the text
+stays.
 
 ## Key bindings
 
@@ -439,26 +455,25 @@ AZERTY, they go to the program unless bound to `go_to_tab_1` to
 `go_to_tab_8` or `last_tab`.
 Lines blitz cannot read are skipped.
 
-The actions are `copy`, `copy_without_indent`, `paste`,
-`scroll_page_up`, `scroll_page_down`, `scroll_to_top`,
-`scroll_to_bottom`, `clear_scrollback`, `reset_terminal`, `new_tab`,
-`close_pane`, `close_tab`, `reopen_closed`, `rename_session`,
-`rename_tab`, `next_tab`, `previous_tab`, `move_tab_left`,
-`move_tab_right`, `move_pane_to_new_tab`, `split_right`, `split_down`,
-`new_claude`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
-`jump_to_attention`, `go_to_session`, `toggle_sidebar`, `update`,
-`theme_picker`,
-`settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
-`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
-`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
-`fullscreen`, `command_palette`, `find`, `previous_prompt`,
-`next_prompt`, `system_menu`, `claude_setup`, `go_to_tab_1` to
-`go_to_tab_8` and `last_tab`. Typing a name in the command palette finds
-its action.
+The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
+`select_last_output`, `scroll_page_up`, `scroll_page_down`,
+`scroll_to_top`, `scroll_to_bottom`, `clear_scrollback`,
+`reset_terminal`, `new_tab`, `close_pane`, `close_tab`, `reopen_closed`,
+`rename_session`, `rename_tab`, `next_tab`, `previous_tab`,
+`move_tab_left`, `move_tab_right`, `move_pane_to_new_tab`,
+`split_right`, `split_down`, `new_claude`, `focus_left`, `focus_right`,
+`focus_up`, `focus_down`, `jump_to_attention`, `go_to_session`,
+`toggle_sidebar`, `update`, `theme_picker`, `settings`, `zoom`,
+`resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
+`swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
+`font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
+`find`, `quick_select`, `previous_prompt`, `next_prompt`,
+`system_menu`, `claude_setup`, `go_to_tab_1` to `go_to_tab_8` and
+`last_tab`. Typing a name in the command palette finds its action.
 
 A binding can also type text into the focused pane: `text:` and the
 text, with `\e` for Esc, `\r` for Enter, `\n`, `\t`, `\s` for a space,
-`\\` for a backslash and `\xNN` for any byte. Put the line in single
+`\` for a backslash and `\xNN` for any byte. Put the line in single
 quotes to keep a `#` in the text.
 
 ```
