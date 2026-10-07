@@ -170,18 +170,29 @@ fn trim_end(s: &str) -> usize {
 
 /// Where a path word from the text is: as it is when it starts with a
 /// drive, else in the pane's folder `cwd`. Only a path that exists counts,
-/// and one that would reach another machine is never looked at.
+/// and one that would reach another machine is never looked at, nor is
+/// one through a link; see [`plain`].
 // ponytail: looks at the disk on the UI thread for each move over a path
 // while Ctrl is held; keep the last answer if a slow drive makes that lag.
 pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
-    let full = if vt::osc::local_dir(word) {
-        PathBuf::from(word)
+    let (full, from) = if vt::osc::local_dir(word) {
+        (PathBuf::from(word), 3)
     } else if vt::osc::local_dir(cwd) {
-        Path::new(cwd).join(word)
+        (Path::new(cwd).join(word), cwd.len())
     } else {
         return None;
     };
-    full.exists().then_some(full)
+    plain(&full, from).then_some(full)
+}
+
+/// Whether each folder and file `path` names after its first `from`
+/// bytes is there and is no symbolic link or junction. Each is looked at
+/// without following it: a link can lead to another machine, and looking
+/// at a file there makes Windows sign in to it.
+fn plain(path: &Path, from: usize) -> bool {
+    (path.ancestors())
+        .take_while(|a| a.as_os_str().len() > from)
+        .all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| !m.file_type().is_symlink()))
 }
 
 /// What opening an OSC 8 link's `uri` does. Only `http`, `https` and
@@ -241,6 +252,10 @@ pub fn plan(t: &Target, pathext: &str) -> Option<Open> {
     match p {
         Open::Uri(_) => Some(p),
         Open::File(p) | Open::Reveal(p) => {
+            // A path from the text passed [`resolve`] already.
+            if matches!(t, Target::Uri(_)) && !plain(&p, 3) {
+                return None;
+            }
             let real = std::fs::canonicalize(p).ok()?;
             let real = real.to_str()?;
             plan_path(
@@ -502,5 +517,29 @@ mod tests {
         assert!(matches!(notes_plan, Some(Open::File(p)) if p.ends_with(r"sub\notes.txt")));
         assert!(matches!(tool_plan, Some(Open::Reveal(p)) if p.ends_with("tool.cmd")));
         assert_eq!((gone, far), (None, None));
+    }
+
+    #[test]
+    fn links_never_look_through_a_link() {
+        let dir = std::env::temp_dir().join(format!("blitz-links-j-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real")).expect("dir");
+        std::fs::write(dir.join("real").join("a.txt"), "x").expect("write");
+        // A junction needs no rights to make, unlike a symbolic link.
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(dir.join("j"))
+            .arg(dir.join("real"))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let cwd = dir.display().to_string();
+        let real = resolve("real/a.txt", &cwd);
+        let through = resolve("j/a.txt", &cwd);
+        let link = resolve("j", &cwd);
+        let uri = format!("file:///{}", dir.join("j").join("a.txt").display());
+        let opened = plan(&Target::Uri(uri.replace('\\', "/")), "");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(made, "mklink");
+        assert!(real.is_some());
+        assert_eq!((through, link, opened), (None, None, None));
     }
 }
