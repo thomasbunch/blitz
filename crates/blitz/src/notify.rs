@@ -3,10 +3,68 @@
 
 use std::ffi::c_void;
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIcon, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, HICON,
+    ChangeWindowMessageFilterEx, CreateIcon, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, HICON,
+    MSGFLT_ALLOW, RegisterWindowMessageW,
 };
+use windows::core::w;
+use winit::event_loop::EventLoopProxy;
+
+use crate::app::UserEvent;
+
+/// The id of blitz's own subclass of its window; the hand-off's is 1.
+const SUBCLASS: usize = 2;
+
+/// What the window's subclass keeps: where events go, and the number of
+/// the message Explorer sends once it has made the taskbar button.
+struct Hook {
+    proxy: EventLoopProxy<UserEvent>,
+    button: u32,
+}
+
+/// The event for window message `msg`, if blitz wants it. `button` is the
+/// number of TaskbarButtonCreated, 0 when it could not be had.
+fn event(msg: u32, button: u32) -> Option<UserEvent> {
+    (button != 0 && msg == button).then_some(UserEvent::TaskbarButton)
+}
+
+/// Makes `hwnd` hear when Explorer makes its taskbar button again, as it
+/// does after a restart, so the progress and badge can go back on.
+pub fn install(hwnd: isize, proxy: EventLoopProxy<UserEvent>) {
+    let hwnd = HWND(hwnd as *mut c_void);
+    // SAFETY: a NUL-terminated name.
+    let button = unsafe { RegisterWindowMessageW(w!("TaskbarButtonCreated")) };
+    // An elevated blitz hears from Explorer only if it lets this one in.
+    // SAFETY: a live window owned by this thread.
+    let _ = unsafe { ChangeWindowMessageFilterEx(hwnd, button, MSGFLT_ALLOW, None) };
+    // Leaked on purpose: the window lives as long as the process.
+    let hook = Box::into_raw(Box::new(Hook { proxy, button }));
+    // SAFETY: a live window owned by this thread; the subclass proc only
+    // reads `hook`, which is never freed.
+    let ok = unsafe { SetWindowSubclass(hwnd, Some(proc), SUBCLASS, hook as usize) };
+    if !ok.as_bool() {
+        eprintln!("blitz: cannot tell when the taskbar button is made again");
+    }
+}
+
+unsafe extern "system" fn proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    hook: usize,
+) -> LRESULT {
+    // SAFETY: `install` leaked this hook for the window's lifetime.
+    let hook = unsafe { &*(hook as *const Hook) };
+    if let Some(e) = event(msg, hook.button) {
+        let _ = hook.proxy.send_event(e);
+    }
+    // SAFETY: passes the message on unchanged.
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
 
 /// Flashes the taskbar button of `hwnd` `count` times. The button stays
 /// lit after the last one until the window comes to the front, so a few
@@ -63,6 +121,18 @@ pub fn badge_icon(size: u32, fg: u32, bg: u32, ring: bool) -> Option<HICON> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_taskbar_button_is_the_only_message_taken() {
+        let button = 0xc0de;
+        assert!(matches!(
+            event(button, button),
+            Some(UserEvent::TaskbarButton)
+        ));
+        assert!(event(0x0010, button).is_none(), "WM_CLOSE");
+        // Without the registered number, no message is it, not even WM_NULL.
+        assert!(event(0, 0).is_none());
+    }
 
     #[test]
     fn badges_are_round_dots_or_rings() {

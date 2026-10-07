@@ -150,6 +150,8 @@ pub enum UserEvent {
     Settings,
     /// The user let go of the window after moving or sizing it.
     Sized,
+    /// Explorer made the window's taskbar button, which starts out blank.
+    TaskbarButton,
 }
 
 /// Command-line options of the GUI.
@@ -1524,6 +1526,7 @@ impl App {
             self.hwnd = h.hwnd.get();
         }
         crate::handoff::install(self.hwnd, self.proxy.clone(), !self.args.new_window);
+        crate::notify::install(self.hwnd, self.proxy.clone());
         watch_settings(self.proxy.clone());
         self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
         self.frame_theme();
@@ -6523,9 +6526,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.error(id, format!("Update failed: {e}"));
                 }
             }
+            // Explorer restarted. A new TaskbarList too, as the old one
+            // may still talk to the Explorer that is gone.
+            UserEvent::TaskbarButton => {
+                self.taskbar = None;
+                self.taskbar_shows = None;
+                self.badge_shows = None;
+                self.taskbar_progress();
+                self.taskbar_badge();
+            }
             UserEvent::Handoff(ask) => {
                 let hwnd = HWND(self.hwnd as *mut c_void);
                 crate::handoff::to_current_desktop(hwnd);
+
                 // First, since a minimized window has no room for a pane.
                 if let Some(w) = &self.window {
                     w.set_minimized(false);
