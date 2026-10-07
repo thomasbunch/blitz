@@ -6091,11 +6091,15 @@ fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
 }
 
 /// Paths as a paste types them: joined by spaces, each in quotes when it
-/// holds a space, as Windows Terminal does.
+/// holds anything but letters, digits and `_.-:\/`, so no shell reads a
+/// name such as `a&calc.txt` as syntax. A `$` or backtick gets single
+/// quotes, which PowerShell does not expand; they mean nothing to cmd.
 fn quote_paths(paths: &[PathBuf]) -> String {
+    let plain = |c: char| c.is_alphanumeric() || "_.-:\\/".contains(c);
     let quoted: Vec<String> = (paths.iter())
         .map(|p| match p.to_string_lossy() {
-            s if s.contains(' ') => format!("\"{s}\""),
+            s if s.contains(['$', '`']) => format!("'{}'", s.replace('\'', "''")),
+            s if !s.chars().all(plain) => format!("\"{s}\""),
             s => s.into_owned(),
         })
         .collect();
@@ -8883,10 +8887,17 @@ mod tests {
     }
 
     #[test]
-    fn app_files_paste_as_paths_quoted_only_with_spaces() {
+    fn app_files_paste_as_paths_quoted_only_when_a_shell_would_read_them() {
         let paths = [r"C:\some dir\shot.png", r"D:\b.txt"].map(PathBuf::from);
         assert_eq!(quote_paths(&paths), r#""C:\some dir\shot.png" D:\b.txt"#);
         assert_eq!(quote_paths(&paths[1..]), r"D:\b.txt");
+        let one = |p: &str| quote_paths(&[PathBuf::from(p)]);
+        assert_eq!(one(r"C:\x&calc&.txt"), r#""C:\x&calc&.txt""#);
+        assert_eq!(one(r"C:\x(1);y.txt"), r#""C:\x(1);y.txt""#);
+        assert_eq!(one(r"C:\%PATH%^.txt"), r#""C:\%PATH%^.txt""#);
+        assert_eq!(one(r"C:\$(calc).txt"), r"'C:\$(calc).txt'");
+        assert_eq!(one(r"C:\it's $x.txt"), r"'C:\it''s $x.txt'");
+        assert_eq!(one(r"C:\café_1-2.txt"), r"C:\café_1-2.txt");
     }
 
     #[test]
