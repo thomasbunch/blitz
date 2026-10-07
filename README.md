@@ -163,6 +163,8 @@ good place to start.
 | Ctrl+Shift+R | Split right |
 | Ctrl+Shift+D | Split down |
 | Ctrl+Alt+Arrows | Move focus between panes |
+| Alt+Shift+Arrows | Resize the focused pane (or drag the line between panes) |
+| Ctrl+Alt+Shift+Arrows | Swap the focused pane with its neighbour |
 | Ctrl+Shift+J | Jump to the next session that needs you |
 | Ctrl+Shift+B | Expand or collapse the sidebar |
 | Ctrl+Shift+U | Update, when a newer release is available |

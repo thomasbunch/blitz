@@ -32,13 +32,13 @@ use winit::platform::windows::{
     EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Icon, UserAttentionType, Window, WindowId};
+use winit::window::{CursorIcon, Icon, UserAttentionType, Window, WindowId};
 
 use crate::attention::{Attn, Ev};
 use crate::config::{Config, Kind};
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
-use crate::layout::{self, Dir, PaneId, Rect, Tab};
+use crate::layout::{self, Axis, Dir, PaneId, Rect, Tab};
 use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
 use crate::render::chrome::{self, ChromeModel};
 use crate::render::d3d11::{Gpu, Swapchain, is_device_lost};
@@ -346,6 +346,11 @@ struct Mouse {
     wheel: f64,
     /// A left-button drag is making a selection from this cell.
     anchor: Option<(u16, u16)>,
+    /// A left-button drag is moving this divider of the active tab; the
+    /// second value is the smallest pane it may leave.
+    divider: Option<(usize, (i32, i32))>,
+    /// The pointer is over a divider along this axis and shows it.
+    over_divider: Option<Axis>,
 }
 
 /// A session and what the window keeps to draw it.
@@ -801,6 +806,8 @@ impl App {
     fn close(&mut self, el: &ActiveEventLoop, id: PaneId) {
         let before = self.focus_id();
         self.win.close_pane(id);
+        // The divider being dragged may be gone.
+        self.mouse.divider = None;
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
         if self.views.is_empty() {
@@ -1583,6 +1590,20 @@ impl App {
             }
             // The focused session is skipped: the user is already looking
             // at it, and a session that exited stays red until closed.
+            Action::Resize(dir) | Action::Swap(dir) => {
+                let (area, min, (cw, ch)) = (self.tab_area(), self.min_pane(), self.cell());
+                let active = self.win.active;
+                let Some(t) = (self.win.tabs.get_mut(active)).filter(|t| t.panes().len() >= 2)
+                else {
+                    return false;
+                };
+                match (a, dir) {
+                    (Action::Swap(_), _) => t.swap(dir, area),
+                    (_, Dir::Left | Dir::Right) => t.resize(dir, cw as i32, area, min),
+                    _ => t.resize(dir, ch as i32, area, min),
+                };
+                self.request_redraw();
+            }
             Action::JumpToAttention => {
                 let waiting = (self.views.iter())
                     .filter(|v| Some(v.pane.id) != before)
@@ -1846,6 +1867,28 @@ impl App {
         (id, side)
     }
 
+    /// The divider of the active tab under a point, if the settings panel
+    /// is not over it. Dividers are 1 px wide, so a few px either side count.
+    fn divider_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, Axis)> {
+        let t = (self.win.tabs.get(self.win.active)).filter(|_| self.settings.is_none())?;
+        let slop = (3.0 * self.scale).round() as i32;
+        t.divider_at(self.tab_area(), pos.x as i32, pos.y as i32, slop)
+    }
+
+    /// The smallest pane, frame included, that still holds `MIN_COLS` by
+    /// `MIN_ROWS` cells as the active tab is drawn now.
+    fn min_pane(&self) -> (i32, i32) {
+        let (cw, ch) = self.cell();
+        let chrome = chrome::build(&self.model(&self.win, &[], None));
+        let outer = (self.win.tabs.get(self.win.active)).map(|t| t.rects(self.tab_area()));
+        let frame = (outer.iter().flatten().zip(&chrome.panes).next())
+            .map_or((0, 0), |(o, i)| (o.1.w - i.1.w, o.1.h - i.1.h));
+        (
+            layout::MIN_COLS * cw as i32 + frame.0,
+            layout::MIN_ROWS * ch as i32 + frame.1,
+        )
+    }
+
     /// Brings a session to the front: its tab becomes the active one and
     /// it gets focus.
     fn show(&mut self, id: PaneId) {
@@ -1902,6 +1945,16 @@ impl App {
             self.act(el, Action::Update);
             return;
         }
+        if b == 0 && !pressed && self.mouse.divider.take().is_some() {
+            return;
+        }
+        if let Some((i, _)) = self
+            .divider_at(self.mouse.pos)
+            .filter(|_| pressed && b == 0)
+        {
+            self.mouse.divider = Some((i, self.min_pane()));
+            return;
+        }
         // A click on another pane or in the sidebar only moves focus.
         if pressed {
             let (id, side) = self.hit(self.mouse.pos);
@@ -1942,6 +1995,15 @@ impl App {
 
     fn on_mouse_move(&mut self, pos: PhysicalPosition<f64>) {
         self.mouse.pos = pos;
+        if let Some((i, min)) = self.mouse.divider {
+            let (area, active) = (self.tab_area(), self.win.active);
+            if let Some(t) = self.win.tabs.get_mut(active)
+                && t.drag(i, pos.x as i32, pos.y as i32, area, min)
+            {
+                self.request_redraw();
+            }
+            return;
+        }
         if let Some(anchor) = self.mouse.anchor {
             let here = self.cell_at(pos);
             let sel = Some((anchor, here));
@@ -1950,6 +2012,17 @@ impl App {
                 self.request_redraw();
             }
             return;
+        }
+        let over = self.divider_at(pos).map(|d| d.1);
+        if over != self.mouse.over_divider {
+            self.mouse.over_divider = over;
+            if let Some(w) = &self.window {
+                w.set_cursor(match over {
+                    Some(Axis::Row) => CursorIcon::ColResize,
+                    Some(Axis::Column) => CursorIcon::RowResize,
+                    None => CursorIcon::Default,
+                });
+            }
         }
         let mods = mods_now();
         if let Some(m) = self.mouse_to_program(&mods) {
