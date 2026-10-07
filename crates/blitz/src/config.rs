@@ -494,16 +494,23 @@ fn save_in(dir: &Path, key: &str, value: Option<&str>) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut path = dir.join(FILE);
     // A config.toml linked from elsewhere, as from a dotfiles folder, is
-    // written where the link points, so the link stays.
+    // written where the link points, so the link stays; one made before
+    // the file it points to makes that file.
     if path
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
     {
-        path = std::fs::canonicalize(&path)?;
+        path = match std::fs::canonicalize(&path) {
+            Ok(p) => p,
+            Err(_) => dir.join(std::fs::read_link(&path)?),
+        };
     }
+    // Where it went wrong, which is not config.toml when it is a link.
+    let named =
+        |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()));
     let old = match std::fs::read(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        r => decode(&r?),
+        r => decode(&r.map_err(named)?),
     };
     // Named for this process, so two blitz windows saving at once never
     // write or move each other's file.
@@ -513,7 +520,7 @@ fn save_in(dir: &Path, key: &str, value: Option<&str>) -> std::io::Result<()> {
     if saved.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    saved
+    saved.map_err(named)
 }
 
 /// `text` with its last `key` line, the one that counts, set to `value`,
@@ -1027,5 +1034,33 @@ scenery = stars
             .map(|e| e.file_name())
             .collect();
         assert_eq!(left, ["blitz.toml"]);
+    }
+
+    #[test]
+    fn save_makes_the_file_a_link_points_to() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as link;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as link;
+        let t = Temp::new("dangling");
+        std::fs::create_dir(t.0.join("dotfiles")).unwrap();
+        let dir = t.0.join("blitz");
+        std::fs::create_dir(&dir).unwrap();
+        // Made before its target, and relative to its own folder.
+        let to = Path::new("..").join("dotfiles").join("blitz.toml");
+        if let Err(e) = link(&to, dir.join(FILE)) {
+            eprintln!("skipped, cannot make a link here: {e}");
+            return;
+        }
+        save_in(&dir, "flash", Some("false")).unwrap();
+        let meta = std::fs::symlink_metadata(dir.join(FILE)).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link stays");
+        let target = std::fs::read_to_string(t.0.join("dotfiles").join("blitz.toml")).unwrap();
+        assert_eq!(target, "flash = false\n");
+        // A link into a folder that is not there says where it points.
+        std::fs::remove_file(dir.join(FILE)).unwrap();
+        link(t.0.join("gone").join("blitz.toml"), dir.join(FILE)).unwrap();
+        let err = save_in(&dir, "flash", Some("true")).unwrap_err();
+        assert!(err.to_string().contains("gone"), "{err}");
     }
 }
