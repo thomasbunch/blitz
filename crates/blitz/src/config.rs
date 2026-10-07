@@ -38,6 +38,8 @@ pub struct Config {
     pub scenery: String,
     /// The spark at the foot of the sidebar.
     pub mascot: bool,
+    /// A right click copies the selection, or pastes without one.
+    pub right_click_paste: bool,
     /// Ctrl+click opens a file at its line through this URI, with
     /// `{path}`, `{line}` and `{col}` filled in, as in
     /// `vscode://file/{path}:{line}:{col}`. Empty opens files with their
@@ -68,6 +70,7 @@ impl Default for Config {
             restore_scrollback: false,
             scenery: "off".into(),
             mascot: false,
+            right_click_paste: true,
             editor_uri: String::new(),
             keys: Vec::new(),
             texts: Vec::new(),
@@ -193,6 +196,15 @@ pub const SETTINGS: &[Setting] = &[
         applies: NEW_PANES,
     },
     Setting {
+        key: "right_click_paste",
+        group: "Mouse",
+        label: "Right-click copy and paste",
+        help: "A right click copies the selection, or pastes when nothing is \
+               selected. Hold Shift when a program takes the mouse.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
         key: "editor_uri",
         group: "Mouse",
         label: "Editor",
@@ -293,6 +305,7 @@ impl Config {
             "check_updates" => flag(self.check_updates),
             "scenery" => quote(&self.scenery),
             "mascot" => flag(self.mascot),
+            "right_click_paste" => flag(self.right_click_paste),
             "editor_uri" => quote(&self.editor_uri),
             _ => String::new(),
         }
@@ -364,6 +377,7 @@ impl Config {
             "bell_attention" => &mut self.bell_attention,
             "check_updates" => &mut self.check_updates,
             "mascot" => &mut self.mascot,
+            "right_click_paste" => &mut self.right_click_paste,
             _ => return None,
         })
     }
@@ -828,6 +842,7 @@ scenery = stars
             ("check_updates", "false"),
             ("scenery", "\"snow\""),
             ("mascot", "true"),
+            ("right_click_paste", "false"),
             ("editor_uri", "\"cursor://file/{path}:{line}:{col}\""),
         ] {
             assert!(c.set(k, v), "{k} = {v}");

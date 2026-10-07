@@ -3862,6 +3862,15 @@ impl App {
             }
             return;
         }
+        if b == 2 && pressed {
+            let selected = (self.current()).is_some_and(|v| {
+                let term = lock(&v.pane.term);
+                v.selection.as_ref().is_some_and(|s| s.kept(&term))
+            });
+            if let Some(a) = right_click_does(self.config.right_click_paste, selected) {
+                self.act(el, a);
+            }
+        }
         if b != 0 {
             return;
         }
@@ -4654,6 +4663,17 @@ fn hidden_target(
 /// fullscreen, so with an `editor` set blitz opens its file paths there.
 fn opens_link(target: &Target, program: bool, claude: bool, editor: &str) -> bool {
     !program || claude && !editor.is_empty() && matches!(target, Target::Path(..))
+}
+
+/// What a right click that is not the program's does, with
+/// `right_click_paste` `on`: copies the selection when there is one
+/// (`selected`), else pastes, asking first as Ctrl+V does.
+fn right_click_does(on: bool, selected: bool) -> Option<Action> {
+    on.then_some(if selected {
+        Action::Copy
+    } else {
+        Action::Paste
+    })
 }
 
 /// Whether Windows shows animations; off under Accessibility, Visual
@@ -6564,6 +6584,13 @@ mod tests {
         let (range, found) = crate::links::scan(&l.text).remove(0);
         assert_eq!(found, Link::Url("https://e.com/abc".into()));
         assert_eq!(l.span(range), ((0, 3), (1, 9)), "across the wrap");
+    }
+
+    #[test]
+    fn app_right_click_copies_a_selection_or_pastes() {
+        assert_eq!(right_click_does(true, true), Some(Action::Copy));
+        assert_eq!(right_click_does(true, false), Some(Action::Paste));
+        assert_eq!(right_click_does(false, true), None, "turned off");
     }
 
     #[test]
