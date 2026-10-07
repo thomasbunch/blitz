@@ -193,7 +193,9 @@ resuming its Claude Code conversation. A program that exits with an error
 leaves its pane open with the exit code: Enter starts it again in place,
 Esc closes the pane.
 
-Saved state lives in `%LOCALAPPDATA%\blitz`.
+Saved state lives in `%LOCALAPPDATA%\blitz`. If blitz ever stops after
+an internal error, it writes what happened to `crash.txt` there, and the
+next start says so once and keeps the file as `last-crash.txt`.
 
 ## Shells
 
