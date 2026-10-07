@@ -39,9 +39,9 @@ use windows::Win32::UI::Shell::{
     TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, GetCursorPos, GetSystemMetrics, MB_OK, MSG, SM_CXSMICON, SetForegroundWindow,
-    TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CreateCaret, DestroyCaret, DestroyIcon, GetCursorPos, GetSystemMetrics, MB_OK, MSG,
+    SM_CXSMICON, SetCaretPos, SetForegroundWindow, TranslateMessage, WM_CHAR, WM_DEADCHAR,
+    WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows::core::{HSTRING, PWSTR};
 use winit::application::ApplicationHandler;
@@ -1084,10 +1084,13 @@ struct App {
     find_bar: Option<Rect>,
     /// Keys whose releases belong to a shortcut or a panel and are not sent.
     eaten: Eaten,
-    /// Where the IME was last told typing goes, in client pixels.
+    /// Where the IME and the caret were last told typing goes, in client
+    /// pixels.
     ime_at: Option<Rect>,
     /// What the title bar shows.
     title: String,
+    /// The size of the system caret while the window has one.
+    caret: Option<(u32, u32)>,
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
     /// A Claude Code hook has reported from a pane since blitz started.
@@ -1559,6 +1562,7 @@ impl App {
             eaten: Eaten::default(),
             ime_at: None,
             title: "blitz".into(),
+            caret: None,
             checked_conpty: false,
             hooked: false,
             capture_then_exit: false,
@@ -5388,6 +5392,10 @@ impl App {
             self.ime_at = Some(at);
             let size = PhysicalSize::new(at.w.max(1) as u32, at.h.max(1) as u32);
             w.set_ime_cursor_area(PhysicalPosition::new(at.x, at.y), size);
+            // Magnifier follows the caret to where typing goes.
+            if self.focused {
+                self.caret = place_caret(self.hwnd, (at.x, at.y), (cw, ch), self.caret);
+            }
         }
     }
 
@@ -6487,6 +6495,35 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// Moves the system caret to `at`, in client pixels, first making one of
+/// `size` when `made`, the size of the caret there is, differs. It is
+/// never shown, as blitz draws its own cursor, but Magnifier and other
+/// tools that follow the text cursor follow it. Returns the caret's size.
+fn place_caret(
+    hwnd: isize,
+    at: (i32, i32),
+    size: (u32, u32),
+    made: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    let made = match made {
+        Some(s) if s == size => made,
+        // SAFETY: our own window, on its thread; it replaces any old caret.
+        _ => unsafe {
+            CreateCaret(
+                HWND(hwnd as *mut c_void),
+                None,
+                size.0 as i32,
+                size.1 as i32,
+            )
+        }
+        .ok()
+        .map(|()| size),
+    };
+    // SAFETY: plain call; it moves this thread's caret, if there is one.
+    let _ = unsafe { SetCaretPos(at.0, at.1) };
+    made
+}
+
 /// The local time as `2026-10-02 14:32`.
 fn local_stamp() -> String {
     // SAFETY: plain Win32 call with no arguments.
@@ -7058,6 +7095,13 @@ impl ApplicationHandler<UserEvent> for App {
                     crate::handoff::forget_activating_click();
                     self.set_drag(None);
                 }
+                // Only the window with the keys has a caret; the next frame
+                // makes it again.
+                if !f && self.caret.take().is_some() {
+                    // SAFETY: plain call on the thread that made the caret.
+                    let _ = unsafe { DestroyCaret() };
+                }
+                self.ime_at = None;
                 // Ctrl may be let go while another window has the keys.
                 self.set_hover(None);
                 self.hide_pointer(false);
@@ -8216,6 +8260,54 @@ mod tests {
         assert_eq!(due, None);
         assert!(!save_now(true, false, at(700), &mut due));
         assert!(save_now(true, false, at(1200), &mut due));
+    }
+
+    /// The caret goes where the cursor is, and is made again only for a
+    /// new cell size.
+    #[test]
+    fn app_caret_follows_the_cursor() {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetCaretPos, WINDOW_EX_STYLE, WS_POPUP,
+        };
+        // A hidden window of this thread, which then owns the caret.
+        // SAFETY: a system class with no parent; destroyed below.
+        let w = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                None,
+                WS_POPUP,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("window");
+        let hwnd = w.0 as isize;
+        let pos = || {
+            let mut p = POINT::default();
+            // SAFETY: a valid out pointer.
+            unsafe { GetCaretPos(&mut p) }.expect("a caret");
+            (p.x, p.y)
+        };
+        let made = place_caret(hwnd, (16, 32), (8, 16), None);
+        assert_eq!(made, Some((8, 16)));
+        assert_eq!(pos(), (16, 32));
+        assert_eq!(place_caret(hwnd, (24, 32), (8, 16), made), made);
+        assert_eq!(pos(), (24, 32));
+        assert_eq!(place_caret(hwnd, (30, 40), (10, 20), made), Some((10, 20)));
+        assert_eq!(pos(), (30, 40));
+        // SAFETY: this thread's caret and window.
+        unsafe {
+            DestroyCaret().expect("caret");
+            DestroyWindow(w).expect("window");
+        }
     }
 
     /// A session that could not be written is tried again, later after
