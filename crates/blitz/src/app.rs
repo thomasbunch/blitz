@@ -90,8 +90,9 @@ const SCENERY_FRAME: Duration = Duration::from_millis(66);
 /// one runs every few hours.
 const UPDATE_FIRST: Duration = Duration::from_secs(10);
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
-/// Why an update or a look for one stopped when its thread panicked.
-const INTERNAL: &str = "blitz stopped after an internal error";
+/// Why an update or a look for one stopped when its thread panicked; only
+/// that thread did.
+const INTERNAL: &str = "an internal error";
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
 /// After this long with no key or mouse input anywhere, the user counts as
@@ -104,8 +105,9 @@ const RESUME_AFTER: Duration = Duration::from_secs(3);
 const SAVED_LINES: usize = 1000;
 /// Lines scrolled per wheel notch when the program takes no mouse input.
 const WHEEL_LINES: isize = 3;
-/// How long a changed layout waits before it is saved, so dragging a
-/// divider or holding a resize key writes the file once, not every step.
+/// How long a changed layout waits before it is saved, so holding a resize
+/// key writes the file at most once this often rather than every step. A
+/// divider drag writes it once, after the drag.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// How long to wait before building the renderer again after it failed.
 const GFX_RETRY: Duration = Duration::from_secs(1);
@@ -239,8 +241,9 @@ struct Keys {
     chars: bool,
     /// High half of a surrogate pair from WM_CHAR.
     high: Option<u16>,
-    /// The release of this key was already handled as text.
-    skip_up: Option<u16>,
+    /// Keys whose release was already handled as text. Several can be
+    /// down at once, as digits typed fast for an Alt code.
+    skip_up: Eaten,
 }
 
 enum Input {
@@ -306,11 +309,7 @@ impl Keys {
     /// Whether this is the release of a key whose text came as WM_CHAR,
     /// which was handled along with it.
     fn skipped(&mut self, vk: u16, down: bool) -> bool {
-        let skip = !down && self.skip_up == Some(vk);
-        if skip {
-            self.skip_up = None;
-        }
-        skip
+        !down && self.skip_up.release(vk)
     }
 
     /// A key transition from a key message. Its text comes as WM_CHAR
@@ -328,7 +327,7 @@ impl Keys {
             self.dead = false;
         }
         if vk == VK_PACKET || self.chars && down && !modifier {
-            self.skip_up = Some(vk);
+            self.skip_up.press(vk);
         } else {
             self.queue
                 .push(Input::Key(owned(input), input.text.to_string(), held));
@@ -1157,6 +1156,7 @@ impl App {
         self.ensure_gfx();
 
         let mut win = layout::Window::default();
+        let mut lost = None;
         if let Some(s) = &saved {
             match self.restore(s) {
                 Ok(()) => win = self.win.clone(),
@@ -1165,6 +1165,7 @@ impl App {
                     // Keep it for the next start rather than saving this
                     // run's fresh tab over it.
                     self.persist = false;
+                    lost = Some(e);
                 }
             }
         }
@@ -1179,6 +1180,14 @@ impl App {
             win.active = win.tabs.len() - 1;
             let cmd = self.args.cmd.clone();
             self.open(win, id, cmd.as_deref(), cwd)?;
+            // Said where it is seen: the release build has no console. It
+            // stays, as nothing this window does is saved.
+            if let Some(e) = lost {
+                let text = format!(
+                    "The last session did not come back ({e}); it is kept for the next start, and this window is not saved"
+                );
+                self.set_notice(id, text, None, false);
+            }
         }
 
         if let Some(script) = self.args.selftest.clone() {
@@ -1253,11 +1262,24 @@ impl App {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
         for (id, meta) in panes {
+            // A session saved before panes had keys filed output by tab
+            // and leaf; the pane's fresh key files it anew at the next exit.
             let old = (self.config.restore_scrollback)
-                .then(|| session::load_output(&meta.key))
+                .then(|| {
+                    if session::is_key(&meta.key) {
+                        session::load_output(&meta.key)
+                    } else {
+                        (leaf_index(&win, id))
+                            .and_then(|(tab, leaf)| session::load_legacy_output(tab, leaf))
+                    }
+                })
                 .flatten();
+            // When the retry fails too, the first failure says why.
             let started = (self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()))
-                .or_else(|_| self.spawn(id, &grids, None, None, old.as_deref()));
+                .or_else(|first| {
+                    (self.spawn(id, &grids, None, None, old.as_deref()))
+                        .map_err(|then| joined(first, then))
+                });
             if let Err(e) = started {
                 self.views.clear();
                 return Err(e);
@@ -2281,29 +2303,32 @@ impl App {
             return;
         }
         // A repeat of a key blitz took goes where its press went, and only
-        // some keys do anything again; see `keymap::drops_repeat`.
+        // some keys do anything again; see `keymap::drops_repeat`. blitz
+        // run takes keys as a panel does, so a held jump keeps jumping.
         let panel = self.commands.is_some()
             || self.picker.is_some()
             || self.settings.is_some()
-            || self.find.is_some();
+            || self.find.is_some()
+            || self.game.is_some();
         let taken = self.eaten.0.contains(&k.vk);
         if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
             return;
         }
-        if let Some((g, _)) = &mut self.game {
+        // Every key pressed while blitz run is open is the game's, and so is
+        // its release; one pressed before it opened is released to the
+        // program, as with the picker.
+        if let Some((g, _)) = self.game.as_mut().filter(|_| k.down) {
             // Every key is the game's, but a shortcut closes it and runs.
             if keymap::action(k, &self.config.keys).is_some() {
                 self.close_game();
             } else {
-                if k.down {
-                    self.eaten.press(k.vk);
-                    match k.vk {
-                        VK_ESCAPE => self.close_game(),
-                        vk if is_jump(vk) => g.jump(),
-                        _ => {}
-                    }
-                    self.request_redraw();
+                self.eaten.press(k.vk);
+                match k.vk {
+                    VK_ESCAPE => self.close_game(),
+                    vk if is_jump(vk) => g.jump(),
+                    _ => {}
                 }
+                self.request_redraw();
                 return;
             }
         }
@@ -4198,6 +4223,23 @@ fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
     }
 }
 
+/// The tab and leaf index of pane `id` in `win`, by which output saved
+/// before panes had keys is filed.
+fn leaf_index(win: &layout::Window, id: PaneId) -> Option<(usize, usize)> {
+    (win.tabs.iter().enumerate())
+        .find_map(|(t, tab)| Some((t, tab.panes().iter().position(|&p| p == id)?)))
+}
+
+/// Why a pane failed to start in its folder and then again without one;
+/// once when both say the same.
+fn joined(first: String, then: String) -> String {
+    if first == then {
+        first
+    } else {
+        format!("{first}; then {then}")
+    }
+}
+
 /// What to type into a restored pane's shell to bring back the Claude Code
 /// session it was running, if anything. The id comes from a file on disk,
 /// so only a well-formed one is ever typed.
@@ -4470,11 +4512,21 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(f) => {
                 self.focused = f;
                 // A key still held goes up in the other window, so its
-                // release never comes back to clear `eaten`; so does the
-                // button ending a drag.
+                // release never comes back to clear `eaten`; so does a
+                // button, ending a drag or a selection. A program that saw
+                // the button go down sees it come up here, as it went where
+                // its press did.
                 if !f {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
+                    self.mouse.drag = None;
+                    self.mouse.scroll_at = None;
+                    let mods = mods_now();
+                    for b in 0..3 {
+                        if let Some(id) = route_button(&mut self.mouse.reported, b, false, None) {
+                            self.mouse_report(id, MouseKind::Release, b as u8, mods);
+                        }
+                    }
                 }
                 // Ctrl may be let go while another window has the keys.
                 self.set_hover(None);
@@ -5314,6 +5366,15 @@ mod tests {
         // Without Alt, keypad digits are keys.
         k.key(&pad(0x61, true), false, false);
         assert_eq!(queued(&mut k), ["+61"]);
+        // Typed fast, the next digit goes down before the last comes up;
+        // neither release reaches the program.
+        k.key(&alt(true), false, false);
+        k.key(&pad(0x60, true), true, false);
+        k.key(&pad(0x62, true), true, false);
+        assert!(k.skipped(0x60, false), "the first digit");
+        assert!(k.skipped(0x62, false));
+        k.key(&alt(false), false, false);
+        assert_eq!(queued(&mut k), ["+12", "-12"]);
     }
 
     #[test]
@@ -5710,6 +5771,33 @@ mod tests {
         let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
         assert!(a.new_window);
         assert_eq!(a.cwd, Some(r"C:\foo".into()));
+    }
+
+    #[test]
+    fn output_from_before_keys_is_found_by_tab_and_tree_order() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut a = Tab::new("a".into(), PaneId(1));
+        assert!(a.split(layout::Dir::Right, PaneId(2), area, (1, 1)));
+        let win = layout::Window {
+            tabs: vec![a, Tab::new("b".into(), PaneId(3))],
+            ..Default::default()
+        };
+        assert_eq!(
+            [1, 2, 3, 4].map(|i| leaf_index(&win, PaneId(i))),
+            [Some((0, 0)), Some((0, 1)), Some((1, 0)), None]
+        );
+    }
+
+    #[test]
+    fn a_pane_that_fails_twice_says_why_first() {
+        let (a, b) = ("folder too long".to_string(), "no shell".to_string());
+        assert_eq!(joined(a.clone(), a.clone()), a);
+        assert_eq!(joined(a, b), "folder too long; then no shell");
     }
 
     #[test]

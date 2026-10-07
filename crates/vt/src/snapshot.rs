@@ -52,6 +52,17 @@ pub mod attr {
     pub const INVERSE: u16 = s::INVERSE;
     pub const STRIKE: u16 = s::STRIKE;
     pub const OVERLINE: u16 = s::OVERLINE;
+
+    // Each field is its own, or the build fails.
+    const _: () = {
+        let fields = [BOLD, ITALIC, UNDERLINE, INVERSE, DIM, STRIKE, OVERLINE];
+        let (mut all, mut i) = (0u16, 0);
+        while i < fields.len() {
+            assert!(fields[i] != 0 && all & fields[i] == 0);
+            all |= fields[i];
+            i += 1;
+        }
+    };
 }
 
 /// Longest grapheme cluster a cell holds, in bytes: its first code point
@@ -180,20 +191,5 @@ mod tests {
         let ul = 1 << attr::UNDERLINE_SHIFT;
         let (st, ov) = (attr::STRIKE, attr::OVERLINE);
         assert_eq!(attrs, [st, st | ov, ov, ul, st | ov | ul, 0]);
-        // Each field is its own.
-        let fields = [
-            attr::BOLD,
-            attr::ITALIC,
-            attr::UNDERLINE,
-            attr::INVERSE,
-            attr::DIM,
-            attr::STRIKE,
-            attr::OVERLINE,
-        ];
-        for (i, a) in fields.iter().enumerate() {
-            for b in &fields[i + 1..] {
-                assert_eq!(a & b, 0, "{a:#x} and {b:#x}");
-            }
-        }
     }
 }
