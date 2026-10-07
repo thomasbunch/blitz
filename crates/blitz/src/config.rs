@@ -336,8 +336,10 @@ impl Config {
 }
 
 /// A config file's text. Notepad can save UTF-16 ("Unicode"), and a file
-/// saved as ANSI is not UTF-8: its other bytes become U+FFFD rather than
-/// costing every setting in the file.
+/// that is not UTF-8 is read as ANSI, Windows-1252 as Western Windows
+/// writes it, so saving it back as UTF-8 keeps every character.
+// ponytail: Windows-1252 only; the system's code page (CP_ACP) for files
+// saved on, say, a Japanese or Polish Windows.
 pub(crate) fn decode(bytes: &[u8]) -> String {
     let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
         let units: Vec<u16> = rest.as_chunks().0.iter().map(|&c| unit(c)).collect();
@@ -346,7 +348,24 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
     match bytes {
         [0xff, 0xfe, rest @ ..] => utf16(rest, u16::from_le_bytes),
         [0xfe, 0xff, rest @ ..] => utf16(rest, u16::from_be_bytes),
-        _ => String::from_utf8_lossy(bytes).into_owned(),
+        _ => match std::str::from_utf8(bytes) {
+            Ok(text) => text.to_string(),
+            Err(_) => bytes.iter().map(|&b| windows_1252(b)).collect(),
+        },
+    }
+}
+
+/// A Windows-1252 byte. 0x80-0x9F are its own; the five it leaves
+/// undefined read as their C1 controls, as Windows reads them.
+fn windows_1252(b: u8) -> char {
+    const HIGH: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
+        'ž', 'Ÿ',
+    ];
+    match b {
+        0x80..=0x9f => HIGH[usize::from(b - 0x80)],
+        _ => char::from(b),
     }
 }
 
@@ -777,7 +796,14 @@ scenery = stars
         let ansi = b"# R\xe9glages\nflash = false\nfont_family = \"Caf\xe9\"\n";
         let c = Config::parse(&decode(ansi));
         assert!(!c.flash);
-        assert_eq!(c.font_family, "Caf\u{fffd}");
+        assert_eq!(c.font_family, "Café");
+        // Windows-1252, the ANSI of Western Windows, with its own 0x80-0x9F
+        // and the five bytes it leaves undefined as their C1 controls.
+        assert_eq!(decode(b"\x80\x8a\x96\x99\x9f\xa0\xff"), "€Š–™Ÿ\u{a0}ÿ");
+        assert_eq!(
+            decode(b"\x81\x8d\x8f\x90\x9d"),
+            "\u{81}\u{8d}\u{8f}\u{90}\u{9d}"
+        );
         // Notepad's "Unicode": UTF-16 with a byte order mark.
         let text = "flash = false\r\ntheme = \"Rose Pine\"\r\n";
         let le: Vec<u8> = [0xff, 0xfe]
@@ -952,12 +978,14 @@ scenery = stars
             .map(|e| e.file_name())
             .collect();
         assert_eq!(names, [FILE]);
-        // A file in the old encoding comes back as UTF-8, its settings kept.
+        // A file in the old encoding comes back as UTF-8, every character
+        // in it kept.
         std::fs::write(dir.join(FILE), b"# R\xe9glages\nflash = false\n").unwrap();
         save_in(&dir, "theme", Some("\"B\"")).unwrap();
-        let c = Config::read(&dir.join(FILE));
-        assert!(!c.flash);
-        assert_eq!(c.theme, "B");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FILE)).unwrap(),
+            "# Réglages\nflash = false\ntheme = \"B\"\n"
+        );
     }
 
     #[test]
