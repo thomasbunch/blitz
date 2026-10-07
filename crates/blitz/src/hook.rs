@@ -1012,14 +1012,42 @@ mod tests {
                 .expect("icacls");
             assert!(out.status.success(), "icacls {args:?}");
         };
-        // Only SYSTEM; as the owner this process can still read and change
-        // the list.
-        icacls(&["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F"]);
-        assert!(!others_can_write(&dir));
-        icacls(&["/grant", "*S-1-1-0:(OI)(CI)RX"]);
-        assert!(!others_can_write(&dir));
-        icacls(&["/grant", "*S-1-1-0:(OI)(CI)M"]);
-        assert!(others_can_write(&dir));
+        // `"DOMAIN\user","S-1-5-..."`
+        let whoami = std::process::Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .expect("whoami");
+        let me = String::from_utf8_lossy(&whoami.stdout)
+            .trim()
+            .rsplit(',')
+            .next()
+            .expect("a SID")
+            .trim_matches('"')
+            .to_owned();
+        assert!(me.starts_with("S-1-"), "{me}");
+        let mut seen = Vec::new();
+        for (grant, others) in [
+            // Only SYSTEM; as the owner this process can still read and
+            // change the list.
+            ("*S-1-5-18:(OI)(CI)F", false),
+            // The user installing it, the common per-user install.
+            (&*format!("*{me}:(OI)(CI)M"), false),
+            ("*S-1-5-32-544:(OI)(CI)F", false),
+            ("*S-1-1-0:(OI)(CI)RX", false),
+            // For files created inside, not for the folder itself.
+            ("*S-1-1-0:(OI)(CI)(IO)M", false),
+            ("*S-1-5-32-545:(OI)(CI)M", true),
+        ] {
+            let args: &[&str] = match seen.is_empty() {
+                true => &["/inheritance:r", "/grant:r", grant],
+                false => &["/grant", grant],
+            };
+            icacls(args);
+            seen.push((grant.to_owned(), others_can_write(&dir), others));
+        }
         let _ = std::fs::remove_dir(&dir);
+        for (grant, got, want) in seen {
+            assert_eq!(got, want, "after {grant}");
+        }
     }
 }
