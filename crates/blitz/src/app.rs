@@ -7021,9 +7021,10 @@ fn arms(at_close: Option<&AtClose>, v: &str) -> bool {
 }
 
 /// Whether the installer of release `v`, once here, takes the place of the
-/// one `at_close` holds: an older release's, ready to install.
+/// one `at_close` holds: an older release's, ready to install. An older
+/// one's download that lands late never takes a newer one's place.
 fn replaces(at_close: Option<&AtClose>, v: &str) -> bool {
-    at_close.is_some_and(|a| a.0 != v && a.1.is_some())
+    at_close.is_some_and(|a| a.1.is_some() && crate::update::newer(&a.0, v).is_some())
 }
 
 /// Whether Ctrl+Shift+U asks before it updates to release `v`: not when it
@@ -10444,6 +10445,7 @@ mod tests {
         assert!(replaces(Some(&left("0.0.5", true)), "0.0.6"));
         assert!(!replaces(Some(&left("0.0.5", false)), "0.0.6"));
         assert!(!replaces(Some(&left("0.0.6", true)), "0.0.6"));
+        assert!(!replaces(Some(&left("0.0.6", true)), "0.0.5"));
         assert!(!replaces(None, "0.0.6"));
         // Hiding the banner drops it, but not a restart asked for while it
         // downloads.
