@@ -202,8 +202,9 @@ next start says so once and keeps the file as `last-crash.txt`.
 Besides the shell in the settings, the command palette opens a tab on
 any shell installed: PowerShell, cmd, Git Bash or a WSL distribution.
 The pane keeps its shell when blitz reopens it. New panes get the PATH
-Windows has now, so a program installed while blitz runs is found
-without restarting blitz.
+blitz started with, in its order, then the folders Windows' Path has
+gained since, so a program installed while blitz runs is found without
+restarting blitz.
 
 With shell integration on, PowerShell and cmd mark each prompt and tell
 blitz their folder, around the prompt you have, also one that
