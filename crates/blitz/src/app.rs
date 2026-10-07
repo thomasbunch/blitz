@@ -9716,6 +9716,22 @@ mod tests {
         }
     }
 
+    /// A notice that stays, as an error or the one that says the window is
+    /// not saved, outranks one that goes by itself, as a hint does.
+    #[test]
+    fn passing_notices_never_hide_one_that_stays() {
+        let n = |until, ask| Notice {
+            text: String::new(),
+            until,
+            dim: true,
+            ask,
+        };
+        assert!(stays(&n(None, Ask::Key)), "an error, as the crash notice");
+        assert!(stays(&n(None, Ask::Nothing)), "not saved");
+        assert!(stays(&n(None, Ask::Update)), "a question");
+        assert!(!stays(&n(Some(Instant::now() + HINT), Ask::Nothing)));
+    }
+
     /// A question stays until it is answered or another key is pressed,
     /// which then does what it always does; an error goes at the next key
     /// in its pane; other notices stay.
