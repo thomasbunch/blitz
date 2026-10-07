@@ -932,16 +932,16 @@ pub fn build(m: &ChromeModel) -> Chrome {
         find_bar(&mut extra, f, c, r, s, (tw, th));
     }
     if let Some(st) = &m.settings {
-        out.settings = Some(settings(&mut extra, st, c, m.size, s, (tw, th)));
+        out.settings = Some(settings(&mut extra, st, c, area, s, (tw, th)));
     }
     if let Some(pk) = &m.picker {
-        picker(&mut extra, pk, c, m.size, s, (tw, th));
+        picker(&mut extra, pk, c, area, s, (tw, th));
     }
     if let Some(g) = m.game {
         g.draw(&mut extra, area, m.scale, c, (tw, th));
     }
     if let Some(cm) = &m.commands {
-        out.commands = Some(commands(&mut extra, cm, c, m.size, s, (tw, th)));
+        out.commands = Some(commands(&mut extra, cm, c, area, s, (tw, th)));
     }
     out.prims.extend(extra);
     out
@@ -1021,15 +1021,16 @@ struct List<'a> {
     width: f32,
 }
 
-/// A list panel near the top: the title and the filter, a window of rows
-/// that follows the highlight, and a key hint. `side(p, i, row, right)`
-/// draws the right end of row `i` up to `right` and returns where the name
-/// must end. Returns the panel and each row shown, by index.
+/// A list panel near the top of the panes' area `a`, clear of the sidebar:
+/// the title and the filter, a window of rows that follows the highlight,
+/// and a key hint. `side(p, i, row, right)` draws the right end of row `i`
+/// up to `right` and returns where the name must end. Returns the panel
+/// and each row shown, by index.
 fn list(
     p: &mut Vec<Prim>,
     l: &List,
     c: &Ui,
-    (w, h): (i32, i32),
+    a: Rect,
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
     mut side: impl FnMut(&mut Vec<Prim>, usize, Rect, i32) -> i32,
@@ -1046,11 +1047,11 @@ fn list(
     };
     let (pad, row_h, one) = (s(12.0), th + s(10.0), s(1.0).max(1));
     let shown = l.names.len().clamp(1, PICKER_ROWS) as i32;
-    let pw = s(l.width).min(w - s(32.0)).max(0);
+    let pw = s(l.width).min(a.w - s(32.0)).max(0);
     let ph = 2 * row_h + shown * row_h + s(12.0);
     let panel = Rect {
-        x: (w - pw) / 2,
-        y: s(56.0).min((h - ph) / 2).max(0),
+        x: a.x + (a.w - pw) / 2,
+        y: a.y + s(56.0).min((a.h - ph) / 2).max(0),
         w: pw,
         h: ph,
     };
@@ -1120,7 +1121,7 @@ fn picker(
     p: &mut Vec<Prim>,
     pk: &Picker,
     c: &Ui,
-    size: (i32, i32),
+    a: Rect,
     s: impl Fn(f32) -> i32,
     cells: (i32, i32),
 ) {
@@ -1138,7 +1139,7 @@ fn picker(
     // background.
     let (sq, gap, one) = (s(8.0), s(4.0), s(1.0).max(1));
     let strip_w = 7 * sq + 8 * gap;
-    list(p, &l, c, size, &s, cells, |p, i, row, right| {
+    list(p, &l, c, a, &s, cells, |p, i, row, right| {
         let t = pk.items[i];
         let strip = Rect {
             x: right - strip_w,
@@ -1172,7 +1173,7 @@ fn commands(
     p: &mut Vec<Prim>,
     cm: &Commands,
     c: &Ui,
-    size: (i32, i32),
+    a: Rect,
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
 ) -> (Rect, Vec<(usize, Rect)>) {
@@ -1198,7 +1199,7 @@ fn commands(
             width: 460.0,
         },
     };
-    list(p, &l, c, size, s, (tw, th), |p, i, row, right| {
+    list(p, &l, c, a, s, (tw, th), |p, i, row, right| {
         let keys = &cm.items[i].1;
         let x = right - text_w(keys, tw);
         p.push(Prim::Text {
@@ -1231,7 +1232,7 @@ fn settings(
     p: &mut Vec<Prim>,
     st: &Settings,
     c: &Ui,
-    (w, h): (i32, i32),
+    a: Rect,
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
 ) -> SettingsHits {
@@ -1271,7 +1272,7 @@ fn settings(
     let help_h = s(10.0) + 3 * help_line + gap;
     // Everything but the list: border, search line, rules, help and hint.
     let fixed = 2 * one + head_h + one + 2 * gap + one + help_h + line_h;
-    let room = (h - s(48.0) - fixed) / line_h.max(1);
+    let room = (a.h - s(48.0) - fixed) / line_h.max(1);
     let shown = room.clamp(1, lines.len().max(1) as i32) as usize;
     // Scroll as little as shows the highlight, and its group's heading
     // when there is room.
@@ -1286,11 +1287,11 @@ fn settings(
     let first = (st.top.min(lines.len().saturating_sub(shown)).min(head))
         .max((at + 1).saturating_sub(shown));
 
-    let pw = s(600.0).min(w - s(32.0)).max(0);
+    let pw = s(600.0).min(a.w - s(32.0)).max(0);
     let ph = fixed + shown as i32 * line_h;
     let panel = Rect {
-        x: (w - pw) / 2,
-        y: s(48.0).min((h - ph) / 2).max(0),
+        x: a.x + (a.w - pw) / 2,
+        y: a.y + s(48.0).min((a.h - ph) / 2).max(0),
         w: pw,
         h: ph,
     };
@@ -2562,6 +2563,36 @@ mod tests {
                 .all(|&(_, row, ctl)| { inside(row, hits.panel) && inside(ctl, row) && ctl.w > 0 })
         );
         assert_eq!(hits.top, 0);
+    }
+
+    #[test]
+    fn panels_sit_over_the_panes_not_the_sidebar() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.settings = Some(Settings {
+            filter: "",
+            rows: setting_rows(),
+            sel: 0,
+            top: 0,
+            error: None,
+        });
+        m.commands = Some(Commands {
+            filter: "",
+            items: vec![("Split right", String::new())],
+            sel: 0,
+        });
+        let c = build(&m);
+        let a = area(&win, m.size, 1.0, false);
+        assert!(a.x > 0, "the sidebar is open");
+        let settings = c.settings.expect("settings").panel;
+        let commands = c.commands.expect("palette").0;
+        for p in [settings, commands] {
+            assert!(p.x > a.x && p.right() < a.right(), "{p:?} in {a:?}");
+            assert!(
+                (p.x - a.x - (a.right() - p.right())).abs() <= 1,
+                "centred: {p:?}"
+            );
+        }
     }
 
     #[test]
