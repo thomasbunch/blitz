@@ -121,7 +121,9 @@ at marks it as needing you until you look. Claude Code rings one when
 it waits for you if its settings have
 `"preferredNotifChannel": "terminal_bell"`. The hooks add what the title
 cannot show: a question waiting for you, the prompt and the reply under
-the session's name, and the conversation to resume.
+the session's name, and the conversation to resume. Only they raise a
+Windows notification or keep the PC awake: any program can ring a bell
+or set a title, and a bell only flashes the taskbar button.
 
 ### Session marks
 
@@ -248,7 +250,7 @@ there shows in the panel with what blitz uses instead.
 | `restore_session` | `true` | Reopen the last window's tabs, splits and folders |
 | `restore_claude` | `true` | Resume the Claude Code sessions they were running |
 | `restore_scrollback` | `false` | Save each pane's last 1000 lines when blitz closes and show them again above the new prompt. Off by default because old output can contain secrets |
-| `keep_awake` | `false` | Keep the PC from going to sleep by itself while a session is working |
+| `keep_awake` | `false` | Keep the PC from going to sleep by itself while Claude Code works in a session, as its hooks say |
 | `check_updates` | `true` | Look for a newer release |
 | `flash` | `true` | Flash the taskbar button when a session needs you |
 | `toasts` | `"needs-you"` | Windows notifications while blitz is in the background: `"needs-you"` for sessions that need you or failed, `"all"` for finished ones too, or `"off"`. Clicking one takes you to the session |
