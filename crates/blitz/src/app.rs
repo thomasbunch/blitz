@@ -4656,9 +4656,12 @@ fn placement(was: Geometry, now: Geometry, minimized: bool, fullscreen: bool) ->
     if !now.maximized {
         return now;
     }
-    let (cx, cy) = (was.x + was.w as i32 / 2, was.y + was.h as i32 / 2);
-    let there =
-        (now.x..now.x + now.w as i32).contains(&cx) && (now.y..now.y + now.h as i32).contains(&cy);
+    // In i64: `was` can come from the session file, at any size.
+    let inside = |at: i32, size: u32, room_at: i32, room: u32| {
+        let (room_at, mid) = (i64::from(room_at), i64::from(at) + i64::from(size) / 2);
+        (room_at..room_at + i64::from(room)).contains(&mid)
+    };
+    let there = inside(was.x, was.w, now.x, now.w) && inside(was.y, was.h, now.y, now.h);
     let was = Geometry {
         maximized: true,
         ..was
@@ -4666,7 +4669,9 @@ fn placement(was: Geometry, now: Geometry, minimized: bool, fullscreen: bool) ->
     if there {
         return was;
     }
-    let mid = |at: i32, room: u32, size: u32| at + (room as i32 - size as i32).max(0) / 2;
+    let mid = |at: i32, room: u32, size: u32| {
+        at.saturating_add(((i64::from(room) - i64::from(size)).max(0) / 2) as i32)
+    };
     Geometry {
         x: mid(now.x, now.w, was.w),
         y: mid(now.y, now.h, was.h),
@@ -6309,6 +6314,25 @@ mod tests {
         assert_eq!(left, at(560, 220, 800, 600, true));
         let again = placement(left, at(-8, -8, 1936, 1056, true), false, false);
         assert_eq!(again, left, "already there");
+        // A size from a damaged session file goes to the monitor too,
+        // without overflowing.
+        let huge = at(0, 0, 1 << 31, 600, true);
+        let now = at(2400, -8, 2576, 1416, true);
+        assert_eq!(
+            placement(huge, now, false, false),
+            at(2400, 400, 1 << 31, 600, true)
+        );
+        let far = at(-2_147_483_000, 0, 4_000_000_000, 600, true);
+        let now = at(-8, -8, 1936, 1056, true);
+        assert_eq!(
+            placement(far, now, false, false),
+            at(-8, 220, 4_000_000_000, 600, true)
+        );
+        let wide = at(i32::MAX, i32::MAX, u32::MAX, u32::MAX, true);
+        assert_eq!(
+            placement(wide, now, false, false),
+            at(-8, -8, u32::MAX, u32::MAX, true)
+        );
     }
 
     /// The smallest window still has room for the rail or the sidebar and
