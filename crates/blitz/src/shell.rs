@@ -5,13 +5,100 @@ use std::path::{Path, PathBuf};
 
 /// Finds the shell to start when none is configured: `pwsh.exe` on PATH,
 /// then the newest `%ProgramFiles%\PowerShell\<n>\pwsh.exe`, then Windows
-/// PowerShell, then `%ComSpec%`. Looked up once per run: the PATH walk
-/// stats every entry, and each new pane would repeat it.
+/// PowerShell, then `%ComSpec%`. Looked up for each pane, so one installed
+/// while blitz runs is found.
 pub fn detect() -> PathBuf {
-    static SHELL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    SHELL
-        .get_or_init(|| detect_with(|k| std::env::var_os(k)))
-        .clone()
+    detect_with(pane_var)
+}
+
+/// A variable as a new pane gets it: PATH from [`fresh_path`], the rest as
+/// blitz has them.
+pub fn pane_var(k: &str) -> Option<OsString> {
+    let var = std::env::var_os(k);
+    if !k.eq_ignore_ascii_case("PATH") {
+        return var;
+    }
+    let inherited = var.map(|v| v.to_string_lossy().into_owned());
+    fresh_path(registry_path(true), registry_path(false), inherited).map(Into::into)
+}
+
+/// PATH for a new pane: the system's Path, then the user's, as the registry
+/// holds them now, so a program installed while blitz runs is found; then
+/// the folders only `inherited`, blitz's own PATH, has, such as those of the
+/// developer prompt blitz was started from. Just `inherited` when the
+/// registry has neither.
+pub fn fresh_path(
+    machine: Option<String>,
+    user: Option<String>,
+    inherited: Option<String>,
+) -> Option<String> {
+    if machine.is_none() && user.is_none() {
+        return inherited;
+    }
+    let same = |a: &str, b: &str| {
+        let trim = |s: &str| s.trim_end_matches(['\\', '/']).to_lowercase();
+        trim(a) == trim(b)
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for dir in [&machine, &user, &inherited]
+        .into_iter()
+        .flatten()
+        .flat_map(|p| p.split(';'))
+    {
+        if !dir.is_empty() && !out.iter().any(|o| same(o, dir)) {
+            out.push(dir);
+        }
+    }
+    Some(out.join(";"))
+}
+
+/// The system's (`machine`) or the user's Path in the registry, with the
+/// variables in it expanded.
+#[cfg(windows)]
+fn registry_path(machine: bool) -> Option<String> {
+    use windows::Win32::Foundation::ERROR_MORE_DATA;
+    use windows::Win32::System::Registry::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    use windows::core::w;
+
+    let (key, sub) = if machine {
+        let sub = w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment");
+        (HKEY_LOCAL_MACHINE, sub)
+    } else {
+        (HKEY_CURRENT_USER, w!("Environment"))
+    };
+    let mut buf = vec![0u16; 2048];
+    // The value can grow between the size query and the read.
+    for _ in 0..4 {
+        let mut size = (buf.len() * 2) as u32;
+        // SAFETY: `buf` holds `size` bytes; both outlive the call. A
+        // REG_EXPAND_SZ value comes back expanded.
+        let r = unsafe {
+            RegGetValueW(
+                key,
+                sub,
+                w!("Path"),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr().cast()),
+                Some(&mut size),
+            )
+        };
+        if r == ERROR_MORE_DATA {
+            buf.resize((size as usize).div_ceil(2), 0);
+            continue;
+        }
+        r.ok().ok()?;
+        let units = &buf[..(size as usize / 2).min(buf.len())];
+        return Some(String::from_utf16_lossy(units).trim_end_matches('\0').into());
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn registry_path(_machine: bool) -> Option<String> {
+    None
 }
 
 /// [`detect`] with the environment supplied by the caller.
@@ -76,7 +163,7 @@ fn pwsh(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 /// The shells the settings panel offers, as (name, path): first the
 /// automatic choice, whose path is empty, then each one installed.
 pub fn choices() -> Vec<(String, String)> {
-    let found = installed_with(|k| std::env::var_os(k));
+    let found = installed_with(pane_var);
     let auto = detect();
     let name = (found.iter())
         .find(|(_, p)| Path::new(p) == auto)
@@ -418,6 +505,35 @@ mod tests {
             launch(" wsl.exe -d Ubuntu ", true, "t").cmdline,
             "wsl.exe -d Ubuntu"
         );
+    }
+
+    #[test]
+    fn new_panes_get_the_path_the_registry_holds_now() {
+        let s = |v: &str| Some(v.to_string());
+        // Git installed since blitz started is in the registry only, and a
+        // developer prompt's folder only in blitz's own PATH.
+        assert_eq!(
+            fresh_path(
+                s(r"C:\Windows\system32;C:\Program Files\Git\cmd"),
+                s(r"C:\Users\me\.cargo\bin;"),
+                s(r"C:\VS\bin;C:\WINDOWS\System32\;;C:\Users\me\.cargo\bin"),
+            ),
+            s(r"C:\Windows\system32;C:\Program Files\Git\cmd;C:\Users\me\.cargo\bin;C:\VS\bin")
+        );
+        assert_eq!(fresh_path(None, None, s("a;b")), s("a;b"));
+        assert_eq!(fresh_path(None, s("u"), None), s("u"));
+        assert_eq!(fresh_path(None, None, None), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_registry_path_comes_expanded() {
+        let p = registry_path(true).expect("the system's Path");
+        let p = p.to_lowercase();
+        assert!(p.contains(r"\system32"), "{p}");
+        assert!(!p.contains("%systemroot%"), "{p}");
+        let fresh = pane_var("path").expect("a PATH");
+        assert!(fresh.to_string_lossy().to_lowercase().contains(r"\system32"));
     }
 
     /// The setting once took only a path, written without quotes.

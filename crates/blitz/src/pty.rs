@@ -265,7 +265,7 @@ impl Pty {
         mut on_event: impl FnMut(PtyEvent<'_>, &Writer) + Send + 'static,
     ) -> io::Result<Pty> {
         let api = conpty().ok_or_else(|| io::Error::other("ConPTY is not available"))?;
-        let program = find_program(opts.cmdline, |k| std::env::var_os(k))?;
+        let program = find_program(opts.cmdline, crate::shell::pane_var)?;
         let (in_r, in_w) = pipe()?;
         let (out_r, out_w) = pipe()?;
         let size = COORD {
@@ -543,7 +543,8 @@ fn start(opts: &SpawnOpts, program: Option<&Path>, hpc: isize) -> io::Result<Own
         si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
         si.lpAttributeList = list;
 
-        let env = env_block(&child_env(std::env::vars_os(), opts.pane_id, opts.env));
+        let parent = with_path(std::env::vars_os(), crate::shell::pane_var("PATH"));
+        let env = env_block(&child_env(parent, opts.pane_id, opts.env));
         let mut cmd: Vec<u16> = opts.cmdline.encode_utf16().chain([0]).collect();
         let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
         let cwd = opts.cwd.map(wide);
@@ -572,6 +573,18 @@ fn start(opts: &SpawnOpts, program: Option<&Path>, hpc: isize) -> io::Result<Own
     // SAFETY: initialized above and no longer used.
     unsafe { DeleteProcThreadAttributeList(list) };
     result
+}
+
+/// `vars` with `path`, when there is one, in place of their PATH, whatever
+/// its case.
+fn with_path(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+    path: Option<OsString>,
+) -> impl Iterator<Item = (OsString, OsString)> {
+    let fresh = path.is_some();
+    (vars.into_iter())
+        .filter(move |(k, _)| !fresh || !k.eq_ignore_ascii_case("PATH"))
+        .chain(path.map(|p| ("Path".into(), p)))
 }
 
 /// Variables that describe the terminal the parent runs in. A child that
@@ -811,6 +824,19 @@ mod tests {
             .find(|(k, _)| k == "WSLENV")
             .map(|(_, v)| v.clone());
         assert_eq!(set, Some(format!("GOPATH/l:{ours}").into()));
+    }
+
+    #[test]
+    fn a_fresh_path_takes_the_place_of_blitz_own() {
+        let vars = || {
+            [("PATH", r"C:\old"), ("TEMP", r"C:\t")]
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        };
+        let got: Vec<_> = with_path(vars(), Some(r"C:\new".into())).collect();
+        let want = [("TEMP", r"C:\t"), ("Path", r"C:\new")];
+        assert_eq!(got, want.map(|(k, v)| (k.into(), v.into())));
+        let kept: Vec<_> = with_path(vars(), None).collect();
+        assert_eq!(kept, vars());
     }
 
     #[test]
