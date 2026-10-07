@@ -37,7 +37,8 @@ jobs:
       # Releases only accept these licenses (cargo-about in release.yml).
       # Checking here fails the pull request that brings in a crate under
       # another license, or from anywhere but crates.io, instead of the
-      # next release.
+      # next release. Unlike cargo-about this also checks build
+      # dependencies, which cargo-deny cannot leave out.
       - name: Licenses and sources
         run: |
           cat > "$RUNNER_TEMP/deny.toml" <<'EOF'

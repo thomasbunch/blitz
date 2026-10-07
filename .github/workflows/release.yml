@@ -74,6 +74,7 @@ jobs:
           cp conpty/runtimes/win-x64/native/conpty.dll conpty/build/native/runtimes/x64/OpenConsole.exe "$d/"
           cp LICENSE "$d/LICENSE.txt"
 
+          # Keep accepted in step with the license allowlist in ci.yml.
           cat > "$RUNNER_TEMP/about.toml" <<'EOF'
           accepted = ["MIT", "Apache-2.0", "Zlib", "Unicode-3.0"]
           targets = ["x86_64-pc-windows-msvc"]
