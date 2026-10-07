@@ -101,6 +101,23 @@ fn the_alternate_screen_searches_only_itself() {
 }
 
 #[test]
+fn lines_keep_their_number_as_a_screen_without_scrollback_scrolls() {
+    let mut alt = term(20, 3, 100);
+    alt.feed(b"\x1b[?1049hfoo\r\nbar\r\nbaz");
+    let mut none = term(20, 3, 0);
+    none.feed(b"foo\r\nbar\r\nbaz");
+    for t in [&mut alt, &mut none] {
+        let epoch = t.line_epoch();
+        assert_eq!(t.find("baz"), [found((2, 0), (2, 2))]);
+        t.feed(b"\r\nqux");
+        assert_eq!(t.find("baz"), [found((2, 0), (2, 2))]);
+        assert_eq!(t.find("qux"), [found((3, 0), (3, 2))]);
+        assert_eq!(t.lines(), 1..4);
+        assert_eq!(t.line_epoch(), epoch);
+    }
+}
+
+#[test]
 fn snapshots_mark_the_matches_in_view() {
     let mut t = term(10, 2, 100);
     // Lines: "ab", "0123456789" wrapping into "ab", then "ab".

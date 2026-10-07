@@ -473,6 +473,11 @@ impl Grid {
             } else if let Some(mut row) = self.rows.remove(base + top as usize) {
                 row.reset(self.cols, blank);
                 self.rows.insert(base + bottom as usize, row);
+                // Every row moved up, as when the top one goes to
+                // scrollback, so each keeps its line number.
+                if base == 0 && top == 0 && bottom + 1 == self.lines {
+                    self.dropped += 1;
+                }
             }
         }
         self.trim();
