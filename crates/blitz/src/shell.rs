@@ -687,22 +687,30 @@ pub struct Launch {
 
 /// The program and arguments of a `shell` setting. A path to a program
 /// that holds spaces needs no quotes, as the setting once took only a path:
-/// the longest start of it, up to a space, that names a file is the
-/// program, and any arguments may follow. An unquoted path that names no
-/// file is all program, as it always was: cut at its first space, it would
-/// reach `CreateProcessW` unquoted, which then tries `C:\Program.exe` and
-/// the like.
+/// the longest start of it, up to a space, that names a program is the
+/// program, and any arguments may follow. A program has its extension: a
+/// start cut at a space, such as `D:\My` of a missing `D:\My Tools\nu.exe`,
+/// has none, so a file put there is never run. An unquoted path that names
+/// no program is all program, as it always was: cut at its first space, it
+/// would reach `CreateProcessW` unquoted, which then tries `C:\Program.exe`
+/// and the like.
 fn parts(shell: &str) -> (&str, &str) {
     let shell = shell.trim();
     let spaces = shell.rmatch_indices([' ', '\t']).map(|m| m.0);
-    let file = |&i: &usize| {
+    let program = |&i: &usize| {
         let p = Path::new(&shell[..i]);
-        p.is_absolute() && p.is_file()
+        let ext = p.extension().unwrap_or_default();
+        let runs = ["exe", "com", "bat", "cmd"]
+            .iter()
+            .any(|e| ext.eq_ignore_ascii_case(e));
+        // `\Program Files\...`, with no drive, is a path too.
+        p.has_root() && runs && p.is_file()
     };
     let unquoted = !shell.starts_with('"');
-    match (std::iter::once(shell.len()).chain(spaces)).find(|i| unquoted && file(i)) {
+    let path = (shell.split([' ', '\t']).next()).is_some_and(|w| w.contains(['\\', '/']));
+    match (std::iter::once(shell.len()).chain(spaces)).find(|i| unquoted && program(i)) {
         Some(i) => shell.split_at(i),
-        None if unquoted && Path::new(shell).is_absolute() => (shell, ""),
+        None if unquoted && path => (shell, ""),
         None => split_program(shell),
     }
 }
@@ -1048,6 +1056,25 @@ declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""#;
         let dir = std::env::temp_dir().join(format!("blitz no such {}", std::process::id()));
         let shell = format!("{} -i", dir.join("sh").display());
         assert_eq!(launch(&shell, true, "t", &[]).cmdline, quote(&shell));
+        // Without its drive, and from the current folder.
+        for shell in [
+            r"\Program Files\blitz no such\sh.exe -l",
+            r"tools\no such\sh -i",
+        ] {
+            assert_eq!(launch(shell, true, "t", &[]).cmdline, quote(shell));
+        }
+    }
+
+    /// A file put where a missing program's path is cut is not run.
+    #[test]
+    fn a_file_at_the_start_of_a_missing_path_is_not_the_program() {
+        let dir = std::env::temp_dir().join(format!("blitz plant {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("My"), b"").unwrap();
+        let shell = format!("{} -l", dir.join("My Tools").join("nu.exe").display());
+        let got = launch(&shell, true, "t", &[]).cmdline;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, quote(&shell));
     }
 
     #[test]
