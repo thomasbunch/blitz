@@ -10,8 +10,9 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 - With two or more sessions, a sidebar lists them with their directory,
   git branch and state: *needs you*, *working*, *done*, *error*.
   Ctrl+Shift+B collapses it to a narrow rail of status dots.
-- Claude Code hooks tell blitz when a session needs input or has
-  finished, and the taskbar button flashes if blitz is in the background.
+- Claude Code's title tells blitz when a session works and when it
+  stops, and its hooks when it needs input; the taskbar button flashes
+  if blitz is in the background.
 - Progress a program reports (OSC 9;4) shows in the sidebar and on the
   taskbar button.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
@@ -77,10 +78,29 @@ edits that file itself. The hooks run `blitz-hook.exe`, which does
 nothing when Claude Code runs outside blitz. Remove them before you move
 or uninstall blitz: Claude Code keeps running whatever is at that path.
 
+Without the hooks blitz still sees from Claude Code's title when a
+session starts working and when it stops, and a bell or a notification
+(OSC 9 or 777) marks it as needing you until you look. The hooks add
+what the title cannot show: a question waiting for you, the prompt and
+the reply under the session's name, and the conversation to resume.
+
+A question stays marked until you answer it by typing, pasting or
+clicking in its pane; looking only outlines it. Ctrl+Shift+J goes to
+questions you have not seen first, then those you have, then finished
+sessions, then failed ones. Half a minute without a key or mouse touch
+counts as away, even with blitz in front.
+
 ## Sessions
 
+A session running Claude Code goes by the task its title names, which
+Claude's `/rename` changes; others go by their program, with a number
+when two share a name. A tab goes by the folder of its focused pane.
+**Rename session** and **Rename tab** in the command palette name them
+yourself; an empty name goes back to the automatic one.
+
 Closing the window keeps its tabs, splits and folders, and blitz opens
-them again the next time it starts; so does an update. A pane that was
+them again the next time it starts; so does an update. Names you gave
+and results you had not seen yet come back too. A pane that was
 running Claude Code reopens the conversation with `claude --resume`
 once its shell is ready (this needs the hooks above). Typing `exit` in
 the last pane ends it all, and the next start is fresh. **Open in blitz**
@@ -116,7 +136,7 @@ writes it.
 | `restore_scrollback` | `false` | Save each pane's last 1000 lines when blitz closes and show them again above the new prompt. Off by default because old output can contain secrets |
 | `check_updates` | `true` | Look for a newer release |
 | `flash` | `true` | Flash the taskbar button when a session needs you |
-| `bell_attention` | `true` | Treat a bell in a background pane as needing you |
+| `bell_attention` | `true` | Treat a bell or a notification in a background pane as needing you |
 | `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
 | `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
 | `keybind` | | Binds a key to an action; one line per key. See [Key bindings](#key-bindings) |
@@ -240,8 +260,9 @@ pane, split or resize.
 
 The command palette lists every action with its keys. Typing narrows
 the list, the arrow keys choose, and Enter or a click runs the action;
-Esc closes it. Giving the panes equal space has no keys by default, so
-it is only in the palette.
+Esc closes it. Giving the panes equal space and renaming a session or a
+tab have no keys by default, so they are only in the palette; renaming
+takes the name on the palette's line.
 
 ## Key bindings
 
@@ -264,14 +285,15 @@ defaults stay; Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them.
 Lines blitz cannot read are skipped.
 
 The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
-`new_tab`, `close_pane`, `next_tab`, `previous_tab`, `split_right`,
-`split_down`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
-`jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
-`settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
-`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
-`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
-`fullscreen`, `command_palette`, `find`, `previous_prompt` and
-`next_prompt`. Typing a name in the command palette finds its action.
+`new_tab`, `close_pane`, `rename_session`, `rename_tab`, `next_tab`,
+`previous_tab`, `split_right`, `split_down`, `focus_left`,
+`focus_right`, `focus_up`, `focus_down`, `jump_to_attention`,
+`toggle_sidebar`, `update`, `theme_picker`, `settings`, `zoom`,
+`resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
+`swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
+`font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
+`find`, `previous_prompt` and `next_prompt`. Typing a name in the
+command palette finds its action.
 
 ## License
 
