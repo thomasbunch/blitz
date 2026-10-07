@@ -482,7 +482,9 @@ pub fn setup(args: &[String]) -> i32 {
         };
         eprintln!(
             "Merge the \"hooks\" below into ~/.claude/settings.json inside WSL.\n\
-             Claude Code picks the change up without a restart.\n"
+             Claude Code picks the change up without a restart. The path takes\n\
+             drives to be under /mnt/; where /etc/wsl.conf sets another automount\n\
+             root, put that in its place.\n"
         );
         print!("{}", claude_settings(&path));
         return 0;
