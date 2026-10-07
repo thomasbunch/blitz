@@ -591,7 +591,7 @@ fn evens(last: &mut Option<(Instant, Pos, u8)>, i: usize, now: Instant, within: 
     n == 2
 }
 
-/// Selected cells in the focused pane.
+/// Selected cells in a pane.
 struct Selection {
     drag: Drag,
     /// The first and last cell in reading order; a block's top-left and
@@ -690,6 +690,16 @@ fn in_view(
         false => (end.1, row(end.0)),
     };
     Some((a, b))
+}
+
+/// Marks in `snap`, a view from line `top`, what is drawn over the text:
+/// its pane's selection, which every pane keeps while another has focus,
+/// and the link under the pointer.
+fn mark(snap: &mut Snapshot, top: usize, sel: Option<&Selection>, hover: Option<(Pos, Pos)>) {
+    let size = (snap.cols, snap.rows);
+    snap.selection = sel.and_then(|s| in_view(s.start, s.end, s.drag.block, top, size));
+    snap.block = sel.is_some_and(|s| s.drag.block);
+    snap.hover = hover.and_then(|(a, b)| in_view(a, b, false, top, size));
 }
 
 /// The drawn text of a logical line, its rows joined where they wrap.
@@ -834,6 +844,8 @@ struct View {
     claude_working: Option<Instant>,
     /// A hook notification came, so Claude Code's hooks report.
     hooks_seen: bool,
+    /// Selected text, kept while another pane has focus.
+    selection: Option<Selection>,
 }
 
 impl View {
@@ -889,10 +901,8 @@ struct App {
     /// The number the next new session shows after its name.
     next_num: u32,
     focused: bool,
-    /// A selection in the focused pane.
-    selection: Option<Selection>,
-    /// The text of a selection that output rewrote, which Copy still
-    /// takes until the user does something else.
+    /// The text of a selection in the focused pane that output rewrote,
+    /// which Copy still takes until the user does something else.
     orphan: Option<String>,
     /// The link under the pointer while Ctrl is held, drawn underlined:
     /// the line epoch and its first and last cell.
@@ -1198,7 +1208,6 @@ impl App {
             next_id: 1,
             next_num: 1,
             focused: false,
-            selection: None,
             orphan: None,
             hover: None,
             mouse: Mouse::default(),
@@ -1567,6 +1576,7 @@ impl App {
             progress: None,
             claude_working: None,
             hooks_seen: false,
+            selection: None,
         });
         if let Some(text) = fell_back {
             // It covers the pane's last row, so it stays only until the
@@ -1635,14 +1645,13 @@ impl App {
     }
 
     /// Catches up after the focused pane may have changed: focus reports,
-    /// attention, the selection, the find bar and the window title.
+    /// attention, a drag, the find bar and the window title.
     fn focus_moved(&mut self, before: Option<PaneId>) {
         self.request_redraw();
         let now = self.focus_id();
         if now == before {
             return;
         }
-        self.selection = None;
         self.orphan = None;
         self.find = None;
         self.mouse.drag = None;
@@ -1696,6 +1705,10 @@ impl App {
 
     fn current(&self) -> Option<&View> {
         self.focus_id().and_then(|id| self.view(id))
+    }
+
+    fn current_mut(&mut self) -> Option<&mut View> {
+        self.focus_id().and_then(|id| self.view_mut(id))
     }
 
     /// Runs the `--selftest` script on its own thread; the app exits with
@@ -2671,16 +2684,18 @@ impl App {
     /// Sends input the user typed: the view follows the cursor again, and
     /// it answers what the session asked.
     fn typed(&mut self, bytes: Vec<u8>) {
-        if self.selection.take().is_some() {
+        let Some(v) = self.current_mut() else {
+            return;
+        };
+        let selected = v.selection.take().is_some();
+        lock(&v.pane.term).scroll_viewport(isize::MIN);
+        v.pane.send(bytes);
+        let id = v.pane.id;
+        if selected {
             self.request_redraw();
         }
         self.orphan = None;
-        if let Some(v) = self.current() {
-            lock(&v.pane.term).scroll_viewport(isize::MIN);
-            v.pane.send(bytes);
-            let id = v.pane.id;
-            self.answered(id);
-        }
+        self.answered(id);
     }
 
     /// The user typed, pasted or clicked into session `id`. A question it
@@ -2748,8 +2763,8 @@ impl App {
     /// Whether the selection shows in the focused pane's view, when there
     /// is one.
     fn selection_shown(&self) -> Option<bool> {
-        let s = self.selection.as_ref()?;
         let v = self.current()?;
+        let s = v.selection.as_ref()?;
         let top = lock(&v.pane.term).view_top();
         Some(in_view(s.start, s.end, s.drag.block, top, v.grid).is_some())
     }
@@ -2765,7 +2780,7 @@ impl App {
         };
         let id = v.pane.id;
         let term = lock(&v.pane.term);
-        let (text, rewritten) = match self.selection.as_ref().filter(|s| s.kept(&term)) {
+        let (text, rewritten) = match v.selection.as_ref().filter(|s| s.kept(&term)) {
             Some(sel) => (selection_text(&term, &self.theme.pal, sel, 0), false),
             None => match &self.orphan {
                 Some(t) => (t.clone(), true),
@@ -2781,7 +2796,9 @@ impl App {
         let owner = Some(HWND(self.hwnd as *mut c_void));
         let copied = crate::clipboard::set_text(owner, &text);
         if copied {
-            self.selection = None;
+            if let Some(v) = self.current_mut() {
+                v.selection = None;
+            }
             self.orphan = None;
         }
         self.notice_copy(id, copy_notice(&text, copied, rewritten), copied);
@@ -3837,7 +3854,7 @@ impl App {
             return;
         };
         self.orphan = None;
-        let held = self.selection.as_ref().map(|s| s.drag);
+        let held = (self.current()).and_then(|v| Some(v.selection.as_ref()?.drag));
         if let Some(drag) = held.filter(|d| extend && d.epoch == epoch) {
             self.mouse.drag = Some(drag);
             self.extend_drag();
@@ -3855,7 +3872,11 @@ impl App {
         };
         let drag = Drag::new(&lock(&v.pane.term), &self.theme.pal, here, unit, block);
         self.mouse.drag = Some(drag);
-        if self.selection.take().is_some() {
+        if self
+            .current_mut()
+            .and_then(|v| v.selection.take())
+            .is_some()
+        {
             self.request_redraw();
         }
         // A double or triple click selects at once.
@@ -3879,13 +3900,16 @@ impl App {
             return;
         }
         let head = (term.view_top() + usize::from(row), col);
-        if self.selection.is_none() && drag.unit == 1 && head == drag.anchor.0 {
+        if v.selection.is_none() && drag.unit == 1 && head == drag.anchor.0 {
             return;
         }
         let s = Selection::new(&term, &self.theme.pal, drag, head);
         drop(term);
-        if self.selection.as_ref().map(|o| (o.start, o.end)) != Some((s.start, s.end)) {
-            self.selection = Some(s);
+        let Some(v) = self.current_mut() else {
+            return;
+        };
+        if v.selection.as_ref().map(|o| (o.start, o.end)) != Some((s.start, s.end)) {
+            v.selection = Some(s);
             self.request_redraw();
         }
     }
@@ -4201,12 +4225,18 @@ impl App {
                 }
             }
             v.rect = Some(rect);
-            let sel = self.selection.as_mut().filter(|_| Some(id) == focus);
             let mut term = lock(&v.pane.term);
             v.sync_until = term.sync_deadline();
-            if !refresh(&mut term, &mut v.snap, &self.theme.pal, sel) {
-                let lost = self.selection.take();
-                self.orphan = lost.and_then(|s| s.last_text(&term, &self.theme.pal));
+            if !refresh(
+                &mut term,
+                &mut v.snap,
+                &self.theme.pal,
+                v.selection.as_mut(),
+            ) {
+                let lost = v.selection.take();
+                if Some(id) == focus {
+                    self.orphan = lost.and_then(|s| s.last_text(&term, &self.theme.pal));
+                }
             }
             v.snap.highlights.clear();
             if let Some(f) = find {
@@ -4218,15 +4248,12 @@ impl App {
                 }
                 v.snap.highlight(&f.found, f.cur);
             }
-            if Some(id) == focus {
-                let (top, size) = (term.view_top(), (v.snap.cols, v.snap.rows));
-                let sel = self.selection.as_ref();
-                v.snap.selection =
-                    sel.and_then(|s| in_view(s.start, s.end, s.drag.block, top, size));
-                v.snap.block = sel.is_some_and(|s| s.drag.block);
-                let hover = self.hover.filter(|h| h.0 == term.line_epoch());
-                v.snap.hover = hover.and_then(|(_, a, b)| in_view(a, b, false, top, size));
-            } else if chrome::dims(split, v.pane.attn.state) {
+            // Only the focused pane has a link under the pointer.
+            let hover = (self.hover)
+                .filter(|h| Some(id) == focus && h.0 == term.line_epoch())
+                .map(|(_, a, b)| (a, b));
+            mark(&mut v.snap, term.view_top(), v.selection.as_ref(), hover);
+            if Some(id) != focus && chrome::dims(split, v.pane.attn.state) {
                 dimmed.push(id);
             }
         }
@@ -6352,6 +6379,27 @@ mod tests {
         t.feed(b"\x1b[?1049h\x1b[?1049l\x1b[!pPS> ");
         assert!(refresh(&mut t, &mut s, &pal, Some(&mut sel)));
         assert_eq!(selection_text(&t, &pal, &sel, 0), "a b");
+    }
+
+    #[test]
+    fn app_every_pane_shows_its_own_selection() {
+        let pal = crate::theme::dark();
+        let (a, b) = (fed(10, 2, "one\r\ntwo"), fed(10, 2, "three"));
+        let (sa, sb) = (select(&a, (0, 0), (0, 2)), select(&b, (0, 1), (0, 3)));
+        let (mut snap_a, mut snap_b) = (Snapshot::default(), Snapshot::default());
+        let (mut a, mut b) = (a, b);
+        a.snapshot(&mut snap_a, &pal);
+        b.snapshot(&mut snap_b, &pal);
+        // Pane a has focus and the pointer on a link; pane b keeps its
+        // selection all the same.
+        mark(&mut snap_a, 0, Some(&sa), Some(((1, 0), (1, 2))));
+        mark(&mut snap_b, 0, Some(&sb), None);
+        assert_eq!(snap_a.selection, Some(((0, 0), (2, 0))));
+        assert_eq!(snap_a.hover, Some(((0, 1), (2, 1))));
+        assert_eq!(snap_b.selection, Some(((1, 0), (3, 0))));
+        assert_eq!(snap_b.hover, None);
+        mark(&mut snap_b, 0, None, None);
+        assert_eq!(snap_b.selection, None);
     }
 
     #[test]
