@@ -94,16 +94,8 @@ pub fn text_snapshot(text: &str, cols: u16, rows: u16, pal: &Palette) -> Snapsho
     }
 }
 
-/// Draws a pane without focus at reduced contrast: each cell's text moves a
-/// quarter of the way to its background. The cursor is hidden.
-pub fn dim(snap: &mut Snapshot) {
-    for c in &mut snap.cells {
-        c.fg = toward(c.fg, c.bg);
-    }
-    snap.cursor = None;
-}
-
-/// `fg` a quarter of the way to `bg`.
+/// `fg` a quarter of the way to `bg`: text in a pane without focus.
+#[cfg(windows)]
 fn toward(fg: u32, bg: u32) -> u32 {
     let ch = |s: u32| {
         let (f, b) = ((fg >> s & 0xff) as i32, (bg >> s & 0xff) as i32);
@@ -270,8 +262,9 @@ mod gpu {
             self.grid(snap, pal, x, y, false);
         }
 
-        /// [`Self::snapshot`] as [`dim`] would leave it, without copying
-        /// the snapshot.
+        /// [`Self::snapshot`] for a pane without focus: text at reduced
+        /// contrast, each cell's moved a quarter of the way to its
+        /// background, and no cursor or selection.
         pub fn dimmed(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
             self.grid(snap, pal, x, y, true);
         }
@@ -361,10 +354,16 @@ mod gpu {
                     } else {
                         cl.fg
                     };
-                    if cl.attrs & attr::UNDERLINE != 0 {
-                        let w = u32::from(cl.width.max(1)) * cw;
-                        let uy = py(r) + self.font.underline_y;
-                        self.rect(px(c), uy, w, self.font.underline_h, fg);
+                    let w = u32::from(cl.width.max(1)) * cw;
+                    let f = &self.font;
+                    for (bit, y, h) in [
+                        (attr::UNDERLINE, f.underline_y, f.underline_h),
+                        (attr::STRIKE, f.strike_y, f.strike_h),
+                        (attr::OVERLINE, 0, f.underline_h),
+                    ] {
+                        if cl.attrs & bit != 0 {
+                            self.rect(px(c), py(r) + y, w, h, fg);
+                        }
                     }
                     if cl.width == 0 || cl.len == 0 {
                         continue;
@@ -855,18 +854,19 @@ mod gpu {
             }
             let mut snap = Snapshot::default();
             term.snapshot(&mut snap, &pal);
-            if id != web {
-                super::dim(&mut snap);
-            }
-            snaps.push((rect, snap));
+            snaps.push((id, rect, snap));
         }
         let chrome = chrome::build(&model);
 
         let target = r.gpu.offscreen(w, h)?;
         loop {
             r.begin();
-            for (rect, snap) in &snaps {
-                r.snapshot(snap, &pal, rect.x, rect.y);
+            for (id, rect, snap) in &snaps {
+                if *id == web {
+                    r.snapshot(snap, &pal, rect.x, rect.y);
+                } else {
+                    r.dimmed(snap, &pal, rect.x, rect.y);
+                }
             }
             r.chrome(&chrome);
             if !r.draw(&target.rtv, w, h, pal.bg)? && !r.pending() {
@@ -994,17 +994,137 @@ mod tests {
         assert_eq!(s.cells[14].len, 0);
     }
 
+    #[cfg(windows)]
     #[test]
     fn dim_keeps_three_quarters_of_the_contrast() {
-        let mut s = text_snapshot("ab", 2, 1, &pal());
-        s.cells[0].fg = 0xffffff;
-        s.cells[0].bg = 0x000000;
-        s.cells[1].fg = 0x000000;
-        s.cells[1].bg = 0xffffff;
-        s.cursor = Some((0, 0, vt::CursorShape::Block));
-        dim(&mut s);
-        assert_eq!((s.cells[0].fg, s.cells[1].fg), (0xbfbfbf, 0x404040));
-        assert_eq!(s.cursor, None);
+        assert_eq!(toward(0xffffff, 0x000000), 0xbfbfbf);
+        assert_eq!(toward(0x000000, 0xffffff), 0x404040);
+        // Each channel on its own, both ways.
+        assert_eq!(toward(0xff0080, 0x00ff80), 0xbf4080);
+        assert_eq!(toward(0x123456, 0x123456), 0x123456);
+    }
+
+    /// The colour of the pixel at (`x`, `y`) of `w`-wide BGRA pixels.
+    #[cfg(windows)]
+    fn pixel(px: &[u8], w: u32, x: u32, y: u32) -> u32 {
+        let i = ((y * w + x) * 4) as usize;
+        u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_unfocused_pane_hides_cursor_and_selection() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("\u{2588}  ", 3, 1, &p);
+        snap.cursor = Some((1, 0, vt::CursorShape::Block));
+        snap.selection = Some(((2, 0), (2, 0)));
+        let (cw, ch) = r.cell();
+        let (w, h) = (3 * cw, ch);
+        let t = r.gpu.offscreen(w, h).expect("target");
+        r.begin();
+        r.dimmed(&snap, &p, 0, 0);
+        r.draw(&t.rtv, w, h, p.bg).expect("draw");
+        let px = r.gpu.read(&t).expect("read");
+        let mid = ch / 2;
+        assert_eq!(
+            pixel(&px, w, cw / 2, mid),
+            toward(p.fg, p.bg),
+            "text dimmed"
+        );
+        assert_eq!(pixel(&px, w, cw + cw / 2, mid), p.bg, "no cursor");
+        assert_eq!(pixel(&px, w, 2 * cw + cw / 2, mid), p.bg, "no selection");
+        // The same snapshot with focus shows both.
+        r.begin();
+        r.snapshot(&snap, &p, 0, 0);
+        r.draw(&t.rtv, w, h, p.bg).expect("draw");
+        let px = r.gpu.read(&t).expect("read");
+        assert_eq!(pixel(&px, w, cw / 2, mid), p.fg);
+        assert_eq!(pixel(&px, w, cw + cw / 2, mid), p.cursor);
+        assert_eq!(pixel(&px, w, 2 * cw + cw / 2, mid), p.selection_bg);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_glyph_under_a_block_cursor_takes_the_background() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("\u{2588}\u{2588}", 2, 1, &p);
+        snap.cursor = Some((0, 0, vt::CursorShape::Block));
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        assert_eq!(
+            pixel(&px, w, cw / 2, ch / 2),
+            p.bg,
+            "the block shows through"
+        );
+        assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), p.fg);
+        // An underline cursor leaves the glyph its colour.
+        snap.cursor = Some((0, 0, vt::CursorShape::Underline));
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert_eq!(pixel(&px, w, cw / 2, ch / 2), p.fg);
+        // A cursor off the grid is not drawn.
+        snap.cursor = Some((5, 0, vt::CursorShape::Block));
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert_eq!(pixel(&px, w, cw / 2, ch / 2), p.fg);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_strike_and_overline_cross_the_cell() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        // Through the terminal, so the attributes come from SGR.
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 4,
+            rows: 1,
+            ..vt::Options::default()
+        });
+        t.feed(b"\x1b[9m  \x1b[29;53m \x1b[55m \x1b[?25l");
+        let mut snap = Snapshot::default();
+        t.snapshot(&mut snap, &p);
+        assert_eq!(snap.cursor, None);
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let (sy, oy) = (r.font.strike_y as u32, 0);
+        for x in [1, cw / 2, 2 * cw - 2] {
+            assert_eq!(pixel(&px, w, x, sy), p.fg, "strike at x {x}");
+        }
+        assert_eq!(pixel(&px, w, 1, oy), p.bg, "no overline under SGR 9");
+        assert_eq!(pixel(&px, w, 2 * cw + 1, oy), p.fg, "overline");
+        assert_eq!(
+            pixel(&px, w, 2 * cw + 1, sy),
+            p.bg,
+            "SGR 29 ends the strike"
+        );
+        assert_eq!(
+            pixel(&px, w, 3 * cw + 1, oy),
+            p.bg,
+            "SGR 55 ends the overline"
+        );
+        assert_eq!(pixel(&px, w, cw / 2, ch - 1), p.bg, "no underline");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_set_font_draws_at_the_new_size() {
+        let p = pal();
+        let snap = text_snapshot("\u{2588}", 1, 1, &p);
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        render_offscreen(&mut r, &snap, &p).expect("render");
+        let small = r.cell();
+        r.set_font("", 24.0).expect("font");
+        assert!(r.cell().1 > small.1, "{:?} after {small:?}", r.cell());
+        let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert_eq!((w, h), r.cell());
+        // The block was drawn again at the new size, not taken from the
+        // atlas at the old one.
+        assert_eq!(pixel(&px, w, w - 1, h - 1), p.fg, "bottom right");
+        assert_eq!(pixel(&px, w, 0, 0), p.fg, "top left");
+        // A family that is not installed falls back to the defaults.
+        r.set_font("No Such Font 4b1d", 16.0)
+            .expect("fallback font");
+        assert_eq!(r.cell(), small);
     }
 
     #[test]

@@ -53,6 +53,9 @@ pub struct Font {
     /// Top of the underline, from the top of the cell.
     pub underline_y: i32,
     pub underline_h: u32,
+    /// Top of the strikethrough line, from the top of the cell.
+    pub strike_y: i32,
+    pub strike_h: u32,
     /// Text gamma and grayscale contrast boost from the system's
     /// "Adjust ClearType text" settings, applied by the shader.
     pub gamma: f32,
@@ -166,6 +169,16 @@ impl Font {
             let underline_h = (f32::from(m.underlineThickness) * scale).round().max(1.0) as u32;
             let underline_y = (baseline - (f32::from(m.underlinePosition) * scale).round() as i32)
                 .min(cell_h as i32 - underline_h as i32);
+            // The font's position is the top of the line, above the
+            // baseline; through the middle of a lowercase x without one.
+            let strike_h = (f32::from(m.strikethroughThickness) * scale)
+                .round()
+                .max(1.0) as u32;
+            let strike_up = match m.strikethroughPosition {
+                0 => f32::from(m.xHeight) * scale / 2.0 + strike_h as f32 / 2.0,
+                p => f32::from(p) * scale,
+            };
+            let strike_y = (baseline - strike_up.round() as i32).clamp(0, baseline - 1);
             let (gamma, contrast) = factory
                 .CreateRenderingParams()
                 .and_then(|p| p.cast::<IDWriteRenderingParams1>())
@@ -184,6 +197,8 @@ impl Font {
                 baseline,
                 underline_y,
                 underline_h,
+                strike_y,
+                strike_h,
                 gamma,
                 contrast,
                 fallbacks: HashMap::new(),
@@ -495,6 +510,17 @@ mod tests {
         assert!((15..=24).contains(&font.cell_h), "cell_h {}", font.cell_h);
         assert!(font.baseline > 0 && font.baseline < font.cell_h as i32);
         assert!((1.0..=3.0).contains(&font.gamma) && font.contrast >= 0.0);
+        // Underline below the baseline, strikethrough above it and below
+        // the top of the cell, both inside the cell.
+        let bottom = font.cell_h as i32;
+        assert!(font.underline_y >= font.baseline - 1 && font.underline_y < bottom);
+        assert!(font.underline_y + font.underline_h as i32 <= bottom);
+        assert!(
+            font.strike_y > 0 && font.strike_y < font.baseline,
+            "{}",
+            font.strike_y
+        );
+        assert!(font.strike_h >= 1 && font.strike_h <= font.underline_h + 2);
         let a = font.raster("A", 0, 1).expect("raster").expect("ink");
         assert!(ink(&a) > 0);
         // The glyph sits inside its cell, on the baseline.

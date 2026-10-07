@@ -1503,6 +1503,8 @@ fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> R
         (attr::UNDERLINE, snapshot::attr::UNDERLINE),
         (attr::INVERSE, snapshot::attr::INVERSE),
         (attr::DIM, snapshot::attr::DIM),
+        (attr::STRIKE, snapshot::attr::STRIKE),
+        (attr::OVERLINE, snapshot::attr::OVERLINE),
     ] {
         if a & from != 0 {
             attrs |= to;

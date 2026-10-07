@@ -43,6 +43,8 @@ pub mod attr {
     pub const UNDERLINE: u16 = 1 << 2;
     pub const INVERSE: u16 = 1 << 3;
     pub const DIM: u16 = 1 << 4;
+    pub const STRIKE: u16 = 1 << 5;
+    pub const OVERLINE: u16 = 1 << 6;
 }
 
 /// One cell with its colours already resolved through the palette.
@@ -78,4 +80,44 @@ pub struct Snapshot {
     pub alt_screen: bool,
     /// Start and end (column, row), inclusive.
     pub selection: Option<((u16, u16), (u16, u16))>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Options, Terminal};
+
+    #[test]
+    fn line_attributes_reach_the_snapshot() {
+        let pal = Palette {
+            fg: 0xffffff,
+            bg: 0,
+            cursor: 0xff0000,
+            selection_bg: 0x00ff00,
+            ansi: [0x808080; 16],
+        };
+        let mut t = Terminal::new(Options {
+            cols: 6,
+            rows: 1,
+            ..Options::default()
+        });
+        t.feed(b"\x1b[9ma\x1b[53mb\x1b[29mc\x1b[55;4md\x1b[0;9;53;4me\x1b[0mf");
+        let mut s = Snapshot::default();
+        t.snapshot(&mut s, &pal);
+        let attrs: Vec<u16> = s.cells.iter().map(|c| c.attrs).collect();
+        let (st, ov, ul) = (attr::STRIKE, attr::OVERLINE, attr::UNDERLINE);
+        assert_eq!(attrs, [st, st | ov, ov, ul, st | ov | ul, 0]);
+        // Each bit is its own.
+        let bits = [
+            attr::BOLD,
+            attr::ITALIC,
+            attr::UNDERLINE,
+            attr::INVERSE,
+            attr::DIM,
+            attr::STRIKE,
+            attr::OVERLINE,
+        ];
+        let all = bits.iter().fold(0, |a, b| a | b);
+        assert_eq!(all.count_ones() as usize, bits.len());
+    }
 }
