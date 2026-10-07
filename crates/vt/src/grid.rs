@@ -272,18 +272,28 @@ impl Row {
 
     /// Appends the row's text: blanks as spaces, wide characters once.
     pub fn push_text(&self, out: &mut String) {
-        for (x, c) in self.cells.iter().enumerate() {
-            if c.has(cf::SPACER_TAIL | cf::SPACER_HEAD) {
-                continue;
-            }
-            out.push(match c.cp {
-                0 => ' ',
-                cp => char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
-            });
-            if c.has(cf::GRAPHEME) {
-                out.push_str(self.grapheme(x as u16).unwrap_or_default());
-            }
-        }
+        out.extend(self.chars(self.cells.len()).map(|(_, ch)| ch));
+    }
+
+    /// The text of the row's first `end` cells as [`Self::push_text`]
+    /// writes it, each character with the column it is in.
+    fn chars(&self, end: usize) -> impl Iterator<Item = (u16, char)> + '_ {
+        (self.cells[..end].iter().enumerate())
+            .filter(|(_, c)| !c.has(cf::SPACER_TAIL | cf::SPACER_HEAD))
+            .flat_map(move |(x, c)| {
+                let first = match c.cp {
+                    0 => ' ',
+                    cp => char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
+                };
+                let rest = if c.has(cf::GRAPHEME) {
+                    self.grapheme(x as u16).unwrap_or_default()
+                } else {
+                    ""
+                };
+                std::iter::once(first)
+                    .chain(rest.chars())
+                    .map(move |ch| (x as u16, ch))
+            })
     }
 }
 
@@ -400,22 +410,9 @@ impl Grid {
                 text_len(&row.cells)
             };
             starts.push((text.len(), i));
-            for (x, c) in row.cells[..end].iter().enumerate() {
-                if c.has(cf::SPACER_TAIL | cf::SPACER_HEAD) {
-                    continue;
-                }
-                let ch = match c.cp {
-                    0 => ' ',
-                    cp => char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
-                };
+            for (x, ch) in row.chars(end) {
                 text.push(fold(ch));
-                cols.push(x as u16);
-                if c.has(cf::GRAPHEME) {
-                    for g in row.grapheme(x as u16).unwrap_or_default().chars() {
-                        text.push(fold(g));
-                        cols.push(x as u16);
-                    }
-                }
+                cols.push(x);
             }
             let cell = |k: usize| {
                 let r = starts[starts.partition_point(|s| s.0 <= k) - 1].1;
