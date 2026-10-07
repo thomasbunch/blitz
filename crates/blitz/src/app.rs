@@ -711,6 +711,7 @@ impl App {
         self.ensure_gfx();
 
         let mut win = layout::Window::default();
+        let mut lost = None;
         if let Some(s) = &saved {
             match self.restore(s) {
                 Ok(()) => win = self.win.clone(),
@@ -719,6 +720,7 @@ impl App {
                     // Keep it for the next start rather than saving this
                     // run's fresh tab over it.
                     self.persist = false;
+                    lost = Some(e);
                 }
             }
         }
@@ -733,6 +735,14 @@ impl App {
             win.active = win.tabs.len() - 1;
             let cmd = self.args.cmd.clone();
             self.open(win, id, cmd.as_deref(), cwd)?;
+            // Said where it is seen: the release build has no console. It
+            // stays, as nothing this window does is saved.
+            if let Some(e) = lost {
+                let text = format!(
+                    "The last session did not come back ({e}); it is kept for the next start, and this window is not saved"
+                );
+                self.set_notice(id, text, None, false);
+            }
         }
 
         if let Some(script) = self.args.selftest.clone() {
