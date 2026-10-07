@@ -51,12 +51,18 @@ fn run_hook(payload: &[u8], token: Option<&str>) -> (String, i32, std::io::Resul
 }
 
 fn notify(state: &str, msg: &str) -> String {
-    format!("{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:{state};{msg}\\u0007\"}}\n")
+    format!(
+        "{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:{state}:v2;{msg}\\u0007\"}}\n"
+    )
 }
 
 #[test]
 fn hook_prints_each_event() {
     let cases = [
+        (
+            r#"{"hook_event_name":"SessionStart","source":"startup"}"#,
+            notify("ready", ""),
+        ),
         (
             r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#,
             notify("working", "hi"),
@@ -165,6 +171,7 @@ fn in_pane(stdout: &str) -> Vec<(Ev, Option<String>)> {
 #[test]
 fn hook_states_reach_the_pane_with_their_session() {
     let cases = [
+        ("SessionStart", r#","source":"resume""#, Ev::Ready),
         ("UserPromptSubmit", "", Ev::Working),
         (
             "PermissionRequest",

@@ -40,6 +40,8 @@ pub enum Ev {
     /// The user typed, pasted or clicked into the pane, which answers what
     /// it asked.
     Answered,
+    /// Claude Code started and its hooks report. Changes nothing.
+    Ready,
 }
 
 impl Ev {
@@ -50,8 +52,10 @@ impl Ev {
     ///
     /// Newer hooks add the Claude Code session id, `blitz:<token>:done:<id>`,
     /// which comes back too. A title whose id is not a valid one is dropped.
+    /// The protocol stamp at the end, `:v2`, is read by [`notify_protocol`].
     pub fn from_notify<'a>(title: &'a str, token: &str) -> Option<(Ev, Option<&'a str>)> {
-        let rest = title
+        let rest = notify_protocol(title)
+            .0
             .strip_prefix("blitz:")?
             .strip_prefix(token)?
             .strip_prefix(':')?;
@@ -69,6 +73,7 @@ impl Ev {
             "done" => Ev::Done,
             "error" => Ev::Error { sticky: false },
             "idle" => Ev::Idle,
+            "ready" => Ev::Ready,
             _ => return None,
         };
         Some((ev, session))
@@ -96,6 +101,17 @@ pub fn claude_title(title: &str) -> Option<(bool, &str)> {
         _ => return None,
     };
     Some((working, chars.as_str().strip_prefix(' ')?.trim()))
+}
+
+/// A hook title without its protocol stamp, and the protocol: `N` from a
+/// `:vN` ending, or 1 for titles from before the stamp.
+pub fn notify_protocol(title: &str) -> (&str, u32) {
+    match title.rsplit_once(":v") {
+        Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            (head, n.parse().unwrap_or(u32::MAX))
+        }
+        _ => (title, 1),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +193,7 @@ impl PaneAttn {
             return false;
         }
         let next = match ev {
+            Ev::Ready => return false,
             Ev::Attended | Ev::Answered => match self.state {
                 NeedsYou if ev == Ev::Answered || self.bell => self.prev,
                 // Seen, but still waiting for an answer.
@@ -621,6 +638,8 @@ mod tests {
         assert_eq!(ev("done"), Some(Ev::Done));
         assert_eq!(ev("error"), Some(Ev::Error { sticky: false }));
         assert_eq!(ev("idle"), Some(Ev::Idle));
+        assert_eq!(ev("ready"), Some(Ev::Ready));
+        assert_eq!(ev("done:v2"), Some(Ev::Done));
         assert_eq!(ev("bogus"), None);
         assert_eq!(ev(""), None);
         assert_eq!(Ev::from_notify("Build finished", TOKEN), None);
@@ -653,6 +672,37 @@ mod tests {
             &format!("bogus:{SESSION}"),
         ] {
             assert_eq!(ev(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn notify_protocol_stamps() {
+        let t = format!("blitz:{TOKEN}:done:{SESSION}");
+        assert_eq!(notify_protocol(&t), (t.as_str(), 1));
+        assert_eq!(notify_protocol(&format!("{t}:v2")), (t.as_str(), 2));
+        assert_eq!(notify_protocol(&format!("{t}:v10")), (t.as_str(), 10));
+        // Not a stamp: kept, so the title is still checked whole.
+        for odd in [format!("{t}:v"), format!("{t}:vx"), format!("{t}:v2a")] {
+            assert_eq!(notify_protocol(&odd), (odd.as_str(), 1), "{odd}");
+            assert_eq!(Ev::from_notify(&odd, TOKEN), None, "{odd}");
+        }
+        assert_eq!(
+            Ev::from_notify(&format!("{t}:v2"), TOKEN),
+            Some((Ev::Done, Some(SESSION)))
+        );
+        assert_eq!(Ev::from_notify(&format!("{t}:v2:v2"), TOKEN), None);
+    }
+
+    /// Ready says the hooks report; whatever the session was doing, it
+    /// still is.
+    #[test]
+    fn ready_changes_nothing() {
+        for state in [Attn::Idle, Attn::Working, Attn::DoneUnseen, Attn::NeedsYou] {
+            for attended in [AWAY, HERE] {
+                let mut p = pane(state);
+                assert!(!p.apply(Ev::Ready, attended, Instant::now()), "{state:?}");
+                assert_eq!(p.state, state);
+            }
         }
     }
 

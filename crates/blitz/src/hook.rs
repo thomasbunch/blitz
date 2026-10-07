@@ -13,6 +13,10 @@ const MAX_MSG: usize = 120;
 /// What blitz shows for a claude.ai usage limit. The turn is over until
 /// the limit resets, which is not a failure.
 const USAGE_LIMIT: &str = "usage limit";
+/// The version of the titles blitz-hook writes, stamped at their end as
+/// `:v2`; titles without one are version 1. blitz can then tell a hook
+/// older than itself, which settings pasted long ago may still run.
+pub const PROTOCOL: u32 = 2;
 
 /// Entry point of `blitz-hook`. Always returns 0, so a hook can never block
 /// Claude Code.
@@ -52,10 +56,17 @@ pub fn run() -> i32 {
 pub fn claude_output(token: &str, payload: &str) -> Option<String> {
     let ev = Json::parse(payload.strip_prefix('\u{feff}').unwrap_or(payload))?;
     let (state, msg) = claude_state(&ev)?;
+    // A new or cleared session has nothing to resume before its first
+    // prompt.
+    let resumable = state != "ready"
+        || matches!(
+            ev.get("source").and_then(Json::as_str),
+            Some("resume" | "fork")
+        );
     let session = ev
         .get("session_id")
         .and_then(Json::as_str)
-        .filter(|id| is_session_id(id));
+        .filter(|id| resumable && is_session_id(id));
     Some(notify_json(token, state, session, &msg))
 }
 
@@ -67,7 +78,7 @@ pub fn is_session_id(id: &str) -> bool {
 }
 
 /// Maps a hook payload to a state (`working`, `needs-you`, `done`, `error`,
-/// `idle`) and a one-line message.
+/// `idle`, or `ready`, which changes none) and a one-line message.
 pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
     fn field<'a>(v: &'a Json, k: &str) -> &'a str {
         v.get(k).and_then(Json::as_str).unwrap_or("")
@@ -75,6 +86,8 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
     let tool = field(ev, "tool_name");
     let input = ev.get("tool_input").unwrap_or(&Json::Null);
     Some(match field(ev, "hook_event_name") {
+        // Claude Code is up and its hooks report.
+        "SessionStart" => ("ready", String::new()),
         // What the user asked, so the sidebar says what the turn is about.
         "UserPromptSubmit" => ("working", field(ev, "prompt").to_owned()),
         "PermissionRequest" => {
@@ -187,18 +200,22 @@ fn relative<'a>(path: &'a str, cwd: &str) -> &'a str {
     inside.filter(|rest| !rest.is_empty()).unwrap_or(path)
 }
 
-/// `{"terminalSequence":"ESC]777;notify;blitz:<token>:<state>;<msg>BEL"}`
-/// and a newline, with `:<session>` after the state when there is one. The
-/// message is made safe to embed first; the session must already pass
-/// `is_session_id`.
-pub fn notify_json(token: &str, state: &str, session: Option<&str>, msg: &str) -> String {
+/// `ESC]777;notify;blitz:<token>:<state>:v<PROTOCOL>;<msg>BEL`, with
+/// `:<session>` after the state when there is one. The message is made
+/// safe to embed first; the session must already pass `is_session_id`.
+pub fn notify_seq(token: &str, state: &str, session: Option<&str>, msg: &str) -> String {
     let session = session.map(|s| format!(":{s}")).unwrap_or_default();
-    let seq = format!(
-        "\x1b]777;notify;blitz:{token}:{state}{session};{}\x07",
+    format!(
+        "\x1b]777;notify;blitz:{token}:{state}{session}:v{PROTOCOL};{}\x07",
         one_line(msg)
-    );
+    )
+}
+
+/// [`notify_seq`] as hook output, `{"terminalSequence":"..."}` and a
+/// newline, for Claude Code to write to its terminal.
+pub fn notify_json(token: &str, state: &str, session: Option<&str>, msg: &str) -> String {
     let mut out = String::from("{\"terminalSequence\":\"");
-    escape_json(&seq, &mut out);
+    escape_json(&notify_seq(token, state, session, msg), &mut out);
     out.push_str("\"}\n");
     out
 }
@@ -226,7 +243,8 @@ fn one_line_max(s: &str, max: usize) -> String {
 }
 
 /// Claude Code events blitz hooks, with the matcher each one needs.
-const CLAUDE_HOOKS: [(&str, &str); 7] = [
+const CLAUDE_HOOKS: [(&str, &str); 8] = [
+    ("SessionStart", ""),
     ("UserPromptSubmit", ""),
     ("PermissionRequest", ""),
     ("PreToolUse", "^(AskUserQuestion|ExitPlanMode)$"),
@@ -667,7 +685,7 @@ pub fn escape_json(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attention::Ev;
+    use crate::attention::{Ev, notify_protocol};
 
     fn state(payload: &str) -> Option<(&'static str, String)> {
         claude_state(&Json::parse(payload).expect("valid test JSON"))
@@ -676,6 +694,10 @@ mod tests {
     #[test]
     fn claude_events() {
         let cases: &[(&str, Option<(&str, &str)>)] = &[
+            (
+                r#"{"hook_event_name":"SessionStart","source":"startup"}"#,
+                Some(("ready", "")),
+            ),
             (
                 r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#,
                 Some(("working", "hi")),
@@ -931,14 +953,51 @@ mod tests {
 
     #[test]
     fn every_state_is_an_attention_event() {
-        for s in ["working", "needs-you", "done", "error", "idle"] {
+        for s in ["working", "needs-you", "done", "error", "idle", "ready"] {
             let title = format!("blitz:{TOKEN}:{s}");
             assert!(Ev::from_notify(&title, TOKEN).is_some(), "{s}");
-            let title = format!("blitz:{TOKEN}:{s}:{SESSION}");
+            for title in [
+                format!("blitz:{TOKEN}:{s}:{SESSION}"),
+                format!("blitz:{TOKEN}:{s}:{SESSION}:v{PROTOCOL}"),
+            ] {
+                assert_eq!(
+                    Ev::from_notify(&title, TOKEN).and_then(|(_, id)| id),
+                    Some(SESSION),
+                    "{title}"
+                );
+            }
+            let out = notify_seq(TOKEN, s, None, "m");
+            let title = out.strip_prefix("\x1b]777;notify;").unwrap();
+            let title = title.split_once(';').unwrap().0;
+            assert!(Ev::from_notify(title, TOKEN).is_some(), "{title}");
+            assert_eq!(notify_protocol(title).1, PROTOCOL);
+        }
+    }
+
+    /// SessionStart says Claude Code's hooks report, and passes on the id
+    /// only of a session that has a conversation to resume.
+    #[test]
+    fn session_start_is_ready() {
+        let seq = |source: &str| {
+            let payload = format!(
+                r#"{{"hook_event_name":"SessionStart","source":"{source}","session_id":"{SESSION}"}}"#
+            );
+            let out = claude_output(TOKEN, &payload).unwrap();
+            let v = Json::parse(&out).unwrap();
+            (v.get("terminalSequence").and_then(Json::as_str))
+                .unwrap()
+                .to_owned()
+        };
+        for source in ["resume", "fork"] {
             assert_eq!(
-                Ev::from_notify(&title, TOKEN).and_then(|(_, id)| id),
-                Some(SESSION),
-                "{s}"
+                seq(source),
+                format!("\x1b]777;notify;blitz:{TOKEN}:ready:{SESSION}:v2;\x07")
+            );
+        }
+        for source in ["startup", "clear", "compact", ""] {
+            assert_eq!(
+                seq(source),
+                format!("\x1b]777;notify;blitz:{TOKEN}:ready:v2;\x07")
             );
         }
     }
@@ -948,14 +1007,14 @@ mod tests {
         assert_eq!(
             notify_json(TOKEN, "done", None, "All \"good\" \\ ok"),
             format!(
-                "{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:done;All \\\"good\\\" \\\\ ok\\u0007\"}}\n"
+                "{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:done:v2;All \\\"good\\\" \\\\ ok\\u0007\"}}\n"
             )
         );
         let out = claude_output(TOKEN, r#"{"hook_event_name":"SessionEnd"}"#).unwrap();
         let v = Json::parse(&out).unwrap();
         assert_eq!(
             v.get("terminalSequence").and_then(Json::as_str),
-            Some(format!("\x1b]777;notify;blitz:{TOKEN}:idle;\x07").as_str())
+            Some(format!("\x1b]777;notify;blitz:{TOKEN}:idle:v2;\x07").as_str())
         );
         assert_eq!(claude_output(TOKEN, "not json"), None);
     }
@@ -965,7 +1024,7 @@ mod tests {
     #[test]
     fn output_for_pretty_and_bom_payloads() {
         let want = Some(format!(
-            "{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:done;ok\\u0007\"}}\n"
+            "{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:done:v2;ok\\u0007\"}}\n"
         ));
         let pretty = "{\r\n  \"hook_event_name\": \"Stop\",\r\n  \"last_assistant_message\": \"ok\"\r\n}\r\n";
         assert_eq!(claude_output(TOKEN, pretty), want);
@@ -987,16 +1046,16 @@ mod tests {
             seq(&format!(
                 r#"{{"hook_event_name":"Stop","session_id":"{SESSION}","last_assistant_message":"ok"}}"#
             )),
-            format!("\x1b]777;notify;blitz:{TOKEN}:done:{SESSION};ok\x07")
+            format!("\x1b]777;notify;blitz:{TOKEN}:done:{SESSION}:v2;ok\x07")
         );
         // A bad id is dropped; the state still gets through.
         assert_eq!(
             seq(r#"{"hook_event_name":"SessionEnd","session_id":"x;rm -rf ~"}"#),
-            format!("\x1b]777;notify;blitz:{TOKEN}:idle;\x07")
+            format!("\x1b]777;notify;blitz:{TOKEN}:idle:v2;\x07")
         );
         assert_eq!(
             seq(r#"{"hook_event_name":"SessionEnd","session_id":7}"#),
-            format!("\x1b]777;notify;blitz:{TOKEN}:idle;\x07")
+            format!("\x1b]777;notify;blitz:{TOKEN}:idle:v2;\x07")
         );
     }
 
