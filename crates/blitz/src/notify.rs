@@ -361,8 +361,8 @@ mod tests {
         // SAFETY: the class name outlives the class, which this process
         // drops at exit.
         assert_ne!(unsafe { RegisterClassW(&wc) }, 0, "class");
-        // SAFETY: a plain hidden top-level window of that class.
         let make = || {
+            // SAFETY: a plain hidden top-level window of that class.
             unsafe {
                 CreateWindowExW(
                     WINDOW_EX_STYLE(0),

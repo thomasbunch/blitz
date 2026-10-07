@@ -9,21 +9,20 @@ use std::sync::{Mutex, PoisonError};
 /// PowerShell, then `%ComSpec%`. Looked up again when a new pane's PATH
 /// changed, so one installed while blitz runs is found.
 pub fn detect() -> PathBuf {
-    static LAST: Mutex<Option<(Option<OsString>, PathBuf)>> = Mutex::new(None);
+    static LAST: Memo<Option<OsString>, PathBuf> = Mutex::new(None);
     memo(&LAST, pane_var("PATH"), |path| {
         detect_with(pane_env(path.clone()))
     })
 }
 
+/// The last value [`memo`] made, and its key.
+type Memo<K, T> = Mutex<Option<(K, T)>>;
+
 /// `make(key)`, kept in `last` and made again only once `key` changed.
 /// Looking for a program stats a file in each PATH folder, which takes
 /// seconds on a network drive that is not there; the PATH changes when a
 /// program is installed.
-fn memo<K: PartialEq, T: Clone>(
-    last: &Mutex<Option<(K, T)>>,
-    key: K,
-    make: impl FnOnce(&K) -> T,
-) -> T {
+fn memo<K: PartialEq, T: Clone>(last: &Memo<K, T>, key: K, make: impl FnOnce(&K) -> T) -> T {
     let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((k, v)) = &*last
         && *k == key
@@ -330,7 +329,7 @@ fn pwsh(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 /// the automatic choice, whose setting is empty, then each one installed.
 pub fn choices() -> Vec<(String, String)> {
     type Found = Vec<(String, String)>;
-    static LAST: Mutex<Option<((Option<OsString>, Vec<String>), Found)>> = Mutex::new(None);
+    static LAST: Memo<(Option<OsString>, Vec<String>), Found> = Mutex::new(None);
     let key = (pane_var("PATH"), wsl_distros());
     let found = memo(&LAST, key, |(path, distros)| {
         installed_with(pane_env(path.clone()), distros.clone())

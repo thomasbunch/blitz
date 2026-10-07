@@ -3139,7 +3139,7 @@ impl App {
     /// an error or a question, which wait for a key, or one meant to stay.
     fn holds_notice(&self, id: PaneId) -> bool {
         let n = self.view(id).and_then(|v| v.notice.as_ref());
-        n.is_some_and(|n| stays(n))
+        n.is_some_and(stays)
     }
 
     /// Shows `text` in pane `id` until `ask` is answered or a key takes it
