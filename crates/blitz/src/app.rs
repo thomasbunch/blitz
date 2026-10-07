@@ -1809,12 +1809,16 @@ impl App {
         });
         launch.env.extend(plugin.clone());
         let start = |launch: &crate::shell::Launch| {
+            // The integration's own variables win over the user's.
+            let env: Vec<_> = (self.config.env.iter().cloned())
+                .chain(launch.env.iter().cloned())
+                .collect();
             let proxy = self.proxy.clone();
             Pane::spawn(
                 id,
                 &Spawn {
                     cmdline: &launch.cmdline,
-                    env: &launch.env,
+                    env: &env,
                     cwd: cwd.as_deref(),
                     cols: grid.0,
                     rows: grid.1,

@@ -61,6 +61,9 @@ pub struct Config {
     pub keys: Vec<keymap::Binding>,
     /// What `text:` bindings type, by [`keymap::Action::SendText`] index.
     pub texts: Vec<Vec<u8>>,
+    /// Variables from `env = NAME=VALUE` lines, one per name, for every
+    /// new pane's environment.
+    pub env: Vec<(String, String)>,
 }
 
 impl Default for Config {
@@ -89,6 +92,7 @@ impl Default for Config {
             editor_uri: String::new(),
             keys: Vec::new(),
             texts: Vec::new(),
+            env: Vec::new(),
         }
     }
 }
@@ -377,7 +381,8 @@ impl Config {
     /// Sets `key` from a value as `config.toml` holds it. Returns false,
     /// changing nothing, for an unknown key or a value of the wrong type or
     /// out of range. On/off and numbers must not be quoted; names may be.
-    /// Each `keybind` adds a binding, replacing only one for the same chord.
+    /// Each `keybind` adds a binding, replacing only one for the same chord,
+    /// and each `env` a variable, replacing only one of the same name.
     pub fn set(&mut self, key: &str, value: &str) -> bool {
         let text = unquote(value);
         let bare = text.is_none().then_some(value);
@@ -401,6 +406,14 @@ impl Config {
                 self.keys.retain(|k| (k.0, k.1) != (b.0, b.1));
                 self.keys.push(b);
             }
+            "env" => match text.split_once('=') {
+                Some((k, v)) if !k.trim().is_empty() && !text.contains(char::is_control) => {
+                    let k = k.trim();
+                    self.env.retain(|e| !e.0.eq_ignore_ascii_case(k));
+                    self.env.push((k.into(), v.into()));
+                }
+                _ => return false,
+            },
             "theme" | "font_family" if text.is_empty() => return false,
             "theme" => self.theme = text,
             "font_family" => self.font_family = text,
@@ -779,6 +792,25 @@ keybind = ctrl+shift+n=text:
     }
 
     #[test]
+    fn config_reads_variables_for_panes() {
+        let c = Config::parse(
+            "env = RUST_LOG=debug\n\
+             env = \"EDITOR=code --wait\" # mine\n\
+             env = rust_log=info\n\
+             env = EMPTY=\n\
+             env = =C:=x\n\
+             env = NOEQUALS\n",
+        );
+        // The last line for a name counts, whatever its case.
+        let want = [
+            ("EDITOR", "code --wait"),
+            ("rust_log", "info"),
+            ("EMPTY", ""),
+        ];
+        assert_eq!(c.env, want.map(|(k, v)| (k.to_string(), v.to_string())));
+    }
+
+    #[test]
     fn every_setting_reads_back_what_it_writes() {
         let mut c = Config::default();
         for s in SETTINGS.iter().filter(|s| s.kind != Kind::Game) {
@@ -956,8 +988,9 @@ scenery = stars
         }
         for line in readme.lines().filter(|l| l.starts_with("| `")) {
             let key = line[3..].split('`').next().unwrap_or_default();
-            // Key bindings are read too, though the panel does not show them.
-            let known = key == "keybind" || SETTINGS.iter().any(|s| s.key == key);
+            // Key bindings and variables are read too, though the panel does
+            // not show them.
+            let known = ["keybind", "env"].contains(&key) || SETTINGS.iter().any(|s| s.key == key);
             assert!(
                 known,
                 "README.md documents {key}, which blitz does not read"
