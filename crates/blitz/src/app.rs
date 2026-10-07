@@ -3296,6 +3296,9 @@ impl App {
         if selected {
             self.request_redraw();
         }
+        // ponytail: from when blitz handles the key, which leaves out
+        // its wait in the message queue
+        self.counters.typed(Instant::now());
         self.orphan = None;
         self.answered(id);
     }
@@ -3947,6 +3950,9 @@ impl App {
                 let shown = v.rect.is_some() || !events.is_empty();
                 for e in events {
                     self.on_term_event(id, e);
+                }
+                if self.focus_id() == Some(id) {
+                    self.counters.output();
                 }
                 if let Some(f) = self.find.as_mut().filter(|f| f.pane == id) {
                     f.stale = true;
@@ -5341,9 +5347,12 @@ impl App {
         })();
         self.counters.frame_cpu_ms += (started.elapsed() - waited).as_secs_f64() * 1000.0;
         match result {
-            Ok(_) => {
+            Ok(shown) => {
                 self.reveal(true);
                 self.counters.frames += 1;
+                if shown {
+                    self.counters.presented(Instant::now());
+                }
                 if self.counters.first_present_ms.is_none() {
                     self.counters.first_present_ms =
                         Some(self.started.elapsed().as_secs_f64() * 1000.0);
