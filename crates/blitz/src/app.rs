@@ -2812,6 +2812,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                // A key still held goes up in the other window, so its
+                // release never comes back to clear `eaten`.
+                if !f {
+                    self.eaten = None;
+                }
                 let mut out = Vec::new();
                 vt::encode_focus(f, &self.modes(), &mut out);
                 self.send(out);
