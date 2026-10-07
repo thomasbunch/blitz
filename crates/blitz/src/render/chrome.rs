@@ -387,7 +387,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
         let (pct, fill) = match pr {
             Some(Progress { state: 2, pct }) => (pct, c.error),
             Some(Progress { state: 3, .. }) => (None, super::mix(track.unwrap_or(c.track), fill)),
-            Some(Progress { state: 4, pct }) => (pct, c.accent),
+            Some(Progress { state: 4, pct }) => (pct, c.dim),
             Some(Progress { pct, .. }) => (pct, fill),
             None => (None, fill),
         };
@@ -1059,7 +1059,7 @@ fn list(
         let sel = i == l.sel;
         if sel {
             p.push(Prim::Rect(row, c.row_focus));
-            p.push(Prim::Rect(Rect { w: s(2.0), ..row }, c.accent));
+            p.push(Prim::Rect(Rect { w: s(2.0), ..row }, c.name));
         }
         let end = side(p, i, row, right);
         let color = if sel { c.name } else { c.msg };
@@ -1326,7 +1326,7 @@ fn settings(
                 let sel = i == st.sel;
                 if sel {
                     p.push(Prim::Rect(row, c.row_focus));
-                    p.push(Prim::Rect(Rect { w: s(2.0), ..row }, c.accent));
+                    p.push(Prim::Rect(Rect { w: s(2.0), ..row }, c.name));
                 }
                 // Changed from the default.
                 if r.changed {
@@ -1337,7 +1337,7 @@ fn settings(
                         w: d,
                         h: d,
                     };
-                    dot(p, mark, c.accent);
+                    dot(p, mark, c.dim);
                 }
                 let (lc, ty) = (if sel { c.name } else { c.msg }, mid(y, line_h));
                 text(p, left, ty, fit(r.label, pw / 2 - pad, tw), lc, sel);
@@ -1350,7 +1350,7 @@ fn settings(
                             w: sw,
                             h: sh,
                         };
-                        dot(p, track, if on { c.accent } else { c.track });
+                        dot(p, track, if on { c.fill } else { c.track });
                         let inset = (sh - knob) / 2;
                         let kx = if on {
                             track.right() - inset - knob
@@ -1363,7 +1363,7 @@ fn settings(
                             w: knob,
                             h: knob,
                         };
-                        dot(p, k, if on { c.chip_fg } else { c.dim });
+                        dot(p, k, if on { c.side_bg } else { c.dim });
                         track
                     }
                     None => {
@@ -2240,6 +2240,37 @@ mod tests {
             assert_eq!(marks(m.ui.error), vec![true; n], "square corners");
             assert_eq!(marks(m.ui.mark), vec![false; n], "round");
         }
+    }
+
+    #[test]
+    fn only_needs_you_is_amber() {
+        let (win, mut sessions, now) = fleet(true);
+        sessions[0].state = Attn::Working;
+        sessions[0].progress = Some(Progress {
+            state: 4,
+            pct: Some(30),
+        });
+        let mut m = model(&win, &sessions, now);
+        let mut rows = setting_rows();
+        rows[2].changed = true;
+        m.settings = Some(Settings {
+            filter: "",
+            rows,
+            sel: 2,
+            top: 0,
+            error: None,
+        });
+        m.commands = Some(Commands {
+            filter: "",
+            items: vec![("Split right", String::new())],
+            sel: 0,
+        });
+        let c = build(&m);
+        let amber = |p: &Prim| p_color(p) == m.ui.accent;
+        assert!(!c.prims.iter().any(amber), "nothing needs you");
+        sessions[0].state = Attn::NeedsYou;
+        let c = build(&model(&win, &sessions, now));
+        assert!(c.prims.iter().any(amber));
     }
 
     fn p_color(p: &Prim) -> u32 {
