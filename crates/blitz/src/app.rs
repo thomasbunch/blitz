@@ -265,9 +265,12 @@ fn hook(keys: &RefCell<Keys>, msg: &MSG) -> bool {
             let _ = unsafe { GetKeyboardState(&mut state) };
             let held = |vk: usize| state[vk] & 0x80 != 0;
             // The input method owns the key; winit turns it into IME events.
-            // Alt+F4 still closes the window.
-            if vk == VK_PROCESSKEY || vk == VK_F4 && held(0x12) && !held(0x11) && !held(0x10) {
+            if vk == VK_PROCESSKEY {
                 return false;
+            }
+            // Alt+F4 still closes the window.
+            if vk == VK_F4 && held(0x12) && !held(0x11) && !held(0x10) {
+                return !alt_f4_passes(down, msg.lParam.0);
             }
             if k.skipped(vk, down) {
                 return true;
@@ -430,6 +433,8 @@ enum Ask {
     Paste(String),
     ClosePane,
     Update,
+    /// Closing the window again confirms; any key takes it away.
+    Quit,
 }
 
 impl Ask {
@@ -443,6 +448,7 @@ impl Ask {
             Ask::Paste(_) => Action::Paste,
             Ask::ClosePane => Action::ClosePane,
             Ask::Update => Action::Update,
+            Ask::Quit => return true,
         };
         a != Some(by) && a != Some(Action::Palette)
     }
@@ -3999,6 +4005,23 @@ fn rings(bell_attention: bool, hooked: bool) -> bool {
     bell_attention && !hooked
 }
 
+/// "A session is working", or "3 sessions are busy", of the sessions
+/// that closing would cut short and what each is doing; `place` follows
+/// "session".
+fn busy_text(busy: &[&str], place: &str) -> String {
+    match busy {
+        [what] => format!("A session{place} is {what}"),
+        _ => format!("{} sessions{place} are busy", busy.len()),
+    }
+}
+
+/// Whether a key message for Alt+F4 goes on to Windows, which closes the
+/// window on a press: all but the auto-repeat of a held one, so holding it
+/// cannot answer the question a busy session asks.
+fn alt_f4_passes(down: bool, lparam: isize) -> bool {
+    !down || !keymap::held_before(lparam)
+}
+
 /// How to confirm action `a`: its first key again, or with none, the
 /// palette.
 fn again(a: Action, keys: &[keymap::Binding]) -> String {
@@ -4328,7 +4351,27 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            // Closing ends every session, so a busy one asks first.
+            WindowEvent::CloseRequested => {
+                let busy: Vec<_> = self.views.iter().filter_map(View::busy).collect();
+                match self.focus_id() {
+                    Some(id) if !busy.is_empty() && !self.answered(id, &Ask::Quit) => {
+                        let them = if busy.len() == 1 { "it" } else { "them" };
+                        let text = format!(
+                            "{}. Close the window again to end {them}",
+                            busy_text(&busy, "")
+                        );
+                        self.ask(id, text, Ask::Quit);
+                        // Closed from the taskbar: show the question.
+                        if let Some(w) = &self.window
+                            && w.is_minimized() == Some(true)
+                        {
+                            w.set_minimized(false);
+                        }
+                    }
+                    _ => el.exit(),
+                }
+            }
             WindowEvent::RedrawRequested => {
                 // Keys queued behind this paint go out before its vsync wait.
                 self.drain_keys(el);
@@ -5627,7 +5670,35 @@ mod tests {
             assert_eq!(Ask::Key.gone(None, here), here, "an error, read");
             assert_eq!(Ask::Key.gone(close, here), here);
             assert!(!Ask::Nothing.gone(None, here));
+            assert!(
+                Ask::Quit.gone(None, here),
+                "closing the window, then typing"
+            );
+            assert!(Ask::Quit.gone(Some(Action::Palette), here));
         }
+    }
+
+    #[test]
+    fn busy_sessions_by_what_they_do_or_how_many() {
+        assert_eq!(busy_text(&["working"], ""), "A session is working");
+        assert_eq!(
+            busy_text(&["running a command"], " in this tab"),
+            "A session in this tab is running a command"
+        );
+        assert_eq!(
+            busy_text(&["working", "waiting for you", "working"], ""),
+            "3 sessions are busy"
+        );
+    }
+
+    /// Holding Alt+F4 closes the window once, so a busy session's question
+    /// waits for a second, deliberate press.
+    #[test]
+    fn a_held_alt_f4_closes_once() {
+        let (first, repeat, up) = (0x003e_0001, 0x403e_0001, 0xc03e_0001_u32 as i32 as isize);
+        assert!(alt_f4_passes(true, first));
+        assert!(!alt_f4_passes(true, repeat));
+        assert!(alt_f4_passes(false, up));
     }
 
     #[test]
