@@ -121,9 +121,10 @@ at marks it as needing you until you look. Claude Code rings one when
 it waits for you if its settings have
 `"preferredNotifChannel": "terminal_bell"`. The hooks add what the title
 cannot show: a question waiting for you, the prompt and the reply under
-the session's name, and the conversation to resume. Only they raise a
-Windows notification or keep the PC awake: any program can ring a bell
-or set a title, and a bell only flashes the taskbar button.
+the session's name, and the conversation to resume. Only they, and a
+session that ends in an error, raise a Windows notification, and only
+they keep the PC awake: any program can ring a bell or set a title, so
+a bell alone flashes the taskbar button and no more.
 
 ### Session marks
 
