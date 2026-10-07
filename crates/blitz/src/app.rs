@@ -179,6 +179,14 @@ impl Args {
         Ok(a)
     }
 
+    /// A scripted or test run, which nobody watches.
+    fn scripted(&self) -> bool {
+        self.cmd.is_some()
+            || self.selftest.is_some()
+            || self.exit_after.is_some()
+            || self.capture.is_some()
+    }
+
     /// Takes what the blitz already running made of this launch, `None`
     /// when none runs. True when it took the launch, which is then done.
     /// One that runs but did not take it (it hung, or refused the folder)
@@ -203,11 +211,7 @@ pub fn run(args: &[String]) -> i32 {
     // A launch brings the blitz already running to the front, and a folder
     // opens as a tab there. Scripted and test launches always get a window
     // of their own.
-    let scripted = args.cmd.is_some()
-        || args.selftest.is_some()
-        || args.exit_after.is_some()
-        || args.capture.is_some();
-    if !args.new_window && !scripted {
+    if !args.new_window && !args.scripted() {
         let sent = crate::handoff::send(args.cwd.as_deref());
         if args.handed_off(sent) {
             return 0;
@@ -1060,12 +1064,7 @@ impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
         let config = Config::load();
         let theme = crate::theme::current(&config.theme);
-        let a = &args;
-        let persist = !a.new_window
-            && a.cmd.is_none()
-            && a.selftest.is_none()
-            && a.exit_after.is_none()
-            && a.capture.is_none();
+        let persist = !args.new_window && !args.scripted();
         App {
             args,
             config,
@@ -1354,41 +1353,64 @@ impl App {
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         // Not the token, which is a secret between the pane and its child.
         let key = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
+        let shell =
+            |program: &str| crate::shell::launch(program, self.config.shell_integration, &token);
         let mut launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
                 env: Vec::new(),
             },
-            None => crate::shell::launch(&self.config.shell, self.config.shell_integration, &token),
+            None => shell(&self.config.shell),
         };
         // Claude Code loads blitz's hooks from there, with nothing pasted
         // into its settings.
-        if let Some(dir) = &self.plugin {
+        let plugin = self.plugin.as_ref().map(|dir| {
             let inherited = std::env::var("CLAUDE_CODE_PLUGIN_DIRS").ok();
             let dirs = crate::hook::plugin_dirs(inherited.as_deref(), dir);
-            launch.env.push(("CLAUDE_CODE_PLUGIN_DIRS".into(), dirs));
-        }
-        let proxy = self.proxy.clone();
-        let mut pane = Pane::spawn(
-            id,
-            &Spawn {
-                cmdline: &launch.cmdline,
-                env: &launch.env,
-                cwd: cwd.as_deref(),
-                cols: grid.0,
-                rows: grid.1,
-                scrollback: self.config.scrollback_lines,
-                dark: !self.theme.light,
-                pal: self.theme.pal,
-                parent: Some(self.hwnd),
-                token: &token,
-                restored: &restored,
-            },
-            move |id, note| {
-                let _ = proxy.send_event(UserEvent::Pane(id, note));
-            },
-        )
-        .map_err(|e| format!("cannot start {}: {e}", launch.cmdline))?;
+            ("CLAUDE_CODE_PLUGIN_DIRS".to_owned(), dirs)
+        });
+        launch.env.extend(plugin.clone());
+        let start = |launch: &crate::shell::Launch| {
+            let proxy = self.proxy.clone();
+            Pane::spawn(
+                id,
+                &Spawn {
+                    cmdline: &launch.cmdline,
+                    env: &launch.env,
+                    cwd: cwd.as_deref(),
+                    cols: grid.0,
+                    rows: grid.1,
+                    scrollback: self.config.scrollback_lines,
+                    dark: !self.theme.light,
+                    pal: self.theme.pal,
+                    parent: Some(self.hwnd),
+                    token: &token,
+                    restored: &restored,
+                },
+                move |id, note| {
+                    let _ = proxy.send_event(UserEvent::Pane(id, note));
+                },
+            )
+        };
+        let mut fell_back = None;
+        let mut pane = match start(&launch) {
+            Ok(p) => p,
+            // A shell setting that names a missing or mistyped program would
+            // fail every pane, and blitz would close as it opened. The shell
+            // blitz finds runs instead, and the pane says why.
+            Err(e) if cmd.is_none() && !self.config.shell.is_empty() => {
+                let mut auto = shell("");
+                auto.env.extend(plugin);
+                let p =
+                    (start(&auto)).map_err(|e| format!("cannot start {}: {e}", auto.cmdline))?;
+                let keys = keymap::keys_for(Action::Settings, &self.config.keys);
+                let using = program_name(&auto.cmdline);
+                fell_back = Some(shell_failed(&self.config.shell, &e, &using, keys));
+                launch = auto;
+                p
+            }
+            Err(e) => return Err(format!("cannot start {}: {e}", launch.cmdline)),
+        };
         let (cw, ch) = self.cell();
         lock(&pane.term).set_cell_px(cw as u16, ch as u16);
         pane.name = program_name(&launch.cmdline);
@@ -1409,6 +1431,9 @@ impl App {
             claude_working: None,
             hooks_seen: false,
         });
+        if let Some(text) = fell_back {
+            self.set_notice(id, text, None, false);
+        }
         self.find_branch(id);
         self.next_id = self.next_id.max(id.0 + 1);
         Ok(())
@@ -4229,6 +4254,28 @@ fn resume_line(enabled: bool, claude: Option<&str>) -> Option<String> {
     Some(format!("claude --resume {id}\r"))
 }
 
+/// What a pane says after the `shell` setting failed to start with `err`
+/// and `using`, the shell blitz finds, started in its place. `keys` open
+/// the settings.
+fn shell_failed(
+    shell: &str,
+    err: &dyn std::fmt::Display,
+    using: &str,
+    keys: Option<String>,
+) -> String {
+    let fix = keys.map_or_else(String::new, |k| format!(" \u{b7} {k} settings"));
+    format!("The shell {shell} could not start ({err}); using {using}{fix}")
+}
+
+/// What blitz says when it cannot start at all, `e` being why: a GUI
+/// program has no console to print it to.
+fn start_failed(e: &str, config: Option<&Path>) -> String {
+    let file = config.map_or_else(String::new, |d| {
+        format!("\n\nSettings are in {}", d.join("config.toml").display())
+    });
+    format!("blitz could not start: {e}{file}")
+}
+
 /// The last `n` lines of `text`, without blank lines at either end.
 fn last_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.trim_matches('\n').lines().collect();
@@ -4425,6 +4472,19 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if let Err(e) = self.start(el) {
             eprintln!("blitz: {e}");
+            if !self.args.scripted() {
+                use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+                let text = start_failed(&e, crate::config::dir().as_deref());
+                // SAFETY: two strings that outlive the call, and no owner.
+                unsafe {
+                    MessageBoxW(
+                        None,
+                        &windows::core::HSTRING::from(text),
+                        &windows::core::HSTRING::from("blitz"),
+                        MB_OK | MB_ICONERROR,
+                    )
+                };
+            }
             self.code = 1;
             el.exit();
         }
@@ -5865,6 +5925,32 @@ mod tests {
         assert_eq!(c.sel, 0, "one match");
         c.filter = "zzz".into();
         assert!(c.matches().is_empty());
+    }
+
+    #[test]
+    fn a_shell_that_cannot_start_says_why_and_what_runs_instead() {
+        let err = std::io::Error::other("pwshh.exe is not on PATH");
+        let text = shell_failed("pwshh", &err, "pwsh", Some("Ctrl+,".into()));
+        assert_eq!(
+            text,
+            "The shell pwshh could not start (pwshh.exe is not on PATH); using pwsh \u{b7} Ctrl+, settings"
+        );
+        assert!(
+            !shell_failed("x", &err, "cmd", None).contains('\u{b7}'),
+            "unbound"
+        );
+    }
+
+    #[test]
+    fn a_failed_start_names_the_settings_file() {
+        let dir = Path::new(r"C:\Users\me\AppData\Roaming\blitz");
+        let text = start_failed("no window", Some(dir));
+        assert!(
+            text.starts_with("blitz could not start: no window"),
+            "{text}"
+        );
+        assert!(text.ends_with(r"blitz\config.toml"), "{text}");
+        assert_eq!(start_failed("x", None), "blitz could not start: x");
     }
 
     #[test]
