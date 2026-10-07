@@ -378,15 +378,51 @@ pub fn write_plugin(dir: &Path, hook_exe: &str) -> io::Result<()> {
 /// Writes the plugin where this blitz keeps its state, for the blitz-hook
 /// next to it, and returns its folder; `None` when that cannot be done.
 pub fn install_plugin() -> Option<PathBuf> {
-    let hook = hook_exe().ok().filter(|h| h.is_file())?;
-    let dir = crate::session::dir()?.join("claude-plugin");
-    match write_plugin(&dir, &hook.to_string_lossy()) {
+    plugin_for(&hook_exe().ok()?, &crate::session::dir()?)
+}
+
+/// [`install_plugin`] for the blitz-hook at `hook`, under `state`. Each
+/// blitz-hook has a folder of its own, so a second copy of blitz, such as
+/// a portable one or a release build, never points the panes of the first
+/// at its own. None for a blitz-hook other users can replace, which Claude
+/// Code would run in every session.
+fn plugin_for(hook: &Path, state: &Path) -> Option<PathBuf> {
+    if !hook.is_file() || exposed(hook) {
+        return None;
+    }
+    let hook = hook.to_string_lossy();
+    let dir = plugin_dir(state, &hook);
+    match write_plugin(&dir, &hook) {
         Ok(()) => Some(dir),
         Err(e) => {
             eprintln!("blitz: writing the Claude Code plugin: {e}");
             None
         }
     }
+}
+
+/// The plugin folder under `state` for the blitz-hook at `hook`.
+fn plugin_dir(state: &Path, hook: &str) -> PathBuf {
+    // FNV-1a, which stays the same from one Rust release to the next.
+    let id = (hook.to_lowercase().bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    state.join(format!("claude-plugin-{id:016x}"))
+}
+
+/// Whether others may replace the blitz-hook at `hook`, or add one in its
+/// folder.
+#[cfg(windows)]
+fn exposed(hook: &Path) -> bool {
+    [hook.parent(), Some(hook)]
+        .into_iter()
+        .flatten()
+        .any(others_can_write)
+}
+
+#[cfg(not(windows))]
+fn exposed(_hook: &Path) -> bool {
+    false
 }
 
 /// `CLAUDE_CODE_PLUGIN_DIRS` for a pane: the folders blitz itself was
@@ -429,12 +465,7 @@ pub fn setup(args: &[String]) -> i32 {
             hook.display()
         );
     }
-    #[cfg(windows)]
-    if [hook.parent(), Some(hook.as_path())]
-        .into_iter()
-        .flatten()
-        .any(others_can_write)
-    {
+    if exposed(&hook) {
         eprintln!(
             "warning: other users can replace {}, and Claude Code would run their \
              program in every session. Keep blitz in a folder only you can change, \
@@ -1175,6 +1206,25 @@ mod tests {
     }
 
     #[test]
+    fn each_blitz_hook_has_its_own_plugin() {
+        let state = Path::new(r"C:\Users\me\AppData\Local\blitz");
+        let installed = plugin_dir(state, r"C:\Program Files\blitz\blitz-hook.exe");
+        let built = plugin_dir(state, r"C:\dev\blitz\target\release\blitz-hook.exe");
+        assert_ne!(installed, built);
+        assert_eq!(installed.parent(), Some(state));
+        assert_eq!(
+            plugin_dir(state, r"C:\PROGRAM FILES\blitz\blitz-hook.exe"),
+            installed,
+            "Windows paths ignore case"
+        );
+        assert_eq!(
+            installed.file_name().and_then(|n| n.to_str()),
+            Some("claude-plugin-bc19ae5af3c1512f"),
+            "the same in every release"
+        );
+    }
+
+    #[test]
     fn plugin_dirs_keep_the_users_own() {
         let ours = r"C:\Users\me\AppData\Local\blitz\claude-plugin";
         assert_eq!(plugin_dirs(None, ours), ours);
@@ -1592,7 +1642,16 @@ mod tests {
             icacls(args);
             seen.push((grant.to_owned(), others_can_write(&dir), others));
         }
+        // A blitz-hook in there gets no plugin.
+        let hook = dir.join("blitz-hook.exe");
+        let made = std::fs::write(&hook, "");
+        let state = dir.with_extension("state");
+        let plugin = plugin_for(&hook, &state);
+        let _ = std::fs::remove_file(&hook);
         let _ = std::fs::remove_dir(&dir);
+        made.expect("blitz-hook");
+        assert_eq!(plugin, None);
+        assert!(!state.exists());
         for (grant, got, want) in seen {
             assert_eq!(got, want, "after {grant}");
         }
