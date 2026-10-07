@@ -1908,8 +1908,14 @@ impl App {
         } else {
             shell
         };
-        let launch_of =
-            |program: &str| crate::shell::launch(program, self.config.shell_integration, &token);
+        let launch_of = |program: &str| {
+            crate::shell::launch(
+                program,
+                self.config.shell_integration,
+                &token,
+                &self.config.env,
+            )
+        };
         let mut launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),

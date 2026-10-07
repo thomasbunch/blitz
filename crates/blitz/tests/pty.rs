@@ -371,7 +371,7 @@ fn shells() -> Vec<String> {
 }
 
 fn launch(program: &str) -> blitz::shell::Launch {
-    let mut l = blitz::shell::launch(program, true, TOKEN);
+    let mut l = blitz::shell::launch(program, true, TOKEN, &[]);
     l.cmdline = l.cmdline.replacen(" -NoLogo", " -NoProfile -NoLogo", 1);
     l.env.push(("BLITZ_PANE_TOKEN".into(), TOKEN.into()));
     l

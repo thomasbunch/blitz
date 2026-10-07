@@ -697,9 +697,16 @@ pub fn child_env(
         })
         .collect();
     let id = pane_id.to_string();
-    let user_wslenv = (env.iter())
-        .find(|(k, _)| upper(k) == "WSLENV")
-        .map(|(_, v)| v.to_string_lossy().into_owned());
+    // One `extra` sets joins blitz's too, or the token would not reach WSL.
+    let is_wslenv = |k: &str| k.eq_ignore_ascii_case("WSLENV");
+    let user_wslenv = (extra.iter().rev())
+        .find(|(k, _)| is_wslenv(k))
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            (env.iter())
+                .find(|(k, _)| upper(k) == "WSLENV")
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        });
     let wslenv = wslenv(user_wslenv.as_deref());
     let ours = [
         ("TERM_PROGRAM", "blitz"),
@@ -712,9 +719,11 @@ pub fn child_env(
         ("BLITZ_PANE_ID", id.as_str()),
         ("WSLENV", wslenv.as_str()),
     ];
-    let sets = ours
-        .into_iter()
-        .chain(extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let sets = ours.into_iter().chain(
+        (extra.iter())
+            .filter(|(k, _)| !is_wslenv(k))
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
     for (k, v) in sets {
         let ku = k.to_ascii_uppercase();
         env.retain(|(e, _)| upper(e) != ku);
@@ -836,6 +845,14 @@ mod tests {
             .find(|(k, _)| k == "WSLENV")
             .map(|(_, v)| v.clone());
         assert_eq!(set, Some(format!("GOPATH/l:{ours}").into()));
+        // An `env` line in the settings joins them the same way.
+        let extra = [("wslenv".to_string(), "GOPATH/l".to_string())];
+        let env = child_env([("WSLENV".into(), "X".into())], 1, &extra);
+        let set: Vec<_> = (env.iter())
+            .filter(|(k, _)| k.eq_ignore_ascii_case("WSLENV"))
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(set, [OsString::from(format!("GOPATH/l:{ours}"))]);
     }
 
     #[test]

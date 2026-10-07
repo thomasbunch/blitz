@@ -10,7 +10,9 @@ use std::sync::{Mutex, PoisonError};
 /// changed, so one installed while blitz runs is found.
 pub fn detect() -> PathBuf {
     static LAST: Mutex<Option<(Option<OsString>, PathBuf)>> = Mutex::new(None);
-    memo(&LAST, pane_var("PATH"), |path| detect_with(pane_env(path.clone())))
+    memo(&LAST, pane_var("PATH"), |path| {
+        detect_with(pane_env(path.clone()))
+    })
 }
 
 /// `make(key)`, kept in `last` and made again only once `key` changed.
@@ -697,8 +699,10 @@ pub fn label(shell: &str) -> String {
 /// Builds the command line for `shell`, the `shell` setting: a program and
 /// its arguments, or empty for [`detect`]. Shell integration is added only
 /// when `integrate` is set; otherwise the command runs exactly as
-/// configured. `token` is the pane's `BLITZ_PANE_TOKEN`.
-pub fn launch(shell: &str, integrate: bool, token: &str) -> Launch {
+/// configured. `token` is the pane's `BLITZ_PANE_TOKEN`, and `env` the
+/// variables the settings add, whose PROMPT cmd's marks wrap rather than
+/// blitz's own.
+pub fn launch(shell: &str, integrate: bool, token: &str, env: &[(String, String)]) -> Launch {
     let (program, args) = match parts(shell) {
         ("", args) => (detect(), args),
         (program, args) => (PathBuf::from(program), args),
@@ -724,7 +728,11 @@ pub fn launch(shell: &str, integrate: bool, token: &str) -> Launch {
                 out.cmdline += &quote(POWERSHELL_INTEGRATION);
             }
             Kind::Cmd => {
-                let own = std::env::var_os("PROMPT").map(|p| p.to_string_lossy().into_owned());
+                let set = (env.iter().rev()).find(|e| e.0.eq_ignore_ascii_case("PROMPT"));
+                let own = match set {
+                    Some(e) => Some(e.1.clone()),
+                    None => std::env::var_os("PROMPT").map(|p| p.to_string_lossy().into_owned()),
+                };
                 let own = own.as_deref().map_or("$P$G", own_prompt);
                 out.env.push(("PROMPT".into(), cmd_prompt(token, own)));
             }
@@ -869,6 +877,10 @@ mod tests {
         // From a blitz pane: the prompt that pane's wraps.
         assert_eq!(own_prompt(&wrapped), mine);
         assert_eq!(own_prompt(&cmd_prompt("5eed", "$P$G")), "$P$G");
+        // One the settings set is the one wrapped.
+        let set = [("prompt".to_string(), "$T$G".to_string())];
+        let env = launch("cmd.exe", true, "5eed", &set).env;
+        assert_eq!(env, [("PROMPT".into(), cmd_prompt("5eed", "$T$G"))]);
     }
 
     #[test]
@@ -878,15 +890,15 @@ mod tests {
             cmdline: bash.into(),
             env: Vec::new(),
         };
-        assert_eq!(launch(bash, true, "t"), want);
-        assert_eq!(launch("wsl.exe", true, "t").cmdline, "wsl.exe");
+        assert_eq!(launch(bash, true, "t", &[]), want);
+        assert_eq!(launch("wsl.exe", true, "t", &[]).cmdline, "wsl.exe");
         assert_eq!(
-            launch(" wsl.exe -d Ubuntu ", true, "t").cmdline,
+            launch(" wsl.exe -d Ubuntu ", true, "t", &[]).cmdline,
             "wsl.exe -d Ubuntu"
         );
-        assert_eq!(launch(r#""bash"-i"#, true, "t").cmdline, "bash -i");
+        assert_eq!(launch(r#""bash"-i"#, true, "t", &[]).cmdline, "bash -i");
         // The shell blitz finds, with the arguments given.
-        let auto = launch(r#""" -x"#, false, "t").cmdline;
+        let auto = launch(r#""" -x"#, false, "t", &[]).cmdline;
         assert!(auto.ends_with(" -x") && auto.len() > 3, "{auto}");
     }
 
@@ -902,7 +914,9 @@ mod tests {
                 s(r"C:\Users\me\.cargo\bin;"),
                 s(r"C:\VS\bin;C:\WINDOWS\System32\;;C:\Users\me\.cargo\bin"),
             ),
-            s(r"C:\VS\bin;C:\WINDOWS\System32\;C:\Users\me\.cargo\bin;C:\Program Files\Git\usr\bin")
+            s(
+                r"C:\VS\bin;C:\WINDOWS\System32\;C:\Users\me\.cargo\bin;C:\Program Files\Git\usr\bin"
+            )
         );
         assert_eq!(fresh_path(None, None, s("a;b")), s("a;b"));
         assert_eq!(fresh_path(None, s("u"), None), s("u"));
@@ -969,10 +983,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sh = dir.join("sh.exe");
         std::fs::write(&sh, b"").unwrap();
-        let got = launch(&sh.to_string_lossy(), true, "t").cmdline;
+        let got = launch(&sh.to_string_lossy(), true, "t", &[]).cmdline;
         // Arguments may follow it, and it still runs as one program.
         let args = format!("{} --login -i", sh.display());
-        let (with, shown) = (launch(&args, true, "t").cmdline, label(&args));
+        let (with, shown) = (launch(&args, true, "t", &[]).cmdline, label(&args));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, format!("\"{}\"", sh.display()));
         assert_eq!(with, format!("\"{}\" --login -i", sh.display()));
@@ -985,12 +999,12 @@ mod tests {
     fn a_missing_path_with_spaces_stays_quoted() {
         let dir = std::env::temp_dir().join(format!("blitz no such {}", std::process::id()));
         let shell = format!("{} -i", dir.join("sh").display());
-        assert_eq!(launch(&shell, true, "t").cmdline, quote(&shell));
+        assert_eq!(launch(&shell, true, "t", &[]).cmdline, quote(&shell));
     }
 
     #[test]
     fn powershell_arguments_stay_and_integration_follows_them() {
-        let ps = |s: &str| launch(s, true, "t").cmdline;
+        let ps = |s: &str| launch(s, true, "t", &[]).cmdline;
         let integrated = ps("pwsh -NoProfile -ExecutionPolicy Bypass");
         assert!(
             integrated.starts_with("pwsh -NoProfile -ExecutionPolicy Bypass -NoLogo -NoExit "),
@@ -1090,7 +1104,12 @@ mod tests {
 
     #[test]
     fn launch_integration() {
-        let ps = launch(r#""C:\Program Files\PowerShell\7\pwsh.exe""#, true, "t");
+        let ps = launch(
+            r#""C:\Program Files\PowerShell\7\pwsh.exe""#,
+            true,
+            "t",
+            &[],
+        );
         let script = format!("\"{POWERSHELL_INTEGRATION}\"");
         let head = ps
             .cmdline
@@ -1101,7 +1120,7 @@ mod tests {
             r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit -Command "#
         );
         assert!(!POWERSHELL_INTEGRATION.contains('"'));
-        assert_eq!(launch("pwsh.exe", false, "t").cmdline, "pwsh.exe");
+        assert_eq!(launch("pwsh.exe", false, "t", &[]).cmdline, "pwsh.exe");
     }
 
     /// The script reaches PowerShell as one argument, as written.
@@ -1110,7 +1129,7 @@ mod tests {
     fn the_powershell_script_is_one_argument() {
         use windows::Win32::Foundation::{HLOCAL, LocalFree};
         use windows::Win32::UI::Shell::CommandLineToArgvW;
-        let line = windows::core::HSTRING::from(launch("pwsh", true, "t").cmdline);
+        let line = windows::core::HSTRING::from(launch("pwsh", true, "t", &[]).cmdline);
         let mut n = 0;
         // SAFETY: a valid string and out pointer; the array is freed below.
         let last = unsafe {
