@@ -2018,8 +2018,11 @@ impl App {
         self.orphan = None;
         self.find = None;
         self.quick = None;
-        if let Some(v) = before.and_then(|id| self.view_mut(id)) {
-            v.notice.take_if(|n| n.ask.of_pane());
+        if let Some(left) = before {
+            focus_left(
+                self.views.iter_mut().map(|v| (v.pane.id, &mut v.notice)),
+                left,
+            );
         }
         self.set_drag(None);
         // A drag belongs to the tab it started in.
@@ -2902,19 +2905,32 @@ impl App {
 
     /// Says dimly in pane `id`, for a while, that Claude Code's hooks are
     /// not reporting, or are `older` than this blitz, unless a hint about
-    /// them was shown already.
+    /// them was shown already. One a question keeps out comes at the next
+    /// title or hook.
     fn hooks_hint(&mut self, id: PaneId, older: bool) {
-        if std::mem::replace(&mut self.hooks_hinted, true) {
+        if self.hooks_hinted {
             return;
         }
         let palette = keymap::keys_for(Action::Palette, &self.config.keys);
         let text = hooks_hint_text(older, palette);
-        self.set_notice(id, text, Some(Instant::now() + HINT), true);
+        self.hooks_hinted = self.hint(id, text, Instant::now() + HINT);
+    }
+
+    /// Says `text` dimly in pane `id`, which nobody asked for, until
+    /// `until`, unless a question, an error or a notice that stays up
+    /// waits there. Whether it did.
+    fn hint(&mut self, id: PaneId, text: impl Into<String>, until: Instant) -> bool {
+        let shown =
+            (self.view_mut(id)).is_some_and(|v| hint_into(&mut v.notice, text.into(), until));
+        self.request_redraw();
+        shown
     }
 
     /// Shows `text` in pane `id` until `until`, or else until something
-    /// replaces it, unless it would hide one ([`hides_lasting`]), or it is
-    /// a hint over a question or error ([`hint_fits`]).
+    /// replaces it, in place of any notice there, as what a user's action
+    /// led to does, unless it would hide one that stays up
+    /// ([`hides_lasting`]); a hint nobody asked for goes through
+    /// [`App::hint`].
     fn set_notice(
         &mut self,
         id: PaneId,
@@ -2924,7 +2940,6 @@ impl App {
     ) {
         if let Some(v) = self.view_mut(id)
             && !hides_lasting(v.notice.as_ref(), until, dim)
-            && (!dim || hint_fits(v.notice.as_ref()))
         {
             v.notice = Some(Notice {
                 text: text.into(),
@@ -3549,13 +3564,7 @@ impl App {
                     v.resume = Some(("claude\r".into(), Instant::now() + RESUME_AFTER));
                 }
             }
-            Action::ToggleSidebar => {
-                if !self.win.toggle_sidebar() {
-                    return false;
-                }
-                self.fit_min_size();
-                self.request_redraw();
-            }
+            Action::ToggleSidebar => return self.toggle_sidebar(),
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
             Action::GoToSession => {
@@ -3823,7 +3832,7 @@ impl App {
                     if let Some(text) = crate::pty::inbox_notice() {
                         self.counters.inbox = true;
                         eprintln!("blitz: {text}");
-                        self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                        self.hint(id, text, Instant::now() + NOTICE);
                     }
                 }
                 if shown {
@@ -4109,7 +4118,9 @@ impl App {
             .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
         let size = (size.width as i32, size.height as i32);
         let tw = self.text_cell().0 as i32;
-        chrome::area(&self.win, size, self.scale as f32, self.banner(), tw)
+        let note = self.banner_note.as_ref().map(|n| n.0.as_str());
+        let update = self.update.as_ref();
+        panes_area(&self.win, size, self.scale as f32, update, note, tw)
     }
 
     /// The text of the update strip or cue, which also decides whether
@@ -4202,6 +4213,17 @@ impl App {
             self.scale as f32,
             self.win.sidebar_expanded,
         )
+    }
+
+    /// Expands or collapses the sidebar, and with it the smallest the
+    /// window may get. False when there is none to change.
+    fn toggle_sidebar(&mut self) -> bool {
+        if !self.win.toggle_sidebar() {
+            return false;
+        }
+        self.fit_min_size();
+        self.request_redraw();
+        true
     }
 
     /// Keeps the window from getting smaller than [`min_window`] for the
@@ -4354,9 +4376,7 @@ impl App {
                 }
                 Some(Side::More(ids)) => self.show_hidden(&ids),
                 Some(Side::Rail) => {
-                    self.win.toggle_sidebar();
-                    self.fit_min_size();
-                    self.request_redraw();
+                    self.toggle_sidebar();
                 }
                 None => {}
             }
@@ -4716,7 +4736,7 @@ impl App {
                 let hints = crate::session::dir().map(|d| d.join("hints"));
                 if first_time(hints.as_deref(), "shift-drag") {
                     let text = "Shift+drag selects while the program uses the mouse";
-                    self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                    self.hint(id, text, Instant::now() + NOTICE);
                 }
             }
         } else if self.mouse_to_program(&mods).is_some()
@@ -5576,6 +5596,23 @@ fn tell_focus(v: &View, focused: bool) {
     drop(term);
 }
 
+/// Whether the user, `away` when a pane changed, is back to see the
+/// focused pane: blitz run does not cover it, and they are `here`, which
+/// is asked only then. Clears `away` if so.
+fn back_at_screen(away: &mut bool, game_open: bool, here: impl FnOnce() -> bool) -> bool {
+    let back = *away && !game_open && here();
+    *away &= !back;
+    back
+}
+
+/// Takes a question about pane `left`, which focus just left, off it, so
+/// a press in another pane never answers it. Other notices stay.
+fn focus_left<'a>(notices: impl Iterator<Item = (PaneId, &'a mut Option<Notice>)>, left: PaneId) {
+    for (_, n) in notices.filter(|(id, _)| *id == left) {
+        n.take_if(|n| n.ask.of_pane());
+    }
+}
+
 /// Whether the user is at the window: it is in front, and they touched a
 /// key or the mouse in the last `AWAY_AFTER`, `idle` being how long ago.
 /// Walking away from blitz must not let a question pass as seen.
@@ -5672,6 +5709,21 @@ fn window_title(waiting: usize, pane: &str, admin: bool) -> String {
 /// else its offer; nothing without one.
 fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) -> Option<&'a str> {
     update.map(|u| note.unwrap_or(&u.1))
+}
+
+/// The part of a `size` window that the active tab's panes share, with
+/// the banner strip as the frame draws it: from the note on the update in
+/// hand while there is one, which may need the strip where the offer fit
+/// the sidebar's foot.
+fn panes_area(
+    win: &layout::Window,
+    size: (i32, i32),
+    scale: f32,
+    update: Option<&(String, String)>,
+    note: Option<&str>,
+    tw: i32,
+) -> Rect {
+    chrome::area(win, size, scale, banner_text(update, note), tw)
 }
 
 /// How to flash the taskbar for a session that just changed to `state`
@@ -5840,10 +5892,22 @@ fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
     lines.into_iter().map(|l| format!(" {l}")).collect()
 }
 
-/// A passing hint shows only where no question or error waits, which
-/// it would take the place of.
-fn hint_fits(n: Option<&Notice>) -> bool {
-    n.is_none_or(|n| n.ask == Ask::Nothing)
+/// Puts a hint nobody asked for in a pane's notice `slot`, dim until
+/// `until`, unless a question or an error waits there, which it would
+/// take the place of, or a notice that stays up ([`hides_lasting`]).
+/// Whether it did.
+fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
+    let old = slot.as_ref();
+    let fits = old.is_none_or(|n| n.ask == Ask::Nothing) && !hides_lasting(old, Some(until), true);
+    if fits {
+        *slot = Some(Notice {
+            text,
+            until: Some(until),
+            dim: true,
+            ask: Ask::Nothing,
+        });
+    }
+    fits
 }
 
 /// The notice of a pane, and whether it is dim: its own, else for
@@ -6446,10 +6510,11 @@ fn paste_refused(label: &str, code: Option<u32>) -> Option<String> {
 }
 
 /// Whether a dim notice that goes away at `until` would hide `old`, one
-/// that stays up, such as why nothing was pasted into a pane that exited
-/// or a question waiting for its answer. News never does.
+/// that stays up and asks nothing, such as why nothing was pasted into a
+/// pane that exited. News never does; what an action from the palette
+/// says still shows over a question.
 fn hides_lasting(old: Option<&Notice>, until: Option<Instant>, dim: bool) -> bool {
-    dim && until.is_some() && old.is_some_and(|n| n.until.is_none())
+    dim && until.is_some() && old.is_some_and(|n| n.until.is_none() && n.ask == Ask::Nothing)
 }
 
 /// What pasting answers paste question `ask` with, the clipboard holding
@@ -6844,11 +6909,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.on_drop();
         // Back at the screen, with a key or the mouse: the focused pane
         // is in view again.
-        if self.away && self.game.is_none() && present(self.focused, idle_for()) {
-            self.away = false;
-            if let Some(id) = self.focus_id() {
-                self.attention(id, Ev::Attended);
-            }
+        let game = self.game.is_some();
+        if back_at_screen(&mut self.away, game, || present(self.focused, idle_for()))
+            && let Some(id) = self.focus_id()
+        {
+            self.attention(id, Ev::Attended);
         }
         self.save_session(false);
         // Here, after every batch of events, rather than at each change:
@@ -7230,6 +7295,22 @@ mod tests {
         let note = Some("Downloading blitz 0.2.0\u{2026}");
         assert_eq!(banner_text(Some(&update), note), note);
         assert_eq!(banner_text(None, note), None);
+    }
+
+    /// Hit-testing and dividers see the strip the frame draws: a note too
+    /// long for the sidebar's foot takes a strip under the panes even when
+    /// the offer it stands for fit there.
+    #[test]
+    fn app_the_panes_make_room_for_a_note_the_offer_did_not_need() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("a".into(), PaneId(1)));
+        win.tabs.push(Tab::new("b".into(), PaneId(2)));
+        let offer = crate::update::banner(None, "0.2.0", None, true).expect("an offer");
+        let update = ("0.2.0".to_string(), offer);
+        let note = "Sessions are busy, and updating restarts blitz.                     Press Ctrl+Alt+Shift+F12 again";
+        let area = |note| panes_area(&win, (1440, 900), 1.0, Some(&update), note, 7);
+        assert_eq!(area(None).h, 900, "the offer sits at the sidebar's foot");
+        assert!(area(Some(note)).h < 900, "the note needs the strip");
     }
 
     #[test]
@@ -8659,6 +8740,23 @@ mod tests {
         assert_eq!(min, PhysicalSize::new(w as u32, h as u32), "no rail");
     }
 
+    /// Expanding or collapsing the sidebar changes the smallest window,
+    /// which is why every way of toggling it goes through
+    /// `App::toggle_sidebar` and so `fit_min_size`.
+    #[test]
+    fn app_the_smallest_window_follows_the_sidebar() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("a".into(), PaneId(1)));
+        win.tabs.push(Tab::new("b".into(), PaneId(2)));
+        let min = |win: &layout::Window| min_window(win, (8, 16), (4, 16), 1.0).width;
+        let before = min(&win);
+        assert!(win.toggle_sidebar());
+        let after = min(&win);
+        assert_ne!(before, after);
+        assert!(win.toggle_sidebar());
+        assert_eq!(min(&win), before);
+    }
+
     #[test]
     fn app_an_elevated_window_says_so_in_its_title() {
         assert_eq!(window_title(0, "", false), "blitz");
@@ -9035,8 +9133,9 @@ mod tests {
         }
     }
 
-    /// A passing hint leaves a question or an error where it is, and an
-    /// exited program's line comes back once a notice over it goes.
+    /// A passing hint leaves a question or an error where it is, and says
+    /// so, to be tried again; an exited program's line comes back once a
+    /// notice over it goes.
     #[test]
     fn notices_over_questions_and_exits() {
         let notice = |ask, dim| Notice {
@@ -9045,10 +9144,26 @@ mod tests {
             dim,
             ask,
         };
-        assert!(hint_fits(None));
-        assert!(hint_fits(Some(&notice(Ask::Nothing, true))));
+        let until = Instant::now();
+        let passing = Notice {
+            until: Some(until),
+            ..notice(Ask::Nothing, true)
+        };
+        let mut lasting = Some(notice(Ask::Nothing, true));
+        assert!(!hint_into(&mut lasting, "hint".into(), until));
+        assert!(lasting.is_some_and(|n| n.text == "n"), "one that stays up");
+        for mut slot in [None, Some(passing)] {
+            assert!(hint_into(&mut slot, "hint".into(), until));
+            let n = slot.expect("the hint");
+            assert_eq!(
+                (n.text.as_str(), n.until, n.dim),
+                ("hint", Some(until), true)
+            );
+        }
         for ask in [Ask::ClosePane, Ask::Key, Ask::Quit] {
-            assert!(!hint_fits(Some(&notice(ask, false))));
+            let mut slot = Some(notice(ask.clone(), false));
+            assert!(!hint_into(&mut slot, "hint".into(), until));
+            assert!(slot.is_some_and(|n| n.ask == ask && n.text == "n"));
         }
         let exited = notice_line(None, Some(2)).expect("a line");
         assert_eq!(
@@ -9061,6 +9176,46 @@ mod tests {
             Some(("n".into(), false))
         );
         assert_eq!(notice_line(None, None), None);
+    }
+
+    /// Focus leaving a pane takes its close or paste question with it, and
+    /// leaves every other notice, there and in other panes.
+    #[test]
+    fn focus_leaving_a_pane_takes_its_question() {
+        let notice = |ask| {
+            Some(Notice {
+                text: "n".into(),
+                until: None,
+                dim: false,
+                ask,
+            })
+        };
+        for ask in [Ask::ClosePane, Ask::CloseTab, Ask::Paste(String::new())] {
+            let mut notices = [(PaneId(1), notice(ask.clone())), (PaneId(2), notice(ask))];
+            focus_left(notices.iter_mut().map(|(id, n)| (*id, n)), PaneId(1));
+            assert!(notices[0].1.is_none());
+            assert!(notices[1].1.is_some(), "only the pane focus left");
+        }
+        for ask in [Ask::Key, Ask::Update, Ask::Quit, Ask::Nothing] {
+            let mut notices = [(PaneId(1), notice(ask))];
+            focus_left(notices.iter_mut().map(|(id, n)| (*id, n)), PaneId(1));
+            assert!(notices[0].1.is_some());
+        }
+    }
+
+    /// Coming back to the screen after a change while away sees the
+    /// focused pane, once, unless blitz run covers it.
+    #[test]
+    fn back_at_the_screen_sees_the_focused_pane() {
+        let mut away = false;
+        assert!(!back_at_screen(&mut away, false, || unreachable!()));
+        away = true;
+        assert!(!back_at_screen(&mut away, true, || true));
+        assert!(!back_at_screen(&mut away, false, || false));
+        assert!(away, "still away");
+        assert!(back_at_screen(&mut away, false, || true));
+        assert!(!away);
+        assert!(!back_at_screen(&mut away, false, || true), "once");
     }
 
     #[test]
@@ -9422,6 +9577,14 @@ mod tests {
         assert!(!hides_lasting(Some(&notice(None)), None, true));
         assert!(!hides_lasting(Some(&notice(Some(now))), brief, true));
         assert!(!hides_lasting(None, brief, true));
+        let question = Notice {
+            ask: Ask::ClosePane,
+            ..notice(None)
+        };
+        assert!(
+            !hides_lasting(Some(&question), brief, true),
+            "what an action says shows over a question"
+        );
     }
 
     #[test]

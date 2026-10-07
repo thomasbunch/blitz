@@ -600,9 +600,10 @@ impl Terminal {
 
     /// Changes whenever line numbers start over and name other text: the
     /// width changed and the lines were wrapped again, the other screen is
-    /// shown, or the terminal was reset. Coming back from the alternate
-    /// screen gives the main screen's numbers back, as its lines are still
-    /// where they were: blitz's own prompt goes there and back each time.
+    /// shown, the whole screen scrolled under scrollback that stayed put,
+    /// or the terminal was reset. Coming back from the alternate screen
+    /// gives the main screen's numbers back, as its lines are still where
+    /// they were: blitz's own prompt goes there and back each time.
     pub fn line_epoch(&self) -> u32 {
         self.line_epoch.wrapping_mul(2) | u32::from(self.alt)
     }
@@ -865,10 +866,7 @@ impl Terminal {
             // screen go to scrollback. Full-screen programs draw their
             // transcript this way above a fixed status area.
             let keep = self.top == 0 && !self.alt;
-            let blank = self.blank();
-            self.screen
-                .grid
-                .scroll_up(self.top, self.bottom, 1, blank, keep);
+            self.scroll_up(self.top, 1, keep);
             if keep && (self.viewport > 0 || self.hold) {
                 // Keep a scrolled-back view on the same text. Once the
                 // scrollback is full its length stays put while every row
@@ -884,10 +882,7 @@ impl Terminal {
     fn reverse_index(&mut self) {
         self.cur.pending_wrap = false;
         if self.cur.y == self.top {
-            let blank = self.blank();
-            self.screen
-                .grid
-                .scroll_down(self.top, self.bottom, 1, blank);
+            self.scroll_down(self.top, 1);
         } else if self.cur.y > 0 {
             self.cur.y -= 1;
         }
@@ -1009,6 +1004,25 @@ impl Terminal {
         self.cur.pending_wrap = false;
     }
 
+    /// Scrolls rows `top` to the bottom margin up by `n`; see
+    /// [`Grid::scroll_up`]. Line numbers start over when the screen's rows
+    /// moved under them.
+    fn scroll_up(&mut self, top: u16, n: u16, keep: bool) {
+        let blank = self.blank();
+        if (self.screen.grid).scroll_up(top, self.bottom, n, blank, keep) {
+            self.line_epoch = self.line_epoch.wrapping_add(1);
+        }
+    }
+
+    /// Scrolls rows `top` to the bottom margin down by `n`, as
+    /// [`Self::scroll_up`] does up.
+    fn scroll_down(&mut self, top: u16, n: u16) {
+        let blank = self.blank();
+        if (self.screen.grid).scroll_down(top, self.bottom, n, blank) {
+            self.line_epoch = self.line_epoch.wrapping_add(1);
+        }
+    }
+
     /// IL (`down`) or DL: shifts the rows from the cursor to the bottom
     /// margin. Does nothing outside the scroll region.
     fn shift_lines(&mut self, n: u16, down: bool) {
@@ -1016,11 +1030,10 @@ impl Terminal {
         if y < self.top || y > self.bottom {
             return;
         }
-        let blank = self.blank();
         if down {
-            self.screen.grid.scroll_down(y, self.bottom, n, blank);
+            self.scroll_down(y, n);
         } else {
-            self.screen.grid.scroll_up(y, self.bottom, n, blank, false);
+            self.scroll_up(y, n, false);
         }
         self.cur.x = 0;
         self.cur.pending_wrap = false;
@@ -1542,16 +1555,9 @@ impl Handler for Terminal {
                 self.row().delete(x, n(0) as usize, blank);
                 self.cur.pending_wrap = false;
             }
-            ([], b'S') => self
-                .screen
-                .grid
-                .scroll_up(self.top, self.bottom, n(0), blank, false),
+            ([], b'S') => self.scroll_up(self.top, n(0), false),
             // With more parameters this is xterm's mouse highlight tracking.
-            ([], b'T') if p.len() <= 1 => {
-                self.screen
-                    .grid
-                    .scroll_down(self.top, self.bottom, n(0), blank);
-            }
+            ([], b'T') if p.len() <= 1 => self.scroll_down(self.top, n(0)),
             ([], b'X') => {
                 self.row().fill(x..x + n(0) as usize, blank);
                 self.cur.pending_wrap = false;
