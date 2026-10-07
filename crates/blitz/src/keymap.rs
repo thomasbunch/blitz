@@ -316,13 +316,15 @@ pub fn keys_for(a: Action, user: &[Binding]) -> Option<String> {
         .map(|(m, vk, _)| chord_label(m, vk))
 }
 
+/// How the command palette shows `a`.
+pub fn label(a: Action) -> &'static str {
+    ACTIONS.iter().find(|x| x.0 == a).map_or("", |x| x.2)
+}
+
 /// What a notice tells the user to press for `a`: its first chord, or
 /// with none its name in the command palette.
 pub fn press_for(a: Action, user: &[Binding]) -> String {
-    keys_for(a, user).unwrap_or_else(|| {
-        let label = ACTIONS.iter().find(|x| x.0 == a).map_or("", |x| x.2);
-        format!("\"{label}\"")
-    })
+    keys_for(a, user).unwrap_or_else(|| format!("\"{}\"", label(a)))
 }
 
 /// The shortcut a key press triggers, if any, with the `user` bindings

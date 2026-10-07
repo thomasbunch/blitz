@@ -1006,6 +1006,8 @@ struct Commands {
     sel: usize,
     /// What the typed text names instead, with no actions to pick.
     rename: Option<Rename>,
+    /// Actions left out, as they have nothing to do now.
+    hidden: Vec<Action>,
 }
 
 /// What the command palette's line names.
@@ -1018,7 +1020,8 @@ enum Rename {
 
 impl Commands {
     /// The matching actions and their labels, in [`keymap::ACTIONS`] order.
-    /// The palette leaves out itself and going to a tab by number.
+    /// The palette leaves out itself, going to a tab by number and the
+    /// `hidden` actions.
     fn matches(&self) -> Vec<(Action, &'static str)> {
         if self.rename.is_some() {
             return Vec::new();
@@ -1028,6 +1031,7 @@ impl Commands {
             .collect();
         (keymap::ACTIONS.iter())
             .filter(|a| !matches!(a.0, Action::Palette | Action::GoToTab(_) | Action::LastTab))
+            .filter(|a| !self.hidden.contains(&a.0))
             .filter(|a| {
                 let text = format!("{} {}", a.2, a.1).to_lowercase();
                 words.iter().all(|w| text.contains(w.as_str()))
@@ -2084,7 +2088,7 @@ impl App {
                 if let Some((r, name)) = rename {
                     self.rename(r, name);
                 } else if let Some(a) = picked {
-                    self.act(el, a);
+                    self.run_picked(el, a);
                 }
             }
             VK_UP => cm.move_by(-1),
@@ -2135,7 +2139,18 @@ impl App {
         self.commands = None;
         self.request_redraw();
         if let Some(a) = picked {
-            self.act(el, a);
+            self.run_picked(el, a);
+        }
+    }
+
+    /// Runs an action picked in the command palette, or says it has
+    /// nothing to do.
+    fn run_picked(&mut self, el: &ActiveEventLoop, a: Action) {
+        if !self.act(el, a)
+            && let Some(id) = self.focus_id()
+        {
+            let text = format!("Nothing to do: {}", keymap::label(a));
+            self.set_notice(id, text, Some(Instant::now() + NOTHING), true);
         }
     }
 
@@ -2841,7 +2856,15 @@ impl App {
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
             Action::Palette => {
-                self.commands = Some(Commands::default());
+                // Update without a release would only look for one.
+                let hidden = match self.update {
+                    None => vec![Action::Update],
+                    Some(_) => Vec::new(),
+                };
+                self.commands = Some(Commands {
+                    hidden,
+                    ..Commands::default()
+                });
                 self.request_redraw();
             }
             Action::Focus(dir) => {
@@ -3043,8 +3066,8 @@ impl App {
                 };
                 self.commands = Some(Commands {
                     filter: name,
-                    sel: 0,
                     rename: Some(rename),
+                    ..Commands::default()
                 });
                 self.request_redraw();
             }
@@ -7143,6 +7166,11 @@ mod tests {
         c.move_by(5);
         assert_eq!(c.sel, 0, "one match");
         c.filter = "zzz".into();
+        assert!(c.matches().is_empty());
+        // What has nothing to do is left out.
+        c.filter = "update".into();
+        assert_eq!(c.matches(), [(Action::Update, "Update blitz")]);
+        c.hidden = vec![Action::Update];
         assert!(c.matches().is_empty());
     }
 
