@@ -5,6 +5,13 @@
 //! ambiguous characters narrow): East Asian Wide and Fullwidth take two
 //! columns, as does anything with Emoji_Presentation; VS16 widens an emoji
 //! base and VS15 never narrows one.
+//!
+//! A few code points on their own follow terminals' wcwidth instead, where
+//! the two disagree: the soft hyphen takes a column, as terminals draw it;
+//! the Hangul fillers U+3164 and U+FFA0 and unassigned default-ignorable
+//! code points keep their East Asian width; and a Hangul medial vowel or
+//! final consonant with no syllable to join takes none. string-width
+//! measures the first three 0 and the last 1.
 
 #[rustfmt::skip]
 #[path = "width_tables.rs"]
@@ -141,7 +148,9 @@ pub fn joins(first: char, last: char, len: usize, c: char) -> bool {
 mod tests {
     use super::*;
 
-    /// Splits `s` into clusters with [`joins`].
+    /// Splits `s` into clusters with [`joins`], as UAX #29 has them. The
+    /// terminal then drops a cluster that starts with a zero-width code
+    /// point, which these keep.
     fn clusters(s: &str) -> Vec<&str> {
         let mut out = Vec::new();
         let mut start = 0;
@@ -301,6 +310,180 @@ mod tests {
         );
         assert_eq!(clusters("a\u{1B}\u{0301}"), ["a", "\u{1B}", "\u{0301}"]);
         assert_eq!(clusters("\u{0600}1"), ["\u{0600}1"], "prepend");
+        assert_eq!(cluster_width("\u{0600}1"), 1);
+        assert_eq!(clusters("\u{0D4E}\u{0D15}x"), ["\u{0D4E}\u{0D15}", "x"]);
         assert_eq!(clusters("क\u{093E}"), ["क\u{093E}"], "spacing mark");
+    }
+
+    #[test]
+    fn width_joins_every_hangul_pair() {
+        let (l, v, t) = ('\u{1100}', '\u{1161}', '\u{11A8}');
+        let (lv, lvt) = ('\u{AC00}', '\u{AC01}');
+        for (a, b, joined) in [
+            (l, l, true),
+            (l, v, true),
+            (l, lv, true),
+            (l, lvt, true),
+            (l, t, false),
+            (v, v, true),
+            (v, t, true),
+            (v, l, false),
+            (lv, v, true),
+            (lv, t, true),
+            (lv, l, false),
+            (lvt, t, true),
+            (lvt, v, false),
+            (t, t, true),
+            (t, v, false),
+            (t, lv, false),
+        ] {
+            assert_eq!(
+                joins(a, a, 1, b),
+                joined,
+                "U+{:X} U+{:X}",
+                a as u32,
+                b as u32
+            );
+        }
+        assert_eq!(cluster_width("가\u{11A8}"), 2);
+        assert_eq!(cluster_width("\u{1100}가"), 2);
+    }
+
+    #[test]
+    fn width_regional_indicators_pair_only_when_adjacent() {
+        assert_eq!(clusters("🇺\u{0301}🇸"), ["🇺\u{0301}", "🇸"]);
+        assert_eq!(clusters("🇺🇸🇬🇧"), ["🇺🇸", "🇬🇧"]);
+        assert_eq!(clusters("a🇺🇸"), ["a", "🇺🇸"]);
+    }
+
+    #[test]
+    fn width_emoji_modifier_range_edges() {
+        for (m, w) in [
+            ('\u{1F3FA}', 1),
+            ('\u{1F3FB}', 2),
+            ('\u{1F3FF}', 2),
+            ('\u{1F400}', 1),
+        ] {
+            assert_eq!(chars_width(['\u{261D}', m], false), w, "U+{:X}", m as u32);
+        }
+        assert_eq!(chars_width(['a', '\u{1F3FB}'], false), 1, "not an emoji");
+    }
+
+    #[test]
+    fn width_ignorable_matches_default_ignorable_code_point() {
+        // Edges of the UCD 17.0 Default_Ignorable_Code_Point ranges.
+        for (c, ignorable) in [
+            ('\u{AC}', false),
+            ('\u{AD}', true),
+            ('\u{AE}', false),
+            ('\u{34E}', false),
+            ('\u{34F}', true),
+            ('\u{350}', false),
+            ('\u{61B}', false),
+            ('\u{61C}', true),
+            ('\u{115E}', false),
+            ('\u{115F}', true),
+            ('\u{1160}', true),
+            ('\u{1161}', false),
+            ('\u{17B3}', false),
+            ('\u{17B4}', true),
+            ('\u{17B5}', true),
+            ('\u{17B6}', false),
+            ('\u{180A}', false),
+            ('\u{180B}', true),
+            ('\u{180F}', true),
+            ('\u{1810}', false),
+            ('\u{200A}', false),
+            ('\u{200B}', true),
+            ('\u{200F}', true),
+            ('\u{2010}', false),
+            ('\u{2029}', false),
+            ('\u{202A}', true),
+            ('\u{202E}', true),
+            ('\u{202F}', false),
+            ('\u{205F}', false),
+            ('\u{2060}', true),
+            ('\u{2065}', true),
+            ('\u{206F}', true),
+            ('\u{2070}', false),
+            ('\u{3163}', false),
+            ('\u{3164}', true),
+            ('\u{3165}', false),
+            ('\u{FDFF}', false),
+            ('\u{FE00}', true),
+            ('\u{FE0F}', true),
+            ('\u{FE10}', false),
+            ('\u{FEFE}', false),
+            ('\u{FEFF}', true),
+            ('\u{FF00}', false),
+            ('\u{FF9F}', false),
+            ('\u{FFA0}', true),
+            ('\u{FFA1}', false),
+            ('\u{FFEF}', false),
+            ('\u{FFF0}', true),
+            ('\u{FFF8}', true),
+            ('\u{FFF9}', false),
+            ('\u{1BC9F}', false),
+            ('\u{1BCA0}', true),
+            ('\u{1BCA3}', true),
+            ('\u{1BCA4}', false),
+            ('\u{1D172}', false),
+            ('\u{1D173}', true),
+            ('\u{1D17A}', true),
+            ('\u{1D17B}', false),
+            ('\u{DFFFF}', false),
+            ('\u{E0000}', true),
+            ('\u{E0FFF}', true),
+            ('\u{E1000}', false),
+        ] {
+            assert_eq!(is_ignorable(c), ignorable, "U+{:X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn width_lone_fillers_and_jamo_follow_wcwidth() {
+        // See the module docs: string-width differs on these.
+        assert_eq!(cluster_width("\u{3164}"), 2, "hangul filler");
+        assert_eq!(cluster_width("\u{FFA0}"), 1, "halfwidth hangul filler");
+        assert_eq!(
+            cluster_width("\u{E0080}"),
+            1,
+            "unassigned default ignorable"
+        );
+        assert_eq!(
+            cluster_width("\u{1161}"),
+            0,
+            "medial vowel without a syllable"
+        );
+        assert_eq!(cluster_width("\u{115F}\u{1161}"), 2, "filler-led syllable");
+    }
+
+    #[test]
+    fn width_table_covers_every_code_point() {
+        assert_eq!(tables::STAGE1.len() << tables::SHIFT, 0x11_0000);
+        assert_eq!(tables::STAGE2.len() % (1 << tables::SHIFT), 0);
+        let blocks = tables::STAGE2.len() >> tables::SHIFT;
+        assert!(tables::STAGE1.iter().all(|&b| usize::from(b) < blocks));
+        for c in (0..=0x10_FFFF).filter_map(char::from_u32) {
+            assert!(gcb(c) <= CONTROL, "U+{:X}", c as u32);
+            assert!(chars_width([c], true) <= 2, "U+{:X}", c as u32);
+        }
+        for c in '\u{AC00}'..='\u{D7A3}' {
+            let lv = (c as u32 - 0xAC00).is_multiple_of(28);
+            assert_eq!(gcb(c), if lv { LV } else { LVT }, "U+{:X}", c as u32);
+            assert_eq!(char_width(c), 2, "U+{:X}", c as u32);
+        }
+        for c in '\u{1F1E6}'..='\u{1F1FF}' {
+            assert_eq!((gcb(c), char_width(c)), (RI, 2), "U+{:X}", c as u32);
+        }
+        assert_eq!(char_width('\u{10FFFF}'), 1);
+        assert_eq!(char_width('\u{D7FF}'), 1, "unassigned past the jamo");
+    }
+
+    #[test]
+    fn width_tables_are_unicode_17() {
+        // Emoji_Presentation since emoji 17.0; unassigned and narrow before.
+        assert_eq!(cluster_width("\u{1F6D8}"), 2, "landslide");
+        assert_eq!(cluster_width("\u{1FAEA}"), 2, "distorted face");
     }
 }
