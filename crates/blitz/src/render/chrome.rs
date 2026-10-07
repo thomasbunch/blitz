@@ -784,8 +784,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
             }
         }
         if !hidden.is_empty() {
-            // Accent when a session out of sight needs you.
-            let urgent = (hidden.iter()).any(|x| matches!(x.state, Attn::NeedsYou | Attn::Error));
+            // Accent when a session out of sight needs you, dark or light
+            // enough to read as text.
+            let urgent = (hidden.iter()).any(|x| x.state == Attn::NeedsYou);
             let r = Rect {
                 x: s(8.0),
                 y,
@@ -793,7 +794,10 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 h: more_h,
             };
             let label = format!("+{} more", hidden.len());
-            let color = if urgent { c.accent } else { c.dim };
+            let color = match urgent {
+                true => crate::theme::readable(c.accent, c.side_bg, 4.5),
+                false => c.dim,
+            };
             text(
                 p,
                 r.x + s(24.0),
@@ -2197,14 +2201,23 @@ mod tests {
         assert_eq!(c.side.at(row.1.x, row.1.y), Some(Side::Session(row.0)));
         assert_eq!(c.side.at(foot.x + 1, foot.bottom()), None);
         let label = format!("+{} more", hidden.len());
-        let ui = crate::theme::blitz(false).ui;
-        assert!(
-            c.prims.iter().any(
-                |p| matches!(p, Prim::Text { text, color, .. } if *text == label && *color == ui.accent)
-            ),
-            "{:?}",
-            texts(&c)
-        );
+        let color = |c: &Chrome| {
+            (c.prims.iter()).find_map(|p| match p {
+                Prim::Text { text, color, .. } if *text == label => Some(*color),
+                _ => None,
+            })
+        };
+        assert_eq!(color(&c), Some(m.ui.accent), "{:?}", texts(&c));
+        // Readable on a light theme too, where amber is faint.
+        m.ui = crate::theme::blitz(true).ui;
+        let amber = color(&build(&m)).expect("footer");
+        assert!(crate::theme::contrast(amber, m.ui.side_bg) >= 4.5);
+        // A hidden error does not need you.
+        let mut sessions = sessions.clone();
+        sessions[11].state = Attn::Error;
+        let mut m = model(&win, &sessions, now);
+        m.scale = 1.5;
+        assert_eq!(color(&build(&m)), Some(m.ui.dim));
     }
 
     #[test]
