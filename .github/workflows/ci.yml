@@ -30,6 +30,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
   # The ConPTY that releases ship, for the release-mode tests. Must match
   # release.yml; the lint job checks.
   CONPTY_VERSION: 1.25.260710002-preview
@@ -101,8 +102,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        timeout-minutes: 15
       # On Windows this runs on the system's console host.
       - run: cargo test --workspace --locked
+        timeout-minutes: 15
       # Otherwise the installer script is only compiled once a tag is pushed.
       - if: runner.os == 'Windows'
         name: Installer script compiles
@@ -132,6 +135,7 @@ jobs:
       # bundled ConPTY.
       - if: runner.os == 'Windows'
         run: cargo test --release -p blitz --locked
+        timeout-minutes: 15
 
   # The licenses the release's THIRD-PARTY-NOTICES.txt accepts, checked
   # before a crate under another one is merged rather than at tag time.

@@ -101,7 +101,9 @@ jobs:
 
       - name: Zip
         shell: pwsh
-        run: Compress-Archive -Path "dist/blitz-${{ steps.v.outputs.version }}-windows-x64" -DestinationPath "out/blitz-${{ steps.v.outputs.version }}-windows-x64.zip"
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: Compress-Archive -Path "dist/blitz-$env:VERSION-windows-x64" -DestinationPath "out/blitz-$env:VERSION-windows-x64.zip"
 
       # PowerShell, because Git Bash rewrites ISCC's /D switches as paths.
       # Paths are absolute: ISCC resolves relative ones against the script.
