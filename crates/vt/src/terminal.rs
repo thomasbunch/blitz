@@ -309,6 +309,11 @@ impl Terminal {
         self.viewport = v;
     }
 
+    /// How many lines the view is scrolled back from the bottom.
+    pub fn viewport(&self) -> usize {
+        self.viewport
+    }
+
     /// The line at the top of the view, numbered as [`Grid::dropped`]
     /// numbers them.
     pub fn view_top(&self) -> usize {

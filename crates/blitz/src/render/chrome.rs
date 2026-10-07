@@ -34,6 +34,8 @@ pub struct Session {
     /// What the program last reported of its progress.
     pub progress: Option<Progress>,
     pub exit_code: Option<u32>,
+    /// Lines of output below the view, when it is scrolled back.
+    pub below: usize,
 }
 
 /// A program's progress, as OSC 9;4 reports it.
@@ -206,6 +208,9 @@ pub struct Chrome {
     pub side: SideHits,
     /// The banner strip, for clicks.
     pub banner: Option<Rect>,
+    /// The chip on each pane scrolled back, which a click takes to the
+    /// bottom.
+    pub below: Vec<(PaneId, Rect)>,
     pub settings: Option<SettingsHits>,
     /// The command palette and each row it shows, by index, for clicks.
     pub commands: Option<(Rect, Vec<(usize, Rect)>)>,
@@ -903,6 +908,35 @@ pub fn build(m: &ChromeModel) -> Chrome {
             bold: false,
             term: false,
         });
+    }
+    // A pane scrolled back says how far below its output goes on.
+    for &(id, r) in &out.panes {
+        let Some(n) = session(id).map(|x| x.below).filter(|&n| n > 0) else {
+            continue;
+        };
+        let label = format!("\u{2193} {n} line{}", if n == 1 { "" } else { "s" });
+        let (pad, one) = (s(8.0), s(1.0).max(1));
+        let (w, h) = (text_w(&label, tw) + 2 * pad, th + s(8.0));
+        if w > r.w || h > r.h {
+            continue;
+        }
+        let chip = Rect {
+            x: r.right() - w,
+            y: r.bottom() - h,
+            w,
+            h,
+        };
+        extra.push(Prim::Rect(chip, c.border));
+        extra.push(Prim::Rect(inset(chip, one), c.side_bg));
+        extra.push(Prim::Text {
+            x: chip.x + pad,
+            y: chip.y + (h - th) / 2,
+            text: label,
+            color: c.msg,
+            bold: false,
+            term: false,
+        });
+        out.below.push((id, chip));
     }
     if let (Some((col, row, t)), Some(r)) = (m.preedit, pane(tab.focus)) {
         let (x, y) = (r.x + i32::from(col) * cw, r.y + i32::from(row) * ch);
@@ -1765,6 +1799,7 @@ mod tests {
             msg: String::new(),
             progress: None,
             exit_code: None,
+            below: 0,
         }
     }
 
@@ -2543,6 +2578,27 @@ mod tests {
         let error = m.ui.error;
         let none = |p: &Prim| matches!(p, Prim::Text { text, color, .. } if text == "no matches" && *color == error);
         assert!(c.prims.iter().any(none));
+    }
+
+    #[test]
+    fn a_pane_scrolled_back_says_how_far_the_bottom_is() {
+        let (win, mut sessions, now) = fleet(true);
+        let c = build(&model(&win, &sessions, now));
+        assert!(c.below.is_empty(), "at the bottom");
+        sessions[1].below = 214;
+        sessions[0].below = 1;
+        let c = build(&model(&win, &sessions, now));
+        let t = texts(&c);
+        assert!(t.contains(&"\u{2193} 214 lines") && t.contains(&"\u{2193} 1 line"));
+        // In the corner of each grid, where a click goes to the bottom.
+        for (id, chip) in &c.below {
+            let grid = c.panes.iter().find(|p| p.0 == *id).expect("pane").1;
+            assert_eq!((chip.right(), chip.bottom()), (grid.right(), grid.bottom()));
+            assert!(chip.x > grid.x && chip.y > grid.y);
+        }
+        let mut ids: Vec<PaneId> = c.below.iter().map(|b| b.0).collect();
+        ids.sort();
+        assert_eq!(ids, [PaneId(1), PaneId(2)]);
     }
 
     #[test]

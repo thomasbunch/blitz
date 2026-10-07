@@ -865,6 +865,7 @@ mod gpu {
             msg: msg.into(),
             progress: None,
             exit_code: None,
+            below: 0,
         };
         let sessions = [
             session(

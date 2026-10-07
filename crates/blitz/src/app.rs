@@ -882,6 +882,8 @@ struct App {
     closed: Option<(String, Option<String>)>,
     /// The banner strip in the last frame, for clicks.
     banner: Option<Rect>,
+    /// The chips on panes scrolled back in the last frame, for clicks.
+    below: Vec<(PaneId, Rect)>,
     /// Keys whose releases belong to a shortcut or a panel and are not sent.
     eaten: Eaten,
     /// Where the IME was last told the cursor is, in client pixels.
@@ -1142,6 +1144,7 @@ impl App {
             updating: None,
             closed: None,
             banner: None,
+            below: Vec::new(),
             eaten: Eaten::default(),
             ime_at: None,
             title: "blitz".into(),
@@ -2224,6 +2227,7 @@ impl App {
                     msg,
                     progress: v.progress.map(|p| p.0),
                     exit_code: p.exit_code,
+                    below: lock(&p.term).viewport(),
                 }
             })
             .collect();
@@ -3368,6 +3372,18 @@ impl App {
             self.act(el, Action::Update);
             return;
         }
+        let chip = (self.below.iter())
+            .find(|(_, r)| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        if pressed
+            && b == 0
+            && let Some(&(id, _)) = chip
+        {
+            if let Some(v) = self.view_mut(id) {
+                lock(&v.pane.term).scroll_viewport(isize::MIN);
+            }
+            self.request_redraw();
+            return;
+        }
         if b == 0 && !pressed && self.mouse.divider.take().is_some() {
             self.settle();
             return;
@@ -3770,6 +3786,7 @@ impl App {
         let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
         self.side = std::mem::take(&mut chrome.side);
         self.banner = chrome.banner;
+        self.below = std::mem::take(&mut chrome.below);
         self.settings_hits = chrome.settings.take();
         self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
