@@ -369,6 +369,8 @@ that, or typing, goes back to the bottom.
 | Ctrl+, | Settings |
 | Ctrl+Shift+P | Command palette |
 | Ctrl+=, Ctrl+-, Ctrl+0 | Font size up, down, and back to the setting, until blitz restarts |
+| Ctrl+Shift+=, Ctrl+NumpadAdd, Ctrl+NumpadSubtract, Ctrl+Numpad0 | The same, with + typed with Shift and on the keypad |
+| Ctrl+wheel | Font size up or down, unless the program takes the mouse |
 | F11 | Full screen |
 | Alt+Space | Window menu: move, size, minimize, close |
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy the selection; Ctrl+C only while it is in view |
@@ -403,7 +405,9 @@ A chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`:
 a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
 `end`, `pageup`, `pagedown`, `insert`, `delete`, `tab`, `enter`, `esc`,
 `space`, `backspace`, or a punctuation key by its character or its name,
-such as `,` or `comma` and `=` or `plus`. The modifiers must match
+such as `,` or `comma` and `=` or `plus`, and on the keypad `numpad0` to
+`numpad9`, `numpadadd`, `numpadsubtract`, `numpadmultiply`,
+`numpaddivide` and `numpaddecimal`. The modifiers must match
 exactly. A binding replaces the default on the same chord, and the other
 defaults stay. Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them,
 on layouts where those keys type digits; on others, such as French
