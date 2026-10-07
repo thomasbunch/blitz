@@ -295,7 +295,7 @@ impl Config {
 /// A config file's text. Notepad can save UTF-16 ("Unicode"), and a file
 /// saved as ANSI is not UTF-8: its other bytes become U+FFFD rather than
 /// costing every setting in the file.
-fn decode(bytes: &[u8]) -> String {
+pub(crate) fn decode(bytes: &[u8]) -> String {
     let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
         let units: Vec<u16> = rest.as_chunks().0.iter().map(|&c| unit(c)).collect();
         String::from_utf16_lossy(&units)
