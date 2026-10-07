@@ -514,6 +514,12 @@ struct Notice {
     ask: Ask,
 }
 
+/// Whether notice `n` stays up until a key or something else takes it
+/// away, rather than going by itself.
+fn stays(n: &Notice) -> bool {
+    n.until.is_none()
+}
+
 /// What a notice waits for. One that asks to confirm stays armed while
 /// it shows, with no deadline to read it by.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1689,6 +1695,21 @@ impl App {
                 self.set_notice(id, text, None, false);
             }
         }
+        // Told once, in the window, as a release build has no console; a
+        // test run, a capture say, leaves it for the user's next start, as
+        // does one that has a more pressing notice to show. It goes at the
+        // next key, having been read. The notices below give way to it.
+        if !self.args.scripted()
+            && let Some(id) = self.focus_id()
+            && !self.holds_notice(id)
+            && let Some(file) = session::take_crash()
+        {
+            let text = format!(
+                "blitz stopped after an internal error last time; details are in {}",
+                file.display()
+            );
+            self.error(id, text);
+        }
         self.note_ignored();
 
         // A dev build is left alone; a scripted run and a separate window
@@ -1708,9 +1729,10 @@ impl App {
                 let _ = proxy.send_event(UserEvent::Finish(0));
             });
         }
-        // Once ever, a few keys worth knowing.
+        // Once ever, a few keys worth knowing: counted only when shown.
         if !self.args.scripted()
             && let Some(id) = self.focus_id()
+            && !self.holds_notice(id)
             && session::dir().is_some_and(|d| session::first_time_in(&d, "keys"))
         {
             let text = first_hint(&self.config.keys);
@@ -1739,18 +1761,6 @@ impl App {
                     std::thread::sleep(UPDATE_EVERY);
                 }
             });
-        }
-        // Told once, in the window, as a release build has no console; a
-        // test run, a capture say, leaves it for the user's next start.
-        if !self.args.scripted()
-            && let Some(id) = self.focus_id()
-            && let Some(file) = session::take_crash()
-        {
-            let text = format!(
-                "blitz stopped after an internal error last time; details are in {}",
-                file.display()
-            );
-            self.set_notice(id, text, None, false);
         }
         Ok(())
     }
@@ -3085,6 +3095,13 @@ impl App {
         self.request_redraw();
     }
 
+    /// Whether pane `id` shows a notice that a passing one must not hide:
+    /// an error or a question, which wait for a key, or one meant to stay.
+    fn holds_notice(&self, id: PaneId) -> bool {
+        let n = self.view(id).and_then(|v| v.notice.as_ref());
+        n.is_some_and(|n| stays(n))
+    }
+
     /// Shows `text` in pane `id` until `ask` is answered or a key takes it
     /// away.
     fn ask(&mut self, id: PaneId, text: impl Into<String>, ask: Ask) {
@@ -3463,8 +3480,7 @@ impl App {
     /// worked, a while longer when it did not. A brief notice never hides
     /// one that stays up, such as how to close a pane that exited.
     fn notice_copy(&mut self, id: PaneId, text: String, worked: bool) {
-        let stays = |v: &View| v.notice.as_ref().is_some_and(|n| n.until.is_none());
-        if worked && self.view(id).is_some_and(stays) {
+        if worked && self.holds_notice(id) {
             return;
         }
         let shown = if worked { BRIEF } else { NOTICE };
@@ -4433,6 +4449,7 @@ impl App {
         // Another main blitz window has it then, and answers it.
         if jump_key_lost(ok, || crate::notify::other_main(self.hwnd))
             && let Some(id) = self.focus_id()
+            && !self.holds_notice(id)
         {
             let text = "Another program has Ctrl+Alt+J, so it cannot bring you to blitz";
             self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
@@ -5021,7 +5038,9 @@ impl App {
     /// Says, dimly in the focused pane, which lines of `config.toml` were
     /// skipped, if any.
     fn note_ignored(&mut self) {
-        if let (Some(text), Some(id)) = (self.config.ignored_notice(), self.focus_id()) {
+        if let (Some(text), Some(id)) = (self.config.ignored_notice(), self.focus_id())
+            && !self.holds_notice(id)
+        {
             self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
         }
     }
