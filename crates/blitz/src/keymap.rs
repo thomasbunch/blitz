@@ -321,10 +321,10 @@ pub fn held_before(lparam: isize) -> bool {
 
 /// Whether the auto-repeat of a held key does again what its press did,
 /// when blitz took the press (`panel` when the theme picker or settings
-/// panel did). Moving, scrolling and typing do. Anything that confirms,
-/// toggles, opens or closes does not: a held key would answer its own
-/// "press again", flicker, close pane after pane, or reach the program
-/// once its press closed what took it.
+/// panel did). Moving, scrolling, the font size and typing do. Anything
+/// that confirms, toggles, opens or closes does not: a held key would
+/// answer its own "press again", flicker, close pane after pane, or reach
+/// the program once its press closed what took it.
 pub fn repeats(k: &KeyInput, user: &[Binding], panel: bool) -> bool {
     match action(k, user) {
         Some(a) => matches!(
@@ -334,6 +334,7 @@ pub fn repeats(k: &KeyInput, user: &[Binding], panel: bool) -> bool {
                 | Action::Focus(_)
                 | Action::Resize(_)
                 | Action::Swap(_)
+                | Action::FontSize(_)
         ),
         None => panel && !matches!(k.key, Key::Enter | Key::Escape | Key::Delete),
     }
@@ -1158,13 +1159,14 @@ mod msg_to_key_tests {
                 assert!(!repeats_with(vk, held, panel), "{vk:#x} panel {panel}");
             }
         }
-        // Moving and scrolling go on while the key is held.
+        // Moving, scrolling and the font size go on while the key is held.
         for (vk, held) in [
             (0x21, &[0xa0][..]),         // ScrollPage
             (0x09, &[0xa2]),             // CycleTab
             (0x25, &[0xa2, 0xa4]),       // Focus
             (0x26, &[0xa4, 0xa0]),       // Resize
             (0x27, &[0xa2, 0xa4, 0xa0]), // Swap
+            (0xbb, &[0xa2]),             // FontSize
         ] {
             assert!(repeats_with(vk, held, false), "{vk:#x}");
         }
