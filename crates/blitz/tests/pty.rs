@@ -3,6 +3,7 @@
 //! ConPTY; otherwise the system's is used.
 #![cfg(windows)]
 
+use std::path::{Path, PathBuf};
 use std::sync::{Once, mpsc};
 use std::time::{Duration, Instant};
 
@@ -93,6 +94,49 @@ fn run(cmdline: &str) -> Run {
                 };
             }
         }
+    }
+}
+
+/// A program that cannot start is an error, and promptly: the window must
+/// not freeze on it.
+#[test]
+fn pty_spawn_failures_are_errors() {
+    // A folder too long to be a process's current directory, which a pane
+    // can still have saved: Explorer and shells both reach such folders.
+    let base = std::env::temp_dir().join(format!("blitz-long-{}", std::process::id()));
+    let mut long = base.clone();
+    while long.as_os_str().len() < 300 {
+        long.push("abcdefghijklmnopqrstuvwxyz0123456789");
+    }
+    std::fs::create_dir_all(Path::new(r"\\?\").join(&long)).expect("long dir");
+    assert!(long.is_dir());
+    let cases = [
+        ("no-such-program-4b1d", None),
+        (r"C:\no\such\4b1d.exe", None),
+        ("cmd /d /c echo hi", Some(PathBuf::from(r"C:\no\such\4b1d"))),
+        ("cmd /d /c echo hi", Some(long.clone())),
+    ];
+    let results: Vec<_> = (cases.into_iter())
+        .map(|(cmdline, cwd)| {
+            let (tx, rx) = mpsc::channel();
+            let what = format!("{cmdline} in {cwd:?}");
+            std::thread::spawn(move || {
+                let opts = SpawnOpts {
+                    cmdline,
+                    cwd: cwd.as_deref(),
+                    cols: 80,
+                    rows: 24,
+                    ..Default::default()
+                };
+                let _ = tx.send(Pty::spawn(&opts, |_, _| {}).map(drop));
+            });
+            (what, rx.recv_timeout(Duration::from_secs(10)))
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(Path::new(r"\\?\").join(&base));
+    for (what, r) in results {
+        let r = r.unwrap_or_else(|_| panic!("{what}: still starting after 10 s"));
+        assert!(r.is_err(), "{what}");
     }
 }
 

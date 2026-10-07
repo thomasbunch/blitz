@@ -283,8 +283,11 @@ impl Pty {
         }
         // The pseudoconsole holds its own copies of these.
         drop((in_r, out_w));
+        // Started before the handle goes into its mutex: a lock taken in the
+        // match below would be held through it, and closing takes it again.
+        let process = start(opts, hpc);
         let hpc = Arc::new(Mutex::new(hpc));
-        let process = match start(opts, *lock(&hpc)) {
+        let process = match process {
             Ok(p) => Arc::new(p),
             Err(e) => {
                 close_hpc(&hpc);
