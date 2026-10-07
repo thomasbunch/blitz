@@ -5,12 +5,17 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # release.yml runs this too, so a tag cannot publish untested code.
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Called from release.yml, github.workflow names the caller, so the group
+  # starts with a fixed name. The event keeps release runs from queueing
+  # behind, or cancelling, push and PR runs.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   # Runs on main always finish, so the cache is saved.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 

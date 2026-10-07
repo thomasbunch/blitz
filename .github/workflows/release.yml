@@ -1,7 +1,8 @@
 name: release
 
 # A v* tag builds the Windows zip and installer and attaches them to a draft
-# release. Running the workflow by hand builds the same files as an artifact.
+# release, once CI has passed on the tagged commit. Running the workflow by
+# hand builds the same files as an artifact.
 # Publishing the draft ships it: blitz offers the latest full release as an
 # update, so the draft is not marked as a prerelease.
 on:
@@ -21,6 +22,13 @@ env:
   CONPTY_SHA256: 86edb1054c6f56d7377117ff75489197a5f095fe9835df3ad04c2ba9d826b114
 
 jobs:
+  # All of CI on the tagged commit, whatever ran on main: publishing needs
+  # it to pass.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 30
@@ -134,7 +142,7 @@ jobs:
 
   publish:
     if: github.ref_type == 'tag'
-    needs: windows
+    needs: [ci, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
