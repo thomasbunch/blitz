@@ -264,6 +264,27 @@ fn hook_ignores_other_subcommands() {
     assert!(out.stdout.is_empty());
 }
 
+/// `notify` never fails the agent that runs it, even when misused; it
+/// says why on stderr. (tests/pty.rs sees what it writes in a pane.)
+#[test]
+fn hook_notify_never_fails() {
+    let run = |args: &[&str], token: Option<&str>| {
+        let mut cmd = Command::new(HOOK);
+        cmd.arg("notify").args(args).stdin(Stdio::null());
+        match token {
+            Some(t) => cmd.env("BLITZ_PANE_TOKEN", t),
+            None => cmd.env_remove("BLITZ_PANE_TOKEN"),
+        };
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        String::from_utf8(out.stderr).unwrap()
+    };
+    assert!(run(&["finished"], Some(TOKEN)).contains("usage: blitz-hook notify"));
+    assert!(run(&[], Some(TOKEN)).contains("usage: blitz-hook notify"));
+    assert_eq!(run(&["done", "ok"], None), "");
+}
+
 #[test]
 fn hook_handles_a_large_payload() {
     let reply = "word ".repeat(100_000);

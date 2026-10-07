@@ -301,6 +301,25 @@ fn pty_hook_sequences_reach_the_reader() {
     assert_eq!(r.code, 0);
 }
 
+/// Other agents' hooks run `blitz-hook notify`, which writes to the pane's
+/// console, not to the stdout the agent reads (here thrown away), and the
+/// console host passes it on.
+#[test]
+fn pty_notify_reaches_the_reader() {
+    let hook = env!("CARGO_BIN_EXE_blitz-hook");
+    let cmd =
+        format!("cmd /d /c \"\"{hook}\" notify needs-you \"Approve r\u{e9}sum\u{e9}\" > NUL\"");
+    let env = [("BLITZ_PANE_TOKEN".to_owned(), TOKEN.to_owned())];
+    let (_pty, _, rx) = spawn(&cmd, &env);
+    let seq = format!("\x1b]777;notify;blitz:{TOKEN}:needs-you:v2;Approve r\u{e9}sum\u{e9}\x07");
+    let mut out = Vec::new();
+    assert!(
+        wait_for(&rx, &mut out, seq.as_bytes()),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
 /// Each shell blitz integrates with that is on this machine, without the
 /// user's profile, which could replace the prompt.
 fn shells() -> Vec<String> {

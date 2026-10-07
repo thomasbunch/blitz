@@ -21,19 +21,32 @@ const USAGE_LIMIT: &str = "usage limit";
 pub const PROTOCOL: u32 = 2;
 
 /// Entry point of `blitz-hook`. Always returns 0, so a hook can never block
-/// Claude Code.
+/// the agent that runs it.
 ///
 /// `blitz-hook claude` reads a hook payload on stdin and prints a
 /// `terminalSequence` for Claude Code to write to its own terminal, so the
 /// state lands in the right pane without any IPC. The sequence carries the
 /// pane's `BLITZ_PANE_TOKEN`, which program output cannot know. Outside a
 /// blitz pane (no token) it prints nothing.
+///
+/// `blitz-hook notify <state> [message]` is for other agents' hooks, which
+/// cannot hand their terminal a sequence: it writes one to the console
+/// the pane gave it.
 pub fn run() -> i32 {
-    let claude = std::env::args().nth(1).as_deref() == Some("claude");
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let token = std::env::var("BLITZ_PANE_TOKEN").unwrap_or_default();
     // It goes into the sequence as is, so nothing in it may end the title.
     let in_pane = !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric());
-    if claude {
+    if args.first().is_some_and(|a| a == "notify") {
+        match notify_output(&token, &args[1..]) {
+            Some(seq) if in_pane => {
+                let _ = write_console(&seq);
+            }
+            Some(_) => {}
+            None => eprintln!("usage: blitz-hook notify {} [message]", STATES.join("|")),
+        }
+    }
+    if args.first().is_some_and(|a| a == "claude") {
         // Read all of it, even outside a pane or past the cap: Claude Code
         // writes the whole payload, and exiting first would break the pipe
         // under it.
@@ -51,6 +64,62 @@ pub fn run() -> i32 {
         }
     }
     0
+}
+
+/// The states `blitz-hook notify` takes.
+const STATES: [&str; 5] = ["working", "needs-you", "done", "error", "idle"];
+
+/// What `blitz-hook notify <state> [message]` writes to its pane, or `None`
+/// for a state blitz does not know. A message that is a JSON object is the
+/// notification Codex adds after the arguments it was given, and its last
+/// reply shows.
+pub fn notify_output(token: &str, args: &[String]) -> Option<String> {
+    let state = args.first().filter(|s| STATES.contains(&s.as_str()))?;
+    let msg = args.get(1).map_or("", String::as_str);
+    let msg = match Json::parse(msg) {
+        Some(j @ Json::Obj(_)) => {
+            let reply = j.get("last-assistant-message").and_then(Json::as_str);
+            reply_line(reply.unwrap_or("")).to_owned()
+        }
+        _ => msg.to_owned(),
+    };
+    Some(notify_seq(token, state, None, &msg))
+}
+
+/// Writes `seq` to the console this process shares with its pane, past
+/// the pipe an agent reads its hooks' output from.
+#[cfg(windows)]
+fn write_console(seq: &str) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, SetConsoleMode,
+        WriteConsoleW,
+    };
+    let con = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("CONOUT$")?;
+    let h = HANDLE(con.as_raw_handle());
+    let wide: Vec<u16> = seq.encode_utf16().collect();
+    let mut mode = CONSOLE_MODE::default();
+    // SAFETY: a console handle that `con` keeps open. The console passes
+    // the sequence on only while it reads escapes; the agent's own mode is
+    // put back after.
+    unsafe {
+        GetConsoleMode(h, &mut mode)?;
+        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)?;
+        let wrote = WriteConsoleW(h, &wide, None, None);
+        let _ = SetConsoleMode(h, mode);
+        wrote?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn write_console(seq: &str) -> io::Result<()> {
+    let mut tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+    tty.write_all(seq.as_bytes())
 }
 
 /// The hook's stdout for one Claude Code payload, or `None` when the event
@@ -153,15 +222,8 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
                 let s = if agents == 1 { "" } else { "s" };
                 return Some(("working", format!("waiting on {agents} agent{s}")));
             }
-            let reply = field(ev, "last_assistant_message");
-            let mut lines = reply.lines().map(str::trim).filter(|l| !l.is_empty());
-            let first = lines.next();
-            // A reply that ends by asking something shows the question.
-            let line = match lines.next_back() {
-                Some(last) if last.ends_with('?') => Some(last),
-                _ => first,
-            };
-            let msg = match (tasks.len(), line.unwrap_or("")) {
+            let line = reply_line(field(ev, "last_assistant_message"));
+            let msg = match (tasks.len(), line) {
                 (0, line) => line.to_owned(),
                 (n, "") => format!("{n} background"),
                 (n, line) => {
@@ -181,6 +243,17 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
         "SessionEnd" => ("idle", String::new()),
         _ => return None,
     })
+}
+
+/// The line of a reply to show: its first, or its last when the reply ends
+/// by asking something.
+fn reply_line(reply: &str) -> &str {
+    let mut lines = reply.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or("");
+    match lines.next_back() {
+        Some(last) if last.ends_with('?') => last,
+        _ => first,
+    }
 }
 
 /// A tool as people read it: `mcp__github__create_issue` is
@@ -1261,6 +1334,34 @@ mod tests {
             &SESSION.replacen("0b", "é", 1),
         ] {
             assert!(!is_session_id(bad), "{bad:?}");
+        }
+    }
+
+    /// Other agents report through `blitz-hook notify`, with the same
+    /// sequence a Claude Code hook gets written.
+    #[test]
+    fn notify_for_other_agents() {
+        let notify = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|&a| a.into()).collect();
+            notify_output(TOKEN, &args)
+        };
+        let seq = |state: &str, msg: &str| Some(notify_seq(TOKEN, state, None, msg));
+        for state in STATES {
+            assert_eq!(notify(&[state]), seq(state, ""), "{state}");
+            let title = format!("blitz:{TOKEN}:{state}:v{PROTOCOL}");
+            assert!(Ev::from_notify(&title, TOKEN).is_some(), "{state}");
+        }
+        assert_eq!(
+            notify(&["needs-you", "Approve\nthe \x1b]0;x\x07plan"]),
+            seq("needs-you", "Approve the ]0;xplan")
+        );
+        // Codex adds its notification as JSON after the arguments.
+        let codex = r#"{"type":"agent-turn-complete","last-assistant-message":"Done.\nShip it?","input-messages":["fix"]}"#;
+        assert_eq!(notify(&["done", codex]), seq("done", "Ship it?"));
+        assert_eq!(notify(&["done", "Built", codex]), seq("done", "Built"));
+        assert_eq!(notify(&["done", "[1]"]), seq("done", "[1]"));
+        for bad in [&[][..], &["ready"], &["Done"], &["needs you"], &["", "x"]] {
+            assert_eq!(notify(bad), None, "{bad:?}");
         }
     }
 
