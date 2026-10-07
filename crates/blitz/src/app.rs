@@ -3988,7 +3988,8 @@ impl App {
                     let rows = v.grid.1.min((at.h / ch as i32) as u16);
                     g.r.clipped(at, |r| {
                         r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
-                        if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code) {
+                        if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code)
+                        {
                             draw_notice(r, &pal, at, (v.grid.0, rows), &text, dim);
                         }
                     });
