@@ -595,6 +595,7 @@ const STRIP: &[&str] = &[
     "TERMINATOR_UUID",
     "XTERM_VERSION",
     "TMUX",
+    "TMUX_PANE",
     "STY",
     "COLORTERM",
     // Set when blitz itself was started from a Claude Code session. Each
@@ -689,6 +690,9 @@ mod tests {
             // that pane's, and the token is a secret.
             ("BLITZ_PANE_TOKEN", "0f1e"),
             ("PROMPT", crate::shell::cmd_prompt("0f1e").as_str()),
+            // In tmux, Claude Code stops turning the mark in its title.
+            ("TMUX", "/tmp/tmux-1000/default,1,0"),
+            ("TMUX_PANE", "%3"),
         ]
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         let extra = [("Path".to_owned(), r"C:\other".to_owned())];
