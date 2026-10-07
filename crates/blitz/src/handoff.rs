@@ -17,10 +17,11 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, HTCLIENT, SMTO_ABORTIFHUNG,
-    SendMessageTimeoutW, WM_COPYDATA, WM_EXITSIZEMOVE, WM_MOUSEACTIVATE,
+    AllowSetForegroundWindow, EnumWindows, FindWindowW, GetClassNameW, GetWindowThreadProcessId,
+    HTCLIENT, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_COPYDATA, WM_EXITSIZEMOVE,
+    WM_MOUSEACTIVATE,
 };
-use windows::core::{GUID, HSTRING};
+use windows::core::{BOOL, GUID, HSTRING};
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::UserEvent;
@@ -32,6 +33,42 @@ pub const CLASS: &str = if cfg!(debug_assertions) {
 } else {
     "blitz"
 };
+
+/// The window class of a window opened with `--new-window`, which takes
+/// no hand-offs.
+const SEPARATE: &str = if cfg!(debug_assertions) {
+    "blitz.dev.window"
+} else {
+    "blitz.window"
+};
+
+/// The window class of the main window, or of a `separate` one.
+pub fn class(separate: bool) -> &'static str {
+    if separate { SEPARATE } else { CLASS }
+}
+
+/// How many blitz windows other processes have open. The installer closes
+/// them all to update.
+pub fn others() -> usize {
+    unsafe extern "system" fn each(hwnd: HWND, count: LPARAM) -> BOOL {
+        let mut buf = [0u16; 32];
+        // SAFETY: a window handle and a buffer to fill.
+        let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+        let mut pid = 0;
+        // SAFETY: as above, with a u32 to fill.
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        let blitz = [CLASS, SEPARATE].contains(&String::from_utf16_lossy(&buf[..n]).as_str());
+        if blitz && pid != std::process::id() {
+            // SAFETY: `others` passes a usize that outlives the enumeration.
+            unsafe { *(count.0 as *mut usize) += 1 };
+        }
+        true.into()
+    }
+    let mut n = 0usize;
+    // SAFETY: the callback only reads each window and counts into `n`.
+    let _ = unsafe { EnumWindows(Some(each), LPARAM(&raw mut n as isize)) };
+    n
+}
 
 /// Tells a blitz folder apart from anything else sent as WM_COPYDATA.
 const MAGIC: usize = 0x626c_7a01;
@@ -278,6 +315,21 @@ mod tests {
 
     fn bytes(units: &[u16]) -> Vec<u8> {
         units.iter().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    /// Only the main window takes folders, and the installer's count of
+    /// blitz windows takes in both kinds.
+    #[test]
+    fn separate_windows_have_a_class_of_their_own() {
+        assert_eq!(class(false), CLASS);
+        assert_ne!(class(true), CLASS);
+        assert_eq!(class(true), SEPARATE);
+        // A class name longer than the buffer `others` reads into would be
+        // cut and never match.
+        assert!(CLASS.len() < 32 && SEPARATE.len() < 32);
+        // Not a full test of the count, as other blitz windows may be open
+        // on this machine, but none of them is this test's.
+        let _ = others();
     }
 
     #[test]

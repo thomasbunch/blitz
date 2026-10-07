@@ -33,6 +33,10 @@ OutputBaseFilename=blitz-{#AppVersion}-windows-x64-setup
 [Tasks]
 Name: desktopicon; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: explorermenu; Description: "Add ""Open in blitz"" to the folder right-click menu"
+; Starting at sign-in reopens the last session, so it is for the user who
+; installs. Setup for all users may run as an administrator who typed their
+; password for another user, whose own sign-in it would not start.
+Name: startup; Description: "Start blitz when I sign in"; Flags: unchecked; Check: not IsAdminInstallMode
 
 [Files]
 Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
@@ -68,6 +72,11 @@ Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz"; Flags: d
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\blitz.window"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
 Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
 Root: HKA; Subkey: "Software\Classes\Drive\shell\blitz.window"; Flags: deletekey dontcreatekey; Check: not WizardIsTaskSelected('explorermenu')
+; The name and icon blitz gives its notifications when it first shows one.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\blitz.terminal"; Flags: uninsdeletekey dontcreatekey
+; Starting at sign-in: unticked on a reinstall, it goes.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "blitz"; ValueData: """{app}\blitz.exe"""; Flags: uninsdeletevalue; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "blitz"; Flags: deletevalue dontcreatekey; Check: not WizardIsTaskSelected('startup')
 
 [Icons]
 Name: "{autoprograms}\blitz"; Filename: "{app}\blitz.exe"

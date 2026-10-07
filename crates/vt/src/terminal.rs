@@ -513,6 +513,21 @@ impl Terminal {
         self.changed = true;
     }
 
+    /// Starts over on blank screens of the same size, as RIS does, keeping
+    /// what the host told it. For a host that cannot trust the state any
+    /// more, say once parsing panicked. The program's modes and screen
+    /// stay too: it is not told they went, and neither console host sends
+    /// them again.
+    pub fn reset(&mut self) {
+        let (modes, alt) = (std::mem::take(&mut self.modes), self.alt);
+        self.full_reset();
+        self.modes = Modes {
+            sync: None,
+            ..modes
+        };
+        self.switch_screen(alt);
+    }
+
     /// The host's theme: whether it is dark, for `CSI ? 996 n`, and its
     /// colours, for colour queries. The next snapshot recolours every cell.
     /// A program that set mode 2031 is told of any change, so it can query
@@ -974,13 +989,12 @@ impl Terminal {
                 0..self.cur.y
             }
             2 => 0..self.rows(),
+            // The alternate screen has no scrollback. A full-screen program
+            // clearing its own this way, as Claude Code does on a redraw,
+            // must not take the shell's history with it.
+            3 if self.alt => return,
             3 => {
-                let main = if self.alt {
-                    &mut self.other
-                } else {
-                    &mut self.screen
-                };
-                main.grid.clear_scrollback();
+                self.screen.grid.clear_scrollback();
                 self.viewport = 0;
                 return;
             }

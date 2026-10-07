@@ -16,8 +16,10 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   colour when one of them needs you, and a click there goes to it.
 - Claude Code's title tells blitz when a session works and when it
   stops, and its hooks, which blitz sets up itself, when it needs input.
-  The window title starts with how many need you, as in `(2) pwsh`, and
-  the taskbar button flashes if blitz is in the background.
+  The window title starts with how many need you, as in `(2) pwsh`. If
+  blitz is in the background, a Windows notification says so and takes
+  you there when clicked, and the taskbar button flashes and shows the
+  session's dot.
 - In PowerShell with PSReadLine (its default), a command that runs for 10
   seconds or more and ends in a pane you are not looking at marks it
   *done*, or *error* with its exit code.
@@ -50,18 +52,31 @@ The shell is PowerShell 7 if installed, else Windows PowerShell, else cmd.
 The installer adds **Open in blitz** to the right-click menu of folders
 and drives; on Windows 11 it is under **Show more options**.
 Shift+right-click also offers **Open in new blitz window**. Untick the
-option during setup to leave the menu alone.
+option during setup to leave the menu alone. Setup for the current user
+can also start blitz when you sign in, with the tabs and sessions you
+left; that option is off unless you tick it.
+
+From a shell, `blitz DIR` opens a tab in that folder, and `blitz .` in
+the one you are in, in the blitz already running if there is one;
+`--new-window` gives it a window of its own. `blitz --help` lists the
+rest.
 
 blitz asks GitHub for the latest release when it starts and every six
-hours. If there is a newer one, the foot of the sidebar says so, or a
-strip under the panes while the sidebar is collapsed or not shown.
-Ctrl+Shift+U downloads the installer, checks it against the release's
-`SHA256SUMS.txt` and restarts blitz on the new version. That ends every
-session, so blitz asks you to press it twice if one is busy. A copy run
-from the zip opens the release page instead. If the installer fails,
-blitz starts again on the old version and a strip under the panes names
-the installer's log. With nothing shown, Ctrl+Shift+U asks GitHub right
-away and says what it found.
+hours, through the proxy Windows is set to use. If there is a newer
+one, the foot of the sidebar says so, or a strip under the panes while
+the sidebar is collapsed or not shown: a click on it opens the release
+notes, and its × hides it until a newer release. Ctrl+Shift+U downloads
+the installer, checks it against the release's `SHA256SUMS.txt` and
+restarts blitz on the new version. That ends every session and closes
+any other blitz window, so blitz asks first. When a session is busy in
+the main blitz window and no other is open, the first press leaves the
+update to install when you close blitz, and the next press restarts
+now. A copy run from the
+zip opens the release page instead. If the installer fails, blitz starts
+again on the old version and a strip under the panes names the
+installer's log. With nothing shown, Ctrl+Shift+U asks GitHub right away
+and says what it found. The settings panel, under **Check for updates**,
+says why the last look or update failed.
 
 ## Build
 
@@ -115,8 +130,10 @@ it waits for you if its settings have
 `"preferredNotifChannel": "terminal_bell"`. The hooks add what the title
 cannot show: a question waiting for you, the prompt and the reply under
 the session's name, the conversation to resume, and that the pane runs
-Claude Code at all, which names the session after its task.
-
+Claude Code at all, which names the session after its task. Only they,
+and a session that ends in an error, raise a Windows notification, and
+only they keep the PC awake: any program can ring a bell or set a
+title, so a bell alone flashes the taskbar button and no more.
 
 ### Session marks
 
@@ -188,7 +205,31 @@ resuming its Claude Code conversation. A program that exits with an error
 leaves its pane open with the exit code: Enter starts it again in place,
 Esc closes the pane.
 
-Saved state lives in `%LOCALAPPDATA%\blitz`.
+Saved state lives in `%LOCALAPPDATA%\blitz`. If blitz ever stops after
+an internal error, it writes what happened to `crash.txt` there, and the
+next start says so once and keeps the file as `last-crash.txt`.
+
+## Shells
+
+Besides the shell in the settings, the command palette opens a tab on
+any shell installed: PowerShell, cmd, Git Bash or a WSL distribution.
+The pane keeps its shell when blitz reopens it. New panes get the PATH
+blitz started with, in its order, then the folders Windows' Path has
+gained since, so a program installed while blitz runs is found without
+restarting blitz.
+
+With shell integration on, PowerShell and cmd mark each prompt and tell
+blitz their folder, around the prompt you have, also one that
+oh-my-posh or posh-git sets later. For bash in Git Bash or WSL,
+
+```
+blitz setup shell bash
+```
+
+prints lines to add to the end of `~/.bashrc` (`zsh` prints them for
+`~/.zshrc`). They do nothing outside blitz. blitz follows only Windows folders, so in
+WSL only folders under `/mnt` are reported, and the lines need
+`BLITZ_PANE_TOKEN`, which reaches WSL only when `WSLENV` lists it.
 
 ## Settings
 
@@ -200,9 +241,12 @@ size and the theme change at once; the panel says when the others take
 effect. A dot marks each setting changed from its default.
 
 The panel saves to `%APPDATA%\blitz\config.toml`, which you can also edit
-yourself: one `key = value` per line, `#` starts a comment. blitz reads
-the file again whenever it is saved, and keeps your comments when it
-writes it.
+yourself: one `key = value` per line, `#` after a space starts a
+comment. **Open config.toml** in the command palette opens it, in
+Notepad when no program opens `.toml` files. blitz reads the file again whenever it is saved, and
+keeps your comments when it writes it. A line it cannot use is skipped,
+and a dim notice in the pane says which. A theme or font that is not
+there shows in the panel with what blitz uses instead.
 
 | Key | Default | |
 |---|---|---|
@@ -210,20 +254,25 @@ writes it.
 | `font_family` | `"Cascadia Mono"` | Falls back to Cascadia Mono, then Consolas, when not installed. Icons the font lacks come from an installed Nerd Font |
 | `font_size` | `11` | In points, 4 to 72 |
 | `line_height` | `1` | Space between the lines in the panes, 0.8 to 2 times the font's own |
-| `shell` | `""` | Path of the program new panes run; empty picks PowerShell 7, then Windows PowerShell, then cmd |
+| `shell` | `""` | The program new panes run, with any arguments, such as `wsl.exe -d Ubuntu`; empty picks PowerShell 7, then Windows PowerShell, then cmd |
 | `shell_integration` | `true` | Let PowerShell and cmd report their folder and prompts to blitz |
 | `scrollback_lines` | `10000` | Lines of history each new pane keeps, up to 100000 |
 | `restore_session` | `true` | Reopen the last window's tabs, splits and folders |
 | `restore_claude` | `true` | Resume the Claude Code sessions they were running |
 | `restore_scrollback` | `false` | Save each pane's last 1000 lines when blitz closes and show them again above the new prompt. Off by default because old output can contain secrets |
+| `keep_awake` | `false` | Keep the PC from going to sleep by itself while Claude Code works in a session, as its hooks say |
 | `check_updates` | `true` | Look for a newer release |
 | `flash` | `true` | Flash the taskbar button when a session needs you |
+| `toasts` | `"needs-you"` | Windows notifications while blitz is in the background: `"needs-you"` for sessions that need you or failed, `"all"` for finished ones too, or `"off"`. Clicking one takes you to the session |
+| `sound` | `false` | Play a sound when a session wants you while blitz is in the background: the notification's, or the default beep without one |
+| `global_jump` | `false` | Let Ctrl+Alt+J bring blitz to the front from any program, on the session that needs you |
 | `bell_attention` | `true` | Treat a bell or a notification in a background pane as needing you |
 | `right_click_paste` | `true` | A right click copies the selection, or pastes when nothing is selected |
 | `editor_uri` | `""` | Ctrl+click on a file path opens it at its line through this URI, such as `"vscode://file/{path}:{line}:{col}"`. Empty opens the file with its program, or shows it in Explorer when it has none |
 | `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
 | `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
 | `keybind` | | Binds a key to an action; one line per key. See [Key bindings](#key-bindings) |
+| `env` | | Sets a variable in new panes, as in `env = RUST_LOG=debug`; one line per variable |
 
 blitz run, the last row of the panel, is a game rather than a setting:
 Enter starts it, and it keeps its best score in
@@ -242,8 +291,9 @@ Built in: **blitz** dark and light (the default), **blitz ember** and
 GitHub Dark and Light, Gruvbox Dark and Light, Rose Pine and Rose Pine
 Dawn, Solarized Dark and Light, and Tokyo Night and Tokyo Night Day.
 
-To make your own, put a file in `%APPDATA%\blitz\themes`; its file name,
-without a `.conf` ending, is the theme's name. The format is Ghostty's,
+To make your own, put a file in `%APPDATA%\blitz\themes`, which **Open
+themes folder** in the command palette opens; its file name, without a
+`.conf` ending, is the theme's name. The format is Ghostty's,
 so the files from
 [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/ghostty)
 work as they are. Edits show up while blitz runs.
@@ -424,24 +474,29 @@ that, or typing, goes back to the bottom.
 | Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
 A zoomed pane stays zoomed until you zoom again, move focus to another
-pane, split or resize.
+pane, split or resize. With `global_jump` on, Ctrl+Alt+J jumps from any
+program: it brings blitz to the front on the session that needs you.
 
-The command palette lists every action with its keys. Typing narrows
-the list, the arrow keys choose, and Enter or a click runs the action;
-Esc closes it. When no action matches, Enter looks for what you typed in
-the settings instead. Starting a new Claude Code session in a split,
-giving the panes equal space, closing a whole tab, reopening the last
-closed pane, moving a pane to a new tab, renaming a session or a tab,
-copying without indent, selecting all, selecting the last command's
-output, clearing the scrollback, resetting the terminal and Claude Code
-setup have no keys by default, so they are only in the palette; renaming
-takes the name on the palette's line. Double-clicking the line between
-panes also gives them equal space. Clearing the scrollback also clears
-the screen above the line the cursor is on, which moves to the top, so
-nothing cleared comes back when the pane is resized. Resetting the
-terminal turns off what a program that crashed can leave on, such as
-mouse reports, a hidden cursor or keys sent as escape codes; the text
-stays.
+The command palette lists every action with its keys, and a **New tab**
+for each shell installed. Typing narrows the list, the arrow keys
+choose, and Enter or a click runs the action; Esc closes it. When no
+action matches, Enter looks for what you typed in the settings instead.
+Starting a new Claude Code session in a split, giving the panes equal
+space, closing a whole tab, reopening the last closed pane, moving a
+pane to a new tab, renaming a session or a tab, copying without indent,
+selecting all, selecting the last command's output, clearing the
+scrollback, resetting the terminal, opening config.toml or the themes
+folder and Claude Code setup have no keys by default, so they are only
+in the palette; renaming takes the name on the palette's line.
+Double-clicking the line between panes also gives them equal space.
+Clearing the scrollback also clears the screen above the line the cursor
+is on, which moves to the top, so nothing cleared comes back when the
+pane is resized. Resetting the terminal turns off what a program that
+crashed can leave on, such as mouse reports, a hidden cursor or keys
+sent as escape codes; the text stays.
+**Report an issue**, also only in the palette, starts a GitHub issue
+that says which blitz, Windows, renderer and ConPTY you run, but no file
+or folder names.
 
 ## Key bindings
 
@@ -476,13 +531,14 @@ The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
 `move_tab_left`, `move_tab_right`, `move_pane_to_new_tab`,
 `split_right`, `split_down`, `new_claude`, `focus_left`, `focus_right`,
 `focus_up`, `focus_down`, `jump_to_attention`, `go_to_session`,
-`toggle_sidebar`, `update`, `theme_picker`, `settings`, `zoom`,
-`resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
-`swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
-`font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
-`find`, `quick_select`, `previous_prompt`, `next_prompt`,
-`system_menu`, `claude_setup`, `go_to_tab_1` to `go_to_tab_8` and
-`last_tab`. Typing a name in the command palette finds its action.
+`toggle_sidebar`, `update`, `theme_picker`, `settings`, `open_config`,
+`open_themes`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
+`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
+`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
+`fullscreen`, `command_palette`, `find`, `quick_select`,
+`previous_prompt`, `next_prompt`, `system_menu`, `claude_setup`,
+`report_issue`, `go_to_tab_1` to `go_to_tab_8` and `last_tab`. Typing a
+name in the command palette finds its action.
 
 A binding can also type text into the focused pane: `text:` and the
 text, with `\e` for Esc, `\r` for Enter, `\n`, `\t`, `\s` for a space,
@@ -499,6 +555,24 @@ text selected, or a resize or swap with no split or neighbour that way.
 Held down, the keys that move focus, switch or move tabs, scroll, resize
 and swap repeat; the others act once, so a held key never answers its own
 "press again".
+
+## Accessibility
+
+- The cursor does not blink, and nothing is animated unless you turn on
+  `scenery` or `mascot`; those keep still while Windows' animation
+  effects are off. `flash = false` stops the taskbar button flashing.
+- With a Windows contrast theme on and the `theme` setting at its
+  default, blitz takes the contrast theme's colours.
+- blitz keeps the system caret, hidden, on the cursor, so Magnifier and
+  other tools that follow the text cursor follow it. Claude Code draws a
+  cursor of its own instead; set `CLAUDE_CODE_ACCESSIBILITY=1` in your
+  environment to have it use the real one.
+- Sessions that need you are marked in the theme's `accent` colour and
+  errors in its `error` colour. If the two are hard to tell apart, set
+  them in a theme file (see [Themes](#themes)). Claude Code's `/theme`
+  has colour-blind-friendly themes for its own output.
+- Ctrl+= and Ctrl+- change the font size; `font_size` sets it.
+- Screen readers cannot read the panes yet.
 
 ## License
 

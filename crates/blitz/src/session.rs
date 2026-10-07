@@ -3,7 +3,7 @@
 
 use std::fmt::Write;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::hook::{Json, escape_json};
@@ -71,6 +71,9 @@ pub struct PaneMeta {
     pub name: Option<String>,
     /// The number after the session's name in the sidebar; 0 for none.
     pub num: u32,
+    /// The `shell` setting the pane runs; empty for the one in the
+    /// settings.
+    pub shell: String,
 }
 
 impl NodeState {
@@ -200,6 +203,25 @@ fn file() -> Option<PathBuf> {
     dir().map(|d| d.join("session.json"))
 }
 
+/// Whether hint `name` shows for the first time, noting in `dir` that it
+/// has: the `hints` file there lists those shown, one a line. One that
+/// cannot be noted does not show, so it never shows on every start.
+pub fn first_time_in(dir: &Path, name: &str) -> bool {
+    let file = dir.join("hints");
+    let shown = std::fs::read_to_string(&file).unwrap_or_default();
+    if shown.lines().any(|l| l == name) {
+        return false;
+    }
+    let noted = std::fs::create_dir_all(dir).and_then(|()| {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file)?;
+        writeln!(f, "{name}")
+    });
+    noted.is_ok()
+}
+
 /// The saved session. A missing or broken file reads as none. A byte order
 /// mark, which an editor may add, is skipped.
 pub fn load() -> Option<State> {
@@ -240,6 +262,24 @@ pub fn save(s: &State) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     swapped
+}
+
+/// Writes down why blitz is about to go, for the next start to point at;
+/// see [`take_crash`].
+pub fn write_crash(text: &str) -> io::Result<()> {
+    let dir = dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("crash.txt"), text)
+}
+
+/// Where the last run wrote down its crash, if it did and no start has
+/// told of it yet. Moved to `last-crash.txt`, replacing an older one, so
+/// it is told of once and still there to read.
+pub fn take_crash() -> Option<PathBuf> {
+    let dir = dir()?;
+    let last = dir.join("last-crash.txt");
+    std::fs::rename(dir.join("crash.txt"), &last).ok()?;
+    Some(last)
 }
 
 /// Forgets the session and its saved output, so the next start is fresh.
@@ -361,6 +401,9 @@ fn node_json(n: &NodeState, out: &mut String) {
                 escape_json(n, out);
                 out.push('"');
             }
+            out.push_str(",\"shell\":\"");
+            escape_json(&m.shell, out);
+            out.push('"');
             out.push_str("}}");
         }
         NodeState::Split { axis, ratio, a, b } => {
@@ -460,6 +503,10 @@ fn node(j: &Json) -> Option<NodeState> {
             .filter(|n| !n.is_empty());
         // Sessions saved before numbers have none.
         let num = int(p.get("num")).unwrap_or(0);
+        // Sessions saved before shells were kept run the one in the settings.
+        let shell = (p.get("shell").and_then(Json::as_str))
+            .unwrap_or_default()
+            .into();
         return Some(NodeState::Pane(PaneMeta {
             cwd,
             claude,
@@ -467,6 +514,7 @@ fn node(j: &Json) -> Option<NodeState> {
             done,
             name,
             num,
+            shell,
         }));
     }
     let axis = match j.get("split")?.as_str()? {
@@ -542,12 +590,31 @@ mod tests {
     use super::*;
     use crate::layout::Dir;
 
+    /// A shell picked in the command palette, with quotes and backslashes.
+    const GIT_BASH: &str = r#""C:\Program Files\Git\bin\bash.exe" --login -i"#;
+
     const AREA: Rect = Rect {
         x: 0,
         y: 0,
         w: 1001,
         h: 601,
     };
+
+    #[test]
+    fn a_hint_shows_once_ever() {
+        let dir = std::env::temp_dir().join(format!("blitz-hints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            first_time_in(&dir, "keys"),
+            "the first time, folder and all"
+        );
+        assert!(!first_time_in(&dir, "keys"));
+        assert!(first_time_in(&dir, "other"), "each hint is its own");
+        assert!(!first_time_in(&dir, "other") && !first_time_in(&dir, "keys"));
+        // With nowhere to note it, it never shows.
+        assert!(!first_time_in(&dir.join("hints").join("x"), "keys"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn pane(cwd: &str, claude: Option<&str>) -> NodeState {
         NodeState::Pane(PaneMeta {
@@ -557,6 +624,7 @@ mod tests {
             done: None,
             name: None,
             num: 0,
+            shell: String::new(),
         })
     }
 
@@ -596,7 +664,11 @@ mod tests {
                     root: split(
                         Axis::Row,
                         0.3333,
-                        pane(r"C:\dev\shop", None),
+                        NodeState::Pane(PaneMeta {
+                            cwd: r"C:\dev\shop".into(),
+                            shell: GIT_BASH.into(),
+                            ..PaneMeta::default()
+                        }),
                         split(
                             Axis::Column,
                             0.25,
@@ -751,9 +823,17 @@ mod tests {
         let good = to_json(&sample());
         let more = good
             .replacen("{\"v\":1,", "{\"v\":1,\"later\":[1,{\"x\":null}],", 1)
-            .replace("\"key\":\"\"}", "\"key\":\"\",\"shell\":\"pwsh\"}");
+            .replace("\"shell\":\"\"}", "\"shell\":\"\",\"later\":\"x\"}");
         assert_ne!(more, good);
         assert_eq!(from_json(&more), Some(sample()));
+    }
+
+    #[test]
+    fn panes_saved_before_shells_were_kept_run_the_set_one() {
+        let old = to_json(&sample()).replace(",\"shell\":\"\"", "");
+        let s = from_json(&old).expect("still a session");
+        let shells: Vec<&str> = (s.layout(1).1.iter()).map(|p| p.1.shell.as_str()).collect();
+        assert_eq!(shells, ["", GIT_BASH, "", "", ""]);
     }
 
     #[test]
@@ -831,11 +911,11 @@ mod tests {
         };
         let s = State::capture(&win, Geometry::default(), |p| PaneMeta {
             cwd: format!("d{}", p.0),
-            claude: None,
             key: format!("{:032x}", p.0),
             done: None,
             name: None,
             num: p.0 + 10,
+            ..PaneMeta::default()
         });
         let s = from_json(&to_json(&s)).expect("reads back");
         // Leaf order is 1, 2, 4, 3: the left split put 4 before 3.
@@ -870,6 +950,7 @@ mod tests {
             done: None,
             name: None,
             num: 0,
+            shell: String::new(),
         });
         assert!(s.sidebar_expanded);
     }

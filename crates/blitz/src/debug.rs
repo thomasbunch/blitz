@@ -189,14 +189,50 @@ pub struct Counters {
     pub wakeups: u64,
     /// Running on the system's ConPTY rather than the bundled one.
     pub inbox: bool,
+    /// Milliseconds from typed input to the first frame on screen after
+    /// the output that followed it, its echo; see [`Self::typed`].
+    pub key_present_ms: Vec<f64>,
+    /// Typed input waiting for its echo: when it was sent, and whether
+    /// output has come since.
+    typed: Option<(Instant, bool)>,
 }
 
+/// Most key-to-present times kept.
+// ponytail: the first ones of a long run only; a histogram if that matters
+const MAX_KEY_TIMES: usize = 10_000;
+
 impl Counters {
+    /// Input the user typed went to the focused pane at `now`. Input that
+    /// follows before its echo is timed with it, from the first.
+    pub fn typed(&mut self, now: Instant) {
+        self.typed.get_or_insert((now, false));
+    }
+
+    /// The focused pane printed something.
+    pub fn output(&mut self) {
+        if let Some(t) = &mut self.typed {
+            t.1 = true;
+        }
+    }
+
+    /// A frame went on screen at `now`; one after the echo ends the time.
+    pub fn presented(&mut self, now: Instant) {
+        if let Some((at, true)) = self.typed {
+            self.typed = None;
+            if self.key_present_ms.len() < MAX_KEY_TIMES {
+                let ms = now.saturating_duration_since(at).as_secs_f64() * 1000.0;
+                self.key_present_ms.push(ms);
+            }
+        }
+    }
+
     pub fn to_json(&self) -> String {
         let ms = |v: Option<f64>| v.map_or_else(|| "null".to_owned(), |v| format!("{v:.1}"));
+        let keys = &self.key_present_ms;
         format!(
             "{{\"first_pty_byte_ms\":{},\"first_post_prelude_ms\":{},\"first_present_ms\":{},\
-             \"frames\":{},\"frame_cpu_ms\":{:.1},\"wakeups\":{},\"inbox\":{}}}",
+             \"frames\":{},\"frame_cpu_ms\":{:.1},\"wakeups\":{},\"inbox\":{},\
+             \"keys\":{},\"key_present_p50_ms\":{},\"key_present_p99_ms\":{}}}",
             ms(self.first_pty_byte_ms),
             ms(self.first_post_prelude_ms),
             ms(self.first_present_ms),
@@ -204,6 +240,9 @@ impl Counters {
             self.frame_cpu_ms,
             self.wakeups,
             self.inbox,
+            keys.len(),
+            ms(percentile(keys, 50)),
+            ms(percentile(keys, 99)),
         )
     }
 
@@ -215,6 +254,14 @@ impl Counters {
             None => Ok(()),
         }
     }
+}
+
+/// The `p`th percentile of `v` by nearest rank; `None` when it is empty.
+fn percentile(v: &[f64], p: usize) -> Option<f64> {
+    let mut v = v.to_vec();
+    v.sort_by(f64::total_cmp);
+    let rank = (v.len() * p).div_ceil(100).max(1);
+    v.get(rank - 1).copied()
 }
 
 /// What the reader thread and the script share.
@@ -399,7 +446,7 @@ impl Runner {
         let (cmdline, mut env) = match &o.cmd {
             Some(c) => (c.clone(), Vec::new()),
             None => {
-                let l = crate::shell::launch("", true, &token);
+                let l = crate::shell::launch("", true, &token, &o.setenv);
                 (l.cmdline, l.env)
             }
         };
@@ -1441,8 +1488,44 @@ mod tests {
         assert_eq!(
             c.to_json(),
             "{\"first_pty_byte_ms\":13.0,\"first_post_prelude_ms\":40.0,\"first_present_ms\":null,\
-             \"frames\":3,\"frame_cpu_ms\":0.0,\"wakeups\":0,\"inbox\":false}"
+             \"frames\":3,\"frame_cpu_ms\":0.0,\"wakeups\":0,\"inbox\":false,\
+             \"keys\":0,\"key_present_p50_ms\":null,\"key_present_p99_ms\":null}"
         );
+        let c = Counters {
+            key_present_ms: (1..=200).rev().map(f64::from).collect(),
+            ..Default::default()
+        };
+        assert!(
+            c.to_json().ends_with(
+                "\"keys\":200,\"key_present_p50_ms\":100.0,\"key_present_p99_ms\":198.0}"
+            ),
+            "{}",
+            c.to_json()
+        );
+        assert_eq!(percentile(&[7.0], 99), Some(7.0));
+    }
+
+    /// A key is timed to the first frame shown after its echo, not to
+    /// frames before it; keys typed meanwhile count from the first.
+    #[test]
+    fn debug_keys_time_to_the_frame_after_their_echo() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut c = Counters::default();
+        // Output and frames with nothing typed time nothing.
+        c.output();
+        c.presented(at(1));
+        c.typed(at(10));
+        c.presented(at(12));
+        c.typed(at(14));
+        c.output();
+        c.presented(at(30));
+        c.presented(at(40));
+        assert_eq!(c.key_present_ms, [20.0]);
+        c.typed(at(50));
+        c.output();
+        c.presented(at(58));
+        assert_eq!(c.key_present_ms, [20.0, 8.0]);
     }
 
     #[test]

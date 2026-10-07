@@ -17,13 +17,21 @@ use vt::grid::Found;
 use vt::{
     Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
 };
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::UI::Notifications::ToastNotification;
+use windows::Win32::Foundation::{HANDLE, HWND, POINT};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows::Win32::System::Power::{
+    PowerClearRequest, PowerCreateRequest, PowerRequestSystemRequired, PowerSetRequest,
+};
+use windows::Win32::System::Threading::{
+    POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, GetKeyboardState, GetLastInputInfo, LASTINPUTINFO,
 };
@@ -32,10 +40,11 @@ use windows::Win32::UI::Shell::{
     TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage,
-    WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    CreateCaret, DestroyCaret, DestroyIcon, GetCursorPos, GetSystemMetrics, MB_OK, MSG,
+    SM_CXSMICON, SetCaretPos, SetForegroundWindow, TranslateMessage, WM_CHAR, WM_DEADCHAR,
+    WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
+use windows::core::{HSTRING, PWSTR};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
@@ -44,9 +53,7 @@ use winit::platform::windows::{
     EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{
-    CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowAttributes, WindowId,
-};
+use winit::window::{CursorIcon, Fullscreen, Icon, Window, WindowAttributes, WindowId};
 
 use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev, claude_title, exit_text};
@@ -82,7 +89,8 @@ const VK_F4: u16 = 0x73;
 
 /// How long a notice that is neither a question nor an error stays up.
 const NOTICE: Duration = Duration::from_secs(5);
-/// How long a hint about setting something up stays up.
+/// How long a hint stays up: about setting something up, or the keys
+/// worth knowing on the first start.
 const HINT: Duration = Duration::from_secs(10);
 /// How long Claude Code may show it is working with no word from its
 /// hooks before blitz says they are not reporting. A turn's first hook
@@ -103,8 +111,8 @@ const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// Why an update or a look for one stopped when its thread panicked; only
 /// that thread did.
 const INTERNAL: &str = "an internal error";
-/// Taskbar flashes per session are at least this far apart.
-const FLASH_GAP: Duration = Duration::from_secs(10);
+/// Alerts about one session are at least this far apart.
+const ALERT_GAP: Duration = Duration::from_secs(10);
 /// After this long with no key or mouse input anywhere, the user counts as
 /// away from the screen, even with blitz in front.
 const AWAY_AFTER: Duration = Duration::from_secs(30);
@@ -117,6 +125,11 @@ const SAVED_LINES: usize = 1000;
 /// key writes the file at most once this often rather than every step. A
 /// divider drag writes it once, after the drag.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// Failed writes of the session in a row after which the user is told,
+/// once: a release build has no console, so the window is otherwise not
+/// saved without a word.
+const SAVE_WARN: u32 = 3;
 /// How long to wait before building the renderer again after it failed.
 const GFX_RETRY: Duration = Duration::from_secs(1);
 /// Time between the steps a drag scrolls while the pointer is held above
@@ -140,13 +153,17 @@ pub enum UserEvent {
     /// Exit with this code: the self-test finished, or `--exit-after`
     /// ran out.
     Finish(i32),
-    /// A newer release, by version, with the installer's log when an
-    /// update to it failed.
-    Update(String, Option<PathBuf>),
-    /// What a look for a newer release that Ctrl+Shift+U asked for found.
-    Checked(Result<Option<String>, String>),
+    /// The update to this newer release failed and wrote this installer
+    /// log.
+    Failed(String, PathBuf),
+    /// What a look for a newer release found, and whether Ctrl+Shift+U
+    /// asked for it.
+    Checked(Result<Option<String>, String>, bool),
     /// The installer started, so blitz exits; or why it did not.
     Installed(Result<(), String>),
+    /// The installer of this release, downloaded to run when blitz
+    /// closes, or why it could not be.
+    Fetched(String, Result<crate::update::Installer, String>),
     /// Another launch asks the window to come to the front, and maybe to
     /// open a tab in its folder.
     Handoff(crate::handoff::Ask),
@@ -154,6 +171,12 @@ pub enum UserEvent {
     Settings,
     /// The user let go of the window after moving or sizing it.
     Sized,
+    /// Explorer made the window's taskbar button, which starts out blank.
+    TaskbarButton,
+    /// The user clicked the notification about this session.
+    ShowPane(PaneId),
+    /// The user pressed the key that brings them to blitz from anywhere.
+    GlobalJump,
 }
 
 /// Command-line options of the GUI.
@@ -181,15 +204,20 @@ impl Args {
                 a.new_window = true;
                 continue;
             }
+            // A folder alone, as in `blitz .`, is `--cwd`. Anything else is
+            // a mistyped command, which must not open a window.
+            if !flag.starts_with("--") {
+                let dir = folder(flag);
+                if !dir.is_dir() {
+                    return Err(format!("no such folder: {flag}"));
+                }
+                a.cwd = Some(dir);
+                continue;
+            }
             let v = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--cmd" => a.cmd = Some(v.clone()),
-                // Explorer passes a drive root as "C:\", and argv parsing
-                // reads the \" as an escaped quote, so it arrives as C:".
-                "--cwd" => match v.strip_suffix('"') {
-                    Some(root) => a.cwd = Some(format!("{root}\\").into()),
-                    None => a.cwd = Some(v.into()),
-                },
+                "--cwd" => a.cwd = Some(folder(v)),
                 "--selftest" => a.selftest = Some(v.into()),
                 "--capture" => a.capture = Some(v.into()),
                 "--exit-after" => {
@@ -237,23 +265,34 @@ impl Args {
     }
 }
 
-/// Runs the GUI until the window closes. Returns the process exit code.
-pub fn run(args: &[String]) -> i32 {
-    let mut args = match Args::parse(args) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("blitz: {e}");
-            return 2;
-        }
+/// A folder from the command line, made absolute, as the tab it opens is
+/// named after it and the session keeps it. Explorer passes a drive root
+/// as "C:\", and argv parsing reads the \" as an escaped quote, so it
+/// arrives as C:".
+fn folder(arg: &str) -> PathBuf {
+    let dir: PathBuf = match arg.strip_suffix('"') {
+        Some(root) => format!("{root}\\").into(),
+        None => arg.into(),
     };
+    std::path::absolute(&dir).unwrap_or(dir)
+}
+
+/// Runs the GUI until the window closes. Returns the process exit code, or
+/// what is wrong with the arguments.
+pub fn run(args: &[String]) -> Result<i32, String> {
+    let mut args = Args::parse(args)?;
     args.admin = elevated();
     // A launch brings the blitz already running to the front, and a folder
     // opens as a tab there.
     if args.main() {
         let sent = crate::handoff::send(args.cwd.as_deref());
         if args.handed_off(sent) {
-            return 0;
+            return Ok(0);
         }
+    }
+    // A test run's panic is the test's to report, not the next start's.
+    if !args.scripted() {
+        catch_crashes();
     }
     // Loading the graphics driver is most of the time to the first
     // frame; it runs while the window is made.
@@ -270,16 +309,36 @@ pub fn run(args: &[String]) -> i32 {
         Ok(l) => l,
         Err(e) => {
             eprintln!("blitz: {e}");
-            return 1;
+            return Ok(1);
         }
     };
     let mut app = App::new(args, keys, event_loop.create_proxy());
     app.gpu = Some(gpu);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("blitz: {e}");
-        return 1;
+        return Ok(1);
     }
-    app.code
+    Ok(app.code)
+}
+
+/// Writes a panic on this thread, the window's, to the crash file before
+/// it takes blitz down, since a release build has no console to say it
+/// on. Other threads catch their own: a pane's reader, an update.
+pub fn catch_crashes() {
+    let ui = std::thread::current().id();
+    let next = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == ui {
+            let text = format!(
+                "blitz {} stopped at {}\n{info}\n\n{}\n",
+                env!("CARGO_PKG_VERSION"),
+                local_stamp(),
+                std::backtrace::Backtrace::force_capture()
+            );
+            let _ = session::write_crash(&text);
+        }
+        next(info);
+    }));
 }
 
 /// Key input taken from raw window messages, waiting for the app.
@@ -470,6 +529,12 @@ struct Notice {
     until: Option<Instant>,
     dim: bool,
     ask: Ask,
+}
+
+/// Whether notice `n` stays up until a key or something else takes it
+/// away, rather than going by itself.
+fn stays(n: &Notice) -> bool {
+    n.until.is_none()
 }
 
 /// What a notice waits for. One that asks to confirm stays armed while
@@ -964,8 +1029,10 @@ struct View {
     /// hidden.
     rect: Option<Rect>,
     notice: Option<Notice>,
-    /// When the taskbar last flashed for this session.
-    flashed: Option<Instant>,
+    /// When blitz last alerted the user about this session.
+    alerted: Option<Instant>,
+    /// The notification about this session, while it is up.
+    toast: Option<ToastNotification>,
     /// A thread is reading the git branch of the session's directory.
     finding_branch: bool,
     /// A line to type at the shell's first prompt, and when to type it
@@ -985,6 +1052,10 @@ struct View {
     /// The number after the session's name, which tells look-alike
     /// sessions apart; kept across restarts.
     num: u32,
+    /// The `shell` setting the session runs when one was picked in the
+    /// command palette; empty for the one in the settings. Kept across
+    /// restarts.
+    shell: String,
     /// The progress the program last reported, and when.
     progress: Option<(chrome::Progress, Instant)>,
     /// When the title first showed Claude Code working.
@@ -1028,6 +1099,8 @@ struct App {
     motion: bool,
     /// Windows hides the pointer while typing.
     vanish: bool,
+    /// The colours of Windows high contrast mode when last looked at.
+    contrast: Option<[u32; 3]>,
     /// The command palette, while it is open.
     commands: Option<Commands>,
     /// Where the command palette and its rows were in the last frame, for
@@ -1087,20 +1160,33 @@ struct App {
     /// Said in the banner in place of the offer for now: the question that
     /// running Update again answers, or that the update is downloading.
     banner_note: Option<(String, Ask)>,
-    /// The banner strip in the last frame, for clicks.
-    banner: Option<Rect>,
+    /// Why the last update failed, which a later look does not clear.
+    update_error: Option<String>,
+    /// Why the last look for a release failed, if it did.
+    look_error: Option<String>,
+    /// The release that installs when blitz closes, with its installer
+    /// once downloaded.
+    at_close: Option<AtClose>,
+    /// The banner strip and the x that closes it in the last frame, for
+    /// clicks.
+    banner: Option<(Rect, Rect)>,
     /// The chips on panes scrolled back in the last frame, for clicks.
     below: Vec<(PaneId, Rect)>,
     /// The find bar in the last frame, for clicks.
     find_bar: Option<Rect>,
     /// Keys whose releases belong to a shortcut or a panel and are not sent.
     eaten: Eaten,
-    /// Where the IME was last told typing goes, in client pixels.
+    /// Where the IME and the caret were last told typing goes, in client
+    /// pixels.
     ime_at: Option<Rect>,
     /// What the title bar shows.
     title: String,
+    /// The size of the system caret while the window has one.
+    caret: Option<(u32, u32)>,
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
+    /// A Claude Code hook has reported from a pane since blitz started.
+    hooked: bool,
     capture_then_exit: bool,
     /// This is the main window, whose layout is saved for the next start.
     /// Separate windows and scripted runs leave the saved one alone.
@@ -1113,6 +1199,10 @@ struct App {
     saved: Option<session::State>,
     /// When a changed layout is saved, unless it changes back first.
     save_after: Option<Instant>,
+    /// Writes of the session in a row that failed.
+    save_fails: u32,
+    /// A notification failed, and the user was told.
+    toasts_failed: bool,
     /// No renderer could be built; the next try is not before this.
     gfx_retry: Option<Instant>,
     /// Where the window last was while not minimized, maximized or full
@@ -1132,6 +1222,15 @@ struct App {
     plugin: Option<String>,
     /// A hint about Claude Code's hooks was shown; one per run is enough.
     hooks_hinted: bool,
+    /// The state whose dot badges the taskbar button.
+    badge_shows: Option<Attn>,
+    /// Ctrl+Alt+J comes to this window from every program.
+    jump_key: bool,
+    /// The power request that keeps the PC awake; made the first time it
+    /// is needed.
+    power: Option<HANDLE>,
+    /// The PC is kept awake.
+    awake: bool,
     counters: Counters,
     code: i32,
 }
@@ -1172,13 +1271,15 @@ impl Picker {
 }
 
 /// What a row of the command palette does when picked.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Pick {
     Run(Action),
     /// Bring this session to the front.
     Show(PaneId),
     /// Open the settings panel on what was typed.
     Settings,
+    /// A new tab running this `shell` setting.
+    Shell(String),
 }
 
 /// The open command palette.
@@ -1196,6 +1297,8 @@ struct Commands {
     /// Sessions to go to, listed in place of the actions: each with its
     /// row and its state.
     sessions: Option<Vec<(PaneId, String, String)>>,
+    /// A row for each shell installed, as (label, `shell` setting).
+    shells: Vec<(String, String)>,
 }
 
 /// What the command palette's line names.
@@ -1207,11 +1310,26 @@ enum Rename {
 }
 
 impl Commands {
+    /// The palette with a "New tab: <name>" row for each of `shells`, as
+    /// [`crate::shell::choices`] lists them; the automatic one is New tab.
+    fn new(shells: Vec<(String, String)>) -> Commands {
+        let shells = (shells.into_iter())
+            .filter(|(_, shell)| !shell.is_empty())
+            .map(|(name, shell)| (format!("New tab: {name}"), shell))
+            .collect();
+        Commands {
+            shells,
+            ..Commands::default()
+        }
+    }
+
     /// The matching rows, each what it does and its label: the sessions
     /// whose row or state holds every typed word, or else actions in
-    /// [`keymap::ACTIONS`] order, leaving out the palette itself, going to
-    /// a tab by number and the `hidden` actions. When none matches what
-    /// was typed, one row searches the settings for it instead.
+    /// [`keymap::ACTIONS`] order with the shells after New tab, leaving out
+    /// the palette itself, going to a tab by number and the `hidden`
+    /// actions. A shell's command line matches too, so `wsl` finds every
+    /// WSL distribution. When none matches what was typed, one row searches
+    /// the settings for it instead.
     fn matches(&self) -> Vec<(Pick, String)> {
         if self.rename.is_some() {
             return Vec::new();
@@ -1229,12 +1347,22 @@ impl Commands {
                 .map(|s| (Pick::Show(s.0), s.1.clone()))
                 .collect();
         }
-        let mut rows: Vec<(Pick, String)> = (keymap::ACTIONS.iter())
+        let mut rows: Vec<(Pick, String)> = Vec::new();
+        let actions = (keymap::ACTIONS.iter())
             .filter(|a| !matches!(a.0, Action::Palette | Action::GoToTab(_) | Action::LastTab))
-            .filter(|a| !self.hidden.contains(&a.0))
-            .filter(|a| hit(format!("{} {}", a.2, a.1)))
-            .map(|a| (Pick::Run(a.0), a.2.to_string()))
-            .collect();
+            .filter(|a| !self.hidden.contains(&a.0));
+        for &(a, name, label) in actions {
+            if hit(format!("{label} {name}")) {
+                rows.push((Pick::Run(a), label.to_string()));
+            }
+            if a == Action::NewTab {
+                for (label, shell) in &self.shells {
+                    if hit(format!("{label} {shell}")) {
+                        rows.push((Pick::Shell(shell.clone()), label.clone()));
+                    }
+                }
+            }
+        }
         let typed = self.filter.trim();
         if rows.is_empty() && !typed.is_empty() {
             rows.push((Pick::Settings, format!("Search settings for \"{typed}\"")));
@@ -1530,6 +1658,7 @@ impl App {
             game_ended: None,
             motion: animations_on(),
             vanish: mouse_vanish(),
+            contrast: crate::theme::system_contrast(),
             commands: None,
             commands_hits: None,
             font_zoom: 0.0,
@@ -1555,19 +1684,26 @@ impl App {
             updating: None,
             closed: None,
             banner_note: None,
+            update_error: None,
+            look_error: None,
+            at_close: None,
             banner: None,
             below: Vec::new(),
             find_bar: None,
             eaten: Eaten::default(),
             ime_at: None,
             title: "blitz".into(),
+            caret: None,
             checked_conpty: false,
+            hooked: false,
             capture_then_exit: false,
             persist,
             hidden_until: None,
             maximize: false,
             saved: None,
             save_after: None,
+            save_fails: 0,
+            toasts_failed: false,
             gfx_retry: None,
             placed: Geometry::default(),
             watched: None,
@@ -1577,6 +1713,10 @@ impl App {
             taskbar_shows: None,
             plugin: None,
             hooks_hinted: false,
+            badge_shows: None,
+            jump_key: false,
+            power: None,
+            awake: false,
             counters: Counters::default(),
             code: 0,
         }
@@ -1601,11 +1741,9 @@ impl App {
             .with_inner_size(LogicalSize::new(980.0, 620.0))
             // Icon group 1, which build.rs links in.
             .with_window_icon(Icon::from_resource(1, Some(small_icon_size())).ok())
-            .with_taskbar_icon(Icon::from_resource(1, None).ok());
-        // Only the main window takes folders from other launches.
-        if !self.args.separate() {
-            attrs = attrs.with_class_name(crate::handoff::CLASS);
-        }
+            .with_taskbar_icon(Icon::from_resource(1, None).ok())
+            // Only the main window takes folders from other launches.
+            .with_class_name(crate::handoff::class(self.args.separate()));
         let saved = (self.persist && self.config.restore_session)
             .then(session::load)
             .flatten();
@@ -1628,6 +1766,7 @@ impl App {
             self.hwnd = h.hwnd.get();
         }
         crate::handoff::install(self.hwnd, self.proxy.clone(), !self.args.separate());
+        crate::notify::install(self.hwnd, self.proxy.clone());
         watch_settings(self.proxy.clone());
         self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
         self.frame_theme();
@@ -1655,15 +1794,20 @@ impl App {
         if self.views.is_empty() || self.args.cwd.is_some() {
             let cwd = match &self.args.cwd {
                 Some(dir) => start_dir(dir),
-                None => first_dir(std::env::current_dir().ok(), &not_a_start()),
+                None => first_dir(
+                    std::env::current_dir().ok(),
+                    &not_a_start(),
+                    std::env::var_os("SystemRoot").map(PathBuf::from).as_deref(),
+                ),
             };
             let id = PaneId(self.next_id);
             win.tabs.push(Tab::new(String::new(), id));
             win.active = win.tabs.len() - 1;
             let cmd = self.args.cmd.clone();
-            self.open(win, id, cmd.as_deref(), cwd)?;
+            self.open(win, id, cmd.as_deref(), "", cwd)?;
             // Said where it is seen: the release build has no console. It
-            // stays, as nothing this window does is saved.
+            // stays, as nothing this window does is saved, and takes the
+            // place of a shell that failed, which each new pane says again.
             if let Some(e) = lost {
                 let text = format!(
                     "The last session did not come back ({e}); it is kept for the next start, and this window is not saved"
@@ -1671,12 +1815,32 @@ impl App {
                 self.set_notice(id, text, None, false);
             }
         }
+        // Told once, in the window, as a release build has no console; a
+        // test run, a capture say, leaves it for the user's next start, as
+        // does one that has a more pressing notice to show. It goes at the
+        // next key, having been read. The notices below give way to it.
+        if !self.args.scripted()
+            && let Some(id) = self.focus_id()
+            && !self.holds_notice(id)
+            && let Some(file) = session::take_crash()
+        {
+            let text = format!(
+                "blitz stopped after an internal error last time; details are in {}",
+                file.display()
+            );
+            self.error(id, text);
+        }
+        self.note_ignored();
 
         // A dev build is left alone; a scripted run and a separate window
-        // have nothing to come back to.
-        if self.persist && !cfg!(debug_assertions) {
+        // have nothing to come back to. Set to start at sign-in, blitz
+        // starts then anyway, and a second start racing it would restore
+        // the same sessions in a second main window.
+        if self.persist && !cfg!(debug_assertions) && !starts_at_sign_in() {
             restart_after_reboot();
         }
+        // Once there is a pane to say it failed in.
+        self.global_jump();
         if let Some(script) = self.args.selftest.clone() {
             self.start_selftest(script);
         }
@@ -1687,8 +1851,16 @@ impl App {
                 let _ = proxy.send_event(UserEvent::Finish(0));
             });
         }
-        let scripted = self.args.selftest.is_some() || self.args.exit_after.is_some();
-        if !scripted && !cfg!(debug_assertions) {
+        // Once ever, a few keys worth knowing: counted only when shown.
+        if !self.args.scripted()
+            && let Some(id) = self.focus_id()
+            && !self.holds_notice(id)
+            && session::dir().is_some_and(|d| session::first_time_in(&d, "keys"))
+        {
+            let text = first_hint(&self.config.keys);
+            self.set_notice(id, text, Some(Instant::now() + HINT), true);
+        }
+        if !self.args.scripted() && !cfg!(debug_assertions) {
             let proxy = self.proxy.clone();
             let look = self.config.check_updates;
             std::thread::spawn(move || {
@@ -1696,17 +1868,16 @@ impl App {
                 // Ctrl+Shift+U updates with checks off too, so a failed
                 // update is shown, and old ones cleared, either way.
                 if let Some((v, log)) = crate::update::failed() {
-                    let _ = proxy.send_event(UserEvent::Update(v, Some(log)));
+                    let _ = proxy.send_event(UserEvent::Failed(v, log));
                 }
                 if !look {
                     return;
                 }
                 loop {
-                    // Quiet when it fails, as offline is normal; Ctrl+Shift+U
-                    // says why.
-                    if let Ok(Some(v)) = crate::update::check()
-                        && proxy.send_event(UserEvent::Update(v, None)).is_err()
-                    {
+                    // Quiet when it fails, as offline is normal; the
+                    // settings panel and Ctrl+Shift+U say why.
+                    let found = crate::update::check();
+                    if proxy.send_event(UserEvent::Checked(found, false)).is_err() {
                         return;
                     }
                     std::thread::sleep(UPDATE_EVERY);
@@ -1717,30 +1888,32 @@ impl App {
     }
 
     /// Starts a session for pane `id` and shows `win`, a layout that
-    /// already holds it, running `cmd` or else the shell. Once a session
-    /// exists, a layout that leaves the new pane, or the one it split,
-    /// below the minimum size is refused; panes the window already made
-    /// small do not count.
+    /// already holds it, running `cmd` or else `shell` (see [`App::spawn`]).
+    /// Once a session exists, a layout that leaves the new pane, or the one
+    /// it split, below the minimum size is refused; panes the window already
+    /// made small do not count.
     fn open(
         &mut self,
         win: layout::Window,
         id: PaneId,
         cmd: Option<&str>,
+        shell: &str,
         cwd: Option<PathBuf>,
     ) -> Result<(), String> {
         let grids = self.grids(&win);
         if !self.views.is_empty() && no_room(&win, &grids, id, self.focus_id()) {
             return Err("no room for another pane".into());
         }
-        self.spawn(id, &grids, cmd, cwd, None)?;
+        self.spawn(id, &grids, cmd, shell, cwd, None)?;
         self.install(win);
         Ok(())
     }
 
     /// Starts every pane of a saved session, each in its folder, and shows
     /// its layout. A pane whose folder a process cannot start in (too long
-    /// a path for one, say) starts where blitz runs instead. Starts none if
-    /// one still fails.
+    /// a path for one, say) starts where blitz runs instead, and one whose
+    /// shell has gone runs the shell in the settings. Starts none if one
+    /// still fails.
     fn restore(&mut self, s: &session::State) -> Result<(), String> {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
@@ -1758,12 +1931,13 @@ impl App {
                     }
                 })
                 .flatten();
-            // When the retry fails too, the first failure says why.
-            let started = (self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()))
-                .or_else(|first| {
-                    (self.spawn(id, &grids, None, None, old.as_deref()))
-                        .map_err(|then| joined(first, then))
-                });
+            let (cwd, old) = (start_dir(&meta.cwd), old.as_deref());
+            // When the retry fails too, the first failure says why. A shell
+            // that has gone gives way in `spawn` itself.
+            let started = (self.spawn(id, &grids, None, &meta.shell, cwd, old)).or_else(|first| {
+                (self.spawn(id, &grids, None, &meta.shell, None, old))
+                    .map_err(|then| joined(first, then))
+            });
             if let Err(e) = started {
                 self.views.clear();
                 self.next_num = 1;
@@ -1816,12 +1990,12 @@ impl App {
             return;
         };
         let (old, new) = (&self.views[i], PaneId(self.next_id));
-        let (cwd, cmd) = (start_dir(&old.pane.cwd), old.cmd.clone());
+        let (cwd, cmd, shell) = (start_dir(&old.pane.cwd), old.cmd.clone(), old.shell.clone());
         let claude = old.pane.claude.clone().filter(|_| cmd.is_none());
         let mut win = self.win.clone();
         win.replace_pane(id, new);
         let grids = self.grids(&win);
-        if let Err(e) = self.spawn(new, &grids, cmd.as_deref(), cwd, None) {
+        if let Err(e) = self.spawn(new, &grids, cmd.as_deref(), &shell, cwd, None) {
             self.error(id, e);
             return;
         }
@@ -1835,13 +2009,15 @@ impl App {
     }
 
     /// Starts a session for pane `id`, sized as `grids` lays it out (or
-    /// 80x24 when it has no place there), running `cmd` or else the shell,
-    /// below `old`, output saved by [`session::save_output`].
+    /// 80x24 when it has no place there), running `cmd`, or else `shell`, a
+    /// `shell` setting (empty for the one in the settings), below `old`,
+    /// output saved by [`session::save_output`].
     fn spawn(
         &mut self,
         id: PaneId,
         grids: &[(PaneId, (i32, i32))],
         cmd: Option<&str>,
+        shell: &str,
         cwd: Option<PathBuf>,
         old: Option<&str>,
     ) -> Result<(), String> {
@@ -1858,14 +2034,26 @@ impl App {
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         // Not the token, which is a secret between the pane and its child.
         let key = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
-        let shell =
-            |program: &str| crate::shell::launch(program, self.config.shell_integration, &token);
+        // The pane's own `shell` setting, else the one in the settings.
+        let setting = if shell.is_empty() {
+            self.config.shell.as_str()
+        } else {
+            shell
+        };
+        let launch_of = |program: &str| {
+            crate::shell::launch(
+                program,
+                self.config.shell_integration,
+                &token,
+                &self.config.env,
+            )
+        };
         let mut launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
                 env: Vec::new(),
             },
-            None => shell(&self.config.shell),
+            None => launch_of(setting),
         };
         // Claude Code loads blitz's hooks from there, with nothing pasted
         // into its settings.
@@ -1876,12 +2064,16 @@ impl App {
         });
         launch.env.extend(plugin.clone());
         let start = |launch: &crate::shell::Launch| {
+            // The integration's own variables win over the user's.
+            let env: Vec<_> = (self.config.env.iter().cloned())
+                .chain(launch.env.iter().cloned())
+                .collect();
             let proxy = self.proxy.clone();
             Pane::spawn(
                 id,
                 &Spawn {
                     cmdline: &launch.cmdline,
-                    env: &launch.env,
+                    env: &env,
                     cwd: cwd.as_deref(),
                     cols: grid.0,
                     rows: grid.1,
@@ -1901,17 +2093,30 @@ impl App {
         let mut pane = match start(&launch) {
             Ok(p) => p,
             // A shell setting that names a missing or mistyped program would
-            // fail every pane, and blitz would close as it opened. The shell
-            // blitz finds runs instead, and the pane says why.
-            Err(e) if cmd.is_none() && !self.config.shell.is_empty() => {
-                let mut auto = shell("");
-                auto.env.extend(plugin);
-                let p =
-                    (start(&auto)).map_err(|e| format!("cannot start {}: {e}", auto.cmdline))?;
-                let keys = keymap::keys_for(Action::Settings, &self.config.keys);
-                let using = program_name(&auto.cmdline);
-                fell_back = Some(shell_failed(&self.config.shell, &e, &using, keys));
-                launch = auto;
+            // fail every pane, and blitz would close as it opened. A pane's
+            // own shell gives way to the one in the settings, and that to
+            // the shell blitz finds; the pane says why.
+            Err(e) if cmd.is_none() && !setting.is_empty() => {
+                let mut started = Err(String::new());
+                for next in fallbacks(shell, &self.config.shell) {
+                    let mut l = launch_of(next);
+                    l.env.extend(plugin.clone());
+                    match start(&l) {
+                        Ok(p) => {
+                            started = Ok((p, l));
+                            break;
+                        }
+                        Err(e) => started = Err(format!("cannot start {}: {e}", l.cmdline)),
+                    }
+                }
+                let (p, used) = started?;
+                // The settings are where to fix only their own shell.
+                let keys = (shell.is_empty())
+                    .then(|| keymap::keys_for(Action::Settings, &self.config.keys))
+                    .flatten();
+                let using = program_name(&used.cmdline);
+                fell_back = Some(shell_failed(setting, &e, &using, keys));
+                launch = used;
                 p
             }
             Err(e) => return Err(format!("cannot start {}: {e}", launch.cmdline)),
@@ -1928,7 +2133,8 @@ impl App {
             resize_at: None,
             rect: None,
             notice: None,
-            flashed: None,
+            alerted: None,
+            toast: None,
             finding_branch: false,
             resume: None,
             prompted: false,
@@ -1936,6 +2142,8 @@ impl App {
             key,
             cmd: cmd.map(str::to_owned),
             num: self.next_num,
+            // What runs: once fallen back, the shell the settings name.
+            shell: if fell_back.is_some() { "" } else { shell }.into(),
             progress: None,
             claude_working: None,
             hooks_seen: false,
@@ -1962,12 +2170,14 @@ impl App {
         self.focus_moved(before);
     }
 
-    /// Opens a pane in a copy of the layout that `place` changes; tells the
-    /// user in the focused pane when that fails. The pane starts in `dir`,
-    /// or else where the focused one is.
+    /// Opens a pane running `shell` (see [`App::spawn`]) in a copy of the
+    /// layout that `place` changes; tells the user in the focused pane when
+    /// that fails. The pane starts in `dir`, or else where the focused one
+    /// is.
     fn add(
         &mut self,
         dir: Option<PathBuf>,
+        shell: &str,
         place: impl FnOnce(&mut layout::Window, PaneId) -> bool,
     ) {
         let cwd = dir.or_else(|| start_dir(self.current().map_or("", |v| v.pane.cwd.as_str())));
@@ -1976,7 +2186,7 @@ impl App {
         if !place(&mut win, id) {
             return;
         }
-        if let Err(e) = self.open(win, id, None, cwd)
+        if let Err(e) = self.open(win, id, None, shell, cwd)
             && let Some(id) = self.focus_id()
         {
             self.error(id, e);
@@ -1992,9 +2202,14 @@ impl App {
         self.win.close_pane(id);
         // The divider being dragged may be gone, even when focus stays.
         self.mouse.divider = None;
+        if self.view_mut(id).is_some_and(|v| v.toast.take().is_some()) {
+            crate::notify::untoast(id);
+        }
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
         self.taskbar_progress();
+        self.taskbar_badge();
+        self.keep_awake();
         if self.views.is_empty() {
             // Nothing is left open, so there is nothing to restore.
             if self.persist {
@@ -2150,7 +2365,7 @@ impl App {
             }),
             settings: self.settings.as_ref().map(|p| chrome::Settings {
                 filter: &p.filter,
-                rows: p.rows(&self.config),
+                rows: p.rows(&self.config, self.update_trouble()),
                 sel: p.sel,
                 top: p.top,
                 error: p.error.as_deref(),
@@ -2164,7 +2379,7 @@ impl App {
                             Pick::Show(id) => (cm.sessions.iter().flatten())
                                 .find(|s| s.0 == id)
                                 .map(|s| s.2.clone()),
-                            Pick::Settings => None,
+                            Pick::Settings | Pick::Shell(_) => None,
                         };
                         (label, side.unwrap_or_default())
                     })
@@ -2264,6 +2479,9 @@ impl App {
         }
         self.theme = t;
         self.frame_theme();
+        // The badge in the new colours.
+        self.badge_shows = None;
+        self.taskbar_badge();
         for v in &self.views {
             let mut term = lock(&v.pane.term);
             term.set_theme(!self.theme.light, &self.theme.pal);
@@ -2315,7 +2533,9 @@ impl App {
                 match picked {
                     Some(t) => {
                         let light = crate::theme::system_is_light();
-                        let setting = crate::theme::pick(&self.config.theme, &t.name, light);
+                        let theme = &self.config.theme;
+                        let contrast = crate::theme::contrast_for(theme).is_some();
+                        let setting = crate::theme::pick(theme, &t.name, light, contrast);
                         let value = crate::config::quote(&setting);
                         if let Err(e) = crate::config::save("theme", Some(&value)) {
                             let text = format!("Cannot save the theme to config.toml: {e}");
@@ -2349,8 +2569,9 @@ impl App {
 
     /// Opens the settings panel on its first setting.
     fn open_settings(&mut self) {
-        let fonts = crate::render::font::monospace_families();
-        self.settings = Some(Panel::new(fonts, crate::shell::choices()));
+        let fonts = crate::render::font::families().to_vec();
+        let themes = crate::theme::all().into_iter().map(|t| t.name).collect();
+        self.settings = Some(Panel::new(fonts, crate::shell::choices(), themes));
         self.request_redraw();
     }
 
@@ -2463,9 +2684,25 @@ impl App {
         if c.font_size != self.config.font_size {
             self.font_zoom = 0.0;
         }
+        let jump = c.global_jump != self.config.global_jump;
+        // The banner, and an update left for when blitz closes, go with
+        // the checks; looks stop at the next start.
+        if self.config.check_updates && !c.check_updates {
+            self.update = None;
+            self.at_close = kept_at_close(self.at_close.take(), self.updating.is_some());
+        }
+        let skipped = c.skips_other_lines(&self.config);
         self.config = c;
+        if jump {
+            self.global_jump();
+        }
+        self.keep_awake();
         if font {
             self.reload_font();
+        }
+        // Once per change, not each time the settings panel saves.
+        if skipped {
+            self.note_ignored();
         }
         // The picker puts the configured theme back when it closes.
         if self.picker.is_none() {
@@ -2519,7 +2756,7 @@ impl App {
         match k.vk {
             VK_ESCAPE => self.commands = None,
             VK_RETURN => {
-                let picked = cm.matches().get(cm.sel).map(|r| r.0);
+                let picked = cm.matches().get(cm.sel).map(|r| r.0.clone());
                 let typed = cm.filter.trim().to_string();
                 let rename = cm.rename.map(|r| (r, crate::hook::one_line(&cm.filter)));
                 self.commands = None;
@@ -2577,7 +2814,7 @@ impl App {
             return;
         };
         self.request_redraw();
-        if let Some(&(p, _)) = cm.matches().get(i) {
+        if let Some((p, _)) = cm.matches().into_iter().nth(i) {
             self.pick(el, p, cm.filter.trim().to_string());
         }
     }
@@ -2595,6 +2832,7 @@ impl App {
                 }
             }
             Pick::Show(id) => self.show(id),
+            Pick::Shell(shell) => self.add(None, &shell, new_tab),
             Pick::Settings => {
                 self.open_settings();
                 if let Some(p) = &mut self.settings {
@@ -2891,6 +3129,122 @@ impl App {
         }
     }
 
+    /// Hides the banner until a newer release, in this run and the next,
+    /// and drops an update left for when blitz closes.
+    fn dismiss_update(&mut self) {
+        self.at_close = kept_at_close(self.at_close.take(), self.updating.is_some());
+        if let Some((v, _)) = self.update.take() {
+            if let Some(dir) = session::dir() {
+                crate::update::dismiss_in(&dir, Some(&v));
+            }
+            self.request_redraw();
+        }
+    }
+
+    /// Opens the notes of the release the banner shows.
+    fn open_notes(&mut self) {
+        let Some((v, _)) = &self.update else {
+            return;
+        };
+        let url = crate::update::notes(v);
+        if !crate::update::open(&url)
+            && let Some(id) = self.focus_id()
+        {
+            let text = format!("Could not open a browser; see {url}");
+            self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+        }
+    }
+
+    /// Whether release `v`, found without Ctrl+Shift+U, or the update to
+    /// it that `failed`, gets the banner: not after checks were turned off,
+    /// and not one whose banner was closed.
+    fn unasked(&self, v: &str, failed: bool) -> bool {
+        let closed = session::dir().and_then(|d| crate::update::dismissed_in(&d));
+        crate::update::show_unasked(v, failed, self.config.check_updates, closed.as_deref())
+    }
+
+    /// Updates to release `v` now, downloading its installer unless
+    /// `installer` is it. blitz exits once the installer starts.
+    fn update_now(&self, v: String, installer: Option<crate::update::Installer>) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let done = std::panic::catch_unwind(move || {
+                let installer = match installer {
+                    Some(p) => p,
+                    None => crate::update::fetch(&v)?,
+                };
+                crate::update::run(&installer, true)
+            })
+            .unwrap_or_else(|_| Err(INTERNAL.into()));
+            let _ = proxy.send_event(UserEvent::Installed(done));
+        });
+    }
+
+    /// The installer of release `v`, to run when blitz closes, finished
+    /// downloading or failed to. If Ctrl+Shift+U asked to update now in
+    /// the meantime, it runs now.
+    fn fetched(&mut self, v: String, got: Result<crate::update::Installer, String>) {
+        // A newer release a look found. Until its installer is here, the
+        // older one stays, and one that fails to come leaves it there,
+        // unsaid: the next look tries again.
+        if replaces(self.at_close.as_ref(), &v) {
+            if let Ok(installer) = got {
+                let keys = keymap::press_for(Action::Update, &self.config.keys);
+                self.update = Some((v.clone(), crate::update::at_close(&v, &keys)));
+                self.at_close = Some((v, Some(installer)));
+                self.request_redraw();
+            }
+            return;
+        }
+        // Dropped in the meantime.
+        if self.at_close.as_ref().is_none_or(|a| a.0 != v) {
+            return;
+        }
+        match got {
+            Ok(installer) if self.updating.is_some() => {
+                self.at_close = None;
+                self.update_now(v, Some(installer));
+            }
+            Ok(installer) => self.at_close = Some((v, Some(installer))),
+            Err(e) => {
+                self.at_close = None;
+                self.banner_note = None;
+                let text = format!("Update failed: {e}");
+                self.update_error = Some(text.clone());
+                // Offered as before.
+                self.update = None;
+                self.offer_update(v, None);
+                if let Some(id) = self.updating.take().or_else(|| self.focus_id()) {
+                    self.error(id, text);
+                }
+            }
+        }
+    }
+
+    /// Why the last update, or else the last look for one, failed.
+    fn update_trouble(&self) -> Option<&str> {
+        (self.update_error.as_deref()).or(self.look_error.as_deref())
+    }
+
+    /// Leaves release `v` to install when blitz closes, and downloads it.
+    fn leave_for_close(&mut self, v: String) {
+        self.at_close = Some((v.clone(), None));
+        let keys = keymap::press_for(Action::Update, &self.config.keys);
+        self.update = Some((v.clone(), crate::update::at_close(&v, &keys)));
+        self.request_redraw();
+        self.fetch(v);
+    }
+
+    /// Downloads the installer of release `v`, which lands in [`Self::fetched`].
+    fn fetch(&self, v: String) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let got = std::panic::catch_unwind(|| crate::update::fetch(&v))
+                .unwrap_or_else(|_| Err(INTERNAL.into()));
+            let _ = proxy.send_event(UserEvent::Fetched(v, got));
+        });
+    }
+
     /// Shows the banner for release `v`, or for the update to it that
     /// failed and wrote `log`.
     fn offer_update(&mut self, v: String, log: Option<PathBuf>) {
@@ -2949,6 +3303,13 @@ impl App {
             });
         }
         self.request_redraw();
+    }
+
+    /// Whether pane `id` shows a notice that a passing one must not hide:
+    /// an error or a question, which wait for a key, or one meant to stay.
+    fn holds_notice(&self, id: PaneId) -> bool {
+        let n = self.view(id).and_then(|v| v.notice.as_ref());
+        n.is_some_and(stays)
     }
 
     /// Shows `text` in pane `id` until `ask` is answered or a key takes it
@@ -3215,6 +3576,9 @@ impl App {
         if selected {
             self.request_redraw();
         }
+        // ponytail: from when blitz handles the key, which leaves out
+        // its wait in the message queue
+        self.counters.typed(Instant::now());
         self.orphan = None;
         self.answered(id);
     }
@@ -3478,7 +3842,7 @@ impl App {
                 }
                 self.request_redraw();
             }
-            Action::NewTab => self.add(None, new_tab),
+            Action::NewTab => self.add(None, "", new_tab),
             Action::ClosePane => {
                 let Some(v) = self.current() else {
                     return true;
@@ -3554,7 +3918,7 @@ impl App {
                 } else {
                     Dir::Down
                 };
-                self.add(None, split(dir));
+                self.add(None, "", split(dir));
             }
             Action::ReopenClosed => {
                 let Some((cwd, claude)) = self.closed.take() else {
@@ -3565,7 +3929,7 @@ impl App {
                     return true;
                 };
                 let id = PaneId(self.next_id);
-                self.add(start_dir(&cwd), split(Dir::Right));
+                self.add(start_dir(&cwd), "", split(Dir::Right));
                 if self.view(id).is_some() {
                     self.resume(id, claude);
                 } else {
@@ -3594,6 +3958,21 @@ impl App {
                 });
                 self.request_redraw();
             }
+            Action::OpenConfig => {
+                let opened = (crate::config::file())
+                    .map_err(|e| format!("Cannot make config.toml: {e}"))
+                    .and_then(|p| crate::links::edit(&p).map_err(String::from));
+                self.tell(opened);
+            }
+            Action::OpenThemes => {
+                let opened = match crate::theme::dir() {
+                    Some(d) => (std::fs::create_dir_all(&d))
+                        .map_err(|e| format!("Cannot make the themes folder: {e}"))
+                        .and_then(|()| crate::links::show_folder(&d).map_err(String::from)),
+                    None => Err("Cannot find the themes folder: APPDATA is not set".into()),
+                };
+                self.tell(opened);
+            }
             Action::Palette => {
                 // Update without a release would only look for one.
                 let hidden = match self.update {
@@ -3602,7 +3981,7 @@ impl App {
                 };
                 self.commands = Some(Commands {
                     hidden,
-                    ..Commands::default()
+                    ..Commands::new(crate::shell::choices())
                 });
                 self.request_redraw();
             }
@@ -3631,23 +4010,7 @@ impl App {
                 }
                 self.request_redraw();
             }
-            // The focused session is skipped: the user is already looking
-            // at it, and a session that exited stays red until closed.
-            Action::JumpToAttention => {
-                let waiting = (self.views.iter())
-                    .filter(|v| Some(v.pane.id) != before)
-                    .map(|v| (v.pane.id, v.pane.attn));
-                let target = crate::attention::jump_target(waiting);
-                match jump(before, target, &mut self.jumped).filter(|&id| self.view(id).is_some()) {
-                    Some(id) => self.show(id),
-                    None => {
-                        if let Some(id) = before {
-                            let until = Some(Instant::now() + NOTHING);
-                            self.set_notice(id, "Nothing needs you", until, true);
-                        }
-                    }
-                }
-            }
+            Action::JumpToAttention => self.jump(),
             Action::Update => {
                 let Some(id) = before else {
                     return false;
@@ -3663,12 +4026,12 @@ impl App {
                         // Always answered, or Ctrl+Shift+U stays busy.
                         let found = std::panic::catch_unwind(crate::update::check)
                             .unwrap_or_else(|_| Err(INTERNAL.into()));
-                        let _ = proxy.send_event(UserEvent::Checked(found));
+                        let _ = proxy.send_event(UserEvent::Checked(found, true));
                     });
                     return true;
                 };
                 if !crate::update::installed() {
-                    if !crate::update::open_page() {
+                    if !crate::update::open(crate::update::PAGE) {
                         let text = format!(
                             "Could not open a browser; get it at {}",
                             crate::update::PAGE
@@ -3677,31 +4040,36 @@ impl App {
                     }
                     return true;
                 }
-                // Updating restarts blitz, which ends every session.
+                // Updating restarts blitz, which ends every session, and
+                // the installer closes every other blitz window.
                 let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
                 let asked = self.banner_note.take_if(|n| n.1 == Ask::Update);
-                if busy > 0 && asked.is_none() {
-                    let what = if busy == 1 {
-                        "A session is"
-                    } else {
-                        "Sessions are"
-                    };
-                    let again = again(a, &self.config.keys);
-                    let text = format!("{what} busy, and updating restarts blitz. {again}");
+                let again = again(a, &self.config.keys);
+                let (others, main) = (crate::handoff::others(), !self.args.separate());
+                let ask = crate::update::confirm(&v, busy, others, main, &again);
+                let asks = asks(asked.is_some(), self.at_close.as_ref(), &v);
+                if let Some((text, later)) = ask.filter(|_| asks) {
                     self.banner_note = Some((text, Ask::Update));
                     self.request_redraw();
+                    if later {
+                        self.leave_for_close(v);
+                    }
                     return true;
+                }
+                // Asked for by hand: shown again if it fails.
+                if let Some(dir) = session::dir() {
+                    crate::update::dismiss_in(&dir, None);
                 }
                 self.updating = Some(id);
                 let text = format!("Downloading blitz {v}\u{2026}");
                 self.banner_note = Some((text, Ask::Nothing));
                 self.request_redraw();
-                let proxy = self.proxy.clone();
-                std::thread::spawn(move || {
-                    let done = std::panic::catch_unwind(move || crate::update::install(&v))
-                        .unwrap_or_else(|_| Err(INTERNAL.into()));
-                    let _ = proxy.send_event(UserEvent::Installed(done));
-                });
+                match self.at_close.take() {
+                    Some((w, Some(installer))) if w == v => self.update_now(v, Some(installer)),
+                    // Its download starts the installer when it lands.
+                    Some((w, None)) if w == v => self.at_close = Some((w, None)),
+                    _ => self.update_now(v, None),
+                }
             }
             // The next frame sizes each pane's session to its new place, as
             // it does after a split.
@@ -3818,8 +4186,40 @@ impl App {
                 };
                 self.typed(text.clone());
             }
+            Action::ReportIssue => self.report_issue(),
         }
         true
+    }
+
+    /// Opens a new GitHub issue with what a report needs to know about
+    /// this blitz filled in.
+    fn report_issue(&mut self) {
+        let renderer = match self.gfx.as_ref().map(|g| g.r.gpu.warp) {
+            Some(false) => "Direct3D 11",
+            Some(true) => "Direct3D 11 WARP, in software",
+            None => "none",
+        };
+        let conpty = match crate::pty::inbox_notice() {
+            Some(_) => "the Windows console host",
+            None => "bundled",
+        };
+        let hooks = if self.hooked { "seen" } else { "not seen" };
+        let windows = windows_version();
+        let facts = [
+            ("blitz", env!("CARGO_PKG_VERSION")),
+            ("Windows", &windows),
+            ("renderer", renderer),
+            ("ConPTY", conpty),
+            ("Claude Code hooks", hooks),
+            ("last update error", self.update_trouble().unwrap_or("none")),
+        ];
+        let url = crate::update::issue(&facts);
+        if !crate::update::open(&url)
+            && let Some(id) = self.focus_id()
+        {
+            let text = "Could not open a browser to report an issue";
+            self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+        }
     }
 
     fn on_pane(&mut self, el: &ActiveEventLoop, id: PaneId, note: Note) {
@@ -3839,6 +4239,9 @@ impl App {
                 let shown = v.rect.is_some() || !events.is_empty();
                 for e in events {
                     self.on_term_event(id, e);
+                }
+                if self.focus_id() == Some(id) {
+                    self.counters.output();
                 }
                 if let Some(f) = self.find.as_mut().filter(|f| f.pane == id) {
                     f.stale = true;
@@ -3860,7 +4263,7 @@ impl App {
                 v.pane.cmd = Default::default();
                 v.progress = None;
                 self.taskbar_progress();
-                self.attention(id, Ev::from_exit(code));
+                self.attention_told(id, Ev::from_exit(code), true);
                 // A clean exit or Ctrl+C closes the session; anything else
                 // stays up so the output can be read.
                 if matches!(code, 0 | 0xC000_013A) && self.args.selftest.is_none() {
@@ -3870,8 +4273,22 @@ impl App {
                 // `notice_line` says so from now on.
                 self.request_redraw();
             }
+            // The selection and link under the pointer end with the line
+            // numbers they used; matches are found again.
+            // The console host draws what the fresh screen lacks, and
+            // events parsed before the panic, such as a notification, are
+            // taken now.
+            Note::Reset => {
+                v.pane.repaint(v.grid.0, v.grid.1);
+                if let Some(f) = self.find.as_mut().filter(|f| f.pane == id) {
+                    f.stale = true;
+                }
+                self.on_pane(el, id, Note::Dirty);
+                let text = "the screen was cleared after an internal error";
+                self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+            }
             Note::Dead => {
-                self.attention(id, Ev::Error { sticky: true });
+                self.attention_told(id, Ev::Error { sticky: true }, true);
                 self.set_notice(
                     id,
                     "this session stopped updating after an internal error",
@@ -3951,10 +4368,11 @@ impl App {
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
                     hook_confirms_paste(&mut lock(&v.pane.term), ev);
                     v.pane.hooked = ev != Ev::Idle;
+                    self.hooked = true;
                     if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
                         self.hooks_hint(id, true);
                     }
-                    self.attention(id, ev);
+                    self.attention_told(id, ev, true);
                     if turn_ends(ev) {
                         self.find_branch(id);
                     }
@@ -4032,14 +4450,7 @@ impl App {
         if latest == self.taskbar_shows {
             return;
         }
-        if self.taskbar.is_none() {
-            // SAFETY: COM calls on the window's thread, where winit has
-            // started OLE for drag and drop.
-            self.taskbar = unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) }
-                .ok()
-                .filter(|t: &ITaskbarList3| unsafe { t.HrInit() }.is_ok());
-        }
-        let Some(t) = &self.taskbar else {
+        let Some(t) = self.taskbar() else {
             return;
         };
         self.taskbar_shows = latest;
@@ -4064,10 +4475,100 @@ impl App {
         }
     }
 
+    /// The taskbar button, made the first time it is needed.
+    fn taskbar(&mut self) -> Option<ITaskbarList3> {
+        if self.taskbar.is_none() {
+            // SAFETY: COM calls on the window's thread, where winit has
+            // started OLE for drag and drop.
+            self.taskbar = unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) }
+                .ok()
+                .filter(|t: &ITaskbarList3| unsafe { t.HrInit() }.is_ok());
+        }
+        self.taskbar.clone()
+    }
+
+    /// Badges the taskbar button with the sidebar dot of the session that
+    /// most wants the user, or clears it once none does.
+    fn taskbar_badge(&mut self) {
+        let top = badge_state(self.views.iter().map(|v| v.pane.attn.state));
+        if top == self.badge_shows {
+            return;
+        }
+        let Some(t) = self.taskbar() else {
+            return;
+        };
+        self.badge_shows = top;
+        let ui = &self.theme.ui;
+        let (fg, ring, label) = badge_look(top, ui);
+        let icon = top.and_then(|_| {
+            let size = small_icon_size().width;
+            crate::notify::badge_icon(size, fg, ui.term_bg, ring)
+        });
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        // SAFETY: a live window; the taskbar keeps a copy of the icon, so
+        // it is destroyed once set.
+        unsafe {
+            let _ = t.SetOverlayIcon(hwnd, icon.unwrap_or_default(), &HSTRING::from(label));
+            if let Some(i) = icon {
+                let _ = DestroyIcon(i);
+            }
+        }
+    }
+
+    /// While `keep_awake` is on and a session works, keeps the PC from going
+    /// to sleep by itself; `powercfg /requests` says why.
+    fn keep_awake(&mut self) {
+        let states = self
+            .views
+            .iter()
+            .map(|v| (v.pane.attn.state, v.pane.hooked));
+        let on = stays_awake(self.config.keep_awake, states);
+        if on == self.awake {
+            return;
+        }
+        if self.power.is_none() {
+            let mut why: Vec<u16> = "A session is working".encode_utf16().chain([0]).collect();
+            let context = REASON_CONTEXT {
+                // POWER_REQUEST_CONTEXT_VERSION
+                Version: 0,
+                Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+                Reason: REASON_CONTEXT_0 {
+                    SimpleReasonString: PWSTR(why.as_mut_ptr()),
+                },
+            };
+            // SAFETY: the context and its string outlive the call, which
+            // copies them. The request lives as long as blitz.
+            self.power = unsafe { PowerCreateRequest(&context) }.ok();
+        }
+        let Some(r) = self.power else {
+            return;
+        };
+        // SAFETY: a power request blitz made and never closes.
+        let done = unsafe {
+            if on {
+                PowerSetRequest(r, PowerRequestSystemRequired)
+            } else {
+                PowerClearRequest(r, PowerRequestSystemRequired)
+            }
+        };
+        if done.is_ok() {
+            self.awake = on;
+        }
+    }
+
     /// Feeds a session's attention state; flashes the taskbar button when
     /// it changes to something the user should see while looking away.
-    /// Returns true when the state changed.
+    /// Returns true when the state changed. Program output raised `ev`, so
+    /// it shows no Windows notification; see [`App::attention_told`].
     fn attention(&mut self, id: PaneId, ev: Ev) -> bool {
+        self.attention_told(id, ev, false)
+    }
+
+    /// [`App::attention`], `told` when blitz itself or the pane's hooks,
+    /// which carry its token, raised `ev`. Only then may a Windows
+    /// notification tell of it: any program can ring a bell, or name its
+    /// pane with a title, which the notification would show as blitz's.
+    fn attention_told(&mut self, id: PaneId, ev: Ev, told: bool) -> bool {
         // Back to work: blitz run ends when a session starts needing the
         // user. It closes first, so the focused pane is in view again for
         // the event, as if the game had never been open.
@@ -4085,20 +4586,124 @@ impl App {
         let here = present(self.focused, idle_for());
         self.away |= !here;
         let attended = here && self.game.is_none() && self.focus_id() == Some(id);
-        let away = !here && self.config.flash;
-        let Some(v) = self.view_mut(id) else {
+        let away = !here;
+        let Some(v) = self.views.iter_mut().find(|v| v.pane.id == id) else {
             return false;
         };
         let changed = v.pane.attn.apply(ev, attended, now);
-        let kind = (changed && away)
-            .then(|| flash_kind(v.pane.attn.state, &mut v.flashed, now))
-            .flatten();
-        // The sidebar shows the new state.
+        let alert = (changed && away)
+            .then(|| alert(v.pane.attn.state, &self.config, &mut v.alerted, now))
+            .flatten()
+            .map(|a| if told { a } else { from_output(a) });
+        if untoasts(attended || ev == Ev::Attended, v.pane.attn.state) && v.toast.take().is_some() {
+            crate::notify::untoast(id);
+        }
+        // The sidebar shows the new state, and the taskbar button its dot.
         self.request_redraw();
-        if let (Some(kind), Some(w)) = (kind, &self.window) {
-            w.request_user_attention(Some(kind));
+        if changed {
+            self.taskbar_badge();
+            self.keep_awake();
+        }
+        if let Some(a) = alert {
+            self.alert(id, a);
         }
         changed
+    }
+
+    /// Tells the user, who is in another program, about session `id`.
+    fn alert(&mut self, id: PaneId, a: Alert) {
+        if a.flashes > 0 {
+            crate::notify::flash(self.hwnd, a.flashes);
+        }
+        // Never from a test run.
+        if self.args.scripted() {
+            return;
+        }
+        let shown = a.toast && self.toast(id);
+        if a.beeps(shown) {
+            // SAFETY: a plain call.
+            let _ = unsafe { MessageBeep(MB_OK) };
+        }
+    }
+
+    /// Shows a Windows notification about session `id`; false when none
+    /// was shown.
+    fn toast(&mut self, id: PaneId) -> bool {
+        let Some(s) = self.sessions().into_iter().find(|s| s.id == id) else {
+            return false;
+        };
+        let titled = self.view(id).is_some_and(|v| v.pane.msg.is_empty());
+        let lines = toast_text(&s, titled);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let xml = crate::notify::toast_xml(&lines, !self.config.sound);
+        match crate::notify::toast(id, &xml, &self.proxy) {
+            Ok(Some(t)) => {
+                if let Some(v) = self.view_mut(id) {
+                    v.toast = Some(t);
+                }
+                true
+            }
+            Ok(None) => false,
+            // Said once, where it is seen: a release build has no console.
+            Err(e) => {
+                eprintln!("blitz: notification: {e}");
+                if !std::mem::replace(&mut self.toasts_failed, true) {
+                    self.error(id, format!("Windows notifications are not working: {e}"));
+                }
+                false
+            }
+        }
+    }
+
+    /// Shows the session that most wants the user; see [`jump_to`]. With
+    /// none, goes back to where the jumps started, or says nothing needs
+    /// the user.
+    fn jump(&mut self) {
+        let before = self.focus_id();
+        let waiting = (self.views.iter()).map(|v| (v.pane.id, v.pane.attn));
+        let target = jump_to(waiting, before, self.focused);
+        match jump(before, target, &mut self.jumped).filter(|&id| self.view(id).is_some()) {
+            Some(id) => self.show(id),
+            None => {
+                if let Some(id) = before {
+                    let until = Some(Instant::now() + NOTHING);
+                    self.set_notice(id, "Nothing needs you", until, true);
+                }
+            }
+        }
+    }
+
+    /// Takes Ctrl+Alt+J from every program while `global_jump` is on, in
+    /// the main window only, or gives it back. Says so in the focused pane
+    /// when another program has it.
+    fn global_jump(&mut self) {
+        // Not `persist`, which a session that failed to come back turns
+        // off while the window still takes launches.
+        let on = self.config.global_jump && self.args.main();
+        if on == self.jump_key {
+            return;
+        }
+        let ok = crate::notify::global_jump(self.hwnd, on);
+        self.jump_key = on && ok;
+        // Another main blitz window has it then, and answers it.
+        if jump_key_lost(ok, || crate::notify::other_main(self.hwnd))
+            && let Some(id) = self.focus_id()
+            && !self.holds_notice(id)
+        {
+            let text = "Another program has Ctrl+Alt+J, so it cannot bring you to blitz";
+            self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
+        }
+    }
+
+    /// Brings the window to the front, out of the taskbar if minimized.
+    /// Windows lets it when the user just asked for blitz.
+    fn to_front(&self) {
+        // First, since a minimized window has no room for a pane.
+        if let Some(w) = &self.window {
+            w.set_minimized(false);
+        }
+        // SAFETY: our own window.
+        let _ = unsafe { SetForegroundWindow(HWND(self.hwnd as *mut c_void)) };
     }
 
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> (u16, u16) {
@@ -4201,7 +4806,7 @@ impl App {
             }
             Some(Dropped::Open(dirs)) => {
                 for dir in dirs {
-                    self.add(Some(dir), new_tab);
+                    self.add(Some(dir), "", new_tab);
                 }
             }
             None => {}
@@ -4341,9 +4946,11 @@ impl App {
             return;
         }
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let on_banner = (self.banner).is_some_and(|r| r.contains(x, y));
-        if pressed && b == 0 && on_banner {
-            self.act(el, Action::Update);
+        if let Some(click) = banner_click(self.banner, x, y).filter(|_| pressed && b == 0) {
+            match click {
+                BannerClick::Close => self.dismiss_update(),
+                BannerClick::Notes => self.open_notes(),
+            }
             return;
         }
         let chip = (self.below.iter()).find(|(_, r)| r.contains(x, y));
@@ -4667,7 +5274,7 @@ impl App {
             || self.game.is_some();
         let divider = self.divider_at(pos).map(|d| d.1).filter(|_| !panel);
         let hand = self.hover.is_some()
-            || self.banner.as_ref().is_some_and(inside)
+            || self.banner.as_ref().is_some_and(|b| inside(&b.0))
             || self.mouse.over_side.is_some();
         let mods = mods_now();
         let grid = (!panel).then(|| self.hit(pos)).and_then(|(id, side)| {
@@ -4698,7 +5305,22 @@ impl App {
 
     /// Opens a link, or says in the pane why not.
     fn open_link(&mut self, target: &Target) {
-        if let Err(e) = crate::links::open(target, &self.config.editor_uri)
+        self.tell(crate::links::open(target, &self.config.editor_uri).map_err(String::from));
+    }
+
+    /// Says, dimly in the focused pane, which lines of `config.toml` were
+    /// skipped, if any.
+    fn note_ignored(&mut self) {
+        if let (Some(text), Some(id)) = (self.config.ignored_notice(), self.focus_id())
+            && !self.holds_notice(id)
+        {
+            self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+        }
+    }
+
+    /// Says in the focused pane why something did not open.
+    fn tell(&mut self, opened: Result<(), String>) {
+        if let Err(e) = opened
             && let Some(id) = self.focus_id()
         {
             self.error(id, e);
@@ -4746,12 +5368,12 @@ impl App {
             // select instead.
             let here = self.cell_in(id, pos);
             let press = &mut self.mouse.program_press;
-            if b == 0 && press.take_if(|p| p.1 && p.0 != here).is_some() {
-                let hints = crate::session::dir().map(|d| d.join("hints"));
-                if first_time(hints.as_deref(), "shift-drag") {
-                    let text = "Shift+drag selects while the program uses the mouse";
-                    self.hint(id, text, Instant::now() + NOTICE);
-                }
+            if b == 0
+                && press.take_if(|p| p.1 && p.0 != here).is_some()
+                && session::dir().is_some_and(|d| session::first_time_in(&d, "shift-drag"))
+            {
+                let text = "Shift+drag selects while the program uses the mouse";
+                self.hint(id, text, Instant::now() + NOTICE);
             }
         } else if self.mouse_to_program(&mods).is_some()
             && let Some(id) = self.focus_id()
@@ -4885,10 +5507,9 @@ impl App {
             .map(|(c, r)| (c, r, self.preedit.as_str()));
         let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
         self.side = std::mem::take(&mut chrome.side);
-        self.banner = chrome.banner;
+        self.banner = chrome.banner.zip(chrome.banner_close);
         self.below = std::mem::take(&mut chrome.below);
         self.find_bar = chrome.find;
-
         self.settings_hits = chrome.settings.take();
         self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
@@ -5067,12 +5688,18 @@ impl App {
         })();
         self.counters.frame_cpu_ms += (started.elapsed() - waited).as_secs_f64() * 1000.0;
         match result {
-            Ok(_) => {
+            Ok(shown) => {
                 self.reveal(true);
                 self.counters.frames += 1;
+                if shown {
+                    self.counters.presented(Instant::now());
+                }
                 if self.counters.first_present_ms.is_none() {
                     self.counters.first_present_ms =
                         Some(self.started.elapsed().as_secs_f64() * 1000.0);
+                    // Ready before the settings panel wants them, and
+                    // not in the way of the first frame.
+                    std::thread::spawn(crate::render::font::families);
                 }
                 // Glyphs still waiting for a font lookup come next frame.
                 if self.gfx.as_ref().is_some_and(|g| g.r.pending()) {
@@ -5102,6 +5729,10 @@ impl App {
             self.ime_at = Some(at);
             let size = PhysicalSize::new(at.w.max(1) as u32, at.h.max(1) as u32);
             w.set_ime_cursor_area(PhysicalPosition::new(at.x, at.y), size);
+            // Magnifier follows the caret to where typing goes.
+            if self.focused {
+                self.caret = place_caret(self.hwnd, (at.x, at.y), (cw, ch), self.caret);
+            }
         }
     }
 
@@ -5166,6 +5797,7 @@ impl App {
                     .map(|v| v.pane.msg.clone()),
                 name: v.and_then(|v| v.pane.named.clone()),
                 num: v.map_or(0, |v| v.num),
+                shell: v.map(|v| v.shell.clone()).unwrap_or_default(),
             }
         };
         let s = session::State::capture(&self.win, self.placed, meta);
@@ -5177,13 +5809,24 @@ impl App {
         self.save_after = None;
         // Output, which changes all the time, is saved only at exit, and
         // only once the layout holding the keys it is filed by was written.
-        match session::save(&s) {
-            Ok(()) if force => self.save_output(),
-            Ok(()) => {}
-            Err(e) => eprintln!("blitz: saving the session: {e}"),
+        let written = session::save(&s);
+        if written.is_ok() && force {
+            self.save_output();
         }
-        // Kept even when the write failed, so it is not retried every turn.
-        self.saved = Some(s);
+        let now = Instant::now();
+        let ok = written.is_ok();
+        self.save_after = saved(ok, s, now, &mut self.saved, &mut self.save_fails);
+        if let Err(e) = written {
+            eprintln!("blitz: saving the session: {e}");
+            if save_warns(self.save_fails)
+                && let Some(id) = self.focus_id()
+            {
+                self.error(
+                    id,
+                    format!("blitz cannot save this window ({e}); it keeps trying"),
+                );
+            }
+        }
     }
 
     /// Saves each pane's recent output when `restore_scrollback` is on, and
@@ -5268,6 +5911,39 @@ impl App {
         .flatten()
         .min()
     }
+}
+
+/// How long a session that `fails` writes in a row could not save waits
+/// before the next try: twice as long each time, up to about a minute.
+fn save_retry(fails: u32) -> Duration {
+    SAVE_DELAY * 2u32.pow(fails.min(7))
+}
+
+/// Whether the window says it cannot save after `fails` failures in a
+/// row: once, at the [`SAVE_WARN`]th, not at every retry after it.
+fn save_warns(fails: u32) -> bool {
+    fails == SAVE_WARN
+}
+
+/// Takes in whether `s`, the session, was `written` at `now`. Once it is,
+/// it is the state saved. A failed write is not, so it is tried again at
+/// the time returned: later after each failure in a row, so a busy or
+/// full drive is not written to every turn.
+fn saved<T>(
+    written: bool,
+    s: T,
+    now: Instant,
+    saved: &mut Option<T>,
+    fails: &mut u32,
+) -> Option<Instant> {
+    if written {
+        *saved = Some(s);
+        *fails = 0;
+        return None;
+    }
+    let next = now + save_retry(*fails);
+    *fails = fails.saturating_add(1);
+    Some(next)
 }
 
 /// Whether a layout that `changed` since the last save is written now. A
@@ -5367,20 +6043,6 @@ fn right_click_does(on: bool, selected: bool) -> Option<Action> {
     } else {
         Action::Paste
     })
-}
-
-/// Whether the hint `name` shows: only the first time ever, as remembered
-/// by a file of that name in `dir`. With nowhere to remember it, never, so
-/// it cannot show at every start.
-fn first_time(dir: Option<&Path>, name: &str) -> bool {
-    let Some(dir) = dir else {
-        return false;
-    };
-    let file = dir.join(name);
-    !file.exists()
-        && std::fs::create_dir_all(dir)
-            .and_then(|()| std::fs::write(file, ""))
-            .is_ok()
 }
 
 /// The pointer's shape: a resize arrow on a `divider` between panes, the
@@ -5725,21 +6387,125 @@ fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) 
     update.map(|u| note.unwrap_or(&u.1))
 }
 
-/// How to flash the taskbar for a session that just changed to `state`
-/// while the window is in the background: urgently when it needs the
-/// user or failed, gently when it finished, and at most once per session
-/// every `FLASH_GAP`. `last` is when this session last flashed.
-fn flash_kind(state: Attn, last: &mut Option<Instant>, now: Instant) -> Option<UserAttentionType> {
-    let kind = match state {
-        Attn::NeedsYou | Attn::Error => UserAttentionType::Critical,
-        Attn::DoneUnseen => UserAttentionType::Informational,
+/// The state whose dot badges the taskbar button: the one of `states`
+/// that most wants the user, if any does.
+fn badge_state(states: impl Iterator<Item = Attn>) -> Option<Attn> {
+    states.max().filter(|&s| s >= Attn::DoneUnseen)
+}
+
+/// How the badge for `top` looks, in the colours the sidebar marks that
+/// state with: its colour, whether it is a ring, and what it says to a
+/// screen reader.
+fn badge_look(top: Option<Attn>, ui: &crate::theme::Ui) -> (u32, bool, &'static str) {
+    match top {
+        Some(Attn::NeedsYou) => (ui.mark, false, "A session needs you"),
+        Some(Attn::Error) => (ui.error, false, "A session failed"),
+        Some(_) => (ui.name, true, "A session finished"),
+        None => (0, false, ""),
+    }
+}
+
+/// How blitz tells the user, who is in another program, about a session.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Alert {
+    /// Times to flash the taskbar button.
+    flashes: u32,
+    /// Show a Windows notification.
+    toast: bool,
+    /// Make a sound: the notification's, or a beep without one.
+    sound: bool,
+}
+
+impl Alert {
+    /// Whether to beep, once the notification was `shown` or not: one that
+    /// was makes its own sound.
+    fn beeps(&self, shown: bool) -> bool {
+        self.sound && !shown
+    }
+}
+
+/// How to tell the user about a session that just changed to `state`
+/// while the window is in the background: three flashes when it needs
+/// the user or failed, one when it finished, a notification as `toasts`
+/// says, with `sound` the notification's sound or else a beep, and at
+/// most once per session every `ALERT_GAP`. `last` is when this session
+/// last alerted.
+fn alert(state: Attn, c: &Config, last: &mut Option<Instant>, now: Instant) -> Option<Alert> {
+    let (flashes, urgent) = match state {
+        Attn::NeedsYou | Attn::Error => (3, true),
+        Attn::DoneUnseen => (1, false),
         Attn::Working | Attn::Idle => return None,
     };
-    if last.is_some_and(|t| now.saturating_duration_since(t) < FLASH_GAP) {
+    let toast = c.toasts == "all" || urgent && c.toasts == "needs-you";
+    let a = Alert {
+        flashes: if c.flash { flashes } else { 0 },
+        toast,
+        sound: c.sound,
+    };
+    if a == Alert::default() || last.is_some_and(|t| now.saturating_duration_since(t) < ALERT_GAP) {
         return None;
     }
     *last = Some(now);
-    Some(kind)
+    Some(a)
+}
+
+/// An alert `a` for something program output did: the flash, the badge and
+/// the sound, but no notification, whose text that output would choose.
+fn from_output(a: Alert) -> Alert {
+    Alert { toast: false, ..a }
+}
+
+/// Whether blitz keeps the PC awake: `keep_awake` is on and one of
+/// `states` is working, as its pane's hooks say. A title alone says so
+/// too, but any program can print one and keep it up.
+fn stays_awake(keep_awake: bool, mut states: impl Iterator<Item = (Attn, bool)>) -> bool {
+    keep_awake && states.any(|(s, hooked)| hooked && s == Attn::Working)
+}
+
+/// The session a jump goes to: the one waiting longest among those that
+/// most want the user. The focused one counts only while blitz is in the
+/// background (`front` false): in front, the user is already looking at
+/// it. A session that exited stays red until closed.
+fn jump_to(
+    sessions: impl Iterator<Item = (PaneId, crate::attention::PaneAttn)>,
+    focus: Option<PaneId>,
+    front: bool,
+) -> Option<PaneId> {
+    let skip = focus.filter(|_| front);
+    crate::attention::jump_target(sessions.filter(|s| Some(s.0) != skip))
+}
+
+/// Whether the user should hear that the jump key could not be had:
+/// not when it was `got`, nor when another main blitz window is open,
+/// which then has it and brings the user to blitz just the same.
+fn jump_key_lost(got: bool, other_blitz: impl FnOnce() -> bool) -> bool {
+    !got && !other_blitz()
+}
+
+/// Whether a session's notification comes down: the user is looking at
+/// the session, or it no longer wants them.
+fn untoasts(attended: bool, state: Attn) -> bool {
+    attended || state < Attn::DoneUnseen
+}
+
+/// The lines of a notification about session `s`: its name, numbered as
+/// the sidebar numbers it, and what it wants, its last message, and its
+/// folder. A message that is only the pane's title (`titled`), which any
+/// program sets, is left out, or it would speak as blitz; an exit gives
+/// its code there instead.
+fn toast_text(s: &chrome::Session, titled: bool) -> [String; 3] {
+    let what = match s.state {
+        Attn::NeedsYou => "needs you",
+        Attn::Error => "failed",
+        _ => "finished",
+    };
+    let num = s.num.map(|n| format!(" {n}")).unwrap_or_default();
+    let msg = match s.exit_code {
+        _ if !titled => s.msg.clone(),
+        Some(code) => crate::attention::exit_text(code),
+        None => String::new(),
+    };
+    [format!("{}{num} {what}", s.name), msg, s.cwd.clone()]
 }
 
 /// How many rows of `cell_h` pixels the find bar covers at the top of a
@@ -5943,6 +6709,24 @@ fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text
     r.snapshot(&s, &banner, at.x, y);
 }
 
+/// The Windows version, such as `10.0.26200`. The manifest build.rs links
+/// in keeps Windows from giving an older one.
+fn windows_version() -> String {
+    use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+    let mut v = OSVERSIONINFOW {
+        dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a struct to fill, its size set as the call needs.
+    match unsafe { GetVersionExW(&mut v) } {
+        Ok(()) => format!(
+            "{}.{}.{}",
+            v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber
+        ),
+        Err(_) => "unknown".into(),
+    }
+}
+
 /// The title bar icon size, so Windows picks the hand-tuned small icon
 /// rather than shrinking the big one.
 fn small_icon_size() -> PhysicalSize<u32> {
@@ -6046,6 +6830,47 @@ fn restart_after_reboot() {
     let flags = RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_PATCH;
     // SAFETY: no command line, so blitz starts with none.
     let _ = unsafe { RegisterApplicationRestart(None, flags) };
+}
+
+/// Whether setup made blitz start when the user signs in, and the user has
+/// not since turned that off in Task Manager or Settings.
+fn starts_at_sign_in() -> bool {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_ANY, RegGetValueW};
+    let value = |sub, buf: Option<&mut [u8; 12]>| {
+        let mut size = 12u32;
+        let (data, size) = match buf {
+            Some(b) => (Some(b.as_mut_ptr().cast()), Some(&mut size as *mut u32)),
+            None => (None, None),
+        };
+        // SAFETY: with a buffer, it holds the `size` bytes given; without
+        // one, only whether the value is there comes back.
+        let r = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                sub,
+                windows::core::w!("blitz"),
+                RRF_RT_ANY,
+                None,
+                data,
+                size,
+            )
+        };
+        r.is_ok()
+    };
+    let run = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let approved = windows::core::w!(
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+    );
+    let mut flags = [0u8; 12];
+    let set = value(approved, Some(&mut flags)).then_some(flags[0]);
+    sign_in_starts(value(run, None), set)
+}
+
+/// Whether a `Run` value starts blitz. Turning it off in Task Manager
+/// leaves the value and sets the first byte of blitz's `StartupApproved`
+/// entry, `approved`, to an odd one.
+fn sign_in_starts(run: bool, approved: Option<u8>) -> bool {
+    run && approved.is_none_or(|b| b & 1 == 0)
 }
 
 /// Whether a session `now` differs from the one last `saved`. The window's
@@ -6152,6 +6977,14 @@ fn shell_failed(
     format!("The shell {shell} could not start ({err}); using {using}{fix}")
 }
 
+/// The shells to try, in order, once a pane's own `shell` failed, or the
+/// one in the settings, `settings`, when it has none: the one in the
+/// settings, unless that was it, then the one blitz finds.
+fn fallbacks<'a>(shell: &str, settings: &'a str) -> Vec<&'a str> {
+    let own = !shell.is_empty() && !settings.is_empty() && shell != settings;
+    (own.then_some(settings).into_iter()).chain([""]).collect()
+}
+
 /// What blitz says when it cannot start at all, `e` being why: a GUI
 /// program has no console to print it to.
 fn start_failed(e: &str, config: Option<&Path>) -> String {
@@ -6161,10 +6994,108 @@ fn start_failed(e: &str, config: Option<&Path>) -> String {
     format!("blitz could not start: {e}{file}")
 }
 
+/// The hint the first start shows: the keys of the command palette and of
+/// a few actions worth knowing, as bound now. An action without keys is
+/// left out.
+fn first_hint(user: &[keymap::Binding]) -> String {
+    let keys = [
+        (Action::Palette, "every action"),
+        (Action::SplitRight, "split"),
+        (Action::JumpToAttention, "the session that needs you"),
+        (Action::Settings, "settings"),
+    ];
+    let parts: Vec<String> = (keys.iter())
+        .filter_map(|&(a, what)| Some(format!("{} {what}", keymap::keys_for(a, user)?)))
+        .collect();
+    parts.join(" \u{b7} ")
+}
+
+/// An update left for when blitz closes: its release, and its installer
+/// once downloaded.
+type AtClose = (String, Option<crate::update::Installer>);
+
+/// Whether Ctrl+Shift+U, leaving release `v` for when blitz closes, starts
+/// its download: not when `at_close` already holds it, but when it holds an
+/// older release, which a later look replaced on the banner.
+fn arms(at_close: Option<&AtClose>, v: &str) -> bool {
+    at_close.is_none_or(|a| a.0 != v)
+}
+
+/// Whether the installer of release `v`, once here, takes the place of the
+/// one `at_close` holds: an older release's, ready to install. An older
+/// one's download that lands late never takes a newer one's place.
+fn replaces(at_close: Option<&AtClose>, v: &str) -> bool {
+    at_close.is_some_and(|a| a.1.is_some() && crate::update::newer(&a.0, v).is_some())
+}
+
+/// Whether Ctrl+Shift+U asks before it updates to release `v`: not when it
+/// answers the question it `asked`, nor once `v` waits in `at_close` for
+/// blitz to close, as its strip then says a press restarts now.
+fn asks(asked: bool, at_close: Option<&AtClose>, v: &str) -> bool {
+    !asked && arms(at_close, v)
+}
+
+/// What is left of an update for when blitz closes once the banner goes,
+/// by its x or with checks turned off: nothing, unless Ctrl+Shift+U asked
+/// to restart now (`updating`) while it downloads. That goes ahead, or its
+/// "Downloading" notice would stay, and the key do nothing, until a restart.
+fn kept_at_close(at_close: Option<AtClose>, updating: bool) -> Option<AtClose> {
+    at_close.filter(|_| updating)
+}
+
+/// What a click on the banner does.
+#[derive(Debug, PartialEq)]
+enum BannerClick {
+    Close,
+    Notes,
+}
+
+/// What a click at (`x`, `y`) does to the banner, given its strip and its
+/// x: the x closes it and anywhere else opens the release notes. Updating
+/// restarts blitz, so only the key does that.
+fn banner_click(banner: Option<(Rect, Rect)>, x: i32, y: i32) -> Option<BannerClick> {
+    let inside = |r: Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+    let (_, close) = banner.filter(|b| inside(b.0))?;
+    Some(if inside(close) {
+        BannerClick::Close
+    } else {
+        BannerClick::Notes
+    })
+}
+
 /// The last `n` lines of `text`, without blank lines at either end.
 fn last_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.trim_matches('\n').lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// Moves the system caret to `at`, in client pixels, first making one of
+/// `size` when `made`, the size of the caret there is, differs. It is
+/// never shown, as blitz draws its own cursor, but Magnifier and other
+/// tools that follow the text cursor follow it. Returns the caret's size.
+fn place_caret(
+    hwnd: isize,
+    at: (i32, i32),
+    size: (u32, u32),
+    made: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    let made = match made {
+        Some(s) if s == size => made,
+        // SAFETY: our own window, on its thread; it replaces any old caret.
+        _ => unsafe {
+            CreateCaret(
+                HWND(hwnd as *mut c_void),
+                None,
+                size.0 as i32,
+                size.1 as i32,
+            )
+        }
+        .ok()
+        .map(|()| size),
+    };
+    // SAFETY: plain call; it moves this thread's caret, if there is one.
+    let _ = unsafe { SetCaretPos(at.0, at.1) };
+    made
 }
 
 /// The local time as `2026-10-02 14:32`.
@@ -6234,12 +7165,18 @@ fn elevated() -> bool {
 }
 
 /// Where the first pane starts when no folder was given: `cwd`, where
-/// blitz was started, unless that is one of `avoid`; else the user's
-/// profile folder.
-fn first_dir(cwd: Option<PathBuf>, avoid: &[PathBuf]) -> Option<PathBuf> {
+/// blitz was started, unless that is one of `avoid` or inside Windows' own
+/// folder, `system_root`, as for blitz started when the user signs in;
+/// else the user's profile folder.
+fn first_dir(
+    cwd: Option<PathBuf>,
+    avoid: &[PathBuf],
+    system_root: Option<&Path>,
+) -> Option<PathBuf> {
     let key = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    let inside = |d: &Path| system_root.is_some_and(|r| Path::new(&key(d)).starts_with(key(r)));
     match cwd {
-        Some(d) if !avoid.iter().any(|a| key(a) == key(&d)) => Some(d),
+        Some(d) if !avoid.iter().any(|a| key(a) == key(&d)) && !inside(&d) => Some(d),
         _ => start_dir(""),
     }
 }
@@ -6828,6 +7765,24 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                // Only the window with the keys has a caret; the next frame
+                // makes it again.
+                if !f && self.caret.take().is_some() {
+                    // SAFETY: plain call on the thread that made the caret.
+                    let _ = unsafe { DestroyCaret() };
+                }
+                self.ime_at = None;
+                // High contrast mode may have been turned on or off while
+                // the window was in the background, and winit passes on no
+                // event for that.
+                if f {
+                    let contrast = crate::theme::system_contrast();
+                    if std::mem::replace(&mut self.contrast, contrast) != contrast
+                        && self.picker.is_none()
+                    {
+                        self.set_theme_from_config();
+                    }
+                }
                 // Ctrl may be let go while another window has the keys.
                 self.set_hover(None);
                 self.hide_pointer(false);
@@ -6890,13 +7845,31 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 el.exit();
             }
-            UserEvent::Update(v, log) => self.offer_update(v, log),
-            UserEvent::Checked(found) => {
-                let (text, failed) = (crate::update::found(&found), found.is_err());
-                if let Ok(Some(v)) = found {
-                    self.offer_update(v, None);
+            UserEvent::Failed(v, log) => {
+                // No path: it can end up in an issue report.
+                self.update_error = Some(format!("the installer of blitz {v} failed"));
+                if self.unasked(&v, true) {
+                    self.offer_update(v, Some(log));
                 }
-                match self.updating.take() {
+            }
+            UserEvent::Checked(found, asked) => {
+                let (text, failed) = (crate::update::found(&found), found.is_err());
+                self.look_error = failed.then(|| text.clone());
+                if let Ok(Some(v)) = found
+                    && (asked || self.unasked(&v, false))
+                {
+                    // A newer release takes the place of one left for when
+                    // blitz closes, rather than show while that one installs;
+                    // a ready one stays until the newer one's installer is here.
+                    match self.at_close.as_ref() {
+                        a if replaces(a, &v) => self.fetch(v),
+                        Some(a) if a.0 != v => self.leave_for_close(v),
+                        _ => self.offer_update(v, None),
+                    }
+                }
+                // A look nobody asked for leaves an update under way alone.
+                let id = if asked { self.updating.take() } else { None };
+                match id {
                     Some(id) if failed => self.error(id, text),
                     Some(id) => self.set_notice(id, text, Some(Instant::now() + NOTICE), false),
                     None => {}
@@ -6909,27 +7882,43 @@ impl ApplicationHandler<UserEvent> for App {
                 None => {}
             },
             UserEvent::Sized => self.settle(),
+            UserEvent::Fetched(v, got) => self.fetched(v, got),
             UserEvent::Installed(Ok(())) => el.exit(),
             UserEvent::Installed(Err(e)) => {
                 eprintln!("blitz: update: {e}");
                 self.banner_note = None;
+                let text = format!("Update failed: {e}");
+                self.update_error = Some(text.clone());
                 if let Some(id) = self.updating.take() {
-                    self.error(id, format!("Update failed: {e}"));
+                    self.error(id, text);
                 }
             }
+            // Explorer restarted. A new TaskbarList too, as the old one
+            // may still talk to the Explorer that is gone.
+            UserEvent::TaskbarButton => {
+                self.taskbar = None;
+                self.taskbar_shows = None;
+                self.badge_shows = None;
+                self.taskbar_progress();
+                self.taskbar_badge();
+            }
             UserEvent::Handoff(ask) => {
-                let hwnd = HWND(self.hwnd as *mut c_void);
-                crate::handoff::to_current_desktop(hwnd);
-                // First, since a minimized window has no room for a pane.
-                if let Some(w) = &self.window {
-                    w.set_minimized(false);
-                }
-                // SAFETY: our own window; the launch that sent this allowed
-                // this process to take the foreground.
-                let _ = unsafe { SetForegroundWindow(hwnd) };
+                crate::handoff::to_current_desktop(HWND(self.hwnd as *mut c_void));
+                // The launch that sent this let this process take the
+                // foreground.
+                self.to_front();
                 if let crate::handoff::Ask::Open(dir) = ask {
-                    self.add(Some(dir), new_tab);
+                    self.add(Some(dir), "", new_tab);
                 }
+            }
+            // So does a click on a notification, and the jump key.
+            UserEvent::ShowPane(id) => {
+                self.to_front();
+                self.show(id);
+            }
+            UserEvent::GlobalJump => {
+                self.jump();
+                self.to_front();
             }
         }
     }
@@ -6959,6 +7948,16 @@ impl ApplicationHandler<UserEvent> for App {
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         // Closing the window, Alt+F4 and an update all keep the layout.
         self.save_session(true);
+        crate::notify::untoast_all();
+        // Not when that would close another blitz window opened since; the
+        // banner offers it again at the next start.
+        if let Some((_, Some(installer))) = self.at_close.take()
+            && crate::handoff::others() == 0
+            && let Err(e) = crate::update::run(&installer, false)
+        {
+            eprintln!("blitz: update: {e}");
+        }
+
         if let Err(e) = self.counters.write_trace() {
             eprintln!("blitz: BLITZ_TRACE: {e}");
         }
@@ -7715,16 +8714,18 @@ mod tests {
 
     #[test]
     fn app_hints_show_once_ever() {
+        // Every hint is noted in the one file, so the keys shown at the
+        // first start and the Shift+drag hint each show once.
         let dir = std::env::temp_dir().join(format!("blitz-hints-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let seen = [
-            first_time(Some(&dir), "shift-drag"),
-            first_time(Some(&dir), "shift-drag"),
-            first_time(Some(&dir), "other"),
+            session::first_time_in(&dir, "keys"),
+            session::first_time_in(&dir, "shift-drag"),
+            session::first_time_in(&dir, "shift-drag"),
+            session::first_time_in(&dir, "keys"),
         ];
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(seen, [true, false, true]);
-        assert!(!first_time(None, "shift-drag"), "nowhere to remember it");
+        assert_eq!(seen, [true, true, false, false]);
     }
 
     #[test]
@@ -8033,6 +9034,101 @@ mod tests {
         assert_eq!(due, None);
         assert!(!save_now(true, false, at(700), &mut due));
         assert!(save_now(true, false, at(1200), &mut due));
+    }
+
+    /// The caret goes where the cursor is, and is made again only for a
+    /// new cell size.
+    #[test]
+    fn app_caret_follows_the_cursor() {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetCaretPos, WINDOW_EX_STYLE, WS_POPUP,
+        };
+        // A hidden window of this thread, which then owns the caret.
+        // SAFETY: a system class with no parent; destroyed below.
+        let w = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                None,
+                WS_POPUP,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("window");
+        let hwnd = w.0 as isize;
+        let pos = || {
+            let mut p = POINT::default();
+            // SAFETY: a valid out pointer.
+            unsafe { GetCaretPos(&mut p) }.expect("a caret");
+            (p.x, p.y)
+        };
+        let made = place_caret(hwnd, (16, 32), (8, 16), None);
+        assert_eq!(made, Some((8, 16)));
+        assert_eq!(pos(), (16, 32));
+        assert_eq!(place_caret(hwnd, (24, 32), (8, 16), made), made);
+        assert_eq!(pos(), (24, 32));
+        assert_eq!(place_caret(hwnd, (30, 40), (10, 20), made), Some((10, 20)));
+        assert_eq!(pos(), (30, 40));
+        // SAFETY: this thread's caret and window.
+        unsafe {
+            DestroyCaret().expect("caret");
+            DestroyWindow(w).expect("window");
+        }
+    }
+
+    /// A session that could not be written is tried again, later after
+    /// each failure in a row, rather than taken as saved.
+    #[test]
+    fn app_failed_session_saves_back_off() {
+        let waits: Vec<u128> = (0..10).map(|n| save_retry(n).as_millis()).collect();
+        assert_eq!(
+            waits,
+            [
+                500, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 64000, 64000
+            ]
+        );
+        assert_eq!(save_retry(u32::MAX), save_retry(7));
+        // The next try waits out its delay as any change does.
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut due = Some(t0 + save_retry(3));
+        assert!(!save_now(true, false, at(3999), &mut due));
+        assert!(save_now(true, false, at(4000), &mut due));
+        // A failed write keeps the last saved state, so the layout still
+        // counts as changed; a write that works is saved and starts over.
+        let (mut kept, mut fails) = (Some("old"), 0);
+        assert_eq!(
+            saved(false, "new", t0, &mut kept, &mut fails),
+            Some(at(500))
+        );
+        assert_eq!((kept, fails), (Some("old"), 1));
+        assert_eq!(
+            saved(false, "new", t0, &mut kept, &mut fails),
+            Some(at(1000))
+        );
+        assert_eq!(saved(true, "new", t0, &mut kept, &mut fails), None);
+        assert_eq!((kept, fails), (Some("new"), 0));
+        assert_eq!(
+            saved(false, "newer", t0, &mut kept, &mut fails),
+            Some(at(500))
+        );
+        // Failing on, it is said once, and again only after a save worked.
+        let (mut kept, mut fails, mut said) = (None, 0, Vec::new());
+        for (i, ok) in [0, 0, 0, 0, 0, 1, 0, 0, 0, 0].into_iter().enumerate() {
+            saved(ok == 1, i, t0, &mut kept, &mut fails);
+            if ok == 0 && save_warns(fails) {
+                said.push(i);
+            }
+        }
+        assert_eq!(said, [2, 8]);
     }
 
     fn input(vk: u16, down: bool, key: vt::Key, text: &'static str) -> KeyInput<'static> {
@@ -8809,34 +9905,258 @@ mod tests {
             .iter()
             .find(|d| d.ends_with("System32") || d.ends_with("system32"));
         let system = system.expect("System32").clone();
-        assert_eq!(first_dir(Some(own), &avoid), home);
-        assert_eq!(first_dir(Some(system.clone()), &avoid), home);
+        assert_eq!(first_dir(Some(own), &avoid, None), home);
+        assert_eq!(first_dir(Some(system.clone()), &avoid, None), home);
         // However Windows spells it.
         let shouted = PathBuf::from(format!("{}\\", system.display()).to_uppercase());
-        assert_eq!(first_dir(Some(shouted), &avoid), home);
+        assert_eq!(first_dir(Some(shouted), &avoid, None), home);
         let dev = PathBuf::from(r"C:\dev\shop");
-        assert_eq!(first_dir(Some(dev.clone()), &avoid), Some(dev));
-        assert_eq!(first_dir(None, &avoid), home);
+        assert_eq!(first_dir(Some(dev.clone()), &avoid, None), Some(dev));
+        assert_eq!(first_dir(None, &avoid, None), home);
     }
 
     #[test]
-    fn app_taskbar_flashes_once_per_session_every_ten_seconds() {
+    fn app_alerts_once_per_session_every_ten_seconds() {
         let t0 = Instant::now();
+        let c = Config::default();
         let mut last = None;
-        let flash = |state, last: &mut Option<Instant>, s| {
-            flash_kind(state, last, t0 + Duration::from_secs(s))
+        let alert = |state, last: &mut Option<Instant>, s| {
+            alert(state, &c, last, t0 + Duration::from_secs(s))
         };
-        assert_eq!(flash(Attn::Working, &mut last, 0), None);
-        assert_eq!(flash(Attn::Idle, &mut last, 0), None);
-        assert_eq!(last, None, "only flashes count");
-        let critical = Some(UserAttentionType::Critical);
-        assert_eq!(flash(Attn::NeedsYou, &mut last, 0), critical);
-        assert_eq!(flash(Attn::Error, &mut last, 9), None);
-        assert_eq!(flash(Attn::Error, &mut last, 10), critical);
-        let gentle = Some(UserAttentionType::Informational);
-        assert_eq!(flash(Attn::DoneUnseen, &mut last, 20), gentle);
+        assert_eq!(alert(Attn::Working, &mut last, 0), None);
+        assert_eq!(alert(Attn::Idle, &mut last, 0), None);
+        assert_eq!(last, None, "only alerts count");
+        let urgent = Some(Alert {
+            flashes: 3,
+            toast: true,
+            sound: false,
+        });
+        assert_eq!(alert(Attn::NeedsYou, &mut last, 0), urgent);
+        assert_eq!(alert(Attn::Error, &mut last, 9), None);
+        assert_eq!(alert(Attn::Error, &mut last, 10), urgent);
+        assert_eq!(
+            alert(Attn::DoneUnseen, &mut last, 20),
+            Some(Alert {
+                flashes: 1,
+                toast: false,
+                sound: false,
+            })
+        );
         // Another session has its own limit.
-        assert_eq!(flash(Attn::NeedsYou, &mut None, 21), critical);
+        assert_eq!(alert(Attn::NeedsYou, &mut None, 21), urgent);
+    }
+
+    #[test]
+    fn app_badge_has_the_sidebar_colours() {
+        // On a light theme the accent itself is too faint on the badge's
+        // background; the mark the sidebar draws is not.
+        let ui = crate::theme::blitz(true).ui;
+        assert_ne!(ui.mark, ui.accent);
+        assert_eq!(badge_look(Some(Attn::NeedsYou), &ui).0, ui.mark);
+        assert_eq!(badge_look(Some(Attn::Error), &ui).0, ui.error);
+        assert_eq!(
+            badge_look(Some(Attn::DoneUnseen), &ui),
+            (ui.name, true, "A session finished")
+        );
+    }
+
+    #[test]
+    fn app_badge_shows_the_session_that_most_wants_you() {
+        use Attn::*;
+        let badge = |s: &[Attn]| badge_state(s.iter().copied());
+        assert_eq!(badge(&[]), None);
+        assert_eq!(badge(&[Idle, Working]), None, "nothing to see");
+        assert_eq!(badge(&[Working, DoneUnseen, Idle]), Some(DoneUnseen));
+        assert_eq!(badge(&[DoneUnseen, Error]), Some(Error));
+        assert_eq!(badge(&[Error, NeedsYou, DoneUnseen]), Some(NeedsYou));
+    }
+
+    /// A flash with no count goes on until blitz is in front; a few are
+    /// enough, as the button stays lit after them.
+    #[test]
+    fn app_flashes_a_few_times_and_none_when_off() {
+        let now = Instant::now();
+        for state in [Attn::NeedsYou, Attn::Error, Attn::DoneUnseen] {
+            let a = alert(state, &Config::default(), &mut None, now).expect("an alert");
+            assert!((1..=3).contains(&a.flashes), "{state:?}");
+        }
+        let off = Config {
+            flash: false,
+            toasts: "off".into(),
+            ..Config::default()
+        };
+        let mut last = None;
+        assert_eq!(alert(Attn::NeedsYou, &off, &mut last, now), None);
+        assert_eq!(last, None, "nothing happened, so nothing to space out");
+    }
+
+    #[test]
+    fn app_notifies_of_sessions_that_need_you_and_of_finished_ones_if_asked() {
+        let now = Instant::now();
+        let toast = |toasts: &str, state| {
+            let c = Config {
+                toasts: toasts.into(),
+                ..Config::default()
+            };
+            alert(state, &c, &mut None, now).is_some_and(|a| a.toast)
+        };
+        for state in [Attn::NeedsYou, Attn::Error] {
+            assert!(toast("needs-you", state), "{state:?}");
+            assert!(toast("all", state), "{state:?}");
+            assert!(!toast("off", state), "{state:?}");
+        }
+        assert!(!toast("needs-you", Attn::DoneUnseen));
+        assert!(toast("all", Attn::DoneUnseen));
+        // With the flash off too, a notification is still news.
+        let quiet = Config {
+            flash: false,
+            ..Config::default()
+        };
+        let a = alert(Attn::NeedsYou, &quiet, &mut None, now);
+        assert_eq!(a.map(|a| (a.flashes, a.toast)), Some((0, true)));
+    }
+
+    #[test]
+    fn app_sounds_once_and_only_when_asked() {
+        let now = Instant::now();
+        let alert = |toasts: &str, sound, state| {
+            let c = Config {
+                toasts: toasts.into(),
+                sound,
+                ..Config::default()
+            };
+            alert(state, &c, &mut None, now)
+        };
+        // As if each notification asked for was shown.
+        let beeps = |a: Option<Alert>| a.is_some_and(|a| a.beeps(a.toast));
+        assert!(!beeps(alert("off", false, Attn::NeedsYou)));
+        assert!(beeps(alert("off", true, Attn::NeedsYou)));
+        // The notification makes it.
+        assert!(!beeps(alert("all", true, Attn::DoneUnseen)));
+        assert!(beeps(alert("needs-you", true, Attn::DoneUnseen)));
+        // Unless Windows did not show it, say as the user turned blitz's
+        // notifications off there.
+        let a = alert("all", true, Attn::NeedsYou).expect("an alert");
+        assert!(a.toast && a.beeps(false));
+        // A sound is enough of an alert by itself.
+        let c = Config {
+            flash: false,
+            toasts: "off".into(),
+            sound: true,
+            ..Config::default()
+        };
+        let a = super::alert(Attn::Error, &c, &mut None, now);
+        assert!(a.is_some_and(|a| a.beeps(false) && a.flashes == 0));
+    }
+
+    #[test]
+    fn app_jumps_skip_the_focused_session_only_while_blitz_is_in_front() {
+        let t0 = Instant::now();
+        let (a, b) = (PaneId(1), PaneId(2));
+        let attn = |state, since| {
+            let mut p = crate::attention::PaneAttn::new(t0);
+            (p.state, p.since) = (state, since);
+            p
+        };
+        let sessions = || {
+            [
+                (a, attn(Attn::NeedsYou, t0)),
+                (b, attn(Attn::NeedsYou, t0 + Duration::from_secs(1))),
+            ]
+            .into_iter()
+        };
+        assert_eq!(jump_to(sessions(), Some(a), true), Some(b));
+        assert_eq!(jump_to(sessions(), Some(a), false), Some(a));
+        assert_eq!(jump_to(sessions(), None, true), Some(a));
+        let idle = [(a, attn(Attn::Idle, t0))].into_iter();
+        assert_eq!(jump_to(idle, Some(a), false), None, "nothing waits");
+    }
+
+    #[test]
+    fn app_says_the_jump_key_is_taken_only_by_another_program() {
+        assert!(!jump_key_lost(true, || unreachable!()));
+        assert!(jump_key_lost(false, || false));
+        assert!(!jump_key_lost(false, || true), "another blitz has it");
+    }
+
+    #[test]
+    fn app_keeps_the_pc_awake_only_while_a_session_works_and_if_asked() {
+        use Attn::*;
+        let awake = |on, s: &[Attn]| stays_awake(on, s.iter().map(|&s| (s, true)));
+        assert!(awake(true, &[Idle, Working, NeedsYou]));
+        assert!(!awake(false, &[Working]), "off by default");
+        assert!(!awake(true, &[]));
+        // Waiting for the user is not working.
+        assert!(!awake(true, &[NeedsYou, DoneUnseen, Error, Idle]));
+        // A title any output can print does not keep it awake by itself.
+        assert!(!stays_awake(true, [(Working, false)].into_iter()));
+    }
+
+    /// A bell, or a notification without the pane's token, flashes and
+    /// badges, but raises no Windows notification in blitz's name.
+    #[test]
+    fn app_output_alone_never_raises_a_notification() {
+        let now = Instant::now();
+        let a = alert(Attn::NeedsYou, &Config::default(), &mut None, now).expect("an alert");
+        assert!(a.toast);
+        let heard = from_output(a);
+        assert!(!heard.toast);
+        assert_eq!(heard.flashes, 3);
+    }
+
+    #[test]
+    fn app_notifications_come_down_once_seen_or_no_longer_wanted() {
+        use Attn::*;
+        for state in [NeedsYou, Error, DoneUnseen] {
+            assert!(!untoasts(false, state), "{state:?} still wants you");
+            assert!(untoasts(true, state), "{state:?} seen");
+        }
+        assert!(untoasts(false, Working), "answered elsewhere");
+        assert!(untoasts(false, Idle));
+    }
+
+    #[test]
+    fn app_notifications_name_the_session_and_say_what_it_wants() {
+        let s = |state| chrome::Session {
+            id: crate::layout::PaneId(3),
+            name: "pwsh 3".into(),
+            cwd: r"C:\dev\blitz".into(),
+            branch: None,
+            state,
+            since: Instant::now(),
+            num: None,
+            turn: None,
+            took: None,
+            seen: false,
+            msg: "Bash: cargo test".into(),
+            progress: None,
+            exit_code: None,
+            below: 0,
+        };
+        assert_eq!(
+            toast_text(&s(Attn::NeedsYou), false),
+            ["pwsh 3 needs you", "Bash: cargo test", r"C:\dev\blitz"]
+        );
+        assert_eq!(toast_text(&s(Attn::Error), false)[0], "pwsh 3 failed");
+        assert_eq!(
+            toast_text(&s(Attn::DoneUnseen), false)[0],
+            "pwsh 3 finished"
+        );
+        // A title, which any program sets, never shows: an exit's code does.
+        let exited = chrome::Session {
+            msg: "Windows Security: sign in".into(),
+            exit_code: Some(1),
+            ..s(Attn::Error)
+        };
+        assert_eq!(toast_text(&exited, true)[1], "exit 1");
+        assert_eq!(toast_text(&s(Attn::Error), true)[1], "");
+        // A session that shares its name has its number, as in the sidebar.
+        let twin = chrome::Session {
+            name: "claude".into(),
+            num: Some(2),
+            ..s(Attn::NeedsYou)
+        };
+        assert_eq!(toast_text(&twin, false)[0], "claude 2 needs you");
     }
 
     #[test]
@@ -9028,6 +10348,14 @@ mod tests {
         assert!(Args::parse(&["--bogus".into(), "1".into()]).is_err());
         assert!(Args::parse(&["--cmd".into()]).is_err());
         assert!(!a.new_window);
+        assert!(a.scripted());
+        // A capture is a test run too, and the user's own launches are not.
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            Args::parse(&args).expect("parse")
+        };
+        assert!(parse(&["--capture", "f.bmp"]).scripted());
+        assert!(!parse(&["--cwd", "C:\\", "--new-window"]).scripted());
     }
 
     #[test]
@@ -9044,6 +10372,19 @@ mod tests {
         let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
         assert!(a.new_window);
         assert_eq!(a.cwd, Some(r"C:\foo".into()));
+        // A folder alone is the same as --cwd, but it has to be one: a
+        // mistyped command opens no window.
+        let here = std::env::temp_dir();
+        assert_eq!(parse(&[here.to_str().expect("UTF-8")]).cwd, Some(here));
+        let a = parse(&["--new-window", "C:\""]);
+        assert!(a.new_window);
+        assert_eq!(a.cwd, Some(r"C:\".into()));
+        let bad = Args::parse(&["stup".into()]).err();
+        assert_eq!(bad.as_deref(), Some("no such folder: stup"));
+        // A relative one is the folder it names now, not later.
+        let here = std::env::current_dir().expect("a current folder");
+        assert_eq!(parse(&["."]).cwd.as_ref(), Some(&here));
+        assert_eq!(parse(&["--cwd", "."]).cwd, Some(here));
     }
 
     /// A launch that a running blitz did not take must not open a second
@@ -9069,6 +10410,118 @@ mod tests {
             ..Args::default()
         };
         assert!(!a.main() && a.separate());
+    }
+
+    #[test]
+    fn the_first_hint_names_the_keys_as_bound() {
+        assert_eq!(
+            first_hint(&[]),
+            "Ctrl+Shift+P every action \u{b7} Ctrl+Shift+R split \u{b7} \
+             Ctrl+Shift+J the session that needs you \u{b7} Ctrl+, settings"
+        );
+        let user = [
+            keymap::binding("alt+p=command_palette").expect("a binding"),
+            keymap::binding("ctrl+shift+r=none").expect("a binding"),
+            keymap::binding("ctrl+shift+j=none").expect("a binding"),
+        ];
+        assert_eq!(
+            first_hint(&user),
+            "Alt+P every action \u{b7} Ctrl+, settings"
+        );
+    }
+
+    #[test]
+    fn a_launch_from_the_windows_folder_starts_at_home() {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let root = Some(Path::new(r"C:\Windows"));
+        // Started at sign-in, the folder is System32, in any case.
+        for at in [
+            r"C:\Windows\system32",
+            r"C:\WINDOWS\System32",
+            r"C:\Windows",
+        ] {
+            assert_eq!(first_dir(Some(at.into()), &[], root), home, "{at}");
+        }
+        assert_eq!(first_dir(None, &[], root), home);
+        for at in [r"C:\src\blitz", r"C:\WindowsApps", r"D:\Windows"] {
+            let at = Some(PathBuf::from(at));
+            assert_eq!(first_dir(at.clone(), &[], root), at);
+        }
+        let at = Some(PathBuf::from(r"C:\Windows\system32"));
+        assert_eq!(first_dir(at.clone(), &[], None), at);
+    }
+
+    #[test]
+    fn an_update_left_for_close_follows_the_banner() {
+        let setup = || crate::update::Installer {
+            path: "setup.exe".into(),
+            sum: String::new(),
+        };
+        let left = |v: &str, got: bool| (v.to_string(), got.then(setup));
+        // Pressed again for the same release, nothing downloads twice; for
+        // a newer one that took the banner, it does.
+        assert!(arms(None, "0.0.5"));
+        assert!(!arms(Some(&left("0.0.5", false)), "0.0.5"));
+        assert!(!arms(Some(&left("0.0.5", true)), "0.0.5"));
+        assert!(arms(Some(&left("0.0.5", true)), "0.0.6"));
+        // Once it waits for the close, the next press restarts, whatever
+        // keys came between.
+        assert!(asks(false, None, "0.0.5"));
+        assert!(!asks(true, None, "0.0.5"));
+        assert!(!asks(false, Some(&left("0.0.5", false)), "0.0.5"));
+        assert!(asks(false, Some(&left("0.0.5", true)), "0.0.6"));
+        // A newer release found later replaces a ready installer only once
+        // its own is here; one still on its way is replaced at once.
+        assert!(replaces(Some(&left("0.0.5", true)), "0.0.6"));
+        assert!(!replaces(Some(&left("0.0.5", false)), "0.0.6"));
+        assert!(!replaces(Some(&left("0.0.6", true)), "0.0.6"));
+        assert!(!replaces(Some(&left("0.0.6", true)), "0.0.5"));
+        assert!(!replaces(None, "0.0.6"));
+        // Hiding the banner drops it, but not a restart asked for while it
+        // downloads.
+        assert_eq!(kept_at_close(Some(left("0.0.5", true)), false), None);
+        assert_eq!(kept_at_close(Some(left("0.0.5", false)), false), None);
+        assert_eq!(
+            kept_at_close(Some(left("0.0.5", false)), true),
+            Some(left("0.0.5", false))
+        );
+        assert_eq!(kept_at_close(None, true), None);
+    }
+
+    /// Startup apps in Task Manager turn the start off without the value.
+    #[test]
+    fn a_sign_in_start_turned_off_does_not_count() {
+        assert!(sign_in_starts(true, None));
+        assert!(sign_in_starts(true, Some(0x02)));
+        assert!(sign_in_starts(true, Some(0x06)));
+        assert!(!sign_in_starts(true, Some(0x03)));
+        assert!(!sign_in_starts(true, Some(0x07)));
+        assert!(!sign_in_starts(false, None));
+        assert!(!sign_in_starts(false, Some(0x02)));
+    }
+
+    #[test]
+    fn a_click_on_the_banner_never_updates() {
+        let strip = Rect {
+            x: 240,
+            y: 578,
+            w: 740,
+            h: 22,
+        };
+        let close = Rect {
+            x: 958,
+            w: 22,
+            ..strip
+        };
+        let banner = Some((strip, close));
+        assert_eq!(banner_click(banner, 300, 590), Some(BannerClick::Notes));
+        assert_eq!(banner_click(banner, 957, 578), Some(BannerClick::Notes));
+        assert_eq!(banner_click(banner, 958, 578), Some(BannerClick::Close));
+        assert_eq!(banner_click(banner, 979, 599), Some(BannerClick::Close));
+        for (x, y) in [(239, 590), (300, 577), (980, 590), (300, 600)] {
+            assert_eq!(banner_click(banner, x, y), None, "{x},{y}");
+        }
+        assert_eq!(banner_click(None, 300, 590), None);
     }
 
     #[test]
@@ -9114,6 +10567,16 @@ mod tests {
         ] {
             assert_eq!(resume_line(true, Some(bad)), None, "{bad:?}");
         }
+    }
+
+    /// A palette's shell that has gone gives way to the one the user set,
+    /// before the one blitz finds.
+    #[test]
+    fn a_shell_that_failed_gives_way_to_the_settings_then_to_blitz() {
+        assert_eq!(fallbacks("bash.exe", "cmd.exe"), ["cmd.exe", ""]);
+        assert_eq!(fallbacks("bash.exe", ""), [""]);
+        assert_eq!(fallbacks("", "cmd.exe"), [""]);
+        assert_eq!(fallbacks("cmd.exe", "cmd.exe"), [""]);
     }
 
     /// A question stays until it is answered or another key is pressed,
@@ -9884,6 +11347,36 @@ mod tests {
         let rows = notice_rows(ask, (12, 2));
         assert_eq!(rows.len(), 2);
         assert!(rows[1].ends_with('\u{2026}'), "{rows:?}");
+    }
+
+    #[test]
+    fn palette_opens_a_tab_on_each_shell() {
+        let wsl = r"C:\Windows\System32\wsl.exe -d Ubuntu";
+        let mut c = Commands::new(vec![
+            ("Automatic (PowerShell 7)".into(), String::new()),
+            (
+                "Command Prompt".into(),
+                r"C:\Windows\System32\cmd.exe".into(),
+            ),
+            ("Ubuntu".into(), wsl.into()),
+        ]);
+        c.filter = "new tab".into();
+        let labels: Vec<String> = c.matches().into_iter().map(|m| m.1).collect();
+        // Right after New tab, before the actions that follow it.
+        assert_eq!(
+            labels,
+            [
+                "New tab",
+                "New tab: Command Prompt",
+                "New tab: Ubuntu",
+                "Move the pane to a new tab"
+            ]
+        );
+        c.filter = "wsl".into();
+        assert_eq!(
+            c.matches(),
+            [(Pick::Shell(wsl.into()), "New tab: Ubuntu".into())]
+        );
     }
 
     #[test]

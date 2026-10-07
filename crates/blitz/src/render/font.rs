@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{E_FAIL, E_NOINTERFACE, S_OK};
 use windows::Win32::Graphics::DirectWrite::{
@@ -25,7 +26,7 @@ pub const ITALIC: u8 = 2;
 pub const E_PENDING: HRESULT = HRESULT(0x8000_000A_u32 as i32);
 
 /// Families tried in order; Consolas ships with every Windows.
-pub const DEFAULT_FAMILIES: &[&str] = &["Cascadia Mono", "Consolas", "Courier New"];
+pub const DEFAULT_FAMILIES: &[&str] = crate::config::FALLBACK_FONTS;
 
 /// Coverage of a rasterized glyph, placed relative to the top-left corner
 /// of its first cell.
@@ -84,31 +85,47 @@ fn weight_style(style: u8) -> (DWRITE_FONT_WEIGHT, DWRITE_FONT_STYLE) {
     (weight, slant)
 }
 
-/// The names of the fixed-width font families installed, sorted. Empty
-/// when DirectWrite cannot list them.
-pub fn monospace_families() -> Vec<String> {
+/// The names of the font families installed, sorted, each with whether it
+/// is fixed-width and no symbol font. A family DirectWrite cannot read is
+/// left out. Empty when DirectWrite cannot list them, and listed again at
+/// the next call. Listed once, as that takes long enough to hitch a frame,
+/// so the app has another thread list them after its first frame.
+// ponytail: a font installed while blitz runs is listed after a restart
+pub fn families() -> &'static [(String, bool)] {
+    static FAMILIES: OnceLock<Vec<(String, bool)>> = OnceLock::new();
+    if let Some(f) = FAMILIES.get() {
+        return f;
+    }
+    match list_families() {
+        Ok(f) => FAMILIES.get_or_init(|| f),
+        Err(_) => &[],
+    }
+}
+
+fn list_families() -> Result<Vec<(String, bool)>> {
     // SAFETY: COM calls with valid out-pointers and buffers of the length
     // passed.
-    let list = || unsafe {
+    unsafe {
         let factory: IDWriteFactory2 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
         let mut collection = None;
         factory.GetSystemFontCollection(&mut collection, false)?;
         let collection = collection.ok_or(windows::core::Error::from(E_FAIL))?;
         let mut out = Vec::new();
         for i in 0..collection.GetFontFamilyCount() {
-            let fam = collection.GetFontFamily(i)?;
-            let font = fam.GetFont(0)?;
-            let mono = font.cast::<IDWriteFont1>()?.IsMonospacedFont().as_bool();
-            if !mono || font.IsSymbolFont().as_bool() {
-                continue;
-            }
-            out.push(family_name(&fam)?);
+            // One broken or unreachable font file costs its family only.
+            let family = || {
+                let fam = collection.GetFontFamily(i)?;
+                let font = fam.GetFont(0)?;
+                let mono = font.cast::<IDWriteFont1>()?.IsMonospacedFont().as_bool()
+                    && !font.IsSymbolFont().as_bool();
+                Result::Ok((family_name(&fam)?, mono))
+            };
+            out.extend(family());
         }
-        out.sort_by_key(|n| n.to_lowercase());
+        out.sort_by_key(|n| n.0.to_lowercase());
         out.dedup();
-        Result::Ok(out)
-    };
-    list().unwrap_or_default()
+        Ok(out)
+    }
 }
 
 /// The English name of `fam`, or its first.
@@ -661,6 +678,19 @@ mod tests {
         // A baseline at the very top, from a broken font at 4 pt.
         assert_eq!(strike_row(0, 2.0), 0);
         assert_eq!(strike_row(-1, 0.0), 0);
+    }
+
+    /// The list another thread made is the one the settings panel gets,
+    /// with no second walk over every font.
+    #[test]
+    fn font_families_are_listed_once_on_any_thread() {
+        let made = std::thread::spawn(families).join().expect("listed");
+        assert!(
+            made.iter().any(|f| f == &("Consolas".into(), true)),
+            "{made:?}"
+        );
+        assert!(made.is_sorted_by_key(|f| f.0.to_lowercase()));
+        assert!(std::ptr::eq(made, families()));
     }
 
     #[test]

@@ -67,6 +67,10 @@ pub enum Action {
     ThemePicker,
     /// Open or close the settings panel.
     Settings,
+    /// Open `config.toml` in an editor.
+    OpenConfig,
+    /// Open the themes folder in Explorer.
+    OpenThemes,
     /// Show only the focused pane, filling the tab, or every pane again.
     Zoom,
     /// Give the tab's panes equal space.
@@ -100,6 +104,9 @@ pub enum Action {
     /// Label the URLs, paths and commit hashes in view, to copy or open
     /// one by its label.
     QuickSelect,
+    /// Open a new GitHub issue with what a report needs to know about
+    /// this blitz filled in.
+    ReportIssue,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -141,6 +148,8 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Update, "update", "Update blitz"),
     (Action::ThemePicker, "theme_picker", "Pick a theme"),
     (Action::Settings, "settings", "Settings"),
+    (Action::OpenConfig, "open_config", "Open config.toml"),
+    (Action::OpenThemes, "open_themes", "Open themes folder"),
     (Action::Zoom, "zoom", "Zoom the pane, or show every pane"),
     (Action::Resize(Dir::Left), "resize_left", "Move the divider left"),
     (Action::Resize(Dir::Right), "resize_right", "Move the divider right"),
@@ -162,6 +171,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
     (Action::SystemMenu, "system_menu", "Window menu"),
     (Action::QuickSelect, "quick_select", "Quick select a link, path or hash"),
+    (Action::ReportIssue, "report_issue", "Report an issue"),
     (Action::GoToTab(0), "go_to_tab_1", "Go to tab 1"),
     (Action::GoToTab(1), "go_to_tab_2", "Go to tab 2"),
     (Action::GoToTab(2), "go_to_tab_3", "Go to tab 3"),

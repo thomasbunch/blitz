@@ -167,6 +167,9 @@ pub struct SettingRow {
     pub more: bool,
     /// The default value, as shown.
     pub default: String,
+    /// Said in place of when a change applies: why the last look for an
+    /// update failed.
+    pub note: Option<String>,
     /// The value is not the default.
     pub changed: bool,
 }
@@ -216,8 +219,9 @@ pub struct Chrome {
     pub panes: Vec<(PaneId, Rect)>,
     /// What a click in the sidebar or rail acts on.
     pub side: SideHits,
-    /// The banner strip, for clicks.
+    /// The banner strip, for clicks, and the x at its end that closes it.
     pub banner: Option<Rect>,
+    pub banner_close: Option<Rect>,
     /// The chip on each pane scrolled back, which a click takes to the
     /// bottom.
     pub below: Vec<(PaneId, Rect)>,
@@ -598,12 +602,22 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 w: side - 1,
                 h: h - bottom,
             };
-            out.banner = Some(foot);
+            // The x that closes it sits at the top right, clear of the
+            // text, which wraps short of it.
+            let bw = s(BANNER_H).min(foot.h);
+            let close = Rect {
+                x: foot.right() - bw,
+                w: bw,
+                h: bw,
+                ..foot
+            };
+            (out.banner, out.banner_close) = (Some(foot), Some(close));
             p.push(Prim::Rect(foot, c.hdr_bg));
             p.push(Prim::Rect(Rect { h: 1, ..foot }, c.hdr_line));
+            let first = bottom + s(5.0) + (lh - th) / 2;
+            text(p, close.x + (bw - tw) / 2, first, "\u{d7}", c.dim, false);
             for (i, l) in lines.iter().enumerate() {
-                let ly = bottom + s(5.0) + i as i32 * lh + (lh - th) / 2;
-                text(p, s(16.0), ly, l, c.dim, false);
+                text(p, s(16.0), first + i as i32 * lh, l, c.dim, false);
             }
         }
         let (gh, gap) = (s(26.0), s(2.0));
@@ -938,16 +952,25 @@ pub fn build(m: &ChromeModel) -> Chrome {
         out.banner = Some(strip);
         extra.push(Prim::Rect(strip, c.hdr_bg));
         extra.push(Prim::Rect(Rect { h: 1, ..strip }, c.hdr_line));
-        let x = strip.x + s(14.0);
-        let msg = fit(msg, strip.right() - s(14.0) - x, tw);
-        extra.push(Prim::Text {
-            x,
-            y: strip.y + (bh + 1 - th) / 2,
-            text: msg,
-            color: c.dim,
-            bold: false,
-            term: false,
-        });
+        let (x, ty) = (strip.x + s(14.0), strip.y + (bh + 1 - th) / 2);
+        // A square at the end, wider than the x drawn in it.
+        let close = Rect {
+            x: strip.right() - bh,
+            w: bh,
+            ..strip
+        };
+        out.banner_close = Some(close);
+        let msg = fit(msg, close.x - s(4.0) - x, tw);
+        for (x, text) in [(x, msg), (close.x + (bh - tw) / 2, "\u{d7}".into())] {
+            extra.push(Prim::Text {
+                x,
+                y: ty,
+                text,
+                color: c.dim,
+                bold: false,
+                term: false,
+            });
+        }
     }
     let typing =
         m.find.is_some() || m.settings.is_some() || m.picker.is_some() || m.commands.is_some();
@@ -1203,7 +1226,7 @@ fn list(
     y += s(4.0);
 
     if l.names.is_empty() {
-        text(p, left, ty(y), l.empty.into(), c.dim, false);
+        text(p, left, ty(y), fit(l.empty, right - left, tw), c.dim, false);
     }
     let mut rows = Vec::new();
     let first = (l.sel + 1).saturating_sub(PICKER_ROWS);
@@ -1254,7 +1277,8 @@ fn picker(
         filter: pk.filter,
         names: pk.items.iter().map(|t| t.name.as_str()).collect(),
         sel: pk.sel,
-        empty: "no theme matches",
+        // Where more themes come from, which nothing else here says.
+        empty: "no match \u{b7} add themes to %APPDATA%\\blitz\\themes",
         hint: "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel",
         prompt: "type to filter",
         width: 380.0,
@@ -1621,8 +1645,11 @@ fn settings(
             text(p, left, y + k as i32 * help_line, l, c.msg, false);
         }
         if st.error.is_none() {
-            let meta = format!("{} \u{b7} default {}", r.applies, r.default);
-            text(p, left, meta_y, fit(&meta, right - left, tw), c.dim, false);
+            let (meta, color) = match &r.note {
+                Some(note) => (note.clone(), c.error),
+                None => (format!("{} \u{b7} default {}", r.applies, r.default), c.dim),
+            };
+            text(p, left, meta_y, fit(&meta, right - left, tw), color, false);
         }
     }
     if let Some(e) = st.error {
@@ -1645,7 +1672,12 @@ fn settings(
 /// `side` px wide, or None when it does not fit there whole, such as a
 /// failure that names the installer's long log path.
 fn foot_lines(msg: &str, side: i32, scale: f32, tw: i32) -> Option<Vec<String>> {
-    let lines = wrap(msg, side - (32.0 * scale).round() as i32, tw, 3);
+    let lines = wrap(
+        msg,
+        side - ((32.0 + BANNER_H) * scale).round() as i32,
+        tw,
+        3,
+    );
     let words = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
     (words(&lines.join(" ")) == words(msg)).then_some(lines)
 }
@@ -2612,6 +2644,18 @@ mod tests {
         assert_eq!(c.banner, Some(strip), "even without a sidebar");
         assert_eq!(c.panes[0].1.bottom(), strip.y, "panes end above it");
         assert!(texts(&c).contains(&"blitz 0.0.2 is available"));
+        // An x at the end closes it, and the text stops short of it.
+        let close = c.banner_close.expect("a close box");
+        assert_eq!((close.right(), close.y, close.h), (AREA.w, strip.y, 22));
+        assert!(texts(&c).contains(&"\u{d7}"));
+        let long = "blitz 0.0.2 is available ".repeat(40);
+        m.banner = Some(&long);
+        let c = build(&m);
+        let cut = c.prims.iter().find_map(|p| match p {
+            Prim::Text { x, text, .. } if text.starts_with("blitz") => Some(x + text_w(text, 7)),
+            _ => None,
+        });
+        assert!(cut.is_some_and(|end| end <= close.x), "{cut:?}");
 
         // Beside the rail, the strip is under the panes.
         let (win, sessions, now) = fleet(false);
@@ -2639,6 +2683,17 @@ mod tests {
         assert!(t.contains(&"blitz 0.0.2 is available \u{b7}"), "{t:?}");
         assert!(t.contains(&"Ctrl+Shift+U to update and") && t.contains(&"restart"));
         assert!(c.side.rows.iter().all(|(_, r)| r.bottom() <= foot.y));
+        // With its x at the top right, which the text stays clear of.
+        let close = c.banner_close.expect("a close box");
+        assert_eq!((close.right(), close.y), (foot.right(), foot.y));
+        assert!(t.contains(&"\u{d7}"));
+        let ends = (c.prims.iter()).filter_map(|p| match p {
+            Prim::Text { x, y, text, .. } if *y >= foot.y && text != "\u{d7}" => {
+                Some(x + text_w(text, 7))
+            }
+            _ => None,
+        });
+        assert!(ends.into_iter().all(|end| end <= close.x));
     }
 
     #[test]
@@ -2937,6 +2992,7 @@ mod tests {
             less: true,
             more: true,
             default: "on".into(),
+            note: None,
             changed: false,
         };
         vec![
@@ -2966,6 +3022,7 @@ mod tests {
             assert!(t.contains(&want), "missing {want:?} in {t:?}");
         }
         assert!(t.contains(&"Help for this setting."));
+        assert!(t.contains(&"Applies now \u{b7} default on"));
         // Every row is shown, inside the panel, with its control on it.
         let inside = |a: Rect, b: Rect| {
             a.x >= b.x && a.y >= b.y && a.right() <= b.right() && a.bottom() <= b.bottom()
@@ -2978,6 +3035,22 @@ mod tests {
                 .all(|&(_, row, ctl)| { inside(row, hits.panel) && inside(ctl, row) && ctl.w > 0 })
         );
         assert_eq!(hits.top, 0);
+
+        // A note takes the place of when the setting applies.
+        let mut rows = setting_rows();
+        rows[1].note = Some("Could not look for an update: offline".into());
+        m.settings = Some(Settings {
+            filter: "",
+            rows,
+            sel: 1,
+            top: 0,
+            error: None,
+        });
+        let c = build(&m);
+        let error = m.ui.error;
+        let note = |p: &Prim| matches!(p, Prim::Text { text, color, .. } if text == "Could not look for an update: offline" && *color == error);
+        assert!(c.prims.iter().any(note));
+        assert!(!texts(&c).contains(&"Applies now \u{b7} default on"));
     }
 
     #[test]
@@ -3349,8 +3422,17 @@ mod tests {
             sel: 0,
         });
         let c = build(&m);
-        assert!(texts(&c).contains(&"no theme matches"));
+        let empty = "no match \u{b7} add themes to %APPDATA%\\blitz\\themes";
+        assert!(texts(&c).contains(&empty), "{:?}", texts(&c));
         assert!(texts(&c).contains(&"zzz"));
+        // Cut to fit a narrow window rather than drawn past the panel.
+        m.size = (300, 400);
+        let c = build(&m);
+        let t = texts(&c);
+        assert!(
+            t.iter()
+                .any(|s| s.starts_with("no match") && s.ends_with('\u{2026}'))
+        );
     }
 
     #[test]

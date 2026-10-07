@@ -1,17 +1,22 @@
 //! Finding a newer release on GitHub and installing it.
 //!
 //! Only full releases count: GitHub's latest release skips drafts and
-//! prereleases. HTTP goes through Windows' own curl.exe.
+//! prereleases. HTTP goes through Windows' own curl.exe, by way of the
+//! proxy Windows is set to use.
 
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
+use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
+use windows::Win32::Networking::WinHttp::{
+    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG, WinHttpGetIEProxyConfigForCurrentUser,
+};
 use windows::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, PWSTR, w};
 
 const REPO: &str = "thomasbunch/blitz";
 /// The latest release's page.
@@ -22,9 +27,18 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// GitHub could not say.
 pub fn check() -> Result<Option<String>, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    // Someone is waiting on this one, so it gives up sooner.
+    // Someone is waiting on this one, so it gives up sooner. The answer
+    // is a few kilobytes, and all of it is held in memory.
     let accept = "Accept: application/vnd.github+json";
-    let body = curl(&["--max-time", "30", "-H", accept, &url])?;
+    let body = curl(&[
+        "--max-time",
+        "30",
+        "--max-filesize",
+        "1M",
+        "-H",
+        accept,
+        &url,
+    ])?;
     latest(&body, env!("CARGO_PKG_VERSION"))
 }
 
@@ -92,6 +106,47 @@ pub fn banner(
     })
 }
 
+/// The banner text once release `v` is to install when blitz closes;
+/// `keys` update now.
+pub fn at_close(v: &str, keys: &str) -> String {
+    format!("blitz {v} installs when you close blitz \u{b7} {keys} to update and restart now")
+}
+
+/// What Ctrl+Shift+U says before an update to `v` that would end `busy`
+/// sessions or close `others` other blitz windows, or `None` to go ahead;
+/// and whether busy sessions leave `v` to install when blitz closes. Only
+/// the `main` window can, when it is the last one, as the installer would
+/// close the others. `again` says how to confirm it.
+pub fn confirm(
+    v: &str,
+    busy: usize,
+    others: usize,
+    main: bool,
+    again: &str,
+) -> Option<(String, bool)> {
+    let what = match (busy, others) {
+        (0, 0) => return None,
+        (0, _) => "Updating",
+        (1, _) => "A session is busy",
+        _ => "Sessions are busy",
+    };
+    if busy > 0 && others == 0 && main {
+        let text =
+            format!("{what}, so blitz {v} installs when you close blitz. {again} to restart now");
+        return Some((text, true));
+    }
+    let and = if busy > 0 { ", and updating" } else { "" };
+    let closes = match others {
+        0 => String::new(),
+        1 => " and closes another blitz window".into(),
+        n => format!(" and closes {n} other blitz windows"),
+    };
+    Some((
+        format!("{what}{and} restarts blitz{closes}. {again}"),
+        false,
+    ))
+}
+
 /// What Ctrl+Shift+U says when it looked for a release itself.
 pub fn found(r: &Result<Option<String>, String>) -> String {
     match r {
@@ -110,14 +165,19 @@ pub fn installed() -> bool {
         .unwrap_or(false)
 }
 
-/// Opens the latest release's page in the browser; false if it could not.
-pub fn open_page() -> bool {
+/// The page of release `v` (from `newer`), with its notes.
+pub fn notes(v: &str) -> String {
+    format!("https://github.com/{REPO}/releases/tag/v{v}")
+}
+
+/// Opens a web page in the browser; false if it could not.
+pub fn open(url: &str) -> bool {
     // SAFETY: valid strings and no window.
     let h = unsafe {
         ShellExecuteW(
             None,
             w!("open"),
-            &HSTRING::from(PAGE),
+            &HSTRING::from(url),
             None,
             None,
             SW_SHOWNORMAL,
@@ -127,23 +187,77 @@ pub fn open_page() -> bool {
     h.0 as isize > 32
 }
 
+/// The page for a new issue about blitz, its text ending in `facts` as
+/// a list of `name: value`. A word with a backslash, a file or folder
+/// that could hold the user's name, is left out.
+pub fn issue(facts: &[(&str, &str)]) -> String {
+    let mut body =
+        String::from("<!-- What happened, and how can it be made to happen again? -->\n\n\n");
+    for (name, value) in facts {
+        let words: Vec<&str> = (value.split(' '))
+            .map(|w| if w.contains('\\') { "(path)" } else { w })
+            .collect();
+        body += &format!("- {name}: {}\n", words.join(" "));
+    }
+    let body: String = (body.bytes())
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("https://github.com/{REPO}/issues/new?body={body}")
+}
+
+/// Where the release whose banner was closed is kept.
+const DISMISSED: &str = "update-dismissed";
+
+/// The release whose banner was closed, as kept in `dir`.
+pub fn dismissed_in(dir: &Path) -> Option<String> {
+    let v = std::fs::read_to_string(dir.join(DISMISSED)).ok()?;
+    version(v.trim())?;
+    Some(v.trim().into())
+}
+
+/// Keeps `v` as the release whose banner was closed, or with `None`
+/// forgets it. A failed save only shows the banner again.
+pub fn dismiss_in(dir: &Path, v: Option<&str>) {
+    let file = dir.join(DISMISSED);
+    match v {
+        Some(v) => {
+            let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(file, v));
+        }
+        None => {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
+/// Whether the banner shows release `v` that a look found unasked, or
+/// whose update `failed`: never one whose banner was `closed` until a
+/// newer release comes, and no offer once `checks` are off.
+pub fn show_unasked(v: &str, failed: bool, checks: bool, closed: Option<&str>) -> bool {
+    (failed || checks) && closed.is_none_or(|d| newer(d, v).is_some())
+}
+
 /// The newest update that `install` started and that did not happen, with
 /// the installer's log: its folder is for a version newer than this build.
 /// The folders of updates to this version or older are removed, and so are
-/// those of updates whose installer never started.
+/// those of updates whose installer never started, unless another blitz
+/// window is open: it may keep one to run when it closes, however long
+/// that takes.
 pub fn failed() -> Option<(String, PathBuf)> {
-    failed_in(
-        &std::env::temp_dir(),
-        env!("CARGO_PKG_VERSION"),
-        SystemTime::now(),
-    )
+    let now = (crate::handoff::others() == 0).then(SystemTime::now);
+    failed_in(&std::env::temp_dir(), env!("CARGO_PKG_VERSION"), now)
 }
 
 /// How long an update's folder may wait for its installer to start, as
 /// another blitz may be about to start it.
 const UNSTARTED: Duration = Duration::from_secs(10 * 60);
 
-fn failed_in(temp: &Path, current: &str, now: SystemTime) -> Option<(String, PathBuf)> {
+/// With no `now`, a folder without a log is left however old it is.
+fn failed_in(temp: &Path, current: &str, now: Option<SystemTime>) -> Option<(String, PathBuf)> {
     let mut out: Option<((u64, u64, u64), String, PathBuf)> = None;
     for e in std::fs::read_dir(temp).ok()?.flatten() {
         let name = e.file_name();
@@ -165,7 +279,7 @@ fn failed_in(temp: &Path, current: &str, now: SystemTime) -> Option<(String, Pat
         let log = e.path().join("setup.log");
         if !log.is_file() {
             let age = (e.metadata().and_then(|m| m.modified()).ok())
-                .and_then(|t| now.duration_since(t).ok());
+                .and_then(|t| now?.duration_since(t).ok());
             if age.is_some_and(|a| a > UNSTARTED) {
                 let _ = std::fs::remove_dir_all(e.path());
             }
@@ -189,16 +303,23 @@ fn installer_name(v: &str) -> String {
     format!("blitz-{v}-windows-x64-setup.exe")
 }
 
+/// An installer [`fetch`] saved, and the SHA-256 it was checked against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Installer {
+    pub path: PathBuf,
+    pub sum: String,
+}
+
 /// Downloads the installer for version `v` (from `newer`), checks it
-/// against the release's SHA256SUMS.txt and starts it. The installer
-/// closes what is left of blitz, installs, and starts it again.
+/// against the release's SHA256SUMS.txt, and returns where it saved it.
 // ponytail: the checksum comes from the same release, so it catches a bad
 // download, not a bad release. Check an Authenticode signer once releases
 // are signed.
-pub fn install(v: &str) -> Result<(), String> {
+pub fn fetch(v: &str) -> Result<Installer, String> {
     let base = format!("https://github.com/{REPO}/releases/download/v{v}");
     let name = installer_name(v);
-    let sums = curl(&[&format!("{base}/SHA256SUMS.txt")])?;
+    let sums_url = format!("{base}/SHA256SUMS.txt");
+    let sums = curl(&["--max-time", "60", "--max-filesize", "1M", &sums_url])?;
     let sums = String::from_utf8_lossy(&sums);
     let want = sum_for(&sums, &name).ok_or("the release has no checksum for its installer")?;
     // A line that trickles just above the stall floor still ends: 64 MB in
@@ -208,42 +329,77 @@ pub fn install(v: &str) -> Result<(), String> {
     if !sha256_hex(&exe).is_some_and(|got| got.eq_ignore_ascii_case(want)) {
         return Err("the download does not match its checksum".into());
     }
-    // %TEMP% is the user's own, so nobody else can swap the file between
-    // the check and the start.
     let dir = std::env::temp_dir().join(format!("blitz-update-{v}"));
     let path = dir.join(&name);
+    // The error names no path: it can end up in an issue report.
+    let saved = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&path, &exe))
+        .map_err(|e| format!("could not save the installer: {e}"));
+    // An installer that never ran leaves nothing to report.
+    if saved.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    saved.map(|()| Installer {
+        path,
+        sum: want.to_ascii_lowercase(),
+    })
+}
+
+/// Starts the `installer` that `fetch` saved. It closes what is left of
+/// blitz and installs, and with `relaunch` starts blitz again. One left
+/// for when blitz closes may wait hours, so the file is checked again,
+/// held open so nothing can change it until the installer has started.
+pub fn run(installer: &Installer, relaunch: bool) -> Result<(), String> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let path = &installer.path;
     // blitz is gone by the time the installer could fail, so the log is
     // what `failed` finds on the next start.
-    let log = format!("/LOG={}", dir.join("setup.log").display());
-    let started = std::fs::create_dir_all(&dir)
-        .and_then(|()| std::fs::write(&path, &exe))
-        .map_err(|e| format!("{}: {e}", path.display()))
-        .and_then(|()| {
-            Command::new(&path)
-                .args(INSTALLER_ARGS)
-                .arg(&log)
+    let log = path.with_file_name("setup.log");
+    let mut data = Vec::new();
+    let started = (std::fs::OpenOptions::new().read(true))
+        .share_mode(FILE_SHARE_READ.0)
+        .open(path)
+        .and_then(|mut held| held.read_to_end(&mut data).map(|_| held))
+        .map_err(|e| format!("could not read the installer: {e}"))
+        .and_then(|held| {
+            if sha256_hex(&data).as_deref() != Some(&installer.sum) {
+                return Err("the installer changed since it was checked".to_string());
+            }
+            let child = Command::new(path)
+                .args(installer_args(&log, relaunch))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()
+                .spawn();
+            drop(held);
+            child
                 .map(drop)
                 .map_err(|e| format!("could not start the installer: {e}"))
         });
-    // An installer that never ran leaves nothing to report.
+    // An installer that never ran leaves nothing to report, nor a folder
+    // that holds only it.
     if started.is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(path);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
     started
 }
 
-/// A silent install that starts blitz again; `.github/blitz.iss` reads
-/// `/relaunch=1`.
-const INSTALLER_ARGS: [&str; 4] = [
-    "/VERYSILENT",
-    "/SUPPRESSMSGBOXES",
-    "/NORESTART",
-    "/relaunch=1",
-];
+/// A silent install writing `log`; `.github/blitz.iss` starts blitz again
+/// after it when told `/relaunch=1`.
+fn installer_args(log: &Path, relaunch: bool) -> Vec<String> {
+    let relaunch = relaunch.then_some("/relaunch=1");
+    (["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"].into_iter())
+        .chain(relaunch)
+        .map(String::from)
+        .chain([format!("/LOG={}", log.display())])
+        .collect()
+}
 
 /// The hex SHA-256 that a `sha256sum` listing gives for file `name`.
 fn sum_for<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
@@ -264,20 +420,18 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
 }
 
 /// Runs System32's curl.exe over HTTPS only, redirects included, and
-/// returns what it downloaded. Named by its full path: a bare name is
-/// looked for in blitz's own folder first, where a planted curl.exe would
-/// run instead.
-// ponytail: curl ignores the system proxy; WinHTTP if that bites.
+/// returns what it downloaded.
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let ua = concat!("blitz/", env!("CARGO_PKG_VERSION"));
-    let exe = crate::shell::system_root(|k| std::env::var_os(k))
-        .join("System32")
-        .join("curl.exe");
+    let exe = curl_exe();
+    // curl does not read Windows' proxy setting itself.
+    let proxy = system_proxy();
     // A slow line still finishes the download; one that stalls gives up.
     let out = Command::new(exe)
         .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https"])
         .args(["--connect-timeout", "20", "--speed-limit", "1000"])
         .args(["--speed-time", "30", "-A", ua])
+        .args(proxy.as_deref().map(proxy_args).into_iter().flatten())
         .args(args)
         .stdin(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
@@ -287,6 +441,67 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
         return Err(curl_error(&out.stderr, out.status.code()));
     }
     Ok(out.stdout)
+}
+
+/// System32's curl.exe, named by its full path: a bare name is looked for
+/// in blitz's own folder first, where a planted curl.exe would run instead.
+fn curl_exe() -> PathBuf {
+    crate::shell::system_root(|k| std::env::var_os(k))
+        .join("System32")
+        .join("curl.exe")
+}
+
+/// curl's options to go through `proxy`. One that asks who is there, as a
+/// work network's often does, is answered as the Windows user, the way
+/// browsers do, and with no password asked for.
+fn proxy_args(proxy: &str) -> [&str; 5] {
+    ["--proxy", proxy, "--proxy-anyauth", "--proxy-user", ":"]
+}
+
+/// The proxy for HTTPS that Windows' proxy settings name, if any.
+// ponytail: a fixed proxy only; a setup script or automatic detection
+// needs WinHttpGetProxyForUrl, and the bypass list is not read.
+fn system_proxy() -> Option<String> {
+    let mut ie = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
+    // SAFETY: a struct for the call to fill.
+    unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut ie) }.ok()?;
+    let take = |s: PWSTR| {
+        if s.is_null() {
+            return None;
+        }
+        // SAFETY: a NUL-terminated string WinHTTP allocated, read once,
+        // then freed with GlobalFree as its documentation says.
+        unsafe {
+            let text = s.to_string().ok();
+            let _ = GlobalFree(Some(HGLOBAL(s.0.cast())));
+            text
+        }
+    };
+    // Every string is freed, used or not.
+    let (list, _, _) = (
+        take(ie.lpszProxy),
+        take(ie.lpszProxyBypass),
+        take(ie.lpszAutoConfigUrl),
+    );
+    https_proxy(&list?)
+}
+
+/// The proxy for HTTPS in a WinHTTP proxy list: `host:port` for every
+/// scheme, or entries such as `http=a:80;https=b:443`.
+fn https_proxy(list: &str) -> Option<String> {
+    let mut all = None;
+    for e in list.split([';', ' ']).filter(|e| !e.is_empty()) {
+        match e.split_once('=') {
+            Some((scheme, p)) if scheme.eq_ignore_ascii_case("https") && !p.is_empty() => {
+                return Some(p.into());
+            }
+            Some(_) => {}
+            None => {
+                all.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    all
 }
 
 /// Why curl failed: what it printed, or its exit code when it printed
@@ -376,10 +591,47 @@ mod tests {
             .expect("OutputBaseFilename");
         let built = format!("{}.exe", base.replace("{#AppVersion}", "1.2.3"));
         assert_eq!(installer_name("1.2.3"), built);
-        // Setup starts blitz again only when told to.
-        assert!(INSTALLER_ARGS.contains(&"/relaunch=1"));
+        // Setup starts blitz again only when told to: not after an update
+        // left for when blitz closes.
+        let log = Path::new(r"C:\t\blitz-update-1.2.3\setup.log");
+        let now = installer_args(log, true);
+        assert_eq!(
+            now,
+            [
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/NORESTART",
+                "/relaunch=1",
+                r"/LOG=C:\t\blitz-update-1.2.3\setup.log"
+            ]
+        );
+        let later = installer_args(log, false);
+        assert_eq!(later, [&now[..3], &now[4..]].concat());
         assert!(iss.contains("ExpandConstant('{param:relaunch|0}') = '1'"));
-        assert!(INSTALLER_ARGS.contains(&"/VERYSILENT") && iss.contains("WizardSilent"));
+        assert!(iss.contains("WizardSilent"));
+    }
+
+    /// Setup offers to start blitz at sign-in, for this user, never ticked
+    /// for them, and takes it away when unticked or uninstalled. Only for
+    /// a per-user install: setup for all users may run as an administrator
+    /// whose own sign-in it would start.
+    #[test]
+    fn setup_can_start_blitz_at_sign_in() {
+        let iss = include_str!("../../../.github/blitz.iss");
+        let task = (iss.lines())
+            .find(|l| l.starts_with("Name: startup;"))
+            .expect("the task");
+        let only = "Flags: unchecked; Check: not IsAdminInstallMode";
+        assert!(task.ends_with(only), "{task}");
+        let run = r#"Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; "#;
+        let lines: Vec<&str> = iss.lines().filter_map(|l| l.strip_prefix(run)).collect();
+        assert_eq!(
+            lines,
+            [
+                r#"ValueType: string; ValueName: "blitz"; ValueData: """{app}\blitz.exe"""; Flags: uninsdeletevalue; Tasks: startup"#,
+                r#"ValueType: none; ValueName: "blitz"; Flags: deletevalue dontcreatekey; Check: not WizardIsTaskSelected('startup')"#,
+            ]
+        );
     }
 
     #[test]
@@ -423,6 +675,132 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_banner_stays_closed_until_a_newer_release() {
+        let dir = std::env::temp_dir().join(format!("blitz-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(dismissed_in(&dir), None);
+        assert!(show_unasked("0.0.5", false, true, None));
+        dismiss_in(&dir, Some("0.0.5"));
+        let closed = dismissed_in(&dir);
+        assert_eq!(closed.as_deref(), Some("0.0.5"));
+        for failed in [false, true] {
+            assert!(!show_unasked("0.0.5", failed, true, closed.as_deref()));
+            assert!(!show_unasked("0.0.4", failed, true, closed.as_deref()));
+            assert!(show_unasked("0.0.6", failed, true, closed.as_deref()));
+        }
+        // With checks off only a failed update shows.
+        assert!(!show_unasked("0.0.6", false, false, closed.as_deref()));
+        assert!(show_unasked("0.0.6", true, false, None));
+        // Anything else in the file closes nothing.
+        std::fs::write(dir.join(DISMISSED), "0.0.5/../x").unwrap();
+        assert_eq!(dismissed_in(&dir), None);
+        dismiss_in(&dir, Some("0.0.5"));
+        dismiss_in(&dir, None);
+        assert_eq!(dismissed_in(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_issue_says_what_blitz_runs_on_but_names_no_path() {
+        let url = issue(&[
+            ("blitz", "0.0.4"),
+            ("ConPTY", "the Windows console host"),
+            (
+                "last update error",
+                r"C:\Users\Jo Smith\AppData\Local\Temp\x: Access is denied. (os error 5)",
+            ),
+        ]);
+        let query = url
+            .strip_prefix("https://github.com/thomasbunch/blitz/issues/new?body=")
+            .expect("the new issue page");
+        assert!(
+            query
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~%".contains(&b)),
+            "{query}"
+        );
+        // Undo the escapes.
+        let mut body = Vec::new();
+        let mut bytes = query.bytes();
+        while let Some(b) = bytes.next() {
+            match b {
+                b'%' => {
+                    let hex = [bytes.next().unwrap(), bytes.next().unwrap()];
+                    let hex = std::str::from_utf8(&hex).unwrap();
+                    body.push(u8::from_str_radix(hex, 16).unwrap());
+                }
+                b => body.push(b),
+            }
+        }
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.starts_with("<!-- What happened"), "{body}");
+        assert!(
+            body.ends_with(
+                "\n- blitz: 0.0.4\n- ConPTY: the Windows console host\n\
+                 - last update error: (path) (path) Access is denied. (os error 5)\n"
+            ),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn the_notes_are_on_the_release_page() {
+        assert_eq!(
+            notes("0.0.5"),
+            "https://github.com/thomasbunch/blitz/releases/tag/v0.0.5"
+        );
+    }
+
+    #[test]
+    fn an_update_that_ends_sessions_or_closes_windows_asks_first() {
+        let again = "Press Ctrl+Shift+U again";
+        assert_eq!(confirm("0.0.5", 0, 0, true, again), None);
+        assert_eq!(confirm("0.0.5", 0, 0, false, again), None);
+        for (busy, others, main, text) in [
+            (
+                1,
+                0,
+                false,
+                "A session is busy, and updating restarts blitz",
+            ),
+            (
+                3,
+                0,
+                false,
+                "Sessions are busy, and updating restarts blitz",
+            ),
+            (
+                0,
+                1,
+                true,
+                "Updating restarts blitz and closes another blitz window",
+            ),
+            (
+                2,
+                2,
+                true,
+                "Sessions are busy, and updating restarts blitz and closes 2 other blitz windows",
+            ),
+        ] {
+            let want = Some((format!("{text}. {again}"), false));
+            assert_eq!(confirm("0.0.5", busy, others, main, again), want);
+        }
+        // Busy sessions in the last window, the main one, can leave it
+        // until blitz closes.
+        let later = "Sessions are busy, so blitz 0.0.5 installs when you close blitz. \
+                     Press Ctrl+Shift+U again to restart now";
+        assert_eq!(
+            confirm("0.0.5", 2, 0, true, again),
+            Some((later.to_string(), true))
+        );
+
+        assert_eq!(
+            at_close("0.0.5", "Ctrl+Shift+U"),
+            "blitz 0.0.5 installs when you close blitz \u{b7} Ctrl+Shift+U to update and restart now"
+        );
+    }
+
+    #[test]
     fn a_look_by_hand_says_what_it_found() {
         assert_eq!(found(&Ok(Some("9.9.9".into()))), "blitz 9.9.9 is available");
         let now = env!("CARGO_PKG_VERSION");
@@ -443,6 +821,66 @@ mod tests {
         );
         assert_eq!(curl_error(b"", Some(28)), "curl stopped with code 28");
         assert_eq!(curl_error(b" \r\n", None), "curl stopped");
+    }
+
+    #[test]
+    fn the_proxy_for_https_comes_from_the_windows_list() {
+        assert_eq!(https_proxy("proxy:8080").as_deref(), Some("proxy:8080"));
+        assert_eq!(
+            https_proxy("http://proxy.corp:3128").as_deref(),
+            Some("http://proxy.corp:3128")
+        );
+        let split = "http=a:80;https=b:443;ftp=c:21";
+        assert_eq!(https_proxy(split).as_deref(), Some("b:443"));
+        assert_eq!(
+            https_proxy("HTTPS=b:443 http=a:80").as_deref(),
+            Some("b:443")
+        );
+        // A proxy for other schemes only leaves HTTPS direct.
+        for list in ["", ";", "http=a:80", "socks=s:1080;ftp=c:21", "https="] {
+            assert_eq!(https_proxy(list), None, "{list:?}");
+        }
+        // Reads, and frees, this machine's own setting.
+        let _ = system_proxy();
+    }
+
+    /// curl tells a proxy that asks who is there the Windows user, signed
+    /// in by Windows itself.
+    #[test]
+    fn a_proxy_that_asks_is_told_the_windows_user() {
+        use std::io::{Read, Write};
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let at = proxy.local_addr().expect("its address").to_string();
+        let asked = std::thread::spawn(move || {
+            let (mut c, _) = proxy.accept()?;
+            c.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+            let (mut seen, mut buf) = (String::new(), [0; 4096]);
+            // The first try, and the one that answers the 407.
+            for _ in 0..2 {
+                let n = c.read(&mut buf)?;
+                seen += &String::from_utf8_lossy(&buf[..n]);
+                c.write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                      Proxy-Authenticate: Negotiate\r\nContent-Length: 0\r\n\r\n",
+                )?;
+            }
+            std::io::Result::Ok(seen)
+        });
+        let _ = Command::new(curl_exe())
+            .args(["-sS", "--max-time", "10"])
+            .args(proxy_args(&at))
+            .arg("https://example.invalid/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        // Wakes the proxy if curl never came.
+        let _ = std::net::TcpStream::connect(&at);
+        let seen = asked.join().expect("the proxy").expect("a request");
+        assert!(seen.contains("CONNECT example.invalid:443"), "{seen}");
+        let auth = "\r\nProxy-Authorization: Negotiate ";
+        assert!(seen.contains(auth), "{seen}");
     }
 
     #[test]
@@ -474,7 +912,7 @@ mod tests {
         }
         // Not a folder: left alone.
         std::fs::write(temp.join("blitz-update-0.0.99"), "").unwrap();
-        let got = failed_in(&temp, current, SystemTime::now());
+        let got = failed_in(&temp, current, Some(SystemTime::now()));
         let mut left: Vec<_> = (std::fs::read_dir(&temp).unwrap().flatten())
             .map(|e| e.file_name().into_string().unwrap())
             .collect();
@@ -539,7 +977,7 @@ mod tests {
         let (got, _, _) = failed_with("nothing", &[], "0.0.2");
         assert_eq!(got, None);
         let missing = std::env::temp_dir().join(format!("blitz-no-temp-{}", std::process::id()));
-        assert_eq!(failed_in(&missing, "0.0.2", SystemTime::now()), None);
+        assert_eq!(failed_in(&missing, "0.0.2", Some(SystemTime::now())), None);
     }
 
     #[test]
@@ -548,15 +986,21 @@ mod tests {
         let dir = temp.join("blitz-update-0.0.5");
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&dir).unwrap();
-        let after = |s| SystemTime::now() + Duration::from_secs(s);
+        let after = |s| Some(SystemTime::now() + Duration::from_secs(s));
         // Another blitz may be about to start it.
         let soon = failed_in(&temp, "0.0.2", after(60));
         let kept = dir.exists();
+        // Or, while one is open, keep it to run when it closes.
+        let open = failed_in(&temp, "0.0.2", None);
+        let still = dir.exists();
         // One that has not started in ten minutes never will.
         let later = failed_in(&temp, "0.0.2", after(11 * 60));
         let gone = !dir.exists();
         let _ = std::fs::remove_dir_all(&temp);
-        assert_eq!((soon, kept, later, gone), (None, true, None, true));
+        assert_eq!(
+            (soon, kept, open, still, later, gone),
+            (None, true, None, true, None, true)
+        );
     }
 
     #[test]
@@ -564,6 +1008,47 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc").as_deref(),
             Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    /// An installer left for when blitz closes is checked again before it
+    /// starts: hours may have passed since the download.
+    #[test]
+    fn an_installer_changed_since_its_check_does_not_start() {
+        let dir = std::env::temp_dir().join(format!("blitz-recheck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("setup.exe");
+        std::fs::write(&path, b"abc").unwrap();
+        let installer = Installer {
+            path: path.clone(),
+            sum: sha256_hex(b"abc").unwrap(),
+        };
+        // As checked: it passes, and only then fails to start, being no
+        // program at all.
+        let same = run(&installer, false);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"abd").unwrap();
+        let swapped = run(&installer, false);
+        // A real program starts while blitz holds it.
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("whoami.exe");
+        let system = crate::shell::system_root(|k| std::env::var_os(k)).join("System32");
+        std::fs::copy(system.join("whoami.exe"), &exe).unwrap();
+        let real = Installer {
+            sum: sha256_hex(&std::fs::read(&exe).unwrap()).unwrap(),
+            path: exe,
+        };
+        let started = run(&real, false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(started, Ok(()));
+        assert!(
+            same.as_ref()
+                .is_err_and(|e| e.starts_with("could not start")),
+            "{same:?}"
+        );
+        assert_eq!(
+            swapped,
+            Err("the installer changed since it was checked".into())
         );
     }
 }

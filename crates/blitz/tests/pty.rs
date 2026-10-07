@@ -371,7 +371,7 @@ fn shells() -> Vec<String> {
 }
 
 fn launch(program: &str) -> blitz::shell::Launch {
-    let mut l = blitz::shell::launch(program, true, TOKEN);
+    let mut l = blitz::shell::launch(program, true, TOKEN, &[]);
     l.cmdline = l.cmdline.replacen(" -NoLogo", " -NoProfile -NoLogo", 1);
     l.env.push(("BLITZ_PANE_TOKEN".into(), TOKEN.into()));
     l
@@ -382,10 +382,6 @@ fn pty_shells_print_prompt_marks() {
     let mark = format!("\x1b]133;A;blitz={TOKEN}");
     for program in shells() {
         let launch = launch(&program);
-        if program.ends_with("cmd.exe") && launch.env.len() < 2 {
-            eprintln!("SKIPPED: cmd with the user's own PROMPT, which blitz leaves alone");
-            continue;
-        }
         let (_pty, _, rx) = spawn(&launch.cmdline, &launch.env);
         let mut out = Vec::new();
         assert!(
@@ -403,10 +399,68 @@ fn pty_shells_print_prompt_marks() {
     }
 }
 
+/// What `blitz setup shell bash` prints, in Git Bash: the prompt is
+/// marked, its folder reported, and a failed command's code comes with
+/// the next prompt.
+#[test]
+fn pty_git_bash_runs_the_bash_integration() {
+    let pf = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    let bash = pf.unwrap_or_default().join(r"Git\bin\bash.exe");
+    if !bash.is_file() {
+        eprintln!("SKIPPED: no Git Bash at {}", bash.display());
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("blitz-bash-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let rc = dir.join("rc");
+    // A prompt command of the user's, which ends with `;` and reads `$?`.
+    let mine = "PROMPT_COMMAND='printf \"<%s>\" $?;'\n";
+    std::fs::write(&rc, format!("{mine}{}", blitz::shell::BASH_INTEGRATION)).expect("rc");
+    let rc = rc.display().to_string().replace('\\', "/");
+    let cmdline = format!("\"{}\" --noprofile --rcfile {rc} -i", bash.display());
+    let env = [("BLITZ_PANE_TOKEN".to_string(), TOKEN.to_string())];
+    let (pty, _, rx) = spawn_in(&cmdline, &env, Some(&dir));
+    let mut out = Vec::new();
+    let mark = format!("\x1b]133;A;blitz={TOKEN}\x07");
+    let prompt = wait_for(&rx, &mut out, mark.as_bytes())
+        && wait_for(&rx, &mut out, b"\x1b]7;file:///")
+        && wait_for(&rx, &mut out, b"\x1b]133;B\x07");
+    pty.writer().send(&b"false\r"[..]);
+    let ran = prompt
+        && wait_for(&rx, &mut out, b"\x1b]133;C\x07")
+        && wait_for(&rx, &mut out, b"<1>")
+        && wait_for(&rx, &mut out, b"\x1b]133;D;1\x07")
+        && wait_for(&rx, &mut out, mark.as_bytes());
+    drop(pty);
+    let _ = std::fs::remove_dir_all(&dir);
+    let shown = String::from_utf8_lossy(&out);
+    assert!(ran, "{shown:?}");
+    let name = dir.file_name().expect("name").to_string_lossy();
+    let url = (shown.split("\x1b]7;").nth(1)).and_then(|s| s.split('\x07').next());
+    assert!(url.is_some_and(|u| u.ends_with(&*name)), "{url:?}");
+}
+
+/// cmd shows a prompt the user set, between blitz's marks.
+#[test]
+fn pty_cmd_keeps_the_users_prompt() {
+    let env = [
+        ("PROMPT", blitz::shell::cmd_prompt(TOKEN, "mine$G")),
+        ("BLITZ_PANE_TOKEN", TOKEN.into()),
+    ]
+    .map(|(k, v)| (k.to_string(), v));
+    let (_pty, _, rx) = spawn("cmd.exe", &env);
+    let mut out = Vec::new();
+    let mark = format!("\x1b]133;A;blitz={TOKEN}");
+    let shown =
+        wait_for(&rx, &mut out, mark.as_bytes()) && wait_for(&rx, &mut out, b"mine>\x1b]133;B");
+    assert!(shown, "{:?}", String::from_utf8_lossy(&out));
+}
+
 /// PowerShell marks where each command starts, and ends it with the code
 /// of the program it ran, even the same as last time, or 1 for a failed
 /// cmdlet, which leaves the last program's code behind in `$LASTEXITCODE`.
-/// It does so too when the user's profile turns strict mode on.
+/// It does so too when the user's profile turns strict mode on, and the
+/// script runs as written under each PowerShell.
 #[test]
 fn pty_powershell_reports_how_commands_end() {
     let shells = shells().into_iter().filter(|p| !p.ends_with("cmd.exe"));
@@ -417,12 +471,11 @@ fn pty_powershell_reports_how_commands_end() {
                 "Set-StrictMode -Version Latest\n{}",
                 blitz::shell::POWERSHELL_INTEGRATION
             );
-            let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            let encoded = blitz::shell::base64(&utf16);
-            l.cmdline = format!(
-                "{} -NoProfile -NoLogo -NoExit -EncodedCommand {encoded}",
-                blitz::shell::quote(&program)
-            );
+            let integration = blitz::shell::quote(blitz::shell::POWERSHELL_INTEGRATION);
+            l.cmdline = l
+                .cmdline
+                .replace(&integration, &blitz::shell::quote(&script));
+            assert!(l.cmdline.contains("Set-StrictMode"), "{}", l.cmdline);
         }
         let (pty, _, rx) = spawn(&l.cmdline, &l.env);
         let mut out = Vec::new();
@@ -454,6 +507,40 @@ fn pty_powershell_reports_how_commands_end() {
                 "{program}: {line}: {shown:?}"
             );
         }
+    }
+}
+
+/// A prompt defined after blitz's, as oh-my-posh or posh-git can, is
+/// marked again from the next command on: once, though it calls the one
+/// it replaced as conda's does, and still told when a command failed.
+#[test]
+fn pty_powershell_marks_a_prompt_defined_later() {
+    let mark = format!("\x1b]133;A;blitz={TOKEN}");
+    for program in shells().iter().filter(|p| !p.ends_with("cmd.exe")) {
+        let l = launch(program);
+        let (pty, _, rx) = spawn(&l.cmdline, &l.env);
+        let mut out = Vec::new();
+        // Each step looks only at the output that came after it.
+        let mut step = |typed: &str, shown: &str| {
+            pty.writer().send(typed.as_bytes());
+            let mut new = Vec::new();
+            let seen = wait_for(&rx, &mut new, shown.as_bytes());
+            out.extend(new);
+            seen
+        };
+        let ok = step("", &mark)
+            && step(
+                "function global:prompt { if ($global:?) { 'ok> ' } else { 'no> ' } }\r",
+                "ok> ",
+            )
+            && step("\r", "ok> \x1b]133;B\x07")
+            && step("Get-Item nope-4b1d\r", "no> \x1b]133;B\x07")
+            && step(
+                "$old = $function:prompt; function global:prompt { 'W' + (& $old) }\r",
+                "ok> \x1b]133;B\x07",
+            )
+            && step("\r", "Wok> \x1b]133;B\x07");
+        assert!(ok, "{program}: {:?}", String::from_utf8_lossy(&out));
     }
 }
 

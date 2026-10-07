@@ -285,6 +285,12 @@ fn erase_scrollback_with_csi_3_j() {
     }
     assert!(!t.scrollback_text().is_empty());
     let screen = t.screen_text();
+    // A full-screen program clearing its screen, as Claude Code redraws,
+    // leaves the shell's history alone.
+    let history = t.scrollback_text();
+    feed(&mut t, "\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[?1049l");
+    assert_eq!(t.scrollback_text(), history);
+    assert_eq!(t.screen_text(), screen);
     feed(&mut t, "\x1b[3J");
     assert_eq!(t.scrollback_text(), "");
     assert_eq!(t.screen_text(), screen);
@@ -944,8 +950,11 @@ fn viewport_follows_its_text() {
     // to the same text.
     feed(&mut t, "\x1b[?1049h\x1b[?1049l");
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "6");
-    // Unless the scrollback went meanwhile.
+    // Clearing the scrollback there clears none of the main screen's.
     feed(&mut t, "\x1b[?1049h\x1b[3J\x1b[?1049l");
+    assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "6");
+    // Unless the scrollback went meanwhile.
+    feed(&mut t, "\x1b[3J");
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), "9");
     t.scroll_viewport(2);
     t.scroll_viewport(-100);
