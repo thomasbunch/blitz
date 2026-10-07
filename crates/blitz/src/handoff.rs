@@ -124,12 +124,13 @@ pub fn send(dir: Option<&Path>) -> Option<bool> {
 /// another desktop brings blitz over rather than switching desktops. That
 /// desktop is known by a window on it: the one in front, or failing that
 /// (the taskbar and the Start menu are on every desktop) the next one
-/// down that is.
+/// down that is. A launch from the desktop itself, which is behind every
+/// window, looks again from the top.
 pub fn to_current_desktop(hwnd: HWND) {
     use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
     use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GW_HWNDNEXT, GetForegroundWindow, GetWindow, IsWindowVisible,
+        GW_HWNDNEXT, GetForegroundWindow, GetTopWindow, GetWindow, IsWindowVisible,
     };
     // SAFETY: COM is set up on this thread, which winit's window lives on;
     // the calls take window handles, and a stale one only fails.
@@ -146,15 +147,20 @@ pub fn to_current_desktop(hwnd: HWND) {
             return;
         }
         let mut windows = Vec::new();
-        let mut w = GetForegroundWindow();
-        // ponytail: looks at the first 64 windows down from the front.
-        while !w.is_invalid() && windows.len() < 64 {
-            if w != hwnd && IsWindowVisible(w).as_bool() {
-                let here = desktops.IsWindowOnCurrentVirtualDesktop(w);
-                let id = desktops.GetWindowDesktopId(w).unwrap_or_default();
-                windows.push((here.is_ok_and(|b| b.as_bool()), id));
+        for mut w in [
+            GetForegroundWindow(),
+            GetTopWindow(None).unwrap_or_default(),
+        ] {
+            // ponytail: looks at the first 64 shown windows down from each.
+            let seen = windows.len();
+            while !w.is_invalid() && windows.len() - seen < 64 {
+                if w != hwnd && IsWindowVisible(w).as_bool() {
+                    let here = desktops.IsWindowOnCurrentVirtualDesktop(w);
+                    let id = desktops.GetWindowDesktopId(w).unwrap_or_default();
+                    windows.push((here.is_ok_and(|b| b.as_bool()), id));
+                }
+                w = GetWindow(w, GW_HWNDNEXT).unwrap_or_default();
             }
-            w = GetWindow(w, GW_HWNDNEXT).unwrap_or_default();
         }
         if let Some(id) = current_desktop(windows.into_iter()) {
             let _ = desktops.MoveWindowToDesktop(hwnd, &id);
