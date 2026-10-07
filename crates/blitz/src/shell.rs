@@ -547,7 +547,10 @@ pub struct Launch {
 /// The program and arguments of a `shell` setting. A path to a program
 /// that holds spaces needs no quotes, as the setting once took only a path:
 /// the longest start of it, up to a space, that names a file is the
-/// program, and any arguments may follow.
+/// program, and any arguments may follow. An unquoted path that names no
+/// file is all program, as it always was: cut at its first space, it would
+/// reach `CreateProcessW` unquoted, which then tries `C:\Program.exe` and
+/// the like.
 fn parts(shell: &str) -> (&str, &str) {
     let shell = shell.trim();
     let spaces = shell.rmatch_indices([' ', '\t']).map(|m| m.0);
@@ -558,6 +561,7 @@ fn parts(shell: &str) -> (&str, &str) {
     let unquoted = !shell.starts_with('"');
     match (std::iter::once(shell.len()).chain(spaces)).find(|i| unquoted && file(i)) {
         Some(i) => shell.split_at(i),
+        None if unquoted && Path::new(shell).is_absolute() => (shell, ""),
         None => split_program(shell),
     }
 }
@@ -823,6 +827,15 @@ mod tests {
         assert_eq!(got, format!("\"{}\"", sh.display()));
         assert_eq!(with, format!("\"{}\" --login -i", sh.display()));
         assert_eq!(shown, "sh.exe --login -i");
+    }
+
+    /// Cut at its first space, a missing program would run as the first
+    /// word of its path, which another user may have put there.
+    #[test]
+    fn a_missing_path_with_spaces_stays_quoted() {
+        let dir = std::env::temp_dir().join(format!("blitz no such {}", std::process::id()));
+        let shell = format!("{} -i", dir.join("sh").display());
+        assert_eq!(launch(&shell, true, "t").cmdline, quote(&shell));
     }
 
     #[test]
