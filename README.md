@@ -74,10 +74,12 @@ drops some features such as synchronized output.
 
 Claude Code 2.1.280 or later reports to blitz with nothing to set up.
 blitz keeps a small Claude Code plugin in
-`%LOCALAPPDATA%\blitz\claude-plugin`, whose hooks run the
-`blitz-hook.exe` next to `blitz.exe`, and every pane loads it through
-`CLAUDE_CODE_PLUGIN_DIRS`. blitz never edits Claude Code's settings. If
-Claude Code works for a while and no hook reports, blitz says so once.
+`%LOCALAPPDATA%\blitz\claude-plugin-…`, one for each copy of blitz, whose
+hooks run the `blitz-hook.exe` next to `blitz.exe`, and every pane
+loads it through `CLAUDE_CODE_PLUGIN_DIRS`. blitz never edits Claude
+Code's settings, and writes no plugin where other users could replace
+`blitz-hook.exe`. If Claude Code works for a while and no hook reports,
+blitz says so once.
 
 An older Claude Code, or managed settings that turn off plugin folders,
 needs the hooks in `~/.claude/settings.json`. **Claude Code setup** in
@@ -103,7 +105,8 @@ at marks it as needing you until you look. Claude Code rings one when
 it waits for you if its settings have
 `"preferredNotifChannel": "terminal_bell"`. The hooks add what the title
 cannot show: a question waiting for you, the prompt and the reply under
-the session's name, and the conversation to resume.
+the session's name, the conversation to resume, and that the pane runs
+Claude Code at all, which names the session after its task.
 
 
 ### Session marks
