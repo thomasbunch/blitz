@@ -5471,22 +5471,20 @@ impl App {
         self.save_after = None;
         // Output, which changes all the time, is saved only at exit, and
         // only once the layout holding the keys it is filed by was written.
-        match session::save(&s) {
+        let written = match session::save(&s) {
             Ok(()) => {
                 if force {
                     self.save_output();
                 }
-                self.saved = Some(s);
-                self.save_fails = 0;
+                true
             }
-            // Not saved, so tried again, later each time it fails: a busy
-            // or full drive is not written to every turn.
             Err(e) => {
                 eprintln!("blitz: saving the session: {e}");
-                self.save_after = Some(Instant::now() + save_retry(self.save_fails));
-                self.save_fails = self.save_fails.saturating_add(1);
+                false
             }
-        }
+        };
+        let now = Instant::now();
+        self.save_after = saved(written, s, now, &mut self.saved, &mut self.save_fails);
     }
 
     /// Saves each pane's recent output when `restore_scrollback` is on, and
@@ -5577,6 +5575,27 @@ impl App {
 /// before the next try: twice as long each time, up to about a minute.
 fn save_retry(fails: u32) -> Duration {
     SAVE_DELAY * 2u32.pow(fails.min(7))
+}
+
+/// Takes in whether `s`, the session, was `written` at `now`. Once it is,
+/// it is the state saved. A failed write is not, so it is tried again at
+/// the time returned: later after each failure in a row, so a busy or
+/// full drive is not written to every turn.
+fn saved<T>(
+    written: bool,
+    s: T,
+    now: Instant,
+    saved: &mut Option<T>,
+    fails: &mut u32,
+) -> Option<Instant> {
+    if written {
+        *saved = Some(s);
+        *fails = 0;
+        return None;
+    }
+    let next = now + save_retry(*fails);
+    *fails = fails.saturating_add(1);
+    Some(next)
 }
 
 /// Whether a layout that `changed` since the last save is written now. A
@@ -8343,6 +8362,24 @@ mod tests {
         let mut due = Some(t0 + save_retry(3));
         assert!(!save_now(true, false, at(3999), &mut due));
         assert!(save_now(true, false, at(4000), &mut due));
+        // A failed write keeps the last saved state, so the layout still
+        // counts as changed; a write that works is saved and starts over.
+        let (mut kept, mut fails) = (Some("old"), 0);
+        assert_eq!(
+            saved(false, "new", t0, &mut kept, &mut fails),
+            Some(at(500))
+        );
+        assert_eq!((kept, fails), (Some("old"), 1));
+        assert_eq!(
+            saved(false, "new", t0, &mut kept, &mut fails),
+            Some(at(1000))
+        );
+        assert_eq!(saved(true, "new", t0, &mut kept, &mut fails), None);
+        assert_eq!((kept, fails), (Some("new"), 0));
+        assert_eq!(
+            saved(false, "newer", t0, &mut kept, &mut fails),
+            Some(at(500))
+        );
     }
 
     fn input(vk: u16, down: bool, key: vt::Key, text: &'static str) -> KeyInput<'static> {
