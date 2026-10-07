@@ -3536,10 +3536,7 @@ impl App {
         let sidebar = self.views.len() >= 2 && self.win.sidebar_expanded;
         let timer = (self.views.iter())
             .filter(|v| sidebar && v.pane.attn.state == Attn::Working)
-            .map(|v| {
-                let since = v.pane.attn.since;
-                since + Duration::from_secs(now.saturating_duration_since(since).as_secs() + 1)
-            })
+            .map(|v| chrome::next_tick(v.pane.attn.since, now))
             .min();
         let resume = (self.views.iter())
             .filter_map(|v| Some(v.resume.as_ref()?.1))

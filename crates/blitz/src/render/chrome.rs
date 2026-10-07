@@ -1228,14 +1228,23 @@ fn state_word(x: &Session, now: Instant) -> String {
     }
 }
 
-/// `45s`, `1m 12s`, `2h 5m`.
+/// `45s`, `12m`, `2h 5m`: seconds only in the first minute, so a long
+/// turn wakes blitz once a minute, not every second.
 fn elapsed(d: Duration) -> String {
     let t = d.as_secs();
     match t {
         0..60 => format!("{t}s"),
-        60..3600 => format!("{}m {}s", t / 60, t % 60),
+        60..3600 => format!("{}m", t / 60),
         _ => format!("{}h {}m", t / 3600, t / 60 % 60),
     }
+}
+
+/// When the time [`elapsed`] shows for something that began at `start`
+/// next changes, as of `now`.
+pub fn next_tick(start: Instant, now: Instant) -> Instant {
+    let t = now.saturating_duration_since(start).as_secs();
+    let next = if t < 60 { t + 1 } else { (t / 60 + 1) * 60 };
+    start + Duration::from_secs(next)
 }
 
 /// Width of `t` in pixels in a font whose cells are `cw` wide.
@@ -1456,14 +1465,7 @@ mod tests {
         // Panes start below their 22 px header strips.
         assert_eq!(c.panes[0].1.y, 22 + 8);
         let t = texts(&c);
-        for want in [
-            "shop",
-            "db",
-            "api",
-            "web",
-            "needs you",
-            "working \u{b7} 1m 12s",
-        ] {
+        for want in ["shop", "db", "api", "web", "needs you", "working \u{b7} 1m"] {
             assert!(t.contains(&want), "missing {want:?} in {t:?}");
         }
         assert!(t.contains(&"idle"));
@@ -1784,8 +1786,27 @@ mod tests {
         assert_eq!(fit("abcdef", 42, 7), "abcdef");
         assert_eq!(fit("abcdefg", 42, 7), "abcde\u{2026}");
         assert_eq!(fit_left(r"C:\dev\shop", 35, 7), "\u{2026}shop");
-        assert_eq!(elapsed(Duration::from_secs(72)), "1m 12s");
+        assert_eq!(elapsed(Duration::from_secs(72)), "1m");
         assert_eq!(elapsed(Duration::from_secs(7500)), "2h 5m");
+    }
+
+    /// Seconds tick for the first minute, then minutes do.
+    #[test]
+    fn times_tick_each_second_then_each_minute() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let ms = |m| t0 + Duration::from_millis(m);
+        assert_eq!(next_tick(t0, t0), at(1));
+        assert_eq!(next_tick(t0, ms(59_500)), at(60));
+        assert_eq!(next_tick(t0, at(60)), at(120));
+        assert_eq!(next_tick(t0, ms(119_999)), at(120));
+        assert_eq!(next_tick(t0, at(3601)), at(3660));
+        // Each tick is where the text changes.
+        for s in [0, 59, 60, 61, 119, 3599, 3600] {
+            let d = |t: Instant| elapsed(t - t0);
+            let next = next_tick(t0, at(s));
+            assert_ne!(d(next), d(next - Duration::from_millis(1)), "{s}");
+        }
     }
 
     #[test]
