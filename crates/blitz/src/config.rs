@@ -340,7 +340,7 @@ pub const SETTINGS: &[Setting] = &[
 
 impl Config {
     /// The defaults with the settings from a `config.toml` applied: one
-    /// `key = value` per line, `#` starts a comment. Lines it doesn't
+    /// `key = value` per line, `#` after a space starts a comment. Lines it doesn't
     /// understand are skipped, so a typo never stops blitz from starting,
     /// and listed in `ignored`.
     pub fn parse(text: &str) -> Config {
@@ -439,7 +439,8 @@ impl Config {
                 Some((k, v)) if !k.trim().is_empty() && !text.contains(char::is_control) => {
                     let k = k.trim();
                     self.env.retain(|e| !e.0.eq_ignore_ascii_case(k));
-                    self.env.push((k.into(), v.into()));
+                    // `FOO = bar`, spaced as the line's own `=`.
+                    self.env.push((k.into(), v.trim_start().into()));
                 }
                 _ => return false,
             },
@@ -589,14 +590,16 @@ fn number(v: &str) -> Option<f64> {
 }
 
 /// The key and value of a `key = value` line, and what follows the value,
-/// such as a comment. A quoted value keeps its quotes and may hold a `#`.
+/// such as a comment. A quoted value keeps its quotes and may hold a `#`;
+/// so may another inside a word, as in `env = COLOR=#ff0000`.
 fn entry(line: &str) -> Option<(&str, &str, &str)> {
     let (key, rest) = line.split_once('=')?;
     let rest = rest.trim_start();
+    let comment = |(i, _): &(usize, &str)| *i == 0 || rest[..*i].ends_with([' ', '\t']);
     let (value, after) = match rest.chars().next() {
         Some(q @ ('"' | '\'')) => rest.split_at(closing(rest, q)? + 1),
-        _ => match rest.find('#') {
-            Some(i) => (rest[..i].trim(), &rest[i..]),
+        _ => match rest.match_indices('#').find(comment) {
+            Some((i, _)) => (rest[..i].trim(), &rest[i..]),
             None => (rest.trim(), ""),
         },
     };
@@ -954,13 +957,17 @@ keybind = ctrl+shift+n=text:
              env = rust_log=info\n\
              env = EMPTY=\n\
              env = =C:=x\n\
-             env = NOEQUALS\n",
+             env = NOEQUALS\n\
+             env = COLOR=#ff0000 # red\n\
+             env = SPACED = out\n",
         );
         // The last line for a name counts, whatever its case.
         let want = [
             ("EDITOR", "code --wait"),
             ("rust_log", "info"),
             ("EMPTY", ""),
+            ("COLOR", "#ff0000"),
+            ("SPACED", "out"),
         ];
         assert_eq!(c.env, want.map(|(k, v)| (k.to_string(), v.to_string())));
     }
