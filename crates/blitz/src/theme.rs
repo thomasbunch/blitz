@@ -463,8 +463,14 @@ pub fn choose(setting: &str, system_light: bool) -> &str {
 }
 
 /// The `theme` setting after picking `name`. Of a `light:X,dark:Y` pair
-/// only the half in use now changes.
-pub fn pick(setting: &str, name: &str, system_light: bool) -> String {
+/// only the half in use now changes. While high contrast sets the colours
+/// (`contrast`), the pick is the whole setting: a blitz theme in its half
+/// of the default pair would make it the default again, and high contrast
+/// would win over the pick.
+pub fn pick(setting: &str, name: &str, system_light: bool, contrast: bool) -> String {
+    if contrast {
+        return name.into();
+    }
     match (half(setting, "light:"), half(setting, "dark:")) {
         (Some(_), Some(d)) if system_light => format!("light:{name},dark:{d}"),
         (Some(l), Some(_)) => format!("light:{l},dark:{name}"),
@@ -487,7 +493,14 @@ pub const HIGH_CONTRAST: &str = "high contrast";
 /// The colours of Windows high contrast mode while it is on and the
 /// `theme` setting is the default; a theme set by hand wins.
 pub fn contrast_for(setting: &str) -> Option<[u32; 3]> {
-    system_contrast().filter(|_| setting == DEFAULT)
+    system_contrast().filter(|_| is_default(setting))
+}
+
+/// Whether `setting` picks the default's themes, however it is written.
+fn is_default(setting: &str) -> bool {
+    [false, true]
+        .iter()
+        .all(|&light| choose(setting, light).eq_ignore_ascii_case(choose(DEFAULT, light)))
 }
 
 /// The theme of Windows high contrast mode: its window background, text
@@ -736,11 +749,24 @@ mod tests {
 
     #[test]
     fn pick_keeps_the_other_half_of_a_pair() {
-        assert_eq!(pick(DEFAULT, "X", true), "light:X,dark:blitz dark");
-        assert_eq!(pick(DEFAULT, "X", false), "light:blitz light,dark:X");
-        assert_eq!(pick("Rose Pine", "X", true), "X");
-        assert_eq!(pick("light:A", "X", true), "X");
-        assert_eq!(choose(&pick(DEFAULT, "X", false), false), "X");
+        assert_eq!(pick(DEFAULT, "X", true, false), "light:X,dark:blitz dark");
+        assert_eq!(pick(DEFAULT, "X", false, false), "light:blitz light,dark:X");
+        assert_eq!(pick("Rose Pine", "X", true, false), "X");
+        assert_eq!(pick("light:A", "X", true, false), "X");
+        assert_eq!(choose(&pick(DEFAULT, "X", false, false), false), "X");
+    }
+
+    /// The default pair gives way to high contrast; a blitz theme picked
+    /// then must not be that pair again.
+    #[test]
+    fn a_pick_under_high_contrast_is_not_the_default() {
+        assert!(is_default(DEFAULT) && is_default("light: Blitz Light , dark:blitz dark"));
+        for light in [false, true] {
+            let name = choose(DEFAULT, light);
+            assert!(is_default(&pick(DEFAULT, name, light, false)));
+            assert_eq!(pick(DEFAULT, name, light, true), name);
+            assert!(!is_default(&pick(DEFAULT, name, light, true)));
+        }
     }
 
     #[test]
@@ -754,7 +780,7 @@ mod tests {
             "light: x",
         ] {
             for light in [false, true] {
-                let setting = pick(DEFAULT, name, light);
+                let setting = pick(DEFAULT, name, light, false);
                 assert_eq!(choose(&setting, light), name.trim(), "{setting:?}");
                 let other = if light { "blitz dark" } else { "blitz light" };
                 assert_eq!(choose(&setting, !light), other, "{setting:?}");
@@ -1023,7 +1049,7 @@ mod tests {
         // A theme set by hand wins over the mode.
         assert_eq!(contrast_for(DEFAULT), system_contrast());
         assert_eq!(contrast_for("Rose Pine"), None);
-        assert_eq!(contrast_for(&pick(DEFAULT, "Rose Pine", true)), None);
+        assert_eq!(contrast_for(&pick(DEFAULT, "Rose Pine", true, false)), None);
     }
 
     #[test]

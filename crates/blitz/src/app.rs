@@ -2383,7 +2383,9 @@ impl App {
                 match picked {
                     Some(t) => {
                         let light = crate::theme::system_is_light();
-                        let setting = crate::theme::pick(&self.config.theme, &t.name, light);
+                        let theme = &self.config.theme;
+                        let contrast = crate::theme::contrast_for(theme).is_some();
+                        let setting = crate::theme::pick(theme, &t.name, light, contrast);
                         let value = crate::config::quote(&setting);
                         if let Err(e) = crate::config::save("theme", Some(&value)) {
                             let text = format!("Cannot save the theme to config.toml: {e}");
