@@ -128,8 +128,9 @@ pub enum UserEvent {
     Checked(Result<Option<String>, String>),
     /// The installer started, so blitz exits; or why it did not.
     Installed(Result<(), String>),
-    /// Another launch handed this folder over to open in a new tab.
-    OpenHere(PathBuf),
+    /// Another launch asks the window to come to the front, and maybe to
+    /// open a tab in its folder.
+    Handoff(crate::handoff::Ask),
     /// Something in `%APPDATA%\blitz` was written: settings or a theme.
     Settings,
 }
@@ -177,29 +178,40 @@ impl Args {
         }
         Ok(a)
     }
+
+    /// Takes what the blitz already running made of this launch, `None`
+    /// when none runs. True when it took the launch, which is then done.
+    /// One that runs but did not take it (it hung, or refused the folder)
+    /// keeps the saved session, so this launch gets a separate window: a
+    /// second main window would restore the same tabs and resume Claude
+    /// Code conversations that are live in the first.
+    fn handed_off(&mut self, sent: Option<bool>) -> bool {
+        self.new_window |= sent == Some(false);
+        sent == Some(true)
+    }
 }
 
 /// Runs the GUI until the window closes. Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
-    let args = match Args::parse(args) {
+    let mut args = match Args::parse(args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("blitz: {e}");
             return 2;
         }
     };
-    // A folder opens as a tab in the blitz already running. Scripted and
-    // test launches always get a window of their own.
+    // A launch brings the blitz already running to the front, and a folder
+    // opens as a tab there. Scripted and test launches always get a window
+    // of their own.
     let scripted = args.cmd.is_some()
         || args.selftest.is_some()
         || args.exit_after.is_some()
         || args.capture.is_some();
-    if let Some(dir) = &args.cwd
-        && !args.new_window
-        && !scripted
-        && crate::handoff::send(dir)
-    {
-        return 0;
+    if !args.new_window && !scripted {
+        let sent = crate::handoff::send(args.cwd.as_deref());
+        if args.handed_off(sent) {
+            return 0;
+        }
     }
     // Loading the graphics driver is most of the time to the first
     // frame; it runs while the window is made.
@@ -4558,15 +4570,17 @@ impl ApplicationHandler<UserEvent> for App {
                     self.error(id, format!("Update failed: {e}"));
                 }
             }
-            UserEvent::OpenHere(dir) => {
+            UserEvent::Handoff(ask) => {
                 // First, since a minimized window has no room for a pane.
                 if let Some(w) = &self.window {
                     w.set_minimized(false);
                 }
-                // SAFETY: our own window; the launch that sent the folder
-                // allowed this process to take the foreground.
+                // SAFETY: our own window; the launch that sent this allowed
+                // this process to take the foreground.
                 let _ = unsafe { SetForegroundWindow(HWND(self.hwnd as *mut c_void)) };
-                self.add(Some(dir), new_tab);
+                if let crate::handoff::Ask::Open(dir) = ask {
+                    self.add(Some(dir), new_tab);
+                }
             }
         }
     }
@@ -5710,6 +5724,18 @@ mod tests {
         let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
         assert!(a.new_window);
         assert_eq!(a.cwd, Some(r"C:\foo".into()));
+    }
+
+    /// A launch that a running blitz did not take must not open a second
+    /// main window, which would restore and resume the same sessions.
+    #[test]
+    fn a_launch_blitz_did_not_take_leaves_the_session_alone() {
+        let mut a = Args::default();
+        assert!(!a.handed_off(None), "none running");
+        assert!(!a.new_window, "the main window");
+        assert!(a.handed_off(Some(true)), "taken");
+        assert!(!a.handed_off(Some(false)), "hung or refused");
+        assert!(a.new_window, "a window of its own");
     }
 
     #[test]

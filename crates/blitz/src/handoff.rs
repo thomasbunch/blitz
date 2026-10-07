@@ -1,6 +1,6 @@
-//! Opening a folder in the blitz that is already running: a second
-//! `blitz --cwd X` sends X to the main window and exits, and that window
-//! opens a tab there.
+//! Launching blitz while it runs: a second `blitz` brings the main window
+//! to the front and exits, and a second `blitz --cwd X` also sends X, and
+//! that window opens a tab there.
 //!
 //! Any process on the desktop at the same or a higher integrity level can
 //! send this message, so it only ever carries a folder, never a command.
@@ -37,52 +37,60 @@ const MAX_BYTES: usize = 32 * 1024 * 2;
 /// window.
 const TIMEOUT_MS: u32 = 2000;
 
-/// The payload for `dir`: its path as UTF-16.
+/// What another launch asks of the main window.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// Come to the front.
+    Show,
+    /// Come to the front and open a tab in this folder.
+    Open(PathBuf),
+}
+
+/// The payload for `dir`: its path as UTF-16. A launch without a folder
+/// sends none, which asks only for [`Ask::Show`].
 pub fn encode(dir: &Path) -> Vec<u16> {
     dir.as_os_str().encode_wide().collect()
 }
 
-/// The folder in a payload, or `None` when it is not one blitz sent or not
-/// a local drive folder. Any program on the desktop can send one, and the
-/// window procedure looks at it, so a network or device path would make
-/// Windows sign in to that host or open that device for the sender. A
-/// blitz refused one opens a window of its own there instead.
-pub fn decode(data: usize, bytes: &[u8]) -> Option<PathBuf> {
-    if data != MAGIC
-        || bytes.is_empty()
-        || bytes.len() > MAX_BYTES
-        || !bytes.len().is_multiple_of(2)
-    {
+/// What a payload asks, or `None` when it is not one blitz sent or its
+/// folder is not a local drive folder. Any program on the desktop can send
+/// one, and the window procedure looks at it, so a network or device path
+/// would make Windows sign in to that host or open that device for the
+/// sender. A blitz refused one opens a window of its own there instead.
+pub fn decode(data: usize, bytes: &[u8]) -> Option<Ask> {
+    if data != MAGIC || bytes.len() > MAX_BYTES || !bytes.len().is_multiple_of(2) {
         return None;
+    }
+    if bytes.is_empty() {
+        return Some(Ask::Show);
     }
     let units: Vec<u16> = (bytes.as_chunks().0.iter())
         .map(|&b| u16::from_le_bytes(b))
         .collect();
     let text = String::from_utf16(&units).ok()?;
     // The same rule as a folder a program reports with OSC 7.
-    vt::osc::local_dir(&text).then(|| PathBuf::from(text))
+    vt::osc::local_dir(&text).then(|| Ask::Open(PathBuf::from(text)))
 }
 
-/// Sends `dir` to the running blitz. True only when it took it; on false
-/// the caller opens a window of its own.
-pub fn send(dir: &Path) -> bool {
+/// Sends this launch, and `dir` when it names one, to the running blitz.
+/// `None` when blitz is not running, else whether it took the launch.
+pub fn send(dir: Option<&Path>) -> Option<bool> {
+    // SAFETY: a class name and no window name.
+    let hwnd = unsafe { FindWindowW(&HSTRING::from(CLASS), None) }.ok()?;
     // The receiver's directory is not ours.
-    let Ok(dir) = std::path::absolute(dir) else {
-        return false;
+    let units = match dir.map(std::path::absolute) {
+        Some(Ok(dir)) => encode(&dir),
+        Some(Err(_)) => return Some(false),
+        None => Vec::new(),
     };
-    let units = encode(&dir);
     let bytes = units.len() * 2;
     if bytes > MAX_BYTES {
-        return false;
+        return Some(false);
     }
     let cds = COPYDATASTRUCT {
         dwData: MAGIC,
         cbData: bytes as u32,
         lpData: units.as_ptr() as *mut c_void,
-    };
-    // SAFETY: a class name and no window name.
-    let Ok(hwnd) = (unsafe { FindWindowW(&HSTRING::from(CLASS), None) }) else {
-        return false;
     };
     let mut pid = 0;
     // SAFETY: a window handle and a u32 to fill; a stale handle only fails.
@@ -105,11 +113,11 @@ pub fn send(dir: &Path) -> bool {
             Some(&mut took),
         )
     };
-    sent.0 != 0 && took == 1
+    Some(sent.0 != 0 && took == 1)
 }
 
-/// Makes `hwnd` take hand-offs: each folder it is sent arrives as
-/// `UserEvent::OpenHere`.
+/// Makes `hwnd` take hand-offs: each launch it is sent arrives as
+/// `UserEvent::Handoff`.
 pub fn install(hwnd: isize, proxy: EventLoopProxy<UserEvent>) {
     // Leaked on purpose: the window lives as long as the process.
     let proxy = Box::into_raw(Box::new(proxy));
@@ -141,11 +149,11 @@ unsafe extern "system" fn proc(
             },
         };
         let took = decode(cds.dwData, bytes)
-            .filter(|d| d.is_dir())
-            .is_some_and(|d| {
+            .filter(|a| !matches!(a, Ask::Open(d) if !d.is_dir()))
+            .is_some_and(|a| {
                 // SAFETY: `install` leaked this proxy for the window's lifetime.
                 let proxy = unsafe { &*(proxy as *const EventLoopProxy<UserEvent>) };
-                proxy.send_event(UserEvent::OpenHere(d)).is_ok()
+                proxy.send_event(UserEvent::Handoff(a)).is_ok()
             });
         return LRESULT(took.into());
     }
@@ -164,14 +172,21 @@ mod tests {
     #[test]
     fn handoff_round_trips_a_folder() {
         let dir = Path::new(r"C:\Users\jo\Desktop\café ünï 文件");
-        assert_eq!(decode(MAGIC, &bytes(&encode(dir))).as_deref(), Some(dir));
+        let ask = decode(MAGIC, &bytes(&encode(dir)));
+        assert_eq!(ask, Some(Ask::Open(dir.into())));
+    }
+
+    /// A second launch without a folder only brings blitz to the front.
+    #[test]
+    fn handoff_without_a_folder_asks_to_show() {
+        assert_eq!(decode(MAGIC, &[]), Some(Ask::Show));
+        assert_eq!(decode(MAGIC + 1, &[]), None, "another magic");
     }
 
     #[test]
     fn handoff_rejects_what_blitz_never_sends() {
         let ok = bytes(&encode(Path::new(r"C:\x")));
         assert_eq!(decode(MAGIC + 1, &ok), None, "another magic");
-        assert_eq!(decode(MAGIC, &[]), None, "empty");
         assert_eq!(decode(MAGIC, &ok[..ok.len() - 1]), None, "odd byte count");
         let drive: Vec<u16> = r"C:\".encode_utf16().collect();
         assert_eq!(
@@ -197,7 +212,8 @@ mod tests {
     /// the receiver's directory, which is not the sender's.
     #[test]
     fn handoff_takes_only_local_drive_folders() {
-        let take = |p: &str| decode(MAGIC, &bytes(&encode(Path::new(p)))).is_some();
+        let take =
+            |p: &str| decode(MAGIC, &bytes(&encode(Path::new(p)))) == Some(Ask::Open(p.into()));
         for ok in [r"C:\x", r"z:\", "C:/x"] {
             assert!(take(ok), "{ok}");
         }
