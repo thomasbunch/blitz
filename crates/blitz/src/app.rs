@@ -886,6 +886,8 @@ struct App {
     eaten: Eaten,
     /// Where the IME was last told the cursor is, in client pixels.
     ime_at: Option<(i32, i32)>,
+    /// What the title bar shows.
+    title: String,
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
     capture_then_exit: bool,
@@ -1142,6 +1144,7 @@ impl App {
             banner: None,
             eaten: Eaten::default(),
             ime_at: None,
+            title: "blitz".into(),
             checked_conpty: false,
             capture_then_exit: false,
             persist,
@@ -1177,7 +1180,7 @@ impl App {
         // flash of white or black.
         self.hidden_until = Some(Instant::now() + FIRST_FRAME);
         let mut attrs = Window::default_attributes()
-            .with_title(window_title("", self.admin))
+            .with_title(window_title(0, "", self.admin))
             .with_visible(false)
             .with_inner_size(LogicalSize::new(980.0, 620.0))
             // Icon group 1, which build.rs links in.
@@ -1586,16 +1589,24 @@ impl App {
                 self.attention(id, Ev::Attended);
             }
         }
-        let title = self.current().map(|v| v.pane.title.clone());
-        self.set_title(&title.unwrap_or_default());
         if let (Some(w), Some(v)) = (&self.watched, self.current()) {
             *lock(w) = v.pane.term.clone();
         }
     }
 
-    fn set_title(&self, t: &str) {
-        if let Some(w) = &self.window {
-            w.set_title(&window_title(t, self.admin));
+    /// Puts the focused pane's title and the number of sessions that need
+    /// you in the title bar, when either changed.
+    fn sync_title(&mut self) {
+        let waiting = (self.views.iter())
+            .filter(|v| v.pane.attn.state == Attn::NeedsYou)
+            .count();
+        let pane = self.current().map_or("", |v| v.pane.title.as_str());
+        let title = window_title(waiting, pane, self.admin);
+        if title != self.title
+            && let Some(w) = &self.window
+        {
+            w.set_title(&title);
+            self.title = title;
         }
     }
 
@@ -2973,7 +2984,6 @@ impl App {
     /// it needs the user, what to show and which session it is, and
     /// blitz's own prompt coming back says it has exited.
     fn on_term_event(&mut self, id: PaneId, e: Event) {
-        let focus = self.focus_id() == Some(id);
         let bell = self.config.bell_attention;
         let Some(v) = self.view_mut(id) else {
             return;
@@ -2988,10 +2998,6 @@ impl App {
                 let asked = v.pane.attn.state == Attn::NeedsYou;
                 v.pane.claude_title = now;
                 v.pane.title = t;
-                if focus {
-                    let t = v.pane.title.clone();
-                    self.set_title(&t);
-                }
                 // This needs no hooks, and it sees a turn the user
                 // interrupted end, which runs no hook at all.
                 match (was, now) {
@@ -4362,6 +4368,22 @@ fn again(a: Action, keys: &[keymap::Binding]) -> String {
     }
 }
 
+/// The window title: the focused pane's, after how many sessions need you,
+/// so Alt+Tab, the taskbar and screen readers tell too, and marked the way
+/// Windows marks its own consoles when blitz runs as administrator.
+fn window_title(waiting: usize, pane: &str, admin: bool) -> String {
+    let pane = if pane.is_empty() { "blitz" } else { pane };
+    let pane = if admin {
+        format!("Administrator: {pane}")
+    } else {
+        pane.to_string()
+    };
+    match waiting {
+        0 => pane,
+        n => format!("({n}) {pane}"),
+    }
+}
+
 /// How to flash the taskbar for a session that just changed to `state`
 /// while the window is in the background: urgently when it needs the
 /// user or failed, gently when it finished, and at most once per session
@@ -4659,16 +4681,6 @@ fn split(dir: Dir) -> impl FnOnce(&mut layout::Window, PaneId) -> bool {
         };
         let active = win.active;
         (win.tabs.get_mut(active)).is_some_and(|t| t.split(dir, id, any, (0, 0)))
-    }
-}
-/// The window title for the focused pane's title `t`, marked the way
-/// Windows marks its own consoles when blitz runs as administrator.
-fn window_title(t: &str, admin: bool) -> String {
-    let t = if t.is_empty() { "blitz" } else { t };
-    if admin {
-        format!("Administrator: {t}")
-    } else {
-        t.to_string()
     }
 }
 
@@ -5077,6 +5089,9 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.drain_keys(el);
         self.save_session(false);
+        // Here, after every batch of events, rather than at each change:
+        // a minimized window is not drawn.
+        self.sync_title();
         let flow = match self.next_deadline() {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,
@@ -5441,6 +5456,15 @@ mod tests {
     /// What a copy of the selection dragged from `a` to `b` takes.
     fn copy(t: &vt::Terminal, a: Pos, b: Pos) -> String {
         selection_text(t, &crate::theme::dark(), &select(t, a, b), 0)
+    }
+
+    #[test]
+    fn app_title_counts_the_sessions_that_need_you() {
+        assert_eq!(window_title(0, "pwsh", false), "pwsh");
+        assert_eq!(window_title(2, "pwsh", false), "(2) pwsh");
+        assert_eq!(window_title(0, "", false), "blitz");
+        assert_eq!(window_title(1, "", false), "(1) blitz");
+        assert_eq!(window_title(2, "pwsh", true), "(2) Administrator: pwsh");
     }
 
     #[test]
@@ -6198,10 +6222,10 @@ mod tests {
 
     #[test]
     fn app_an_elevated_window_says_so_in_its_title() {
-        assert_eq!(window_title("", false), "blitz");
-        assert_eq!(window_title("~/shop", false), "~/shop");
-        assert_eq!(window_title("", true), "Administrator: blitz");
-        assert_eq!(window_title("~/shop", true), "Administrator: ~/shop");
+        assert_eq!(window_title(0, "", false), "blitz");
+        assert_eq!(window_title(0, "~/shop", false), "~/shop");
+        assert_eq!(window_title(0, "", true), "Administrator: blitz");
+        assert_eq!(window_title(0, "~/shop", true), "Administrator: ~/shop");
     }
 
     /// Started from the Start menu, a pin or Win+R, blitz runs in its own
