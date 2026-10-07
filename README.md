@@ -16,8 +16,10 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   colour when one of them needs you, and a click there goes to it.
 - Claude Code's title tells blitz when a session works and when it
   stops, and its hooks, which blitz sets up itself, when it needs input.
-  The window title starts with how many need you, as in `(2) pwsh`, and
-  the taskbar button flashes if blitz is in the background.
+  The window title starts with how many need you, as in `(2) pwsh`. If
+  blitz is in the background, a Windows notification says so and takes
+  you there when clicked, and the taskbar button flashes and shows the
+  session's dot.
 - In PowerShell, a command that runs for 10 seconds or more and ends in
   a pane you are not looking at marks it *done*, or *error* with its exit
   code.
@@ -213,8 +215,12 @@ writes it.
 | `restore_session` | `true` | Reopen the last window's tabs, splits and folders |
 | `restore_claude` | `true` | Resume the Claude Code sessions they were running |
 | `restore_scrollback` | `false` | Save each pane's last 1000 lines when blitz closes and show them again above the new prompt. Off by default because old output can contain secrets |
+| `keep_awake` | `false` | Keep the PC from going to sleep by itself while a session is working |
 | `check_updates` | `true` | Look for a newer release |
 | `flash` | `true` | Flash the taskbar button when a session needs you |
+| `toasts` | `"needs-you"` | Windows notifications while blitz is in the background: `"needs-you"` for sessions that need you or failed, `"all"` for finished ones too, or `"off"`. Clicking one takes you to the session |
+| `sound` | `false` | Play a sound when a session wants you while blitz is in the background: the notification's, or the default beep without one |
+| `global_jump` | `false` | Let Ctrl+Alt+J bring blitz to the front from any program, on the session that needs you |
 | `bell_attention` | `true` | Treat a bell or a notification in a background pane as needing you |
 | `right_click_paste` | `true` | A right click copies the selection, or pastes when nothing is selected |
 | `editor_uri` | `""` | Ctrl+click on a file path opens it at its line through this URI, such as `"vscode://file/{path}:{line}:{col}"`. Empty opens the file with its program, or shows it in Explorer when it has none |
@@ -411,7 +417,8 @@ that, or typing, goes back to the bottom.
 | Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
 A zoomed pane stays zoomed until you zoom again, move focus to another
-pane, split or resize.
+pane, split or resize. With `global_jump` on, Ctrl+Alt+J jumps from any
+program: it brings blitz to the front on the session that needs you.
 
 The command palette lists every action with its keys. Typing narrows
 the list, the arrow keys choose, and Enter or a click runs the action;
