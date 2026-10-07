@@ -3821,10 +3821,11 @@ impl App {
                 let again = again(a, &self.config.keys);
                 let (others, main) = (crate::handoff::others(), !self.args.new_window);
                 let ask = crate::update::confirm(&v, busy, others, main, &again);
-                if let Some((text, later)) = ask.filter(|_| asked.is_none()) {
+                let asks = asks(asked.is_some(), self.at_close.as_ref(), &v);
+                if let Some((text, later)) = ask.filter(|_| asks) {
                     self.banner_note = Some((text, Ask::Update));
                     self.request_redraw();
-                    if later && arms(self.at_close.as_ref(), &v) {
+                    if later {
                         self.at_close = Some((v.clone(), None));
                         let keys = keymap::press_for(Action::Update, &self.config.keys);
                         self.update = Some((v.clone(), crate::update::at_close(&v, &keys)));
@@ -6576,6 +6577,13 @@ type AtClose = (String, Option<crate::update::Installer>);
 /// older release, which a later look replaced on the banner.
 fn arms(at_close: Option<&AtClose>, v: &str) -> bool {
     at_close.is_none_or(|a| a.0 != v)
+}
+
+/// Whether Ctrl+Shift+U asks before it updates to release `v`: not when it
+/// answers the question it `asked`, nor once `v` waits in `at_close` for
+/// blitz to close, as its strip then says a press restarts now.
+fn asks(asked: bool, at_close: Option<&AtClose>, v: &str) -> bool {
+    !asked && arms(at_close, v)
 }
 
 /// What is left of an update for when blitz closes once the banner goes,
@@ -9652,6 +9660,12 @@ mod tests {
         assert!(!arms(Some(&left("0.0.5", false)), "0.0.5"));
         assert!(!arms(Some(&left("0.0.5", true)), "0.0.5"));
         assert!(arms(Some(&left("0.0.5", true)), "0.0.6"));
+        // Once it waits for the close, the next press restarts, whatever
+        // keys came between.
+        assert!(asks(false, None, "0.0.5"));
+        assert!(!asks(true, None, "0.0.5"));
+        assert!(!asks(false, Some(&left("0.0.5", false)), "0.0.5"));
+        assert!(asks(false, Some(&left("0.0.5", true)), "0.0.6"));
         // Hiding the banner drops it, but not a restart asked for while it
         // downloads.
         assert_eq!(kept_at_close(Some(left("0.0.5", true)), false), None);
