@@ -2517,13 +2517,17 @@ impl App {
             k.key,
             vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
         );
-        let a = keymap::action(k, &self.config.keys);
+        let action = keymap::action(k, &self.config.keys);
         if k.down && !modifier {
-            self.dismiss(a);
+            self.dismiss(action);
         }
-        if let Some(a) = a
+        if let Some(a) = action
             && self.act(el, a)
         {
+            self.eaten.press(k.vk);
+            return;
+        }
+        if action == Some(Action::Copy) && eats_copy_key(k, &self.modes()) {
             self.eaten.press(k.vk);
             return;
         }
@@ -4914,6 +4918,13 @@ fn label(
     (name.to_owned(), msg.to_owned())
 }
 
+/// Whether a copy key that found nothing to copy is kept from the program.
+/// Ctrl+Shift+C would reach it as Ctrl+C and interrupt it, unless kitty
+/// flags make it a key of its own; plain Ctrl+C is meant to interrupt.
+fn eats_copy_key(k: &KeyInput, m: &InputModes) -> bool {
+    !vt::keys::is_interrupt(k) && vt::keys::interrupts(k, m)
+}
+
 /// Whether a paste into `term` goes in without asking; see
 /// [`vt::keys::needs_paste_confirm`]. Claude Code, known by its hook
 /// notifications (`claude`), reads every paste under bracketed paste as
@@ -6899,6 +6910,33 @@ mod tests {
         );
         assert!(text.ends_with(r"blitz\config.toml"), "{text}");
         assert_eq!(start_failed("x", None), "blitz could not start: x");
+    }
+
+    #[test]
+    fn app_ctrl_shift_c_with_nothing_to_copy_never_interrupts() {
+        let chord = |vk, key, shift| {
+            let mut k = input(vk, true, key, "c");
+            (k.mods.lctrl, k.mods.lshift) = (true, shift);
+            k
+        };
+        let ctrl_c = chord(0x43, vt::Key::Char('c'), false);
+        let ctrl_shift_c = chord(0x43, vt::Key::Char('c'), true);
+        let ctrl_insert = chord(0x2d, vt::Key::Insert, false);
+        let legacy = InputModes::default();
+        let w32im = InputModes {
+            w32im: true,
+            ..legacy
+        };
+        let kitty = InputModes { kitty: 1, ..legacy };
+        for m in [legacy, w32im] {
+            assert!(eats_copy_key(&ctrl_shift_c, &m), "{m:?}");
+        }
+        // A key of its own under kitty flags, which Claude Code ignores.
+        assert!(!eats_copy_key(&ctrl_shift_c, &kitty));
+        for m in [legacy, w32im, kitty] {
+            assert!(!eats_copy_key(&ctrl_c, &m), "the interrupt");
+            assert!(!eats_copy_key(&ctrl_insert, &m));
+        }
     }
 
     #[test]
