@@ -47,6 +47,10 @@ pub struct Pane {
     /// notifications. Kept until Claude ends the session, so a window closed
     /// mid-session can resume it.
     pub claude: Option<String>,
+    /// Claude Code's hooks report for the pane, from the first one with
+    /// its token until the session ends. Bells and other notifications
+    /// would only say the same again.
+    pub hooked: bool,
     /// Set once the child has exited.
     pub exit_code: Option<u32>,
     /// Set by the reader thread when there is new output to draw.
@@ -174,6 +178,7 @@ impl Pane {
             msg: String::new(),
             token: s.token.into(),
             claude: None,
+            hooked: false,
             exit_code: None,
             dirty,
         })

@@ -2578,6 +2578,7 @@ impl App {
     /// blitz's own prompt coming back says it has exited.
     fn on_term_event(&mut self, id: PaneId, e: Event) {
         let focus = self.focus_id() == Some(id);
+        let bell = self.config.bell_attention;
         let Some(v) = self.view_mut(id) else {
             return;
         };
@@ -2623,15 +2624,23 @@ impl App {
                 } else {
                     v.pane.claude = None;
                     v.pane.claude_title = None;
+                    v.pane.hooked = false;
                     self.attention(id, Ev::Exited);
                 }
             }
-            Event::Notify { title, body } => {
-                if let Some((ev, session)) = Ev::from_notify(&title, &v.pane.token) {
+            Event::Notify { title, body } => match Ev::from_notify(&title, &v.pane.token) {
+                Some((ev, session)) => {
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
+                    v.pane.hooked = ev != Ev::Idle;
                     self.attention(id, ev);
                 }
-            }
+                // Another program's, or Claude Code's own without hooks
+                // (OSC 9 or 777): like a bell.
+                None if rings(bell, v.pane.hooked) => {
+                    self.attention(id, Ev::Bell);
+                }
+                None => {}
+            },
             Event::Progress { state, pct } => {
                 let next = chrome::Progress::next(v.progress.map(|p| p.0), state, pct);
                 v.progress = next.map(|p| (p, Instant::now()));
@@ -2640,7 +2649,7 @@ impl App {
             }
             // It needs the user, unless they are already looking at the
             // pane; looking is all it asks for.
-            Event::Bell if self.config.bell_attention => {
+            Event::Bell if rings(bell, v.pane.hooked) => {
                 self.attention(id, Ev::Bell);
             }
             _ => {}
@@ -3667,6 +3676,13 @@ fn note_hook(
         *claude = Some(id.to_owned());
     }
     *msg = body;
+}
+
+/// Whether a bell, or a notification without the pane's token, needs the
+/// user: when `bell_attention` is on, and Claude Code's hooks do not
+/// report for the pane already, which would only say the same twice.
+fn rings(bell_attention: bool, hooked: bool) -> bool {
+    bell_attention && !hooked
 }
 
 /// How to flash the taskbar for a session that just changed to `state`
@@ -5005,6 +5021,23 @@ mod tests {
         // The session ended: nothing to show or resume.
         note_hook(&mut msg, &mut claude, Ev::Idle, Some(id), String::new());
         assert_eq!((msg.as_str(), claude), ("", None));
+    }
+
+    #[test]
+    fn app_bells_and_notifications_leave_hooked_panes_to_the_hooks() {
+        assert!(rings(true, false));
+        assert!(!rings(true, true));
+        assert!(!rings(false, false));
+        // What reaches the app as a notification: OSC 9 and 777, with
+        // no pane token.
+        let mut t = vt::Terminal::new(vt::Options::default());
+        t.feed(b"\x1b]9;Claude is waiting for your input\x07\x1b]777;notify;Build;done\x07");
+        let mut evs = Vec::new();
+        t.take_events(&mut evs);
+        let untokened = (evs.iter())
+            .filter(|e| matches!(e, Event::Notify { title, .. } if Ev::from_notify(title, "0f1e").is_none()))
+            .count();
+        assert_eq!(untokened, 2);
     }
 
     #[test]
