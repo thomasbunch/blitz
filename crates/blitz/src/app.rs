@@ -810,8 +810,12 @@ impl App {
             let old = (self.config.restore_scrollback)
                 .then(|| session::load_output(&meta.key))
                 .flatten();
+            // When the retry fails too, the first failure says why.
             let started = (self.spawn(id, &grids, None, start_dir(&meta.cwd), old.as_deref()))
-                .or_else(|_| self.spawn(id, &grids, None, None, old.as_deref()));
+                .or_else(|first| {
+                    (self.spawn(id, &grids, None, None, old.as_deref()))
+                        .map_err(|then| joined(first, then))
+                });
             if let Err(e) = started {
                 self.views.clear();
                 return Err(e);
@@ -2786,6 +2790,16 @@ fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
     }
 }
 
+/// Why a pane failed to start in its folder and then again without one;
+/// once when both say the same.
+fn joined(first: String, then: String) -> String {
+    if first == then {
+        first
+    } else {
+        format!("{first}; then {then}")
+    }
+}
+
 /// What to type into a restored pane's shell to bring back the Claude Code
 /// session it was running, if anything. The id comes from a file on disk,
 /// so only a well-formed one is ever typed.
@@ -3929,6 +3943,13 @@ mod tests {
         let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
         assert!(a.new_window);
         assert_eq!(a.cwd, Some(r"C:\foo".into()));
+    }
+
+    #[test]
+    fn a_pane_that_fails_twice_says_why_first() {
+        let (a, b) = ("folder too long".to_string(), "no shell".to_string());
+        assert_eq!(joined(a.clone(), a.clone()), a);
+        assert_eq!(joined(a, b), "folder too long; then no shell");
     }
 
     #[test]
