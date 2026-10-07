@@ -350,7 +350,14 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
         [0xfe, 0xff, rest @ ..] => utf16(rest, u16::from_be_bytes),
         _ => match std::str::from_utf8(bytes) {
             Ok(text) => text.to_string(),
-            Err(_) => bytes.iter().map(|&b| windows_1252(b)).collect(),
+            // Line by line: one line an editor saved in the ANSI code page
+            // must not turn the UTF-8 around it into mojibake.
+            Err(_) => (bytes.split_inclusive(|&b| b == b'\n'))
+                .map(|line| match std::str::from_utf8(line) {
+                    Ok(line) => line.to_string(),
+                    Err(_) => line.iter().map(|&b| windows_1252(b)).collect(),
+                })
+                .collect(),
         },
     }
 }
@@ -406,34 +413,32 @@ fn entry(line: &str) -> Option<(&str, &str, &str)> {
     Some((key.trim(), value, after))
 }
 
-/// Where the string that starts `s` with quote `q` ends. In a `"` string
-/// `\"` is a quote and `\\` a backslash, counted in pairs, when only a
-/// comment or nothing follows the end that gives. Otherwise the first `"`
-/// ends it, so a hand-written path ending in `\` reads as it always did,
-/// whatever its comment holds.
+/// Where the string that starts `s` with quote `q` ends. A `"` string ends
+/// at its first `"` when only a comment or nothing follows it, so a
+/// hand-written path ending in `\` reads as it always did, whatever its
+/// comment holds. Otherwise a `\"` in it is a quote, and it ends at the
+/// next `"` that only a comment or nothing follows, else the first.
 fn closing(s: &str, q: char) -> Option<usize> {
     let first = s[1..].find(q)? + 1;
     if q == '\'' {
         return Some(first);
     }
-    let b = s.as_bytes();
-    let mut i = 1;
-    while i < b.len() && b[i] != b'"' {
-        i += if b[i] == b'\\' { 2 } else { 1 };
+    let ends = |i: usize| {
+        let after = s.get(i + 1..).unwrap_or("").trim_start();
+        after.is_empty() || after.starts_with('#')
+    };
+    if ends(first) {
+        return Some(first);
     }
-    let after = s.get(i + 1..).unwrap_or("").trim_start();
-    Some(
-        if i < b.len() && (after.is_empty() || after.starts_with('#')) {
-            i
-        } else {
-            first
-        },
-    )
+    let b = s.as_bytes();
+    let end = (first + 1..b.len()).find(|&i| b[i] == b'"' && b[i - 1] != b'\\' && ends(i));
+    Some(end.unwrap_or(first))
 }
 
 /// The text of a quoted value; `None` when it is not quoted. In a `"`
-/// string only `\"` and `\\` are escapes: any other backslash stays, as
-/// Windows paths are written by hand.
+/// string `\"` is a quote, and so are the unicode escapes [`quote`] writes
+/// for a quote and a backslash; any other backslash stays, as Windows
+/// paths, UNC ones too, are written by hand.
 fn unquote(value: &str) -> Option<String> {
     let q = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
     let inner = value.strip_prefix(q)?.strip_suffix(q)?;
@@ -441,29 +446,39 @@ fn unquote(value: &str) -> Option<String> {
         return Some(inner.to_string());
     }
     let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        match (c, chars.peek()) {
-            ('\\', Some(&e @ ('"' | '\\'))) => {
-                out.push(e);
-                chars.next();
-            }
-            _ => out.push(c),
-        }
+    let mut rest = inner;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let unit = |e: &str| tail.get(..6).is_some_and(|t| t.eq_ignore_ascii_case(e));
+        let (c, n) = if tail.starts_with("\\\"") {
+            ('"', 2)
+        } else if unit("\\u0022") {
+            ('"', 6)
+        } else if unit("\\u005c") {
+            ('\\', 6)
+        } else {
+            ('\\', 1)
+        };
+        out.push(c);
+        rest = &tail[n..];
     }
+    out.push_str(rest);
     Some(out)
 }
 
 /// `s` as a TOML string. One holding `"` or `\` is a literal string, as a
-/// basic one would read those as escapes; one that also holds `'` is a
-/// basic string with its `"` and `\` escaped.
+/// basic one would read those as escapes. One that also holds `'` is a
+/// basic string with its `"` and `\` written as unicode escapes, so it
+/// holds no `"` before its end and no backslash a path could have.
 pub fn quote(s: &str) -> String {
     if !s.contains(['"', '\\']) {
         format!("\"{s}\"")
     } else if !s.contains('\'') {
         format!("'{s}'")
     } else {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        let s = s.replace('\\', "\\u005C").replace('"', "\\u0022");
+        format!("\"{s}\"")
     }
 }
 
@@ -825,6 +840,11 @@ scenery = stars
         let c = Config::parse(&decode(ansi));
         assert!(!c.flash);
         assert_eq!(c.font_family, "Café");
+        // One ANSI line in a UTF-8 file leaves the UTF-8 lines as they are.
+        assert_eq!(
+            decode(b"theme = \"Ros\xc3\xa9\"\r\n# caf\xe9\n"),
+            "theme = \"Rosé\"\r\n# café\n"
+        );
         // Windows-1252, the ANSI of Western Windows, with its own 0x80-0x9F
         // and the five bytes it leaves undefined as their C1 controls.
         assert_eq!(decode(b"\x80\x8a\x96\x99\x9f\xa0\xff"), "€Š–™Ÿ\u{a0}ÿ");
@@ -899,6 +919,9 @@ scenery = stars
             r#"'"\"#,
             r#"it's "C:\x\""#,
             r#"\\'\""#,
+            r#"it's a" # b"#,
+            r#"\u0022'""#,
+            r"\\server\share\x",
             "plain",
             "",
             "No #1",
@@ -917,8 +940,15 @@ scenery = stars
             Config::parse(r#"shell = "C:\x\sh.exe""#).shell,
             r"C:\x\sh.exe"
         );
+        // A UNC path keeps its two backslashes.
+        assert_eq!(
+            Config::parse(r#"shell = "\\server\share\pwsh.exe""#).shell,
+            r"\\server\share\pwsh.exe"
+        );
         // Nor does a quote in a comment after it, and saving keeps that
         // comment.
+        let six = r#"shell = "C:\tools\" # the 6""#;
+        assert_eq!(Config::parse(six).shell, r"C:\tools\");
         let fast = r#"shell = "C:\tools\" # the "fast" one"#;
         assert_eq!(Config::parse(fast).shell, r"C:\tools\");
         assert_eq!(
