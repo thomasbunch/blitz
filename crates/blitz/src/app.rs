@@ -4837,12 +4837,12 @@ impl App {
             // select instead.
             let here = self.cell_in(id, pos);
             let press = &mut self.mouse.program_press;
-            if b == 0 && press.take_if(|p| p.1 && p.0 != here).is_some() {
-                let hints = crate::session::dir().map(|d| d.join("hints"));
-                if first_time(hints.as_deref(), "shift-drag") {
-                    let text = "Shift+drag selects while the program uses the mouse";
-                    self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
-                }
+            if b == 0
+                && press.take_if(|p| p.1 && p.0 != here).is_some()
+                && session::dir().is_some_and(|d| session::first_time_in(&d, "shift-drag"))
+            {
+                let text = "Shift+drag selects while the program uses the mouse";
+                self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
             }
         } else if self.mouse_to_program(&mods).is_some()
             && let Some(id) = self.focus_id()
@@ -5453,20 +5453,6 @@ fn right_click_does(on: bool, selected: bool) -> Option<Action> {
     } else {
         Action::Paste
     })
-}
-
-/// Whether the hint `name` shows: only the first time ever, as remembered
-/// by a file of that name in `dir`. With nowhere to remember it, never, so
-/// it cannot show at every start.
-fn first_time(dir: Option<&Path>, name: &str) -> bool {
-    let Some(dir) = dir else {
-        return false;
-    };
-    let file = dir.join(name);
-    !file.exists()
-        && std::fs::create_dir_all(dir)
-            .and_then(|()| std::fs::write(file, ""))
-            .is_ok()
 }
 
 /// The pointer's shape: a resize arrow on a `divider` between panes, the
@@ -7693,16 +7679,18 @@ mod tests {
 
     #[test]
     fn app_hints_show_once_ever() {
+        // Every hint is noted in the one file, so the keys shown at the
+        // first start and the Shift+drag hint each show once.
         let dir = std::env::temp_dir().join(format!("blitz-hints-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let seen = [
-            first_time(Some(&dir), "shift-drag"),
-            first_time(Some(&dir), "shift-drag"),
-            first_time(Some(&dir), "other"),
+            session::first_time_in(&dir, "keys"),
+            session::first_time_in(&dir, "shift-drag"),
+            session::first_time_in(&dir, "shift-drag"),
+            session::first_time_in(&dir, "keys"),
         ];
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(seen, [true, false, true]);
-        assert!(!first_time(None, "shift-drag"), "nowhere to remember it");
+        assert_eq!(seen, [true, true, false, false]);
     }
 
     #[test]
