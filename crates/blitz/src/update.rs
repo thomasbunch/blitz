@@ -6,6 +6,7 @@
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
 
 use windows::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -126,12 +127,21 @@ pub fn open_page() -> bool {
 
 /// The newest update that `install` started and that did not happen, with
 /// the installer's log: its folder is for a version newer than this build.
-/// The folders of updates to this version or older are removed.
+/// The folders of updates to this version or older are removed, and so are
+/// those of updates whose installer never started.
 pub fn failed() -> Option<(String, PathBuf)> {
-    failed_in(&std::env::temp_dir(), env!("CARGO_PKG_VERSION"))
+    failed_in(
+        &std::env::temp_dir(),
+        env!("CARGO_PKG_VERSION"),
+        SystemTime::now(),
+    )
 }
 
-fn failed_in(temp: &Path, current: &str) -> Option<(String, PathBuf)> {
+/// How long an update's folder may wait for its installer to start, as
+/// another blitz may be about to start it.
+const UNSTARTED: Duration = Duration::from_secs(10 * 60);
+
+fn failed_in(temp: &Path, current: &str, now: SystemTime) -> Option<(String, PathBuf)> {
     let mut out: Option<((u64, u64, u64), String, PathBuf)> = None;
     for e in std::fs::read_dir(temp).ok()?.flatten() {
         let name = e.file_name();
@@ -147,12 +157,21 @@ fn failed_in(temp: &Path, current: &str) -> Option<(String, PathBuf)> {
             continue;
         };
         // No log: the installer has not run, or another blitz is about to
-        // start it. A log that says it worked comes from an install this
-        // older copy of blitz did not do.
+        // start it; once that is long past, it never will. A log that says
+        // it worked comes from an install this older copy of blitz did not
+        // do.
         let log = e.path().join("setup.log");
+        if !log.is_file() {
+            let age = (e.metadata().and_then(|m| m.modified()).ok())
+                .and_then(|t| now.duration_since(t).ok());
+            if age.is_some_and(|a| a > UNSTARTED) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+            continue;
+        }
         let worked = std::fs::read(&log)
             .is_ok_and(|b| String::from_utf8_lossy(&b).contains("Installation process succeeded"));
-        let Some(n) = version(&v).filter(|_| log.is_file() && !worked) else {
+        let Some(n) = version(&v).filter(|_| !worked) else {
             continue;
         };
         if out.as_ref().is_none_or(|o| n > o.0) {
@@ -188,21 +207,28 @@ pub fn install(v: &str) -> Result<(), String> {
     // the check and the start.
     let dir = std::env::temp_dir().join(format!("blitz-update-{v}"));
     let path = dir.join(&name);
-    std::fs::create_dir_all(&dir)
-        .and_then(|()| std::fs::write(&path, &exe))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
     // blitz is gone by the time the installer could fail, so the log is
     // what `failed` finds on the next start.
     let log = format!("/LOG={}", dir.join("setup.log").display());
-    Command::new(&path)
-        .args(INSTALLER_ARGS)
-        .arg(&log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("could not start the installer: {e}"))?;
-    Ok(())
+    let started = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&path, &exe))
+        .map_err(|e| format!("{}: {e}", path.display()))
+        .and_then(|()| {
+            Command::new(&path)
+                .args(INSTALLER_ARGS)
+                .arg(&log)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(drop)
+                .map_err(|e| format!("could not start the installer: {e}"))
+        });
+    // An installer that never ran leaves nothing to report.
+    if started.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    started
 }
 
 /// A silent install that starts blitz again; `.github/blitz.iss` reads
@@ -432,7 +458,7 @@ mod tests {
         }
         // Not a folder: left alone.
         std::fs::write(temp.join("blitz-update-0.0.99"), "").unwrap();
-        let got = failed_in(&temp, current);
+        let got = failed_in(&temp, current, SystemTime::now());
         let mut left: Vec<_> = (std::fs::read_dir(&temp).unwrap().flatten())
             .map(|e| e.file_name().into_string().unwrap())
             .collect();
@@ -497,7 +523,24 @@ mod tests {
         let (got, _, _) = failed_with("nothing", &[], "0.0.2");
         assert_eq!(got, None);
         let missing = std::env::temp_dir().join(format!("blitz-no-temp-{}", std::process::id()));
-        assert_eq!(failed_in(&missing, "0.0.2"), None);
+        assert_eq!(failed_in(&missing, "0.0.2", SystemTime::now()), None);
+    }
+
+    #[test]
+    fn an_update_never_started_goes_in_the_end() {
+        let temp = std::env::temp_dir().join(format!("blitz-unstarted-{}", std::process::id()));
+        let dir = temp.join("blitz-update-0.0.5");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&dir).unwrap();
+        let after = |s| SystemTime::now() + Duration::from_secs(s);
+        // Another blitz may be about to start it.
+        let soon = failed_in(&temp, "0.0.2", after(60));
+        let kept = dir.exists();
+        // One that has not started in ten minutes never will.
+        let later = failed_in(&temp, "0.0.2", after(11 * 60));
+        let gone = !dir.exists();
+        let _ = std::fs::remove_dir_all(&temp);
+        assert_eq!((soon, kept, later, gone), (None, true, None, true));
     }
 
     #[test]
