@@ -4613,24 +4613,11 @@ impl App {
         if self.game.is_some() {
             return;
         }
-        // Ctrl and the wheel change the font size, unless the program takes
-        // the mouse.
-        let mods = mods_now();
-        if (mods.lctrl || mods.rctrl) && self.modes().mouse == MouseMode::Off {
-            let now = Instant::now();
-            if let Some(by) = wheel_font(steps, self.mouse.font_at, now) {
-                self.mouse.font_at = Some(now);
-                self.font_size(by);
-            }
-            return;
-        }
         // The pane under the pointer takes the wheel without taking focus:
         // its history scrolls, or a full-screen program there gets the
         // reports at its own cell. Outside the panes it is the focused one's.
+        let mods = mods_now();
         let (under, side) = self.hit(self.mouse.pos);
-        if side {
-            return;
-        }
         let Some(v) = under.or(self.focus_id()).and_then(|id| self.view(id)) else {
             return;
         };
@@ -4638,8 +4625,16 @@ impl App {
         let focused = Some(id) == self.focus_id();
         let m = lock(&v.pane.term).input_modes();
         let lines = steps as isize * wheel_lines(scroll_lines(), v.grid.1);
-        let shift = mods.lshift || mods.rshift;
-        match wheel_does(&m, shift, v.pane.claude.is_some(), focused) {
+        let cells = self.grid_cell(id, self.mouse.pos).is_some();
+        match wheel_does(&m, &mods, v.pane.claude.is_some(), focused, cells) {
+            Wheel::Font => {
+                let now = Instant::now();
+                if let Some(by) = wheel_font(steps, self.mouse.font_at, now) {
+                    self.mouse.font_at = Some(now);
+                    self.font_size(by);
+                }
+            }
+            _ if side => {}
             Wheel::Report => {
                 let kind = if steps > 0.0 {
                     MouseKind::WheelUp
@@ -5558,6 +5553,8 @@ fn reveal(term: &mut vt::Terminal, m: Found, rows: u16) -> bool {
 /// What the wheel does over a pane whose program is in modes `m`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Wheel {
+    /// The font size, with Ctrl.
+    Font,
     /// Wheel reports to the program, which takes the mouse.
     Report,
     /// Arrow keys, as in xterm's alternateScroll (mode 1007): pagers have
@@ -5568,14 +5565,19 @@ enum Wheel {
     Nothing,
 }
 
-/// What the wheel does over a pane in modes `m`; `shift` keeps it from a
-/// program that takes the mouse. Arrows go only to a full-screen program
-/// that did not turn them off, in the `focused` pane, where the user
-/// types, and never to Claude Code (`claude`), where they walk its prompt
-/// history and replace what was typed.
-fn wheel_does(m: &InputModes, shift: bool, claude: bool, focused: bool) -> Wheel {
-    if m.mouse != MouseMode::Off && !shift {
-        Wheel::Report
+/// What the wheel does over a pane in modes `m`, with modifiers `mods`.
+/// Ctrl changes the font size, unless the program takes the mouse; Shift
+/// keeps it from such a program, which hears of it only over its own
+/// `cells`. Arrows go only to a full-screen program that did not turn
+/// them off, in the `focused` pane, where the user types, and never to
+/// Claude Code (`claude`), where they walk its prompt history and replace
+/// what was typed.
+fn wheel_does(m: &InputModes, mods: &Mods, claude: bool, focused: bool, cells: bool) -> Wheel {
+    let program = m.mouse != MouseMode::Off;
+    if (mods.lctrl || mods.rctrl) && !program {
+        Wheel::Font
+    } else if program && !(mods.lshift || mods.rshift) {
+        if cells { Wheel::Report } else { Wheel::Nothing }
     } else if !m.alt_screen {
         Wheel::Scroll
     } else if m.alt_scroll && !claude && focused {
@@ -7446,7 +7448,7 @@ mod tests {
             mouse: MouseMode::Click,
             ..asked
         };
-        let does = |m: &InputModes, shift, claude| wheel_does(m, shift, claude, true);
+        let does = |m: &InputModes, shift, claude| wheel_does(m, &held(shift), claude, true, true);
         assert_eq!(does(&InputModes::default(), false, false), Wheel::Scroll);
         assert_eq!(does(&alt, false, false), Wheel::Nothing, "turned off");
         assert_eq!(does(&asked, false, false), Wheel::Arrows);
@@ -7480,11 +7482,41 @@ mod tests {
             mouse: MouseMode::Drag,
             ..asked
         };
-        assert_eq!(wheel_does(&mouse, false, true, false), Wheel::Report);
-        assert_eq!(wheel_does(&asked, false, false, false), Wheel::Nothing);
-        assert_eq!(wheel_does(&mouse, true, false, false), Wheel::Nothing);
+        let does = |m: &InputModes, shift, claude| wheel_does(m, &held(shift), claude, false, true);
+        assert_eq!(does(&mouse, false, true), Wheel::Report);
+        assert_eq!(does(&asked, false, false), Wheel::Nothing);
+        assert_eq!(does(&mouse, true, false), Wheel::Nothing);
         let main = InputModes::default();
-        assert_eq!(wheel_does(&main, false, false, false), Wheel::Scroll);
+        assert_eq!(does(&main, false, false), Wheel::Scroll);
+        // Not over its header or padding.
+        let none = Mods::default();
+        assert_eq!(
+            wheel_does(&mouse, &none, false, false, false),
+            Wheel::Nothing
+        );
+    }
+
+    /// Shift held, or nothing.
+    fn held(shift: bool) -> Mods {
+        Mods {
+            lshift: shift,
+            ..Mods::default()
+        }
+    }
+
+    #[test]
+    fn app_ctrl_and_the_wheel_size_the_font_unless_the_pane_under_it_takes_the_mouse() {
+        let ctrl = Mods {
+            lctrl: true,
+            ..Mods::default()
+        };
+        let mouse = InputModes {
+            mouse: MouseMode::Click,
+            ..InputModes::default()
+        };
+        let does = |m: &InputModes| wheel_does(m, &ctrl, false, false, true);
+        assert_eq!(does(&InputModes::default()), Wheel::Font);
+        assert_eq!(does(&mouse), Wheel::Report);
     }
 
     #[test]
