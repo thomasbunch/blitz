@@ -800,13 +800,96 @@ fn mouse_sgr_reports() {
         s("\x1b[<34;2;2M")
     );
 
-    // Nothing without tracking, or without SGR encoding.
+    // Nothing without tracking, or without SGR encoding: the X10 byte form
+    // is not implemented.
     assert_eq!(enc_mouse(mouse(Press, 0, 0, 0, ""), &tracking(Off)), None);
-    let x10 = InputModes {
+    let no_sgr = InputModes {
         mouse_sgr: false,
         ..click
     };
-    assert_eq!(enc_mouse(mouse(Press, 0, 0, 0, ""), &x10), None);
+    assert_eq!(enc_mouse(mouse(Press, 0, 0, 0, ""), &no_sgr), None);
+}
+
+#[test]
+fn mouse_sgr_modifiers_buttons_and_edges() {
+    use vt::MouseKind::*;
+    use vt::MouseMode::*;
+    let s = |v: &str| Some(v.to_string());
+    let (click, drag, any) = (tracking(Click), tracking(Drag), tracking(Any));
+    // Shift 4, Alt 8, Ctrl 16, on every kind of event.
+    assert_eq!(
+        enc_mouse(mouse(Release, 2, 0, 0, "c"), &click),
+        s("\x1b[<18;1;1m")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Move, 1, 0, 0, "s"), &drag),
+        s("\x1b[<37;1;1M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Press, 0, 0, 0, "g"), &click),
+        s("\x1b[<8;1;1M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(WheelUp, 0, 0, 0, "s"), &click),
+        s("\x1b[<68;1;1M")
+    );
+    let mut right = mouse(Press, 0, 0, 0, "");
+    right.mods = Mods {
+        rshift: true,
+        rctrl: true,
+        ..Mods::default()
+    };
+    assert_eq!(enc_mouse(right, &click), s("\x1b[<20;1;1M"));
+    // Super is not reported.
+    assert_eq!(
+        enc_mouse(mouse(Press, 0, 0, 0, "w"), &click),
+        s("\x1b[<0;1;1M")
+    );
+    // Drags with any button; motion without one only in mode 1003.
+    assert_eq!(
+        enc_mouse(mouse(Move, 1, 2, 3, ""), &drag),
+        s("\x1b[<33;3;4M")
+    );
+    assert_eq!(
+        enc_mouse(mouse(Move, 2, 2, 3, ""), &drag),
+        s("\x1b[<34;3;4M")
+    );
+    assert_eq!(enc_mouse(mouse(Move, 4, 0, 0, ""), &any), None);
+    assert_eq!(enc_mouse(mouse(Release, 3, 0, 0, ""), &click), None);
+    // SGR has no coordinate limit.
+    assert_eq!(
+        enc_mouse(mouse(Press, 0, u16::MAX, u16::MAX, ""), &click),
+        s("\x1b[<0;65536;65536M")
+    );
+}
+
+/// A move the modes did not ask for is not a report, so it does not stop
+/// the next move to the same cell once they do.
+#[test]
+fn mouse_motion_not_sent_does_not_count() {
+    use vt::MouseKind::*;
+    let mut tracker = vt::keys::MouseTracker::default();
+    let mut out = Vec::new();
+    assert!(!tracker.encode(
+        mouse(Move, 3, 5, 5, ""),
+        &tracking(vt::MouseMode::Drag),
+        &mut out
+    ));
+    assert!(tracker.encode(
+        mouse(Move, 3, 5, 5, ""),
+        &tracking(vt::MouseMode::Any),
+        &mut out
+    ));
+    assert!(!tracker.encode(mouse(Press, 0, 6, 6, ""), &LEGACY, &mut out));
+    assert!(tracker.encode(
+        mouse(Move, 3, 6, 6, ""),
+        &tracking(vt::MouseMode::Any),
+        &mut out
+    ));
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "\x1b[<35;6;6M\x1b[<35;7;7M"
+    );
 }
 
 #[test]

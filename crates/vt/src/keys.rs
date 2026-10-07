@@ -565,8 +565,11 @@ impl MouseTracker {
         if ev.kind == MouseKind::Move && self.last == cell {
             return false;
         }
-        self.last = cell;
-        encode_mouse(ev, m, out)
+        let sent = encode_mouse(ev, m, out);
+        if sent {
+            self.last = cell;
+        }
+        sent
     }
 }
 
