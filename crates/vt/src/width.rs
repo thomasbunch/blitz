@@ -81,10 +81,11 @@ pub fn is_ignorable(c: char) -> bool {
 
 /// Columns a grapheme cluster occupies.
 ///
-/// This is the width of its first code point, raised to 2 when an emoji
+/// This is the width of its first code point that takes a column (format
+/// characters such as U+0600 can be prepended), raised to 2 when an emoji
 /// base is followed by VS16 or a skin-tone modifier, or starts a ZWJ
-/// sequence. Returns 0 for an empty cluster or one that starts with a
-/// zero-width code point (a lone combining mark, for example).
+/// sequence with another pictograph. Returns 0 for an empty cluster or one
+/// of zero-width code points only (a lone combining mark, for example).
 pub fn cluster_width(s: &str) -> u8 {
     chars_width(s.chars(), false)
 }
@@ -92,13 +93,12 @@ pub fn cluster_width(s: &str) -> u8 {
 /// [`cluster_width`] over a cluster held as code points, with East Asian
 /// ambiguous characters counted as wide when `ambiguous_wide` is set.
 pub fn chars_width(cluster: impl IntoIterator<Item = char>, ambiguous_wide: bool) -> u8 {
-    let mut cps = cluster.into_iter();
+    let mut cps = (cluster.into_iter()).skip_while(|&c| props(c) & WIDTH_MASK == W_ZERO);
     let Some(first) = cps.next() else {
         return 0;
     };
     let p = props(first);
     let w = match p & WIDTH_MASK {
-        W_ZERO => return 0,
         W_WIDE => return 2,
         W_AMBIGUOUS if ambiguous_wide => return 2,
         _ => 1,
@@ -106,11 +106,16 @@ pub fn chars_width(cluster: impl IntoIterator<Item = char>, ambiguous_wide: bool
     if p & (EMOJI | EXT_PICT) == 0 {
         return w;
     }
-    let widens = |c: char| {
-        (p & EMOJI != 0 && (c == VS16 || is_emoji_modifier(c)))
-            || (p & EXT_PICT != 0 && c == '\u{200D}')
-    };
-    if cps.any(widens) { 2 } else { w }
+    let mut joined = false;
+    for c in cps {
+        if p & EMOJI != 0 && (c == VS16 || is_emoji_modifier(c))
+            || joined && p & EXT_PICT != 0 && props(c) & EXT_PICT != 0
+        {
+            return 2;
+        }
+        joined = c == '\u{200D}';
+    }
+    w
 }
 
 /// Whether `c` continues the grapheme cluster that starts with `first`,
@@ -220,6 +225,48 @@ mod tests {
         assert_eq!(char_width('中'), 2);
         assert_eq!(char_width('★'), 1);
         assert_eq!(char_width('\u{1F3FB}'), 2, "modifier on its own");
+    }
+
+    #[test]
+    fn width_prepended_format_characters_take_no_column() {
+        assert_eq!(cluster_width("\u{0600}1"), 1, "number sign before a digit");
+        assert_eq!(cluster_width("\u{0600}\u{0600}\u{0661}"), 1);
+        assert_eq!(cluster_width("\u{0600}中"), 2);
+        assert_eq!(cluster_width("\u{0600}"), 0, "on its own");
+        assert_eq!(cluster_width("\u{0301}\u{0302}"), 0, "marks only");
+        // A spacing prepend is a letter and keeps its column.
+        assert_eq!(cluster_width("\u{0D4E}\u{0D15}"), 1);
+    }
+
+    #[test]
+    fn width_joiner_widens_only_a_pictograph_sequence() {
+        // The base is narrow on its own, so this goes past the early
+        // return for wide bases.
+        assert_eq!(cluster_width("\u{2764}\u{200D}\u{1F525}"), 2);
+        assert_eq!(cluster_width("\u{A9}\u{200D}\u{2764}"), 2);
+        assert_eq!(
+            cluster_width("\u{A9}\u{200D}"),
+            1,
+            "nothing after the joiner"
+        );
+        assert_eq!(cluster_width("\u{A9}\u{200D}\u{0301}"), 1);
+        assert_eq!(cluster_width("#\u{200D}\u{2764}"), 1, "not a pictograph");
+    }
+
+    #[test]
+    fn width_ambiguous_option_leaves_zero_width_and_narrow_alone() {
+        assert_eq!(chars_width(['\u{300}'], true), 0, "ambiguous but a mark");
+        assert_eq!(
+            chars_width(['\u{FE0F}'], true),
+            0,
+            "ambiguous but a selector"
+        );
+        assert_eq!(chars_width(['\u{AD}'], true), 1, "soft hyphen stays narrow");
+        assert_eq!(chars_width(['\u{E000}'], false), 1, "private use");
+        assert_eq!(chars_width(['\u{E000}'], true), 2);
+        assert_eq!(chars_width(['\u{FFFD}'], true), 2);
+        assert_eq!(chars_width(['\u{AE}'], true), 2);
+        assert_eq!(chars_width(['\u{AE}', '\u{FE0F}'], false), 2);
     }
 
     #[test]
