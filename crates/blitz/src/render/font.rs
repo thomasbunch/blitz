@@ -117,6 +117,13 @@ pub fn monospace_families() -> Vec<String> {
     list().unwrap_or_default()
 }
 
+/// The row strikethrough starts on, `up` pixels above the baseline, kept
+/// in the cell above the baseline. A broken font at a tiny size can put
+/// the baseline at row 0, which leaves only row 0.
+fn strike_row(baseline: i32, up: f32) -> i32 {
+    (baseline - up.round() as i32).min(baseline - 1).max(0)
+}
+
 fn glyph_index(face: &IDWriteFontFace, c: char) -> u16 {
     let cp = c as u32;
     let mut g = 0u16;
@@ -178,7 +185,7 @@ impl Font {
                 0 => f32::from(m.xHeight) * scale / 2.0 + strike_h as f32 / 2.0,
                 p => f32::from(p) * scale,
             };
-            let strike_y = (baseline - strike_up.round() as i32).clamp(0, baseline - 1);
+            let strike_y = strike_row(baseline, strike_up);
             let (gamma, contrast) = factory
                 .CreateRenderingParams()
                 .and_then(|p| p.cast::<IDWriteRenderingParams1>())
@@ -501,6 +508,16 @@ mod tests {
 
     fn ink(r: &Raster) -> u32 {
         r.alpha.iter().map(|&a| u32::from(a)).sum()
+    }
+
+    #[test]
+    fn strikethrough_stays_above_the_baseline() {
+        assert_eq!(strike_row(12, 4.0), 8);
+        assert_eq!(strike_row(12, 30.0), 0, "above the cell");
+        assert_eq!(strike_row(12, -3.0), 11, "below the baseline");
+        // A baseline at the very top, from a broken font at 4 pt.
+        assert_eq!(strike_row(0, 2.0), 0);
+        assert_eq!(strike_row(-1, 0.0), 0);
     }
 
     #[test]
