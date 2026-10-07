@@ -272,7 +272,10 @@ pub fn run(args: &[String]) -> Result<i32, String> {
             return Ok(0);
         }
     }
-    catch_crashes();
+    // A test run's panic is the test's to report, not the next start's.
+    if !args.scripted() {
+        catch_crashes();
+    }
     // Loading the graphics driver is most of the time to the first
     // frame; it runs while the window is made.
     let gpu = std::thread::spawn(|| Gpu::new(false));
