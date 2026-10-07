@@ -40,7 +40,9 @@ use winit::platform::windows::{
     EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowId};
+use winit::window::{
+    CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowAttributes, WindowId,
+};
 
 use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev, claude_title, exit_text};
@@ -911,6 +913,8 @@ struct App {
     persist: bool,
     /// The window is hidden until its first frame, or until this time.
     hidden_until: Option<Instant>,
+    /// The window shows maximized, as the saved session left it.
+    maximize: bool,
     /// The session as last saved.
     saved: Option<session::State>,
     /// When a changed layout is saved, unless it changes back first.
@@ -1164,6 +1168,7 @@ impl App {
             capture_then_exit: false,
             persist,
             hidden_until: None,
+            maximize: false,
             saved: None,
             save_after: None,
             gfx_retry: None,
@@ -1214,10 +1219,8 @@ impl App {
         {
             let g = on_screen(el, g);
             self.placed = g;
-            attrs = attrs
-                .with_position(PhysicalPosition::new(g.x, g.y))
-                .with_inner_size(PhysicalSize::new(g.w, g.h))
-                .with_maximized(g.maximized);
+            self.maximize = g.maximized;
+            attrs = placed_at(attrs, g);
         }
         let window = el.create_window(attrs).map_err(|e| e.to_string())?;
         window.set_ime_allowed(true);
@@ -4021,12 +4024,17 @@ impl App {
         self.request_redraw();
     }
 
-    /// Shows the hidden window when [`shows`] says so.
+    /// Shows the hidden window when [`shows`] says so. One restored
+    /// maximized shows its first frame, then maximizes; the frame at the
+    /// new size follows.
     fn reveal(&mut self, presented: bool) {
         if shows(self.hidden_until, presented, Instant::now()) {
             self.hidden_until = None;
             if let Some(w) = &self.window {
                 w.set_visible(true);
+                if self.maximize {
+                    w.set_maximized(true);
+                }
             }
         }
     }
@@ -4677,6 +4685,15 @@ fn placement(was: Geometry, now: Geometry, minimized: bool, fullscreen: bool) ->
         y: mid(now.y, now.h, was.h),
         ..was
     }
+}
+
+/// `attrs` for a window at `g`, the place it is restored to. Not
+/// maximized yet: winit shows a window as it maximizes it, which would be
+/// before its first frame, so [`App::reveal`] does.
+fn placed_at(attrs: WindowAttributes, g: Geometry) -> WindowAttributes {
+    attrs
+        .with_position(PhysicalPosition::new(g.x, g.y))
+        .with_inner_size(PhysicalSize::new(g.w, g.h))
 }
 
 /// `g`, moved onto the primary monitor when no monitor shows enough of it.
@@ -6333,6 +6350,22 @@ mod tests {
             placement(wide, now, false, false),
             at(-8, -8, u32::MAX, u32::MAX, true)
         );
+    }
+
+    /// A window restored maximized is made at its restored place and
+    /// size, hidden, and is maximized only as it shows.
+    #[test]
+    fn app_a_maximized_window_is_not_made_maximized() {
+        let g = Geometry {
+            x: 10,
+            y: 20,
+            w: 800,
+            h: 600,
+            maximized: true,
+        };
+        let attrs = placed_at(Window::default_attributes().with_visible(false), g);
+        assert!(!attrs.maximized && !attrs.visible);
+        assert_eq!(attrs.inner_size, Some(PhysicalSize::new(800, 600).into()));
     }
 
     /// The smallest window still has room for the rail or the sidebar and
