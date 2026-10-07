@@ -2467,8 +2467,7 @@ impl App {
             self.update = None;
             self.at_close = kept_at_close(self.at_close.take(), self.updating.is_some());
         }
-        let skipped = c.ignored != self.config.ignored;
-
+        let skipped = c.skips_other_lines(&self.config);
         self.config = c;
         if jump {
             self.global_jump();

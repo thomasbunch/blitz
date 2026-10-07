@@ -369,6 +369,14 @@ impl Config {
         })
     }
 
+    /// Whether `other` skips lines this one does not, or the other way
+    /// round. Only their text counts: a save from the settings panel can
+    /// move a skipped line without changing it.
+    pub fn skips_other_lines(&self, other: &Config) -> bool {
+        let text = |c: &Config| c.ignored.iter().map(|l| l.1.clone()).collect::<Vec<_>>();
+        text(self) != text(other)
+    }
+
     /// Setting `key` as `config.toml` writes it: `true`, `11` or
     /// `"Consolas"`. Empty for an unknown key.
     pub fn get(&self, key: &str) -> String {
@@ -843,6 +851,33 @@ keybind = ctrl+shift+n=text:
         assert_eq!(c.texts[0], b"claude\r", "replaced, but kept");
         assert_eq!(c.texts[1], b"a=b # not a comment\x1b");
         assert_eq!(c.texts[2], b"git status\r");
+    }
+
+    #[test]
+    fn a_skipped_line_moved_by_a_save_is_no_news() {
+        let old = Config::parse(
+            "flash = false
+[colors]
+",
+        );
+        // The panel adds a setting before the first table.
+        let saved = Config::parse(&with_value(
+            "flash = false
+[colors]
+",
+            "font_size",
+            Some("12"),
+        ));
+        assert_ne!(saved.ignored, old.ignored, "the line moved");
+        assert!(!saved.skips_other_lines(&old));
+        assert!(
+            Config::parse(
+                "[x]
+"
+            )
+            .skips_other_lines(&old)
+        );
+        assert!(Config::default().skips_other_lines(&old));
     }
 
     #[test]
