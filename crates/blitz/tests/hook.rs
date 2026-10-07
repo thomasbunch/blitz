@@ -17,8 +17,18 @@ const TOKEN: &str = "5eed0123456789abcdef0123456789ab";
 /// A Claude Code session id, which every hook payload carries.
 const SESSION: &str = "0b8f6a3e-1c2d-4e5f-9a7b-3c4d5e6f7a8b";
 
-/// Runs `blitz-hook claude` and returns (stdout, exit code).
-fn hook(payload: &str, token: Option<&str>) -> (String, i32) {
+/// Runs `blitz-hook claude` and returns (stdout, exit code). Like Claude
+/// Code, it writes the whole payload, which must not fail.
+fn hook(payload: impl AsRef<[u8]>, token: Option<&str>) -> (String, i32) {
+    let (out, code, wrote) = run_hook(payload.as_ref(), token);
+    if let Err(e) = wrote {
+        panic!("writing the payload: {e}");
+    }
+    (out, code)
+}
+
+/// Runs `blitz-hook claude`: (stdout, exit code, how writing stdin went).
+fn run_hook(payload: &[u8], token: Option<&str>) -> (String, i32, std::io::Result<()>) {
     let mut cmd = Command::new(HOOK);
     cmd.arg("claude")
         .stdin(Stdio::piped())
@@ -29,8 +39,7 @@ fn hook(payload: &str, token: Option<&str>) -> (String, i32) {
         None => cmd.env_remove("BLITZ_PANE_TOKEN"),
     };
     let mut child = cmd.spawn().expect("spawn blitz-hook");
-    // An inert hook may exit without reading; a broken pipe is fine then.
-    let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
+    let wrote = child.stdin.take().unwrap().write_all(payload);
     let out = child.wait_with_output().expect("wait for blitz-hook");
     assert!(
         out.stderr.is_empty(),
@@ -38,7 +47,7 @@ fn hook(payload: &str, token: Option<&str>) -> (String, i32) {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout is UTF-8");
-    (stdout, out.status.code().unwrap_or(-1))
+    (stdout, out.status.code().unwrap_or(-1), wrote)
 }
 
 fn notify(state: &str, msg: &str) -> String {
@@ -191,6 +200,33 @@ fn hook_is_inert_outside_a_pane() {
     // A token that could end the sequence early is not used.
     assert_eq!(hook(payload, Some("a;b")), (String::new(), 0));
     assert_eq!(hook(payload, Some("a\x07b")), (String::new(), 0));
+    // Claude Code in another terminal still writes its whole payload,
+    // more than a pipe holds; the hook reads it rather than breaking the
+    // pipe under the writer.
+    let big = format!(
+        r#"{{"hook_event_name":"Stop","last_assistant_message":"{}"}}"#,
+        "x".repeat(1 << 20)
+    );
+    assert_eq!(hook(&big, None), (String::new(), 0));
+}
+
+#[test]
+fn hook_reads_payloads_that_are_not_utf8() {
+    let payload = b"{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"a\xffb\"}";
+    assert_eq!(
+        hook(payload, Some(TOKEN)),
+        (notify("done", "a\u{FFFD}b"), 0)
+    );
+}
+
+/// A payload past the 64 MiB cap is cut, does not parse and reports
+/// nothing; the hook still exits at once with 0.
+#[test]
+fn hook_drops_a_payload_over_the_cap() {
+    let reply = "x".repeat(64 << 20);
+    let payload = format!(r#"{{"hook_event_name":"Stop","last_assistant_message":"{reply}"}}"#);
+    let (out, code, _) = run_hook(payload.as_bytes(), Some(TOKEN));
+    assert_eq!((out, code), (String::new(), 0));
 }
 
 #[test]

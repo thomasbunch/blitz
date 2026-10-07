@@ -28,9 +28,14 @@ pub fn run() -> i32 {
     let token = std::env::var("BLITZ_PANE_TOKEN").unwrap_or_default();
     // It goes into the sequence as is, so nothing in it may end the title.
     let in_pane = !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric());
-    if claude && in_pane {
+    if claude {
+        // Read even outside a pane: Claude Code writes the whole payload,
+        // and exiting first would break the pipe under it.
         let mut input = Vec::new();
         let _ = std::io::stdin().take(MAX_INPUT).read_to_end(&mut input);
+        if !in_pane {
+            return 0;
+        }
         if let Some(out) = claude_output(&token, &String::from_utf8_lossy(&input)) {
             let mut stdout = std::io::stdout().lock();
             let _ = stdout
@@ -42,9 +47,9 @@ pub fn run() -> i32 {
 }
 
 /// The hook's stdout for one Claude Code payload, or `None` when the event
-/// is not one blitz reports.
+/// is not one blitz reports. A byte-order mark in front is skipped.
 pub fn claude_output(token: &str, payload: &str) -> Option<String> {
-    let ev = Json::parse(payload)?;
+    let ev = Json::parse(payload.strip_prefix('\u{feff}').unwrap_or(payload))?;
     let (state, msg) = claude_state(&ev)?;
     let session = ev
         .get("session_id")
@@ -75,9 +80,9 @@ pub fn claude_state(ev: &Json) -> Option<(&'static str, String)> {
                 "" => field(input, "file_path"),
                 c => c,
             };
-            let msg = match detail {
-                "" => tool.to_owned(),
-                d => format!("{tool}: {d}"),
+            let msg = match (tool, detail) {
+                (t, "") | ("", t) => t.to_owned(),
+                (t, d) => format!("{t}: {d}"),
             };
             ("needs-you", msg)
         }
@@ -357,7 +362,8 @@ pub enum Json {
     Obj(Vec<(String, Json)>),
 }
 
-/// Deeper input is rejected rather than risking the stack.
+/// Most arrays and objects nested in one another; deeper input is rejected
+/// rather than risking the stack.
 const MAX_DEPTH: usize = 128;
 
 impl Json {
@@ -413,12 +419,14 @@ impl Parser<'_> {
         hit
     }
 
+    /// `depth` is the number of arrays and objects around the value.
     fn value(&mut self, depth: usize) -> Option<Json> {
-        if depth > MAX_DEPTH {
+        self.ws();
+        let open = self.peek()?;
+        if matches!(open, b'{' | b'[') && depth >= MAX_DEPTH {
             return None;
         }
-        self.ws();
-        match self.peek()? {
+        match open {
             b'{' => {
                 self.i += 1;
                 let mut m = Vec::new();
@@ -474,15 +482,43 @@ impl Parser<'_> {
         })
     }
 
+    /// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`, as JSON has
+    /// it; Rust's float parser alone also takes `+1`, `01` and `.5`.
     fn number(&mut self) -> Option<Json> {
         let start = self.i;
-        while matches!(
-            self.peek(),
-            Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-        ) {
+        if self.peek() == Some(b'-') {
             self.i += 1;
         }
+        if self.peek() == Some(b'0') {
+            self.i += 1;
+        } else if !self.digits() {
+            return None;
+        }
+        if self.peek() == Some(b'.') {
+            self.i += 1;
+            if !self.digits() {
+                return None;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            if !self.digits() {
+                return None;
+            }
+        }
         self.s[start..self.i].parse().ok().map(Json::Num)
+    }
+
+    /// Skips ASCII digits; true if there was at least one.
+    fn digits(&mut self) -> bool {
+        let start = self.i;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        self.i > start
     }
 
     /// Called on the opening quote.
@@ -585,6 +621,14 @@ mod tests {
                 Some(("needs-you", "mcp__x__y")),
             ),
             (
+                r#"{"hook_event_name":"PermissionRequest","tool_input":{"command":"git push"}}"#,
+                Some(("needs-you", "git push")),
+            ),
+            (
+                r#"{"hook_event_name":"PermissionRequest"}"#,
+                Some(("needs-you", "")),
+            ),
+            (
                 r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which one?"}]}}"#,
                 Some(("needs-you", "Which one?")),
             ),
@@ -612,6 +656,16 @@ mod tests {
                 r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting"}"#,
                 None,
             ),
+            // The settings only run the hook for the types it reports; a
+            // notification without a type must have matched one.
+            (
+                r#"{"hook_event_name":"Notification","message":"m"}"#,
+                Some(("needs-you", "m")),
+            ),
+            (
+                r#"{"hook_event_name":"Notification","notification_type":"auth_success","message":"m"}"#,
+                None,
+            ),
             (
                 r#"{"hook_event_name":"Stop","last_assistant_message":"\n  Done: tests pass.\nMore detail."}"#,
                 Some(("done", "Done: tests pass.")),
@@ -632,6 +686,11 @@ mod tests {
             (
                 r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#,
                 Some(("error", "rate_limit")),
+            ),
+            // Not a string: still an error, without a message.
+            (
+                r#"{"hook_event_name":"StopFailure","error":{"type":"x"}}"#,
+                Some(("error", "")),
             ),
             (
                 r#"{"hook_event_name":"SessionEnd","reason":"clear"}"#,
@@ -717,6 +776,19 @@ mod tests {
             Some(format!("\x1b]777;notify;blitz:{TOKEN}:idle;\x07").as_str())
         );
         assert_eq!(claude_output(TOKEN, "not json"), None);
+    }
+
+    /// Payloads as other writers may send them: pretty-printed with CRLF
+    /// line ends, or behind a byte-order mark.
+    #[test]
+    fn output_for_pretty_and_bom_payloads() {
+        let want = Some(format!(
+            "{{\"terminalSequence\":\"\\u001b]777;notify;blitz:{TOKEN}:done;ok\\u0007\"}}\n"
+        ));
+        let pretty = "{\r\n  \"hook_event_name\": \"Stop\",\r\n  \"last_assistant_message\": \"ok\"\r\n}\r\n";
+        assert_eq!(claude_output(TOKEN, pretty), want);
+        assert_eq!(claude_output(TOKEN, &format!("\u{feff}{pretty}")), want);
+        assert_eq!(claude_output(TOKEN, "\u{feff}"), None);
     }
 
     #[test]
@@ -822,6 +894,44 @@ mod tests {
         );
     }
 
+    /// A high surrogate not followed by a low one stands alone, and what
+    /// follows is read on its own.
+    #[test]
+    fn json_lone_surrogates() {
+        for (lit, want) in [
+            (r#""\ud83dA""#, "\u{FFFD}A"),
+            (r#""\ud83d😀""#, "\u{FFFD}\u{1F600}"),
+            (r#""\ude00\ud83d""#, "\u{FFFD}\u{FFFD}"),
+            (r#""😀""#, "\u{1F600}"),
+        ] {
+            assert_eq!(Json::parse(lit).unwrap().as_str(), Some(want), "{lit}");
+        }
+        assert_eq!(Json::parse(r#""\ud83d\u00""#), None);
+    }
+
+    #[test]
+    fn json_numbers_follow_the_grammar() {
+        for (lit, want) in [
+            ("0", 0.0),
+            ("-0", -0.0),
+            ("10", 10.0),
+            ("1.5", 1.5),
+            ("-2.5e3", -2500.0),
+            ("1E2", 100.0),
+            ("1e-2", 0.01),
+            ("1e+2", 100.0),
+            ("0.25", 0.25),
+        ] {
+            assert_eq!(Json::parse(lit), Some(Json::Num(want)), "{lit}");
+        }
+        for bad in [
+            "+1", "01", "-01", ".5", "1.", "1.e5", "1e", "1e+", "-", "--1", "1.2.3", "1ee2",
+            "0x10", "[01]", "[.5]", "Infinity", "NaN",
+        ] {
+            assert_eq!(Json::parse(bad), None, "{bad:?}");
+        }
+    }
+
     #[test]
     fn json_last_duplicate_key_wins() {
         let v = Json::parse(r#"{"k": 1, "k": 2}"#).unwrap();
@@ -856,8 +966,15 @@ mod tests {
 
     #[test]
     fn json_depth_is_capped() {
-        let ok = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
-        assert!(Json::parse(&ok).is_some());
+        let arrays = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+        let objects = |n: usize| format!("{}1{}", r#"{"a":"#.repeat(n), "}".repeat(n));
+        assert!(Json::parse(&arrays(MAX_DEPTH)).is_some());
+        assert_eq!(Json::parse(&arrays(MAX_DEPTH + 1)), None);
+        assert!(Json::parse(&objects(MAX_DEPTH)).is_some());
+        assert_eq!(Json::parse(&objects(MAX_DEPTH + 1)), None);
+        let empty = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        assert!(Json::parse(&empty(MAX_DEPTH)).is_some());
+        assert_eq!(Json::parse(&empty(MAX_DEPTH + 1)), None);
         let deep = "[".repeat(100_000);
         assert_eq!(Json::parse(&deep), None);
     }
