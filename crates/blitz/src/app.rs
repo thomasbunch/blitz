@@ -2125,7 +2125,7 @@ impl App {
         let mut list: Vec<chrome::Session> = (self.views.iter())
             .map(|v| {
                 let p = &v.pane;
-                let claude = p.claude_title.is_some();
+                let claude = titled_by_claude(p.claude_title, p.hooked, p.claude.as_deref());
                 let (name, msg) = label(p.named.as_deref(), &p.name, &p.title, claude, &p.msg);
                 chrome::Session {
                     id: p.id,
@@ -4331,6 +4331,14 @@ fn new_tab(win: &mut layout::Window, id: PaneId) -> bool {
     true
 }
 
+/// Whether a pane's title names its session: it has Claude Code's mark,
+/// and Claude Code is known to run there, as its hooks with the pane's
+/// token or blitz's resume say. Any program can print the mark, and
+/// would then go by a name it picked, perhaps one like another session's.
+fn titled_by_claude(mark: Option<bool>, hooked: bool, session: Option<&str>) -> bool {
+    mark.is_some() && (hooked || session.is_some())
+}
+
 /// What the sidebar calls a session, and the message under its name: the
 /// name the user gave it, else for Claude Code the task its title names,
 /// which Claude's /rename changes too (`claude` says the title has its
@@ -5550,6 +5558,15 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         assert_eq!(got, home);
         assert_eq!(start_dir(""), home);
+    }
+
+    #[test]
+    fn app_only_claude_code_names_a_session_by_its_title() {
+        let id = Some("3f2a0c1e-0000-4000-8000-00000000abcd");
+        assert!(titled_by_claude(Some(true), true, None));
+        assert!(titled_by_claude(Some(false), false, id));
+        assert!(!titled_by_claude(Some(false), false, None), "any program");
+        assert!(!titled_by_claude(None, true, id), "no mark");
     }
 
     #[test]
