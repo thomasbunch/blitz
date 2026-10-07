@@ -2231,16 +2231,29 @@ impl App {
 
     /// Says dimly in pane `id`, for a while, that Claude Code's hooks are
     /// not reporting, or are `older` than this blitz, unless a hint about
-    /// them was shown already.
+    /// them was shown already. One a question keeps out comes at the next
+    /// title or hook.
     fn hooks_hint(&mut self, id: PaneId, older: bool) {
-        if std::mem::replace(&mut self.hooks_hinted, true) {
+        if self.hooks_hinted {
             return;
         }
         let palette = keymap::keys_for(Action::Palette, &self.config.keys);
         let text = hooks_hint_text(older, palette);
-        self.set_notice(id, text, Some(Instant::now() + HINT), true);
+        self.hooks_hinted = self.hint(id, text, Instant::now() + HINT);
     }
 
+    /// Says `text` dimly in pane `id`, which nobody asked for, until
+    /// `until`, unless a question or an error waits there. Whether it did.
+    fn hint(&mut self, id: PaneId, text: impl Into<String>, until: Instant) -> bool {
+        let shown =
+            (self.view_mut(id)).is_some_and(|v| hint_into(&mut v.notice, text.into(), until));
+        self.request_redraw();
+        shown
+    }
+
+    /// Shows `text` in pane `id` in place of any notice there, as what a
+    /// user's action led to does; a hint nobody asked for goes through
+    /// [`App::hint`].
     fn set_notice(
         &mut self,
         id: PaneId,
@@ -2248,9 +2261,7 @@ impl App {
         until: Option<Instant>,
         dim: bool,
     ) {
-        if let Some(v) = self.view_mut(id)
-            && (!dim || hint_fits(v.notice.as_ref()))
-        {
+        if let Some(v) = self.view_mut(id) {
             v.notice = Some(Notice {
                 text: text.into(),
                 until,
@@ -2852,7 +2863,7 @@ impl App {
                     if let Some(text) = crate::pty::inbox_notice() {
                         self.counters.inbox = true;
                         eprintln!("blitz: {text}");
-                        self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                        self.hint(id, text, Instant::now() + NOTICE);
                     }
                 }
                 if shown {
@@ -4253,11 +4264,20 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
     out
 }
 
-/// Draws a notice over the bottom row of the pane whose grid is at `at`.
-/// A passing hint shows only where no question or error waits, which
-/// it would take the place of.
-fn hint_fits(n: Option<&Notice>) -> bool {
-    n.is_none_or(|n| n.ask == Ask::Nothing)
+/// Puts a hint nobody asked for in a pane's notice `slot`, dim until
+/// `until`, unless a question or an error waits there, which it would
+/// take the place of. Whether it did.
+fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
+    let fits = slot.as_ref().is_none_or(|n| n.ask == Ask::Nothing);
+    if fits {
+        *slot = Some(Notice {
+            text,
+            until: Some(until),
+            dim: true,
+            ask: Ask::Nothing,
+        });
+    }
+    fits
 }
 
 /// The bottom row of a pane, and whether it is dim: its notice, else for
@@ -4274,6 +4294,7 @@ fn notice_line(n: Option<&Notice>, exit: Option<u32>) -> Option<(Cow<'_, str>, b
     }
 }
 
+/// Draws a notice over the bottom row of the pane whose grid is at `at`.
 fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text: &str, dim: bool) {
     let (_, ch) = r.cell();
     let mut s = text_snapshot(&format!(" {text}"), grid.0, 1, pal);
@@ -6014,8 +6035,9 @@ mod tests {
         }
     }
 
-    /// A passing hint leaves a question or an error where it is, and an
-    /// exited program's line comes back once a notice over it goes.
+    /// A passing hint leaves a question or an error where it is, and says
+    /// so, to be tried again; an exited program's line comes back once a
+    /// notice over it goes.
     #[test]
     fn notices_over_questions_and_exits() {
         let notice = |ask, dim| Notice {
@@ -6024,10 +6046,19 @@ mod tests {
             dim,
             ask,
         };
-        assert!(hint_fits(None));
-        assert!(hint_fits(Some(&notice(Ask::Nothing, true))));
+        let until = Instant::now();
+        for mut slot in [None, Some(notice(Ask::Nothing, true))] {
+            assert!(hint_into(&mut slot, "hint".into(), until));
+            let n = slot.expect("the hint");
+            assert_eq!(
+                (n.text.as_str(), n.until, n.dim),
+                ("hint", Some(until), true)
+            );
+        }
         for ask in [Ask::ClosePane, Ask::Key, Ask::Quit] {
-            assert!(!hint_fits(Some(&notice(ask, false))));
+            let mut slot = Some(notice(ask.clone(), false));
+            assert!(!hint_into(&mut slot, "hint".into(), until));
+            assert!(slot.is_some_and(|n| n.ask == ask && n.text == "n"));
         }
         let exited = notice_line(None, Some(2)).expect("a line");
         assert_eq!(
