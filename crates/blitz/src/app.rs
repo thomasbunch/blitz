@@ -2618,6 +2618,22 @@ impl App {
         self.typed(out);
     }
 
+    /// A paste with only an image on the clipboard, such as a screenshot.
+    /// Claude Code pastes one on Alt+V, so its pane gets that. False for
+    /// any other pane, where the key goes on to the program.
+    fn paste_image(&mut self, id: PaneId) -> bool {
+        let claude = |v: &&View| v.pane.claude.is_some() && v.pane.exit_code.is_none();
+        let Some(v) = self.view(id).filter(claude) else {
+            return false;
+        };
+        if !crate::clipboard::has_image() {
+            return false;
+        }
+        let keys = alt_v(&lock(&v.pane.term).input_modes());
+        self.typed(keys);
+        true
+    }
+
     /// Runs a shortcut. Returns false when it does not apply right now, in
     /// which case the key goes to the program.
     fn act(&mut self, el: &ActiveEventLoop, a: Action) -> bool {
@@ -2655,8 +2671,13 @@ impl App {
                     self.paste(id, &text, true);
                     return true;
                 }
-                let Some(text) = crate::clipboard::get_text().filter(|t| !t.is_empty()) else {
-                    return false;
+                let text = match crate::clipboard::get_text().filter(|t| !t.is_empty()) {
+                    Some(t) => t,
+                    // Files copied in Explorer paste as their paths.
+                    None => match crate::clipboard::get_files() {
+                        Some(files) => quote_paths(&files),
+                        None => return self.paste_image(id),
+                    },
                 };
                 self.paste(id, &text, false);
             }
@@ -4855,6 +4876,45 @@ fn paste_trusted(term: &vt::Terminal, claude: bool) -> bool {
     term.paste_trusted() || claude && term.input_modes().bracketed
 }
 
+/// Paths as a paste types them: joined by spaces, each in quotes when it
+/// holds a space, as Windows Terminal does.
+fn quote_paths(paths: &[PathBuf]) -> String {
+    let quoted: Vec<String> = (paths.iter())
+        .map(|p| match p.to_string_lossy() {
+            s if s.contains(' ') => format!("\"{s}\""),
+            s => s.into_owned(),
+        })
+        .collect();
+    quoted.join(" ")
+}
+
+/// Alt+V pressed and released, as the program asked keys to be sent:
+/// the key Claude Code pastes an image on.
+fn alt_v(m: &InputModes) -> Vec<u8> {
+    let mut out = Vec::new();
+    for down in [true, false] {
+        let k = KeyInput {
+            vk: 0x56,
+            scan: 0x2f,
+            extended: false,
+            down,
+            repeat: 1,
+            mods: Mods {
+                lalt: true,
+                ..Mods::default()
+            },
+            locks: vt::Locks::default(),
+            text: "v",
+            uc: u16::from(b'v'),
+            cs: 0,
+            key: vt::Key::Char('v'),
+            us_base: Some('v'),
+        };
+        vt::encode_key(&k, m, &mut out);
+    }
+    out
+}
+
 /// Why nothing is pasted into the pane `label` names, when its program
 /// exited with `code`. The notice it replaces said how to close the pane,
 /// so this one does too.
@@ -6802,6 +6862,26 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn app_files_paste_as_paths_quoted_only_with_spaces() {
+        let paths = [r"C:\some dir\shot.png", r"D:\b.txt"].map(PathBuf::from);
+        assert_eq!(quote_paths(&paths), r#""C:\some dir\shot.png" D:\b.txt"#);
+        assert_eq!(quote_paths(&paths[1..]), r"D:\b.txt");
+    }
+
+    #[test]
+    fn app_an_image_reaches_claude_code_as_alt_v() {
+        let legacy = InputModes::default();
+        assert_eq!(alt_v(&legacy), b"\x1bv");
+        let kitty = InputModes { kitty: 1, ..legacy };
+        assert_eq!(alt_v(&kitty), b"\x1b[118;3u");
+        let w32im = InputModes {
+            w32im: true,
+            ..legacy
+        };
+        assert_eq!(alt_v(&w32im), b"\x1b[86;47;118;1;2;1_\x1b[86;47;118;0;2;1_");
     }
 
     #[test]
