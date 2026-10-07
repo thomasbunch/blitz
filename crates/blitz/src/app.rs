@@ -3469,8 +3469,10 @@ mod tests {
         assert_eq!(a.state, Attn::Working);
         a.apply(Ev::NeedsYou, false, t0);
         assert!(!ends_game(a, Ev::NeedsYou, t0), "a repeat");
-        // Once closed, the focused pane is in view: the needs-you that
-        // closed the game is seen and does not relabel the session.
+        // The rule `attention()` relies on by closing the game first: a
+        // needs-you on a pane in view is seen and does not relabel it.
+        // This pins `PaneAttn` only; the order inside `attention()` is
+        // not covered here.
         let mut b = crate::attention::PaneAttn::new(t0);
         b.apply(Ev::Working, true, t0);
         assert!(!relabels(Ev::NeedsYou, b.apply(Ev::NeedsYou, true, t0)));
