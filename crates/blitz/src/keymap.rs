@@ -211,27 +211,33 @@ const KEY_NAMES: &[(&str, u16)] = &[
 
 /// A binding as `config.toml` writes it: a chord, `=`, and an action's
 /// name from [`ACTIONS`] or `none`, as in `ctrl+shift+r=split_right`. The
-/// chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`.
+/// chord is any of `ctrl`, `shift` and `alt`, each once, and one key,
+/// joined by `+`. Case and spaces around the parts do not matter.
 pub fn binding(s: &str) -> Option<Binding> {
     let (chord, name) = s.rsplit_once('=')?;
     let chord = chord.trim();
-    // A + key leaves a second + at the end.
-    let (mods, key) = match chord.strip_suffix("++") {
-        Some(mods) => (mods, "+"),
+    // A + key ends the chord, after the + that joins it on, if any.
+    let (mods, key) = match chord.strip_suffix('+').map(str::trim_end) {
+        Some("") => ("", "+"),
+        Some(mods) => (mods.strip_suffix('+')?, "+"),
         None => chord.rsplit_once('+').unwrap_or(("", chord)),
     };
     let mut bits = 0;
-    for m in mods.split('+').filter(|m| !m.is_empty()) {
-        bits |= match m.trim().to_ascii_lowercase().as_str() {
+    for m in mods.split('+').filter(|_| !mods.is_empty()) {
+        let bit = match m.trim().to_ascii_lowercase().as_str() {
             "ctrl" => CTRL,
             "shift" => SHIFT,
             "alt" => ALT,
             _ => return None,
         };
+        if bits & bit != 0 {
+            return None;
+        }
+        bits |= bit;
     }
     let action = match name.trim() {
-        "none" => None,
-        name => Some(ACTIONS.iter().find(|a| a.1 == name)?.0),
+        n if n.eq_ignore_ascii_case("none") => None,
+        n => Some(ACTIONS.iter().find(|a| a.1.eq_ignore_ascii_case(n))?.0),
     };
     Some((bits, key_code(key.trim())?, action))
 }
@@ -241,7 +247,9 @@ fn key_code(name: &str) -> Option<u16> {
     if let Some(&(_, vk)) = KEY_NAMES.iter().find(|k| k.0.eq_ignore_ascii_case(name)) {
         return Some(vk);
     }
-    let f = (name.strip_prefix(['f', 'F'])).and_then(|n| n.parse::<u16>().ok());
+    let f = (name.strip_prefix(['f', 'F']))
+        .filter(|n| !n.starts_with('0'))
+        .and_then(|n| n.parse::<u16>().ok());
     match (f, name.as_bytes()) {
         (Some(n @ 1..=24), _) => Some(0x6f + n),
         (_, &[c]) if c.is_ascii_alphanumeric() => Some(c.to_ascii_uppercase().into()),
@@ -992,6 +1000,17 @@ mod msg_to_key_tests {
         assert_eq!(binding("ctrl+,=copy"), binding("ctrl+comma=copy"));
         assert_eq!(binding("shift+pgup=copy"), binding("shift+PageUp=copy"));
         assert_eq!(binding("7=copy"), Some((0, 0x37, Some(Action::Copy))));
+        // Case and spaces do not matter, around a + key either.
+        assert_eq!(
+            binding("Ctrl+E=Split_Right"),
+            Some((CTRL, 0x45, Some(Action::SplitRight)))
+        );
+        assert_eq!(
+            binding("ctrl+shift+r=None"),
+            Some((CTRL | SHIFT, 0x52, None))
+        );
+        assert_eq!(binding("ctrl + + = copy"), plus);
+        assert_eq!(binding("+=copy"), Some((0, 0xbb, Some(Action::Copy))));
         for bad in [
             "ctrl+shift+r",
             "ctrl+shift+r=split_sideways",
@@ -999,6 +1018,11 @@ mod msg_to_key_tests {
             "ctrl+f25=copy",
             "ctrl+caps=copy",
             "=copy",
+            "ctrl+=copy",
+            "ctrl++a=copy",
+            "shift+ctrl+shift+a=copy",
+            "a+b=copy",
+            "f01=copy",
         ] {
             assert_eq!(binding(bad), None, "{bad}");
         }
