@@ -96,19 +96,24 @@ fn url_len(s: &str) -> Option<usize> {
 /// and a joiner left at the end joins nothing.
 fn word_len(s: &str, ok: impl Fn(char) -> bool) -> usize {
     let mut prev = None;
-    // Marks and joiners are never ASCII or space. A Prepend letter such as
-    // U+0D4E joins whatever follows it, so only those can join after one.
     let n = s
         .find(|c: char| {
-            let joined = prev.is_some_and(|p| vt::width::joins(p, p, 1, c))
-                && !c.is_ascii()
-                && !c.is_whitespace()
-                && (!vt::width::is_ignorable(c) || matches!(c, '\u{200C}' | '\u{200D}'));
+            let joined = prev.is_some_and(|p| joins(p, c));
             prev = Some(c);
             !ok(c) && !joined
         })
         .unwrap_or(s.len());
     s[..n].trim_end_matches(['\u{200C}', '\u{200D}']).len()
+}
+
+/// Whether `c` is a mark or joiner that builds one character with `p`.
+/// Marks and joiners take no columns: a Prepend letter such as U+0D4E
+/// joins whatever follows it, so anything with a width must be a word
+/// char on its own.
+fn joins(p: char, c: char) -> bool {
+    vt::width::joins(p, p, 1, c)
+        && vt::width::char_width(c) == 0
+        && (!vt::width::is_ignorable(c) || matches!(c, '\u{200C}' | '\u{200D}'))
 }
 
 /// What a path word is made of: anything a Windows file name can hold
@@ -374,6 +379,14 @@ mod tests {
         one("https://x.com/a\u{D4E}\"q", "https://x.com/a\u{D4E}");
         one("https://x.com/\u{111C2}<b>", "https://x.com/\u{111C2}");
         one("https://x.com/a\u{200C} next", "https://x.com/a");
+        // Nor any punctuation that takes a column.
+        one("https://x.com/a\u{D4E}\u{201C}x", "https://x.com/a\u{D4E}");
+        one("https://x.com/a\u{D4E}\u{3002}x", "https://x.com/a\u{D4E}");
+        one("https://x.com/a\u{D4E}\u{FF02}x", "https://x.com/a\u{D4E}");
+        one(
+            "https://x.com/\u{111C2}\u{300C}y\u{300D}",
+            "https://x.com/\u{111C2}",
+        );
         one(
             "https://example.com/a/b.html",
             "https://example.com/a/b.html",
