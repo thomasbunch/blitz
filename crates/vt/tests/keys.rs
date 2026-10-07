@@ -445,6 +445,26 @@ fn kitty_keys_associated_text() {
         enc(&up(k("", Key::Char('a'), "a")), &kitty(8 | 16 | 2)),
         "\x1b[97;1:3u"
     );
+    // Only keys that type something carry it: Ctrl, Alt and Super chords
+    // type nothing, AltGr types its character.
+    assert_eq!(enc(&k("c", Key::Char('a'), "a"), &m), "\x1b[97;5u");
+    assert_eq!(enc(&k("a", Key::Char('a'), "a"), &m), "\x1b[97;3u");
+    assert_eq!(enc(&k("w", Key::Char('a'), "a"), &m), "\x1b[97;9u");
+    assert_eq!(enc(&k("cs", Key::Char('a'), "A"), &m), "\x1b[97;6u");
+    let at = key(0x51, 16, 0x40, "cg", Key::Char('q'), "@");
+    assert_eq!(enc(&at, &m), "\x1b[113;1;64u");
+    // Every code point of the text, with the alternates when asked.
+    assert_eq!(
+        enc(&k("", Key::Char('e'), "e\u{301}"), &m),
+        "\x1b[101;1;101:769u"
+    );
+    assert_eq!(
+        enc(&k("s", Key::Char('a'), "A"), &kitty(4 | 8 | 16)),
+        "\x1b[97:65;2;65u"
+    );
+    let mut ru = k("s", Key::Char('с'), "С");
+    ru.us_base = Some('c');
+    assert_eq!(enc(&ru, &kitty(4 | 8 | 16)), "\x1b[1089:1057:99;2;1057u");
 }
 
 #[test]

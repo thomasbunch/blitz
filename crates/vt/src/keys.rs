@@ -388,6 +388,9 @@ fn kitty(k: &KeyInput, flags: u8, out: &mut Vec<u8>) {
         return;
     }
     let mut bits = mod_bits(k);
+    // The text is what the key types, and a Ctrl, Alt or Super chord types
+    // nothing; KeyInput's text leaves those modifiers out.
+    let typed = bits & !1 == 0;
     // Lock keys only show up with all keys as escape codes. Apps that push
     // less tend to compare the modifier field exactly, and Num Lock is on
     // for most Windows users.
@@ -395,7 +398,7 @@ fn kitty(k: &KeyInput, flags: u8, out: &mut Vec<u8>) {
         bits |= u32::from(k.locks.caps) << 6 | u32::from(k.locks.num) << 7;
     }
     let m1 = bits + 1;
-    let text = if all && flags & ASSOCIATED_TEXT != 0 && k.down {
+    let text = if all && flags & ASSOCIATED_TEXT != 0 && k.down && typed {
         k.text
     } else {
         ""
