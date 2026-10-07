@@ -1080,8 +1080,10 @@ struct App {
     /// Said in the banner in place of the offer for now: the question that
     /// running Update again answers, or that the update is downloading.
     banner_note: Option<(String, Ask)>,
-    /// Why the last look for a release, or the last update, failed.
+    /// Why the last update failed, which a later look does not clear.
     update_error: Option<String>,
+    /// Why the last look for a release failed, if it did.
+    look_error: Option<String>,
     /// The release that installs when blitz closes, with its installer
     /// once downloaded.
     at_close: Option<AtClose>,
@@ -1566,6 +1568,7 @@ impl App {
             closed: None,
             banner_note: None,
             update_error: None,
+            look_error: None,
             at_close: None,
             banner: None,
             below: Vec::new(),
@@ -2235,7 +2238,7 @@ impl App {
             }),
             settings: self.settings.as_ref().map(|p| chrome::Settings {
                 filter: &p.filter,
-                rows: p.rows(&self.config, self.update_error.as_deref()),
+                rows: p.rows(&self.config, self.update_trouble()),
                 sel: p.sel,
                 top: p.top,
                 error: p.error.as_deref(),
@@ -3059,6 +3062,11 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Why the last update, or else the last look for one, failed.
+    fn update_trouble(&self) -> Option<&str> {
+        (self.update_error.as_deref()).or(self.look_error.as_deref())
     }
 
     /// Leaves release `v` to install when blitz closes, and downloads it.
@@ -3999,10 +4007,7 @@ impl App {
             ("renderer", renderer),
             ("ConPTY", conpty),
             ("Claude Code hooks", hooks),
-            (
-                "last update error",
-                self.update_error.as_deref().unwrap_or("none"),
-            ),
+            ("last update error", self.update_trouble().unwrap_or("none")),
         ];
         let url = crate::update::issue(&facts);
         if !crate::update::open(&url)
@@ -7315,13 +7320,15 @@ impl ApplicationHandler<UserEvent> for App {
                 el.exit();
             }
             UserEvent::Failed(v, log) => {
+                // No path: it can end up in an issue report.
+                self.update_error = Some(format!("the installer of blitz {v} failed"));
                 if self.unasked(&v, true) {
                     self.offer_update(v, Some(log));
                 }
             }
             UserEvent::Checked(found, asked) => {
                 let (text, failed) = (crate::update::found(&found), found.is_err());
-                self.update_error = failed.then(|| text.clone());
+                self.look_error = failed.then(|| text.clone());
                 if let Ok(Some(v)) = found
                     && (asked || self.unasked(&v, false))
                 {
