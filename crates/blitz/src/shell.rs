@@ -22,11 +22,12 @@ pub fn pane_var(k: &str) -> Option<OsString> {
     fresh_path(registry_path(true), registry_path(false), inherited).map(Into::into)
 }
 
-/// PATH for a new pane: the system's Path, then the user's, as the registry
-/// holds them now, so a program installed while blitz runs is found; then
-/// the folders only `inherited`, blitz's own PATH, has, such as those of the
-/// developer prompt blitz was started from. Just `inherited` when the
-/// registry has neither.
+/// PATH for a new pane: `inherited`, blitz's own PATH, in its order, so a
+/// developer prompt or a virtual environment blitz was started from still
+/// finds its own programs first; then the folders of the system's Path and
+/// the user's, as the registry holds them now, that it lacks, so a program
+/// installed while blitz runs is found. Just `inherited` when the registry
+/// has neither.
 pub fn fresh_path(
     machine: Option<String>,
     user: Option<String>,
@@ -40,7 +41,7 @@ pub fn fresh_path(
         trim(a) == trim(b)
     };
     let mut out: Vec<&str> = Vec::new();
-    for dir in [&machine, &user, &inherited]
+    for dir in [&inherited, &machine, &user]
         .into_iter()
         .flatten()
         .flat_map(|p| p.split(';'))
@@ -810,14 +811,15 @@ mod tests {
     fn new_panes_get_the_path_the_registry_holds_now() {
         let s = |v: &str| Some(v.to_string());
         // Git installed since blitz started is in the registry only, and a
-        // developer prompt's folder only in blitz's own PATH.
+        // developer prompt's folder only in blitz's own PATH, where it
+        // comes first: its link.exe, not Git's.
         assert_eq!(
             fresh_path(
-                s(r"C:\Windows\system32;C:\Program Files\Git\cmd"),
+                s(r"C:\Windows\system32;C:\Program Files\Git\usr\bin"),
                 s(r"C:\Users\me\.cargo\bin;"),
                 s(r"C:\VS\bin;C:\WINDOWS\System32\;;C:\Users\me\.cargo\bin"),
             ),
-            s(r"C:\Windows\system32;C:\Program Files\Git\cmd;C:\Users\me\.cargo\bin;C:\VS\bin")
+            s(r"C:\VS\bin;C:\WINDOWS\System32\;C:\Users\me\.cargo\bin;C:\Program Files\Git\usr\bin")
         );
         assert_eq!(fresh_path(None, None, s("a;b")), s("a;b"));
         assert_eq!(fresh_path(None, s("u"), None), s("u"));
