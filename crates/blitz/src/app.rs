@@ -3277,9 +3277,7 @@ impl App {
     /// [`hidden_target`]).
     fn show_hidden(&mut self, ids: &[PaneId]) {
         let states = (ids.iter()).filter_map(|&id| self.view(id));
-        let hidden: Vec<_> = states
-            .map(|v| (v.pane.id, v.pane.attn.state, v.pane.attn.since))
-            .collect();
+        let hidden: Vec<_> = states.map(|v| (v.pane.id, v.pane.attn)).collect();
         if let Some(id) = hidden_target(&hidden, self.focus_id()) {
             self.show(id);
         }
@@ -4147,7 +4145,10 @@ fn cursor_icon(divider: Option<Axis>, hand: bool) -> CursorIcon {
 /// The one of `hidden`, sessions the sidebar has no room for, that a
 /// click on their count goes to: the one waiting longest for the user,
 /// else the one after `focus`, so clicks go round them all.
-fn hidden_target(hidden: &[(PaneId, Attn, Instant)], focus: Option<PaneId>) -> Option<PaneId> {
+fn hidden_target(
+    hidden: &[(PaneId, crate::attention::PaneAttn)],
+    focus: Option<PaneId>,
+) -> Option<PaneId> {
     let others = (hidden.iter().copied()).filter(|h| Some(h.0) != focus);
     crate::attention::jump_target(others).or_else(|| {
         let next = (hidden.iter())
@@ -6616,8 +6617,9 @@ mod tests {
     #[test]
     fn the_count_of_hidden_sessions_goes_round_them() {
         let now = Instant::now();
-        let ids = |v: &[u32]| -> Vec<(PaneId, Attn, Instant)> {
-            v.iter().map(|&i| (PaneId(i), Attn::Idle, now)).collect()
+        let ids = |v: &[u32]| -> Vec<(PaneId, crate::attention::PaneAttn)> {
+            let idle = crate::attention::PaneAttn::new(now);
+            v.iter().map(|&i| (PaneId(i), idle)).collect()
         };
         let hidden = ids(&[7, 8, 9]);
         // Nothing waits: from a pane in view, the first; then each in turn.
@@ -6627,7 +6629,7 @@ mod tests {
         assert_eq!(hidden_target(&hidden, Some(PaneId(9))), Some(PaneId(7)));
         // One that needs you comes first, unless it is already shown.
         let mut waiting = hidden.clone();
-        waiting[2].1 = Attn::NeedsYou;
+        waiting[2].1.state = Attn::NeedsYou;
         assert_eq!(hidden_target(&waiting, Some(PaneId(7))), Some(PaneId(9)));
         assert_eq!(hidden_target(&waiting, Some(PaneId(9))), Some(PaneId(7)));
         // Only the focused one hidden: nowhere to go.

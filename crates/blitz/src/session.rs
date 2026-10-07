@@ -843,6 +843,8 @@ mod tests {
             cwd: "d".into(),
             claude: None,
             key: String::new(),
+            done: None,
+            name: None,
             num: 0,
         });
         assert!(s.sidebar_expanded);
