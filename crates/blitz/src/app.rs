@@ -3813,10 +3813,13 @@ impl App {
                 self.attention(id, Ev::Bell);
             }
             // OSC 52. The pane says so, as any program can write there.
+            // Only the pane the user is in, with blitz in front, copies:
+            // output in another cannot swap the clipboard under them.
             Event::Clipboard(text) => {
+                let here = Some(id) == self.focus_id() && self.focused;
                 let owner = Some(HWND(self.hwnd as *mut c_void));
-                let copied = crate::clipboard::set_text(owner, &text);
-                self.notice_copy(id, program_copy_notice(&text, copied), copied);
+                let copied = here && crate::clipboard::set_text(owner, &text);
+                self.notice_copy(id, program_copy_notice(&text, here, copied), copied);
             }
             _ => {}
         }
@@ -6002,8 +6005,12 @@ fn without_indent(text: &str) -> String {
     lines.join("\r\n")
 }
 
-/// What a pane says when its program copied `text` with OSC 52.
-fn program_copy_notice(text: &str, copied: bool) -> String {
+/// What a pane says when its program copied `text` with OSC 52, `here`
+/// when the pane had the user's focus.
+fn program_copy_notice(text: &str, here: bool, copied: bool) -> String {
+    if !here {
+        return "A program here tried to copy while you were elsewhere; nothing was copied".into();
+    }
     if !copied {
         return copy_notice(text, false, false);
     }
@@ -8745,14 +8752,16 @@ mod tests {
 
     #[test]
     fn app_a_program_copy_says_so() {
-        assert_eq!(program_copy_notice("é", true), "Program copied 1 character");
+        let notice = |t| program_copy_notice(t, true, true);
+        assert_eq!(notice("é"), "Program copied 1 character");
+        assert_eq!(notice("ls -la"), "Program copied 6 characters");
         assert_eq!(
-            program_copy_notice("ls -la", true),
-            "Program copied 6 characters"
+            program_copy_notice("ls", true, false),
+            "Clipboard busy; nothing was copied"
         );
         assert_eq!(
-            program_copy_notice("ls", false),
-            "Clipboard busy; nothing was copied"
+            program_copy_notice("ls", false, false),
+            "A program here tried to copy while you were elsewhere; nothing was copied"
         );
     }
 
