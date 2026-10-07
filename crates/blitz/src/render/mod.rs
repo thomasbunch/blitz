@@ -359,13 +359,6 @@ mod gpu {
                 }
             }
             let marked = |c: usize, r: usize| marks.get(r * cols + c).copied().unwrap_or(0);
-            // Matches sit on a tint halfway to the selection colour, the
-            // current one on the selection colour a quarter of the way to
-            // the text.
-            let (matched, current) = (
-                super::mix(pal.bg, pal.selection_bg),
-                super::toward(pal.selection_bg, pal.fg),
-            );
             let px = |c: usize| x + (c as u32 * cw) as i32;
             let py = |r: usize| y + (r as u32 * ch) as i32;
 
@@ -376,11 +369,13 @@ mod gpu {
             for r in 0..rows {
                 let mut c = 0;
                 while c < cols {
-                    let bg = |c| match (selected(c, r), marked(c, r)) {
-                        (true, _) => pal.selection_bg,
-                        (false, 2) => current,
-                        (false, 1) => matched,
-                        _ => cell(c, r).bg,
+                    // Every match on the selection colour, so each one shows.
+                    let bg = |c| {
+                        if selected(c, r) || marked(c, r) != 0 {
+                            pal.selection_bg
+                        } else {
+                            cell(c, r).bg
+                        }
                     };
                     let color = bg(c);
                     let start = c;
@@ -401,13 +396,7 @@ mod gpu {
                 let (x, y) = (px(usize::from(c)), py(usize::from(r)));
                 let w = u32::from(cell(usize::from(c), usize::from(r)).width.max(1)) * cw;
                 match shape {
-                    CursorShape::Block if hollow => {
-                        let t = self.font.underline_h;
-                        self.rect(x, y, w, t, cursor_rgb);
-                        self.rect(x, y + (ch - t) as i32, w, t, cursor_rgb);
-                        self.rect(x, y, t, ch, cursor_rgb);
-                        self.rect(x + (w - t) as i32, y, t, ch, cursor_rgb);
-                    }
+                    CursorShape::Block if hollow => self.frame(x, y, w, ch, cursor_rgb),
                     CursorShape::Block => self.rect(x, y, w, ch, cursor_rgb),
                     CursorShape::Bar => self.rect(x, y, (cw / 5).max(2), ch, cursor_rgb),
                     CursorShape::Underline => {
@@ -417,6 +406,21 @@ mod gpu {
                 }
             }
             let on_cursor = on_cursor(cursor_rgb, pal);
+            // The current match is outlined in the cursor's colour, one run
+            // of cells a row.
+            for r in (0..rows).filter(|_| !marks.is_empty()) {
+                let mut c = 0;
+                while c < cols {
+                    let start = c;
+                    while c < cols && marked(c, r) == 2 {
+                        c += 1;
+                    }
+                    if c > start {
+                        self.frame(px(start), py(r), (c - start) as u32 * cw, ch, cursor_rgb);
+                    }
+                    c += 1;
+                }
+            }
 
             for r in 0..rows {
                 for c in 0..cols {
@@ -503,6 +507,15 @@ mod gpu {
             for q in &mut self.quads[first..] {
                 clip(q, r.x, r.y, r.right(), r.bottom());
             }
+        }
+        /// Queues the outline of a `w` by `h` box with its top-left corner
+        /// at (`x`, `y`), as thick as an underline.
+        fn frame(&mut self, x: i32, y: i32, w: u32, h: u32, rgb: u32) {
+            let t = self.font.underline_h;
+            self.rect(x, y, w, t, rgb);
+            self.rect(x, y + (h - t) as i32, w, t, rgb);
+            self.rect(x, y, t, h, rgb);
+            self.rect(x + (w - t) as i32, y, t, h, rgb);
         }
 
         /// Queues the lines `attrs` asks for across a cell, or both of a wide
@@ -1584,7 +1597,8 @@ mod tests {
 
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
-        let mut snap = text_snapshot("ab cd", 5, 1, &p);
+        // Blank cells, so no glyph covers a pixel looked at.
+        let mut snap = text_snapshot("", 5, 1, &p);
         snap.highlights = vec![
             Highlight {
                 start: (0, 0),
@@ -1598,14 +1612,24 @@ mod tests {
             },
         ];
         let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
-        let (cw, _) = r.cell();
-        let at = |x: u32| {
-            let i = ((w + x) * 4) as usize;
-            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
-        };
-        assert_eq!(at(cw + 1), 0x1f2125, "halfway to the selection colour");
-        assert_eq!(at(2 * cw + 1), p.bg, "between the matches");
-        assert_eq!(at(5 * cw - 1), toward(p.selection_bg, p.fg), "current");
+        let (cw, ch) = r.cell();
+        let at = |x: u32, y: u32| pixel(&px, w, x, y);
+        // Each match is as plain to see as a selection.
+        for x in [0, cw + cw / 2, 2 * cw - 1] {
+            assert_eq!(at(x, 0), p.selection_bg, "{x}");
+            assert_eq!(at(x, ch - 1), p.selection_bg, "{x}");
+        }
+        assert_eq!(at(2 * cw + 1, ch / 2), p.bg, "between the matches");
+        // The current one, too, in a frame of the cursor's colour.
+        assert_eq!(at(4 * cw, ch / 2), p.selection_bg, "inside");
+        for (x, y) in [
+            (3 * cw, ch / 2),
+            (5 * cw - 1, ch / 2),
+            (4 * cw, 0),
+            (4 * cw, ch - 1),
+        ] {
+            assert_eq!(at(x, y), p.cursor, "edge at {x},{y}");
+        }
     }
 
     #[cfg(windows)]
