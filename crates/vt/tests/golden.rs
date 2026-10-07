@@ -898,6 +898,22 @@ fn resize_under_a_bare_alternate_screen_keeps_the_main_bottom() {
     assert_eq!(t.screen_text(), "top\ntext");
 }
 
+/// Squeezed to one column and back under the alternate screen, the main
+/// screen keeps its text: its saved cursor, past the end of a one-column
+/// row, must not lose its place in the rewrap.
+#[test]
+fn hidden_main_screen_survives_a_squeeze_to_one_column() {
+    let main: String = (0..20).map(|i| format!("line {i}\r\n")).collect();
+    let mut t = run(80, 3, &format!("{main}\x1b[50Gx\x1b[?1049h"));
+    t.resize(1, 3);
+    t.resize(80, 3);
+    feed(&mut t, "\x1b[?1049l");
+    assert_eq!(t.scrollback_text(), lines(0..=17));
+    // One column is too narrow to rewrap into, so the rows on screen were
+    // cut to it; scrollback was not.
+    assert_eq!(t.screen_text(), "l\nl\n");
+}
+
 /// A change of rows alone keeps the spacer a wide character leaves when it
 /// wraps early, or the next width change rewraps it around a blank.
 #[test]

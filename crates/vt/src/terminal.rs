@@ -265,6 +265,8 @@ impl Terminal {
         }
         self.cur.y = self.screen.grid.resize(cols, rows, self.cur.y);
         other_at.1 = self.other.grid.resize(cols, rows, other_at.1);
+        // Without a rewrap it is still at its old column.
+        other_at.0 = other_at.0.min(cols - 1);
         if let Some(c) = &mut self.other.saved {
             (c.x, c.y, c.pending_wrap) = other_at;
         }

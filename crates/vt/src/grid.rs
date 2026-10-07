@@ -494,6 +494,12 @@ impl Grid {
                 }
                 line.push(*c);
             }
+            // A cursor past the end of its row, as one saved before the
+            // row narrowed, keeps to the row's last cell, or the rewrap
+            // would lose its place and every row below the first screen.
+            if i == cy && cursor.is_none() {
+                cursor = Some(line.len().saturating_sub(1));
+            }
             self.pool.push(row);
             if wrapped {
                 continue;
