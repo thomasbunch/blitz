@@ -641,6 +641,9 @@ pub fn child_env(
         ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
         ("COLORTERM", "truecolor"),
         ("FORCE_HYPERLINK", "1"),
+        // Claude Code draws ~~text~~ struck through only in terminals it
+        // knows, and blitz draws strikethrough.
+        ("CLAUDE_CODE_FORCE_STRIKETHROUGH", "1"),
         ("BLITZ_PANE_ID", id.as_str()),
     ];
     let sets = ours
@@ -713,6 +716,7 @@ mod tests {
             ("=C:", r"C:\work"),
             ("ANTHROPIC_MODEL", "m"),
             ("BLITZ_PANE_ID", "7"),
+            ("CLAUDE_CODE_FORCE_STRIKETHROUGH", "1"),
             ("CLAUDE_CONFIG_DIR", "c"),
             ("COLORTERM", "truecolor"),
             ("FORCE_HYPERLINK", "1"),
