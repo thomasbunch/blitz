@@ -48,10 +48,8 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # .cargo/config.toml links the C runtime statically.
       - name: Build
-        # A static CRT lets the exes run without the Visual C++ runtime.
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked -p blitz
 
       - name: Fetch ConPTY

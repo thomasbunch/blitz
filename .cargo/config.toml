@@ -1,0 +1,5 @@
+# A static C runtime lets blitz.exe and blitz-hook.exe run without the
+# Visual C++ redistributable. Set here rather than in the release workflow,
+# so tests, local builds and releases all build the same binaries.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
