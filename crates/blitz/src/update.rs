@@ -96,22 +96,45 @@ pub fn banner(
     })
 }
 
-/// What Ctrl+Shift+U says before an update that would end `busy` sessions
-/// or close `others` other blitz windows, or `None` to go ahead; `again`
-/// says how to confirm it.
-pub fn confirm(busy: usize, others: usize, again: &str) -> Option<String> {
+/// The banner text once release `v` is to install when blitz closes;
+/// `keys` update now.
+pub fn at_close(v: &str, keys: &str) -> String {
+    format!("blitz {v} installs when you close blitz \u{b7} {keys} to update and restart now")
+}
+
+/// What Ctrl+Shift+U says before an update to `v` that would end `busy`
+/// sessions or close `others` other blitz windows, or `None` to go ahead;
+/// and whether busy sessions leave `v` to install when blitz closes. Only
+/// the `main` window can, when it is the last one, as the installer would
+/// close the others. `again` says how to confirm it.
+pub fn confirm(
+    v: &str,
+    busy: usize,
+    others: usize,
+    main: bool,
+    again: &str,
+) -> Option<(String, bool)> {
     let what = match (busy, others) {
         (0, 0) => return None,
         (0, _) => "Updating",
-        (1, _) => "A session is busy, and updating",
-        _ => "Sessions are busy, and updating",
+        (1, _) => "A session is busy",
+        _ => "Sessions are busy",
     };
+    if busy > 0 && others == 0 && main {
+        let text =
+            format!("{what}, so blitz {v} installs when you close blitz. {again} to restart now");
+        return Some((text, true));
+    }
+    let and = if busy > 0 { ", and updating" } else { "" };
     let closes = match others {
         0 => String::new(),
         1 => " and closes another blitz window".into(),
         n => format!(" and closes {n} other blitz windows"),
     };
-    Some(format!("{what} restarts blitz{closes}. {again}"))
+    Some((
+        format!("{what}{and} restarts blitz{closes}. {again}"),
+        false,
+    ))
 }
 
 /// What Ctrl+Shift+U says when it looked for a release itself.
@@ -230,12 +253,11 @@ fn installer_name(v: &str) -> String {
 }
 
 /// Downloads the installer for version `v` (from `newer`), checks it
-/// against the release's SHA256SUMS.txt and starts it. The installer
-/// closes what is left of blitz, installs, and starts it again.
+/// against the release's SHA256SUMS.txt, and returns where it saved it.
 // ponytail: the checksum comes from the same release, so it catches a bad
 // download, not a bad release. Check an Authenticode signer once releases
 // are signed.
-pub fn install(v: &str) -> Result<(), String> {
+pub fn fetch(v: &str) -> Result<PathBuf, String> {
     let base = format!("https://github.com/{REPO}/releases/download/v{v}");
     let name = installer_name(v);
     let sums = curl(&[&format!("{base}/SHA256SUMS.txt")])?;
@@ -252,12 +274,17 @@ pub fn install(v: &str) -> Result<(), String> {
     std::fs::create_dir_all(&dir)
         .and_then(|()| std::fs::write(&path, &exe))
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Starts the `installer` that `fetch` saved. It closes what is left of
+/// blitz and installs, and with `relaunch` starts blitz again.
+pub fn run(installer: &Path, relaunch: bool) -> Result<(), String> {
     // blitz is gone by the time the installer could fail, so the log is
     // what `failed` finds on the next start.
-    let log = format!("/LOG={}", dir.join("setup.log").display());
-    Command::new(&path)
-        .args(INSTALLER_ARGS)
-        .arg(&log)
+    let log = installer.with_file_name("setup.log");
+    Command::new(installer)
+        .args(installer_args(&log, relaunch))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -266,14 +293,16 @@ pub fn install(v: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A silent install that starts blitz again; `.github/blitz.iss` reads
-/// `/relaunch=1`.
-const INSTALLER_ARGS: [&str; 4] = [
-    "/VERYSILENT",
-    "/SUPPRESSMSGBOXES",
-    "/NORESTART",
-    "/relaunch=1",
-];
+/// A silent install writing `log`; `.github/blitz.iss` starts blitz again
+/// after it when told `/relaunch=1`.
+fn installer_args(log: &Path, relaunch: bool) -> Vec<String> {
+    let relaunch = relaunch.then_some("/relaunch=1");
+    (["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"].into_iter())
+        .chain(relaunch)
+        .map(String::from)
+        .chain([format!("/LOG={}", log.display())])
+        .collect()
+}
 
 /// The hex SHA-256 that a `sha256sum` listing gives for file `name`.
 fn sum_for<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
@@ -450,10 +479,24 @@ mod tests {
             .expect("OutputBaseFilename");
         let built = format!("{}.exe", base.replace("{#AppVersion}", "1.2.3"));
         assert_eq!(installer_name("1.2.3"), built);
-        // Setup starts blitz again only when told to.
-        assert!(INSTALLER_ARGS.contains(&"/relaunch=1"));
+        // Setup starts blitz again only when told to: not after an update
+        // left for when blitz closes.
+        let log = Path::new(r"C:\t\blitz-update-1.2.3\setup.log");
+        let now = installer_args(log, true);
+        assert_eq!(
+            now,
+            [
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/NORESTART",
+                "/relaunch=1",
+                r"/LOG=C:\t\blitz-update-1.2.3\setup.log"
+            ]
+        );
+        let later = installer_args(log, false);
+        assert_eq!(later, [&now[..3], &now[4..]].concat());
         assert!(iss.contains("ExpandConstant('{param:relaunch|0}') = '1'"));
-        assert!(INSTALLER_ARGS.contains(&"/VERYSILENT") && iss.contains("WizardSilent"));
+        assert!(iss.contains("WizardSilent"));
     }
 
     /// Setup offers to start blitz at sign-in, for this user, never ticked
@@ -553,26 +596,50 @@ mod tests {
     #[test]
     fn an_update_that_ends_sessions_or_closes_windows_asks_first() {
         let again = "Press Ctrl+Shift+U again";
-        assert_eq!(confirm(0, 0, again), None);
-        for (busy, others, text) in [
-            (1, 0, "A session is busy, and updating restarts blitz"),
-            (3, 0, "Sessions are busy, and updating restarts blitz"),
+        assert_eq!(confirm("0.0.5", 0, 0, true, again), None);
+        assert_eq!(confirm("0.0.5", 0, 0, false, again), None);
+        for (busy, others, main, text) in [
+            (
+                1,
+                0,
+                false,
+                "A session is busy, and updating restarts blitz",
+            ),
+            (
+                3,
+                0,
+                false,
+                "Sessions are busy, and updating restarts blitz",
+            ),
             (
                 0,
                 1,
+                true,
                 "Updating restarts blitz and closes another blitz window",
             ),
             (
                 2,
                 2,
+                true,
                 "Sessions are busy, and updating restarts blitz and closes 2 other blitz windows",
             ),
         ] {
-            assert_eq!(
-                confirm(busy, others, again),
-                Some(format!("{text}. {again}"))
-            );
+            let want = Some((format!("{text}. {again}"), false));
+            assert_eq!(confirm("0.0.5", busy, others, main, again), want);
         }
+        // Busy sessions in the last window, the main one, can leave it
+        // until blitz closes.
+        let later = "Sessions are busy, so blitz 0.0.5 installs when you close blitz. \
+                     Press Ctrl+Shift+U again to restart now";
+        assert_eq!(
+            confirm("0.0.5", 2, 0, true, again),
+            Some((later.to_string(), true))
+        );
+
+        assert_eq!(
+            at_close("0.0.5", "Ctrl+Shift+U"),
+            "blitz 0.0.5 installs when you close blitz \u{b7} Ctrl+Shift+U to update and restart now"
+        );
     }
 
     #[test]

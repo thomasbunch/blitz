@@ -152,6 +152,9 @@ pub enum UserEvent {
     Checked(Result<Option<String>, String>, bool),
     /// The installer started, so blitz exits; or why it did not.
     Installed(Result<(), String>),
+    /// The installer of this release, downloaded to run when blitz
+    /// closes, or why it could not be.
+    Fetched(String, Result<PathBuf, String>),
     /// Another launch asks the window to come to the front, and maybe to
     /// open a tab in its folder.
     Handoff(crate::handoff::Ask),
@@ -1040,6 +1043,9 @@ struct App {
     banner_note: Option<(String, Ask)>,
     /// Why the last look for a release, or the last update, failed.
     update_error: Option<String>,
+    /// The release that installs when blitz closes, with its installer
+    /// once downloaded.
+    at_close: Option<(String, Option<PathBuf>)>,
     /// The banner strip and the x that closes it in the last frame, for
     /// clicks.
     banner: Option<(Rect, Rect)>,
@@ -1484,6 +1490,7 @@ impl App {
             closed: None,
             banner_note: None,
             update_error: None,
+            at_close: None,
             banner: None,
             below: Vec::new(),
             find_bar: None,
@@ -2376,9 +2383,11 @@ impl App {
             self.font_zoom = 0.0;
         }
         let jump = c.global_jump != self.config.global_jump;
-        // The banner goes with the checks; looks stop at the next start.
+        // The banner, and an update left for when blitz closes, go with
+        // the checks; looks stop at the next start.
         if self.config.check_updates && !c.check_updates {
             self.update = None;
+            self.at_close = None;
         }
         self.config = c;
         if jump {
@@ -2794,8 +2803,10 @@ impl App {
         }
     }
 
-    /// Hides the banner until a newer release, in this run and the next.
+    /// Hides the banner until a newer release, in this run and the next,
+    /// and drops an update left for when blitz closes.
     fn dismiss_update(&mut self) {
+        self.at_close = None;
         if let Some((v, _)) = self.update.take() {
             if let Some(dir) = session::dir() {
                 crate::update::dismiss_in(&dir, Some(&v));
@@ -2824,6 +2835,52 @@ impl App {
     fn unasked(&self, v: &str, failed: bool) -> bool {
         let closed = session::dir().and_then(|d| crate::update::dismissed_in(&d));
         crate::update::show_unasked(v, failed, self.config.check_updates, closed.as_deref())
+    }
+
+    /// Updates to release `v` now, downloading its installer unless
+    /// `installer` is it. blitz exits once the installer starts.
+    fn update_now(&self, v: String, installer: Option<PathBuf>) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let done = std::panic::catch_unwind(move || {
+                let installer = match installer {
+                    Some(p) => p,
+                    None => crate::update::fetch(&v)?,
+                };
+                crate::update::run(&installer, true)
+            })
+            .unwrap_or_else(|_| Err(INTERNAL.into()));
+            let _ = proxy.send_event(UserEvent::Installed(done));
+        });
+    }
+
+    /// The installer of release `v`, to run when blitz closes, finished
+    /// downloading or failed to. If Ctrl+Shift+U asked to update now in
+    /// the meantime, it runs now.
+    fn fetched(&mut self, v: String, got: Result<PathBuf, String>) {
+        // Dropped in the meantime.
+        if self.at_close.as_ref().is_none_or(|a| a.0 != v) {
+            return;
+        }
+        match got {
+            Ok(installer) if self.updating.is_some() => {
+                self.at_close = None;
+                self.update_now(v, Some(installer));
+            }
+            Ok(installer) => self.at_close = Some((v, Some(installer))),
+            Err(e) => {
+                self.at_close = None;
+                self.banner_note = None;
+                let text = format!("Update failed: {e}");
+                self.update_error = Some(text.clone());
+                // Offered as before.
+                self.update = None;
+                self.offer_update(v, None);
+                if let Some(id) = self.updating.take().or_else(|| self.focus_id()) {
+                    self.error(id, text);
+                }
+            }
+        }
     }
 
     /// Shows the banner for release `v`, or for the update to it that
@@ -3552,14 +3609,25 @@ impl App {
                 let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
                 let asked = self.banner_note.take_if(|n| n.1 == Ask::Update);
                 let again = again(a, &self.config.keys);
-                let ask = crate::update::confirm(busy, crate::handoff::others(), &again);
-                if let Some(text) = ask.filter(|_| asked.is_none()) {
+                let (others, main) = (crate::handoff::others(), !self.args.new_window);
+                let ask = crate::update::confirm(&v, busy, others, main, &again);
+                if let Some((text, later)) = ask.filter(|_| asked.is_none()) {
                     self.banner_note = Some((text, Ask::Update));
                     self.request_redraw();
+                    if later && self.at_close.is_none() {
+                        self.at_close = Some((v.clone(), None));
+                        let keys = keymap::press_for(Action::Update, &self.config.keys);
+                        self.update = Some((v.clone(), crate::update::at_close(&v, &keys)));
+                        let proxy = self.proxy.clone();
+                        std::thread::spawn(move || {
+                            let got = std::panic::catch_unwind(|| crate::update::fetch(&v))
+                                .unwrap_or_else(|_| Err(INTERNAL.into()));
+                            let _ = proxy.send_event(UserEvent::Fetched(v, got));
+                        });
+                    }
                     return true;
                 }
                 // Asked for by hand: shown again if it fails.
-
                 if let Some(dir) = session::dir() {
                     crate::update::dismiss_in(&dir, None);
                 }
@@ -3567,12 +3635,12 @@ impl App {
                 let text = format!("Downloading blitz {v}\u{2026}");
                 self.banner_note = Some((text, Ask::Nothing));
                 self.request_redraw();
-                let proxy = self.proxy.clone();
-                std::thread::spawn(move || {
-                    let done = std::panic::catch_unwind(move || crate::update::install(&v))
-                        .unwrap_or_else(|_| Err(INTERNAL.into()));
-                    let _ = proxy.send_event(UserEvent::Installed(done));
-                });
+                match self.at_close.take() {
+                    Some((w, Some(installer))) if w == v => self.update_now(v, Some(installer)),
+                    // Its download starts the installer when it lands.
+                    Some((w, None)) if w == v => self.at_close = Some((w, None)),
+                    _ => self.update_now(v, None),
+                }
             }
             // The next frame sizes each pane's session to its new place, as
             // it does after a split.
@@ -6814,6 +6882,7 @@ impl ApplicationHandler<UserEvent> for App {
                 None => {}
             },
             UserEvent::Sized => self.settle(),
+            UserEvent::Fetched(v, got) => self.fetched(v, got),
             UserEvent::Installed(Ok(())) => el.exit(),
             UserEvent::Installed(Err(e)) => {
                 eprintln!("blitz: update: {e}");
@@ -6872,6 +6941,15 @@ impl ApplicationHandler<UserEvent> for App {
         // Closing the window, Alt+F4 and an update all keep the layout.
         self.save_session(true);
         crate::notify::untoast_all();
+        // Not when that would close another blitz window opened since; the
+        // banner offers it again at the next start.
+        if let Some((_, Some(installer))) = self.at_close.take()
+            && crate::handoff::others() == 0
+            && let Err(e) = crate::update::run(&installer, false)
+        {
+            eprintln!("blitz: update: {e}");
+        }
+
         if let Err(e) = self.counters.write_trace() {
             eprintln!("blitz: BLITZ_TRACE: {e}");
         }
