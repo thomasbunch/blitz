@@ -3232,14 +3232,20 @@ impl App {
     /// `MIN_ROWS` cells in a tab of several panes, which is what dragging
     /// and resizing work on.
     fn min_pane(&self) -> (i32, i32) {
-        pane_min(self.cell(), self.scale as f32, self.win.sidebar_expanded)
+        let th = self.text_cell().1 as i32;
+        pane_min(
+            self.cell(),
+            th,
+            self.scale as f32,
+            self.win.sidebar_expanded,
+        )
     }
 
     /// Keeps the window from getting smaller than [`min_window`] for the
     /// layout, font and scale in use.
     fn fit_min_size(&self) {
         if let Some(w) = &self.window {
-            let min = min_window(&self.win, self.cell(), self.scale as f32);
+            let min = min_window(&self.win, self.cell(), self.text_cell(), self.scale as f32);
             w.set_min_inner_size(Some(min));
         }
     }
@@ -4356,9 +4362,10 @@ fn small_icon_size() -> PhysicalSize<u32> {
 }
 
 /// The smallest pane, frame included, that holds `MIN_COLS` by `MIN_ROWS`
-/// cells of `cw` by `ch` pixels in a tab of several panes, at `scale`.
-fn pane_min((cw, ch): (u32, u32), scale: f32, expanded: bool) -> (i32, i32) {
-    let frame = chrome::pane_frame(scale, expanded, true);
+/// cells of `cw` by `ch` pixels in a tab of several panes, at `scale`,
+/// with chrome text `th` pixels high.
+fn pane_min((cw, ch): (u32, u32), th: i32, scale: f32, expanded: bool) -> (i32, i32) {
+    let frame = chrome::pane_frame(scale, expanded, true, th);
     (
         layout::MIN_COLS * cw as i32 + frame.0,
         layout::MIN_ROWS * ch as i32 + frame.1,
@@ -4369,9 +4376,14 @@ fn pane_min((cw, ch): (u32, u32), scale: f32, expanded: bool) -> (i32, i32) {
 /// shows them, and one smallest pane. Any smaller and a pane shrinks to a
 /// column or two, and a program such as Claude Code redraws everything at
 /// that width.
-fn min_window(win: &layout::Window, cell: (u32, u32), scale: f32) -> PhysicalSize<u32> {
-    let (w, h) = pane_min(cell, scale, win.sidebar_expanded);
-    let side = chrome::area(win, (0, 0), scale, false).x;
+fn min_window(
+    win: &layout::Window,
+    cell: (u32, u32),
+    (tw, th): (u32, u32),
+    scale: f32,
+) -> PhysicalSize<u32> {
+    let (w, h) = pane_min(cell, th as i32, scale, win.sidebar_expanded);
+    let side = chrome::area(win, (0, 0), scale, false, tw as i32).x;
     PhysicalSize::new((w + side) as u32, h as u32)
 }
 
@@ -6074,13 +6086,18 @@ mod tests {
             win.tabs.push(Tab::new("a".into(), PaneId(1)));
             win.tabs.push(Tab::new("b".into(), PaneId(2)));
             for (cell, scale) in [((8, 16), 1.0), ((12, 24), 1.5), ((16, 32), 2.0)] {
-                let min = min_window(&win, cell, scale);
+                let th = cell.1 as i32;
+                let min = min_window(&win, cell, (cell.0 / 2, cell.1), scale);
                 let size = (min.width as i32, min.height as i32);
-                let area = chrome::area(&win, size, scale, false);
+                let area = chrome::area(&win, size, scale, false, cell.0 as i32 / 2);
                 assert!(area.x > 0, "the side is shown");
                 let at = format!("{scale} {expanded}");
-                assert_eq!((area.w, area.h), pane_min(cell, scale, expanded), "{at}");
-                let frame = chrome::pane_frame(scale, expanded, true).0;
+                assert_eq!(
+                    (area.w, area.h),
+                    pane_min(cell, th, scale, expanded),
+                    "{at}"
+                );
+                let frame = chrome::pane_frame(scale, expanded, true, th).0;
                 assert_eq!((area.w - frame) / cell.0 as i32, layout::MIN_COLS, "{at}");
             }
         }
@@ -6088,8 +6105,8 @@ mod tests {
             tabs: vec![Tab::new("a".into(), PaneId(1))],
             ..Default::default()
         };
-        let (w, h) = pane_min((8, 16), 1.0, true);
-        let min = min_window(&one, (8, 16), 1.0);
+        let (w, h) = pane_min((8, 16), 16, 1.0, true);
+        let min = min_window(&one, (8, 16), (4, 16), 1.0);
         assert_eq!(min, PhysicalSize::new(w as u32, h as u32), "no rail");
     }
 

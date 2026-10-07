@@ -251,12 +251,18 @@ pub fn area(win: &Window, size: (i32, i32), scale: f32, banner: bool, tw: i32) -
 
 /// What a pane's tile holds besides its terminal grid: the padding left
 /// and right, and the header strip and padding above the grid. A tab of
-/// one pane has no header.
-pub fn pane_frame(scale: f32, expanded: bool, multi: bool) -> (i32, i32) {
+/// one pane has no header. Beside the rail, the pane's name goes in a
+/// band above the grid, `th` high text and a margin, so it covers no
+/// output, such as the footer on Claude Code's last row.
+pub fn pane_frame(scale: f32, expanded: bool, multi: bool, th: i32) -> (i32, i32) {
     let s = |v: f32| (v * scale).round() as i32;
-    let header = if multi && expanded { s(HEADER_H) } else { 0 };
-    let (px, py) = if expanded { (14.0, 8.0) } else { (16.0, 12.0) };
-    (2 * s(px), header + s(py))
+    let (px, top) = match (expanded, multi) {
+        (true, true) => (14.0, s(HEADER_H) + s(8.0)),
+        (true, false) => (14.0, s(8.0)),
+        (false, true) => (16.0, th + s(6.0)),
+        (false, false) => (16.0, s(12.0)),
+    };
+    (2 * s(px), top)
 }
 
 /// Lays out the chrome for one frame.
@@ -396,7 +402,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 let (label, num) = name_parts(x, r.w / 2, tw);
                 let color = if focused { c.label_focus } else { c.label };
                 let nx = r.right() - s(16.0) - text_w(&num, tw);
-                let (lx, ly) = (nx - text_w(&label, tw), r.bottom() - s(10.0) - th);
+                let (lx, ly) = (nx - text_w(&label, tw), r.y + s(3.0));
                 text(p, lx, ly, &label, color, false);
                 text(p, nx, ly, &num, c.dim, false);
             }
@@ -427,7 +433,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             }
         }
         // The grid stays inside its tile, however small the tile is.
-        let (fw, fh) = pane_frame(m.scale, expanded, multi);
+        let (fw, fh) = pane_frame(m.scale, expanded, multi, th);
         let (x, y) = ((r.x + fw / 2).min(r.right()), (r.y + fh).min(r.bottom()));
         let content = Rect {
             x,
@@ -1805,7 +1811,15 @@ mod tests {
         let (win, sessions, now) = fleet(false);
         let c = build(&model(&win, &sessions, now));
         assert_eq!(c.panes[0].1.x, 15 + 16);
-        assert_eq!(c.panes[0].1.y, 12, "no header strip");
+        // No header strip, but a band for the pane's name above the grid.
+        assert_eq!(c.panes[0].1.y, 15 + 6);
+        let label_y = (c.prims.iter())
+            .find_map(|p| match p {
+                Prim::Text { text, y, .. } if text == "api" => Some(*y),
+                _ => None,
+            })
+            .expect("pane label");
+        assert!(label_y > 0 && label_y + 15 <= c.panes[0].1.y, "{label_y}");
         assert!(c.rows.iter().all(|(_, r)| r.right() <= 15) && c.rows.len() == 3);
         let t = texts(&c);
         assert_eq!(t, ["api", "web"], "only the pane labels");
@@ -2145,7 +2159,7 @@ mod tests {
                 "{scale}"
             );
             // Each grid is its tile less the frame.
-            let (fw, fh) = pane_frame(scale, true, true);
+            let (fw, fh) = pane_frame(scale, true, true, 15);
             let tiles = win.tabs[0].rects(a);
             assert_eq!(c.panes.len(), tiles.len());
             for ((id, p), (tid, t)) in c.panes.iter().zip(&tiles) {
@@ -2181,10 +2195,11 @@ mod tests {
             }
         }
         // Without a header, a tab of one pane loses only the padding.
-        assert_eq!(pane_frame(1.0, true, false), (28, 8));
-        assert_eq!(pane_frame(1.0, true, true), (28, 30));
-        assert_eq!(pane_frame(1.0, false, true), (32, 12));
-        assert_eq!(pane_frame(1.5, true, true), (42, 45));
+        assert_eq!(pane_frame(1.0, true, false, 15), (28, 8));
+        assert_eq!(pane_frame(1.0, true, true, 15), (28, 30));
+        assert_eq!(pane_frame(1.0, false, true, 15), (32, 21));
+        assert_eq!(pane_frame(1.0, false, false, 15), (32, 12));
+        assert_eq!(pane_frame(1.5, true, true, 22), (42, 45));
     }
 
     #[test]
