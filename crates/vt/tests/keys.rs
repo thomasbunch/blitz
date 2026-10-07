@@ -720,7 +720,12 @@ fn interrupt_keys_stay_console_records() {
     assert_eq!(enc(&cw_c, &both), "\x1b[67;46;3;1;8;1_");
     let cs_c = key(0x43, 46, 3, "cs", Key::Char('c'), "C");
     assert_eq!(enc(&cs_c, &both), "\x1b[99;6u");
+    // Ctrl+Shift+Break is no copy key, so it still interrupts.
+    let mut cs_break = key(0x03, 70, 3, "cs", Key::Other, "");
+    cs_break.extended = true;
+    assert_eq!(enc(&cs_break, &both), "\x1b[3;70;3;1;280;1_");
     // Without win32-input-mode there is no console record to keep.
+
     assert_eq!(enc(&ctrl_c, &kitty(1)), "\x1b[99;5u");
 }
 
