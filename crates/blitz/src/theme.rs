@@ -310,7 +310,7 @@ fn color(s: &str) -> Option<u32> {
 }
 
 /// `a` moved `t` of the way to `b`, per channel.
-fn mix(a: u32, b: u32, t: f32) -> u32 {
+pub(crate) fn mix(a: u32, b: u32, t: f32) -> u32 {
     let ch = |s: u32| {
         let (x, y) = ((a >> s & 0xff) as f32, (b >> s & 0xff) as f32);
         ((x + (y - x) * t).round() as u32) << s

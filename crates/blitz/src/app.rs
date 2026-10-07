@@ -31,10 +31,11 @@ use windows::Win32::UI::Shell::{
     TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage,
-    WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    DestroyIcon, GetCursorPos, GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow,
+    TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
+use windows::core::HSTRING;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
@@ -1056,6 +1057,8 @@ struct App {
     plugin: Option<String>,
     /// A hint about Claude Code's hooks was shown; one per run is enough.
     hooks_hinted: bool,
+    /// The state whose dot badges the taskbar button.
+    badge_shows: Option<Attn>,
     counters: Counters,
     code: i32,
 }
@@ -1466,6 +1469,8 @@ impl App {
             taskbar_shows: None,
             plugin: None,
             hooks_hinted: false,
+            badge_shows: None,
+
             counters: Counters::default(),
             code: 0,
         }
@@ -1858,6 +1863,7 @@ impl App {
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
         self.taskbar_progress();
+        self.taskbar_badge();
         if self.views.is_empty() {
             // Nothing is left open, so there is nothing to restore.
             if self.persist {
@@ -2124,6 +2130,9 @@ impl App {
         }
         self.theme = t;
         self.frame_theme();
+        // The badge in the new colours.
+        self.badge_shows = None;
+        self.taskbar_badge();
         for v in &self.views {
             let mut term = lock(&v.pane.term);
             term.set_theme(!self.theme.light, &self.theme.pal);
@@ -3830,14 +3839,7 @@ impl App {
         if latest == self.taskbar_shows {
             return;
         }
-        if self.taskbar.is_none() {
-            // SAFETY: COM calls on the window's thread, where winit has
-            // started OLE for drag and drop.
-            self.taskbar = unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) }
-                .ok()
-                .filter(|t: &ITaskbarList3| unsafe { t.HrInit() }.is_ok());
-        }
-        let Some(t) = &self.taskbar else {
+        let Some(t) = self.taskbar() else {
             return;
         };
         self.taskbar_shows = latest;
@@ -3858,6 +3860,51 @@ impl App {
             let _ = t.SetProgressState(hwnd, flag);
             if flag != TBPF_NOPROGRESS && flag != TBPF_INDETERMINATE {
                 let _ = t.SetProgressValue(hwnd, u64::from(pct.unwrap_or(100)), 100);
+            }
+        }
+    }
+
+    /// The taskbar button, made the first time it is needed.
+    fn taskbar(&mut self) -> Option<ITaskbarList3> {
+        if self.taskbar.is_none() {
+            // SAFETY: COM calls on the window's thread, where winit has
+            // started OLE for drag and drop.
+            self.taskbar = unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) }
+                .ok()
+                .filter(|t: &ITaskbarList3| unsafe { t.HrInit() }.is_ok());
+        }
+        self.taskbar.clone()
+    }
+
+    /// Badges the taskbar button with the sidebar dot of the session that
+    /// most wants the user, or clears it once none does.
+    fn taskbar_badge(&mut self) {
+        let top = badge_state(self.views.iter().map(|v| v.pane.attn.state));
+        if top == self.badge_shows {
+            return;
+        }
+        let Some(t) = self.taskbar() else {
+            return;
+        };
+        self.badge_shows = top;
+        let ui = &self.theme.ui;
+        let (fg, ring, label) = match top {
+            Some(Attn::NeedsYou) => (ui.accent, false, "A session needs you"),
+            Some(Attn::Error) => (ui.error, false, "A session failed"),
+            Some(_) => (ui.name, true, "A session finished"),
+            None => (0, false, ""),
+        };
+        let icon = top.and_then(|_| {
+            let size = small_icon_size().width;
+            crate::notify::badge_icon(size, fg, ui.term_bg, ring)
+        });
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        // SAFETY: a live window; the taskbar keeps a copy of the icon, so
+        // it is destroyed once set.
+        unsafe {
+            let _ = t.SetOverlayIcon(hwnd, icon.unwrap_or_default(), &HSTRING::from(label));
+            if let Some(i) = icon {
+                let _ = DestroyIcon(i);
             }
         }
     }
@@ -3890,8 +3937,11 @@ impl App {
         let alert = (changed && away)
             .then(|| alert(v.pane.attn.state, &self.config, &mut v.alerted, now))
             .flatten();
-        // The sidebar shows the new state.
+        // The sidebar shows the new state, and the taskbar button its dot.
         self.request_redraw();
+        if changed {
+            self.taskbar_badge();
+        }
         if let Some(a) = alert {
             self.alert(a);
         }
@@ -5470,6 +5520,12 @@ fn window_title(waiting: usize, pane: &str, admin: bool) -> String {
 /// else its offer; nothing without one.
 fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) -> Option<&'a str> {
     update.map(|u| note.unwrap_or(&u.1))
+}
+
+/// The state whose dot badges the taskbar button: the one of `states`
+/// that most wants the user, if any does.
+fn badge_state(states: impl Iterator<Item = Attn>) -> Option<Attn> {
+    states.max().filter(|&s| s >= Attn::DoneUnseen)
 }
 
 /// How blitz tells the user, who is in another program, about a session.
@@ -8177,6 +8233,17 @@ mod tests {
         );
         // Another session has its own limit.
         assert_eq!(alert(Attn::NeedsYou, &mut None, 21), urgent);
+    }
+
+    #[test]
+    fn app_badge_shows_the_session_that_most_wants_you() {
+        use Attn::*;
+        let badge = |s: &[Attn]| badge_state(s.iter().copied());
+        assert_eq!(badge(&[]), None);
+        assert_eq!(badge(&[Idle, Working]), None, "nothing to see");
+        assert_eq!(badge(&[Working, DoneUnseen, Idle]), Some(DoneUnseen));
+        assert_eq!(badge(&[DoneUnseen, Error]), Some(Error));
+        assert_eq!(badge(&[Error, NeedsYou, DoneUnseen]), Some(NeedsYou));
     }
 
     /// A flash with no count goes on until blitz is in front; a few are
