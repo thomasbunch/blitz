@@ -977,10 +977,6 @@ impl Picker {
     /// list; typing narrows the list and Backspace widens it, each going
     /// back to the first match. Returns false for keys it has no use for.
     fn key(&mut self, k: &KeyInput) -> bool {
-        let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
         let (sel, last) = (self.sel as isize, self.matches().len().saturating_sub(1));
         let step = |by: isize| (sel + by).clamp(0, last as isize) as usize;
         match k.vk {
@@ -988,11 +984,7 @@ impl Picker {
             VK_DOWN => self.sel = step(1),
             VK_PRIOR => self.sel = step(-(chrome::PICKER_ROWS as isize)),
             VK_NEXT => self.sel = step(chrome::PICKER_ROWS as isize),
-            VK_BACK if self.filter.pop().is_some() => self.sel = 0,
-            _ if !chord && !k.text.is_empty() => {
-                self.filter.push_str(k.text);
-                self.sel = 0;
-            }
+            _ if edit_field(&mut self.filter, k) => self.sel = 0,
             _ => return false,
         }
         true
@@ -1938,10 +1930,6 @@ impl App {
         let Some(p) = &mut self.settings else {
             return;
         };
-        let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
         match k.vk {
             VK_ESCAPE if !p.filter.is_empty() => {
                 p.filter.clear();
@@ -1958,12 +1946,7 @@ impl App {
                     self.set_setting(s.key, None);
                 }
             }
-            VK_BACK if p.filter.pop().is_some() => p.sel = 0,
-            VK_BACK => return,
-            _ if !chord && !k.text.is_empty() => {
-                p.filter.push_str(k.text);
-                p.sel = 0;
-            }
+            _ if edit_field(&mut p.filter, k) => p.sel = 0,
             _ => return,
         }
         self.request_redraw();
@@ -2085,10 +2068,6 @@ impl App {
         let Some(cm) = &mut self.commands else {
             return;
         };
-        let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
         let page = chrome::PICKER_ROWS as isize;
         match k.vk {
             VK_ESCAPE => self.commands = None,
@@ -2106,12 +2085,7 @@ impl App {
             VK_DOWN => cm.move_by(1),
             VK_PRIOR => cm.move_by(-page),
             VK_NEXT => cm.move_by(page),
-            VK_BACK if cm.filter.pop().is_some() => cm.sel = 0,
-            VK_BACK => return,
-            _ if !chord && !k.text.is_empty() => {
-                cm.filter.push_str(k.text);
-                cm.sel = 0;
-            }
+            _ if edit_field(&mut cm.filter, k) => cm.sel = 0,
             _ => return,
         }
         self.request_redraw();
@@ -2167,9 +2141,6 @@ impl App {
             return;
         };
         let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
         // Matches are oldest first, so up is back through the list.
         let by = if m.lshift || m.rshift { 1 } else { -1 };
         match k.vk {
@@ -2178,12 +2149,7 @@ impl App {
                 self.request_redraw();
             }
             VK_RETURN | VK_F3 => self.find_go(false, by),
-            VK_BACK if f.query.pop().is_some() => self.find_go(true, 0),
-            VK_BACK => {}
-            _ if !chord && !k.text.is_empty() => {
-                f.query.push_str(k.text);
-                self.find_go(true, 0);
-            }
+            _ if edit_field(&mut f.query, k) => self.find_go(true, 0),
             _ => {}
         }
     }
@@ -2211,8 +2177,9 @@ impl App {
         self.request_redraw();
     }
 
-    /// Typed text for the filter of the command palette, the theme picker
-    /// or the settings panel, or for the find bar. False when none is open.
+    /// Typed or pasted text for the filter of the command palette, the
+    /// theme picker or the settings panel, or for the find bar. False when
+    /// none is open.
     fn filter_text(&mut self, t: &str) -> bool {
         if self.game.is_some() {
             // The game takes keys, not text.
@@ -2468,6 +2435,14 @@ impl App {
             || self.find.is_some();
         let taken = self.eaten.0.contains(&k.vk);
         if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
+            return;
+        }
+        // A paste key pastes into the open panel's text field.
+        if panel && k.down && keymap::action(k, &self.config.keys) == Some(Action::Paste) {
+            self.eaten.press(k.vk);
+            if let Some(text) = crate::clipboard::get_text() {
+                self.filter_text(&first_line(&text));
+            }
             return;
         }
         if let Some((g, _)) = &mut self.game {
@@ -5031,6 +5006,42 @@ fn copy_notice(text: &str, copied: bool, rewritten: bool) -> String {
     format!("Copied {lines} line{s}{old}")
 }
 
+/// A key for a one-line text field, such as the find bar or a list's
+/// filter: a key that types adds its text, Backspace takes off a character
+/// and Ctrl+Backspace a word. Returns whether the field changed.
+fn edit_field(field: &mut String, k: &KeyInput) -> bool {
+    let m = &k.mods;
+    // Ctrl and Alt together are AltGr when the layout gives a character.
+    let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+    let chord = ctrl != alt || (ctrl && k.uc == 0);
+    match k.vk {
+        VK_BACK if ctrl && !alt => {
+            let word = (field.trim_end())
+                .trim_end_matches(|c: char| !c.is_whitespace())
+                .len();
+            let cut = word < field.len();
+            field.truncate(word);
+            cut
+        }
+        VK_BACK => field.pop().is_some(),
+        _ if !chord && !k.text.is_empty() => {
+            field.push_str(k.text);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// What a paste adds to a one-line text field: the first line of `text`,
+/// past any line breaks it starts with, without control characters.
+fn first_line(text: &str) -> String {
+    let line = text.trim_start_matches(['\r', '\n']).lines().next();
+    line.unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
 /// Whether copy key `k` copies a selection that `shown` says is in view or
 /// not, when there is one. Plain Ctrl+C is the interrupt too, so it copies
 /// only what the user can see; the other copy keys always copy.
@@ -6302,6 +6313,29 @@ mod tests {
         (ctrl_alt.mods.lctrl, ctrl_alt.mods.lalt) = (true, true);
         assert!(!p.key(&ctrl_alt), "Ctrl+Alt with no character");
         assert!(!p.key(&key(0x70, "")), "F1");
+    }
+
+    #[test]
+    fn app_text_fields_delete_words_and_take_the_first_line_of_a_paste() {
+        let mut field = String::from("git log  --oneline ");
+        let mut back = input(VK_BACK, true, vt::Key::Backspace, "");
+        assert!(edit_field(&mut field, &back));
+        assert_eq!(field, "git log  --oneline");
+        back.mods.lctrl = true;
+        assert!(edit_field(&mut field, &back));
+        assert_eq!(field, "git log  ");
+        assert!(edit_field(&mut field, &back));
+        assert_eq!(field, "git ");
+        assert!(edit_field(&mut field, &back));
+        assert_eq!(field, "");
+        assert!(!edit_field(&mut field, &back), "nothing left");
+        assert!(edit_field(
+            &mut field,
+            &input(0x41, true, vt::Key::Char('a'), "a")
+        ));
+        assert_eq!(field, "a");
+        assert_eq!(first_line("\r\ngit\tstatus\r\nrm -rf x"), "gitstatus");
+        assert_eq!(first_line(""), "");
     }
 
     #[test]
