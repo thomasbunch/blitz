@@ -93,6 +93,9 @@ struct Cluster {
     first: char,
     last: char,
     len: usize,
+    /// A code point did not fit the cell; the rest of the cluster is
+    /// dropped, so the cell keeps its start.
+    full: bool,
 }
 
 struct Screen {
@@ -495,6 +498,7 @@ impl Terminal {
                 first: c,
                 last: c,
                 len: 1,
+                full: false,
             });
             self.rep = Some(c);
             self.advance(n as u16);
@@ -512,8 +516,12 @@ impl Terminal {
         {
             cl.last = c;
             cl.len += 1;
-            let Cluster { x, y, first, .. } = *cl;
-            self.join(x, y, first, c);
+            let Cluster {
+                x, y, first, full, ..
+            } = *cl;
+            if !full && !self.join(x, y, first, c) {
+                self.cluster = self.cluster.map(|cl| Cluster { full: true, ..cl });
+            }
             return;
         }
         match self.width(c) {
@@ -523,20 +531,23 @@ impl Terminal {
         }
     }
 
-    /// Adds `c` to the cluster in cell (`x`, `y`). VS16 or a skin tone can
-    /// make a narrow emoji wide; it then takes the next column when the
-    /// cursor is still right after it.
-    fn join(&mut self, x: u16, y: u16, first: char, c: char) {
+    /// Adds `c` to the cluster in cell (`x`, `y`); false when it does not
+    /// fit. VS16 or a skin tone can make a narrow emoji wide; it then takes
+    /// the next column when the cursor is still right after it.
+    fn join(&mut self, x: u16, y: u16, first: char, c: char) -> bool {
         let amb = self.opts.ambiguous_wide;
         let at_cursor = self.cur.y == y && self.cur.x == x + 1 && !self.cur.pending_wrap;
         let row = self.screen.grid.row_mut(y);
-        row.push_grapheme(x, c);
+        if !row.push_grapheme(x, c) {
+            return false;
+        }
         let narrow = row.cells[x as usize].flags & cf::WIDE == 0;
         let tail = row.grapheme(x).unwrap_or_default().chars();
         if narrow && at_cursor && chars_width(std::iter::once(first).chain(tail), amb) == 2 {
             row.widen(x as usize);
             self.advance(1);
         }
+        true
     }
 
     fn width(&self, c: char) -> u8 {
@@ -584,6 +595,7 @@ impl Terminal {
             first: c,
             last: c,
             len: 1,
+            full: false,
         });
         self.rep = Some(c);
         self.advance(w);

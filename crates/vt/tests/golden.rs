@@ -383,6 +383,12 @@ fn whole_clusters_reach_the_snapshot() {
     let kept = &over[..32];
     assert_eq!(t.screen_text(), format!("{kept}x"));
     assert_eq!(text(&cell(&snap(&mut t), 0, 0)), kept);
+    // Once a code point does not fit, none after it gets in, however
+    // small: the cell keeps the start of the cluster, never a gap.
+    let start = format!("a{}\u{20D0}", "\u{301}".repeat(11));
+    let mut t = run(10, 1, &format!("{start}\u{1D167}\u{20D0}x"));
+    assert_eq!(text(&cell(&snap(&mut t), 0, 0)), start);
+    assert_eq!(t.screen_text(), format!("{start}x"));
 }
 
 #[test]
