@@ -264,11 +264,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let area = area(m.win, m.size, m.scale, m.banner.is_some());
     let (side, bh) = (area.x, m.banner.map_or(0, |_| s(BANNER_H)));
     let session = |id: PaneId| m.sessions.iter().find(|x| x.id == id);
-    // A tab's sessions, in the order the caller lists them.
-    let members = |t: &Tab| -> Vec<&Session> {
-        let ids = t.panes();
-        m.sessions.iter().filter(|x| ids.contains(&x.id)).collect()
-    };
+    // A tab's sessions in reading order, as its panes sit.
+    let members =
+        |t: &Tab| -> Vec<&Session> { t.panes().into_iter().filter_map(session).collect() };
     let p = &mut out.prims;
     let text = |p: &mut Vec<Prim>, x, y, t: &str, color, bold| {
         if t.is_empty() {
@@ -1680,6 +1678,19 @@ mod tests {
             t.contains(&"access violation") && t.contains(&"exit -1"),
             "{t:?}"
         );
+    }
+
+    #[test]
+    fn sidebar_lists_sessions_as_their_panes_sit() {
+        let (mut win, sessions, now) = fleet(true);
+        // The focused pane, 2, moves left of pane 1.
+        assert!(win.tabs[0].swap(Dir::Left, AREA));
+        for expanded in [true, false] {
+            win.sidebar_expanded = expanded;
+            let c = build(&model(&win, &sessions, now));
+            let rows: Vec<_> = c.rows.iter().map(|(id, _)| id.0).collect();
+            assert_eq!(rows, [2, 1, 3]);
+        }
     }
 
     #[test]
