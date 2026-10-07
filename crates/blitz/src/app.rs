@@ -2523,7 +2523,7 @@ impl App {
             self.dismiss(action);
         }
         if let Some(a) = action
-            && self.act(el, a)
+            && (self.act(el, a) || !keymap::passes_on(a))
         {
             self.eaten.press(k.vk);
             return;
@@ -2702,7 +2702,7 @@ impl App {
     }
 
     /// Runs a shortcut. Returns false when it does not apply right now, in
-    /// which case the key goes to the program.
+    /// which case the key goes to the program if [`keymap::passes_on`].
     fn act(&mut self, el: &ActiveEventLoop, a: Action) -> bool {
         let before = self.focus_id();
         match a {

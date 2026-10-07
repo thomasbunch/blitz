@@ -39,15 +39,13 @@ pub enum Action {
     Swap(Dir),
     JumpToAttention,
     ToggleSidebar,
-    /// Install the newer release, or without one look for it now. Without
-    /// a focused pane the key goes to the program.
+    /// Install the newer release, or without one look for it now.
     Update,
     /// Open the theme picker, or close it unchanged.
     ThemePicker,
     /// Open or close the settings panel.
     Settings,
     /// Show only the focused pane, filling the tab, or every pane again.
-    /// In a tab of one pane the key goes to the program.
     Zoom,
     /// Give the tab's panes equal space.
     Equalize,
@@ -352,6 +350,13 @@ pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
         0x39 => Action::LastTab,
         vk => Action::GoToTab((vk - 0x31) as u8),
     })
+}
+
+/// Whether the key of a shortcut with nothing to do right now goes on to
+/// the program. Update and Zoom keep theirs: under the default chords the
+/// program would get ^U, which erases the line, and ^Z, which suspends.
+pub fn passes_on(a: Action) -> bool {
+    !matches!(a, Action::Update | Action::Zoom)
 }
 
 /// Whether a key message is an auto-repeat: lParam bit 30 says the key was
@@ -1371,5 +1376,17 @@ mod msg_to_key_tests {
             &mut t,
         );
         assert_eq!(action(&k, &user), None);
+    }
+    #[test]
+    fn keymap_update_and_zoom_keys_never_reach_the_program() {
+        // Ctrl+Shift+U and Ctrl+Shift+Z would arrive as ^U and ^Z.
+        for a in [Action::Update, Action::Zoom] {
+            assert!(!passes_on(a), "{a:?}");
+        }
+        // Copy with nothing selected is Ctrl+C for the program, and a
+        // divider that cannot move gives Alt+Shift+Arrows back.
+        for a in [Action::Copy, Action::Paste, Action::Resize(Dir::Left)] {
+            assert!(passes_on(a), "{a:?}");
+        }
     }
 }
