@@ -72,7 +72,7 @@ pub fn text_snapshot(text: &str, cols: u16, rows: u16, pal: &Palette) -> Snapsho
             if c + usize::from(width) > row.len() {
                 break;
             }
-            let mut text = [0u8; 16];
+            let mut text = [0u8; vt::snapshot::CLUSTER_BYTES];
             text[..s.len()].copy_from_slice(s.as_bytes());
             row[c] = RenderCell {
                 text,
@@ -399,7 +399,7 @@ mod gpu {
             if slot.w == 0 {
                 return;
             }
-            let text = &key.text[..usize::from(key.len).min(16)];
+            let text = &key.text[..usize::from(key.len).min(key.text.len())];
             let exact = key.style & SHAPE != 0 || is_builtin(text);
             self.quads.push(Quad {
                 pos: [
@@ -447,7 +447,7 @@ mod gpu {
                         let mut x = *x;
                         for c in text.chars() {
                             let mut key = GlyphKey {
-                                text: [0; 16],
+                                text: [0; vt::snapshot::CLUSTER_BYTES],
                                 len: 0,
                                 style,
                                 width: 1,
@@ -466,7 +466,7 @@ mod gpu {
 
         /// The atlas slot for a glyph, rasterizing it on first use.
         fn glyph(&mut self, key: GlyphKey) -> Option<Slot> {
-            let text = &key.text[..usize::from(key.len).min(16)];
+            let text = &key.text[..usize::from(key.len).min(key.text.len())];
             if text == b" " {
                 return None;
             }
@@ -563,7 +563,7 @@ mod gpu {
     fn shape_key(r: crate::layout::Rect, radius: f32, stroke: f32, branch: bool) -> GlyphKey {
         let (w, h) = (r.w.clamp(0, 2048) as u16, r.h.clamp(0, 2048) as u16);
         let q = |v: f32| ((v * 4.0).round() as u16).to_le_bytes();
-        let mut text = [0u8; 16];
+        let mut text = [0u8; vt::snapshot::CLUSTER_BYTES];
         text[..2].copy_from_slice(&w.to_le_bytes());
         text[2..4].copy_from_slice(&h.to_le_bytes());
         text[4..6].copy_from_slice(&q(radius));

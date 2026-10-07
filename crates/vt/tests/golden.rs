@@ -352,6 +352,54 @@ fn combining_marks_and_line_drawing() {
 }
 
 #[test]
+fn whole_clusters_reach_the_snapshot() {
+    // A family, a kiss and subdivision flags: the longest clusters in
+    // common use, up to 32 bytes.
+    let flag = |tags: &str| {
+        let tags: String = (tags.chars())
+            .map(|c| char::from_u32(0xE0000 + c as u32).unwrap())
+            .collect();
+        format!("\u{1F3F4}{tags}\u{E007F}")
+    };
+    let (scotland, full) = (flag("gbsct"), flag("abcdef"));
+    assert_eq!(full.len(), 32);
+    for cluster in [
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+        "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F48B}\u{200D}\u{1F468}",
+        &scotland,
+        &full,
+    ] {
+        let mut t = run(10, 1, &format!("{cluster}x"));
+        assert_eq!(t.screen_text(), format!("{cluster}x"));
+        let s = snap(&mut t);
+        assert_eq!(text(&cell(&s, 0, 0)), cluster);
+        assert_eq!((cell(&s, 0, 0).width, text(&cell(&s, 2, 0))), (2, "x"));
+    }
+    // Past 32 bytes the code points that do not fit are dropped from the
+    // screen and the snapshot alike, whole.
+    let over = flag("abcdefg");
+    let mut t = run(10, 1, &format!("{over}x"));
+    let kept = &over[..32];
+    assert_eq!(t.screen_text(), format!("{kept}x"));
+    assert_eq!(text(&cell(&snap(&mut t), 0, 0)), kept);
+}
+
+#[test]
+fn endless_marks_are_capped_per_cell() {
+    // Two-byte marks fill the tail exactly; three-byte ones stop short of
+    // it. The cluster still takes one cell and the cursor moves on.
+    let mut t = run(4, 1, &format!("a{}b", "\u{301}".repeat(500)));
+    assert_eq!(t.screen_text(), format!("a{}b", "\u{301}".repeat(14)));
+    assert_eq!(t.cursor(), (2, 0, true));
+    let s = snap(&mut t);
+    assert_eq!(text(&cell(&s, 0, 0)), format!("a{}", "\u{301}".repeat(14)));
+    let mut t = run(4, 1, &format!("\u{1F44D}{}", "\u{20D0}".repeat(50)));
+    let want = format!("\u{1F44D}{}", "\u{20D0}".repeat(9));
+    assert_eq!(text(&cell(&snap(&mut t), 0, 0)), want);
+    assert_eq!(t.screen_text(), want);
+}
+
+#[test]
 fn clusters_that_change_width() {
     // VS16 turns a text-style heart into a two-column emoji.
     let mut t = run(10, 2, "\u{2764}x\r\n\u{2764}\u{FE0F}x");

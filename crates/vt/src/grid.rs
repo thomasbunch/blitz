@@ -51,9 +51,10 @@ pub mod rf {
     pub const WRAPPED: u8 = 1 << 0;
 }
 
-/// Longest grapheme tail kept per cell, in bytes. Anything past it is a
-/// stream of combining marks nobody can render anyway.
-const MAX_GRAPHEME_TAIL: usize = 28;
+/// Longest grapheme tail kept per cell, in bytes, so that with its first
+/// code point a cluster fits a [`RenderCell`](crate::RenderCell). Anything
+/// past it is a stream of combining marks nobody can render anyway.
+const MAX_GRAPHEME_TAIL: usize = crate::snapshot::CLUSTER_BYTES - 4;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Row {
@@ -105,7 +106,7 @@ impl Row {
         cell.flags |= cf::GRAPHEME;
         let ex = self.extra.get_or_insert_with(Default::default);
         match ex.graphemes.iter_mut().find(|g| g.0 == col) {
-            Some(g) if g.1.len() < MAX_GRAPHEME_TAIL => g.1.push(c),
+            Some(g) if g.1.len() + c.len_utf8() <= MAX_GRAPHEME_TAIL => g.1.push(c),
             Some(_) => {}
             None => ex.graphemes.push((col, c.to_string())),
         }
@@ -622,6 +623,26 @@ mod tests {
         assert_eq!(g.resize(2, 2, 2), 1);
         assert_eq!(text(&g), ["a", "b", ""]);
         assert_eq!(g.scrollback_len(), 1);
+    }
+
+    /// A tail never passes 28 bytes, so with the first code point a cluster
+    /// fits the snapshot's 32.
+    #[test]
+    fn grapheme_tails_stop_at_the_byte_cap() {
+        let mut r = Row::new(2);
+        r.put_ascii(0, b"ab", 0);
+        for _ in 0..20 {
+            r.push_grapheme(0, '\u{20D0}');
+            r.push_grapheme(1, '\u{301}');
+        }
+        // Nine three-byte marks; a tenth, or a two-byte one, would pass 28.
+        assert_eq!(r.grapheme(0), Some("\u{20D0}".repeat(9).as_str()));
+        r.push_grapheme(0, '\u{301}');
+        assert_eq!(r.grapheme(0).map(str::len), Some(27));
+        assert_eq!(r.grapheme(1), Some("\u{301}".repeat(14).as_str()));
+        // Past the row's end nothing happens.
+        r.push_grapheme(9, '\u{301}');
+        assert_eq!(r.extra.as_ref().map(|e| e.graphemes.len()), Some(2));
     }
 
     #[test]

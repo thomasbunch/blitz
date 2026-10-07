@@ -47,11 +47,15 @@ pub mod attr {
     pub const OVERLINE: u16 = 1 << 6;
 }
 
+/// Longest grapheme cluster a cell holds, in bytes: its first code point
+/// and up to 28 bytes after it. Enough for a family or a subdivision flag.
+pub const CLUSTER_BYTES: usize = 32;
+
 /// One cell with its colours already resolved through the palette.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderCell {
     /// UTF-8 of the grapheme cluster; `len` bytes are valid.
-    pub text: [u8; 16],
+    pub text: [u8; CLUSTER_BYTES],
     pub len: u8,
     /// 0 for the right half of a wide character, else 1 or 2.
     pub width: u8,
