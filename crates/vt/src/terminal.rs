@@ -56,10 +56,18 @@ pub enum Event {
     Title(String),
     Bell,
     Cwd(String),
-    Notify { title: String, body: String },
-    Progress { state: u8, pct: Option<u8> },
+    Notify {
+        title: String,
+        body: String,
+    },
+    Progress {
+        state: u8,
+        pct: Option<u8>,
+    },
     Prompt(PromptMark),
     Hyperlink,
+    /// Text a program put on the clipboard with OSC 52.
+    Clipboard(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1113,12 +1121,15 @@ impl Terminal {
         }
     }
 
-    /// Queues `ev` for the host. Only the newest title and directory
-    /// matter and pending bells ring once, so each replaces the one
-    /// already queued and a flood of them costs the host a single update.
-    /// Past [`MAX_EVENTS`] the oldest event is dropped.
+    /// Queues `ev` for the host. Only the newest title, directory and
+    /// clipboard text matter and pending bells ring once, so each replaces
+    /// the one already queued and a flood of them costs the host a single
+    /// update. Past [`MAX_EVENTS`] the oldest event is dropped.
     fn event(&mut self, ev: Event) {
-        if matches!(ev, Event::Title(_) | Event::Cwd(_) | Event::Bell) {
+        if matches!(
+            ev,
+            Event::Title(_) | Event::Cwd(_) | Event::Bell | Event::Clipboard(_)
+        ) {
             // At most one of each is queued, and in a flood it was the
             // last one pushed, so searching from the back is quick.
             let kind = std::mem::discriminant(&ev);
@@ -1599,6 +1610,15 @@ impl Handler for Terminal {
                 self.changed = true;
                 return;
             }
+            // Copies only. Answering a query would hand any program what
+            // the user last copied. The parser's MAX_OSC keeps the text
+            // under 1 MiB.
+            "52" => match body.split_once(';').and_then(|(_, data)| osc::base64(data)) {
+                Some(text) if !text.is_empty() => {
+                    Event::Clipboard(String::from_utf8_lossy(&text).into_owned())
+                }
+                _ => return,
+            },
             // Resets palette entries set with OSC 4, which is not
             // supported, so there is nothing to reset.
             "104" => return,

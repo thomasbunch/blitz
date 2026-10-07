@@ -235,12 +235,41 @@ fn link_at_covers_the_link_across_a_wrap() {
 #[test]
 fn ignored_strings_leave_no_trace() {
     let mut t = Terminal::new(Options::default());
-    t.feed(b"\x1b]52;c;aGk=\x07\x1b]104\x07\x1b]1337;SetUserVar=a=b\x07\x1bP+q544e\x1b\\ok");
+    t.feed(b"\x1b]52;c;?\x07\x1b]104\x07\x1b]1337;SetUserVar=a=b\x07\x1bP+q544e\x1b\\ok");
     let (mut ev, mut r) = (Vec::new(), Vec::new());
     t.take_events(&mut ev);
     t.take_replies(&mut r);
     assert_eq!((ev, r), (vec![], vec![]));
     assert_eq!(t.screen_text().lines().next(), Some("ok"));
+}
+
+#[test]
+fn programs_copy_with_osc52_but_never_read() {
+    assert_eq!(one("\x1b]52;c;aGk=\x07"), Event::Clipboard("hi".into()));
+    assert_eq!(one("\x1b]52;;w6k\x1b\\"), Event::Clipboard("é".into()));
+    // A query goes unanswered, and nothing else copies.
+    for s in [
+        "\x1b]52;c;?\x07",
+        "\x1b]52;c;\x07",
+        "\x1b]52;c;not base64\x07",
+        "\x1b]52;aGk=\x07",
+    ] {
+        let mut t = Terminal::new(Options::default());
+        t.feed(s.as_bytes());
+        let (mut ev, mut r) = (Vec::new(), Vec::new());
+        t.take_events(&mut ev);
+        t.take_replies(&mut r);
+        assert_eq!((ev, r), (vec![], vec![]), "{s:?}");
+    }
+    // Only the last of many is kept.
+    let flood: String = (0..3000).map(|i| format!("\x1b]52;c;{i:04}\x07")).collect();
+    let mut t = Terminal::new(Options::default());
+    t.feed(flood.as_bytes());
+    let mut ev = Vec::new();
+    t.take_events(&mut ev);
+    let last = vt::osc::base64("2999").unwrap();
+    let last = String::from_utf8_lossy(&last).into_owned();
+    assert_eq!(ev, [Event::Clipboard(last)]);
 }
 
 const PAL: Palette = Palette {
