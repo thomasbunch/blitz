@@ -1134,9 +1134,10 @@ fn picker(
         prompt: "type to filter",
         width: 380.0,
     };
-    // Six of the theme's colours on its own background.
+    // The theme's needs-you dot, then six of its colours, on its own
+    // background.
     let (sq, gap, one) = (s(8.0), s(4.0), s(1.0).max(1));
-    let strip_w = 6 * sq + 7 * gap;
+    let strip_w = 7 * sq + 8 * gap;
     list(p, &l, c, size, &s, cells, |p, i, row, right| {
         let t = pk.items[i];
         let strip = Rect {
@@ -1147,15 +1148,20 @@ fn picker(
         };
         p.push(Prim::Rect(strip, c.border));
         p.push(Prim::Rect(inset(strip, one), t.pal.bg));
+        let square = |k: i32| Rect {
+            x: strip.x + gap + k * (sq + gap),
+            y: strip.y + gap,
+            w: sq,
+            h: sq,
+        };
+        p.push(Prim::Shape {
+            r: square(0),
+            radius: sq as f32 / 2.0,
+            stroke: 0.0,
+            color: t.ui.mark,
+        });
         for (k, &col) in t.pal.ansi[1..7].iter().enumerate() {
-            let x = strip.x + gap + k as i32 * (sq + gap);
-            let r = Rect {
-                x,
-                y: strip.y + gap,
-                w: sq,
-                h: sq,
-            };
-            p.push(Prim::Rect(r, col));
+            p.push(Prim::Rect(square(k as i32 + 1), col));
         }
         strip.x
     });
@@ -2876,6 +2882,24 @@ mod tests {
         let c = build(&m);
         assert!(texts(&c).contains(&"no theme matches"));
         assert!(texts(&c).contains(&"zzz"));
+    }
+
+    #[test]
+    fn picker_swatches_show_each_themes_needs_you_dot() {
+        let (win, sessions, now) = fleet(true);
+        let t = crate::theme::parse("teal", "accent = #2ec4b6");
+        let mut m = model(&win, &sessions, now);
+        m.picker = Some(Picker {
+            filter: "",
+            items: vec![&t],
+            sel: 0,
+        });
+        let c = build(&m);
+        let dot = |p: &Prim| {
+            matches!(p, Prim::Shape { r, radius, color, .. }
+                if *color == t.ui.mark && *radius == r.w as f32 / 2.0)
+        };
+        assert!(c.prims.iter().any(dot));
     }
 
     #[test]
