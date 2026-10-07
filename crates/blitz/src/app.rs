@@ -6425,10 +6425,11 @@ fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
 /// and ends them at a typographic double quote, so there such a name gets
 /// single quotes, with each of its single quote marks doubled. The shell
 /// reading the line may be one started inside the pane, cmd in PowerShell
-/// or the reverse, so cmd gets single quotes too for a name PowerShell
-/// would run inside double ones, and a name that also holds `&`, which cmd
-/// runs inside single ones, asks first. Any other shell is taken for bash,
-/// where `\` needs quoting too and only `'` ends single quotes.
+/// or the reverse, so a name quoted for the pane's shell that the other
+/// would read as syntax asks first: in cmd one PowerShell would run or
+/// end inside double quotes, in PowerShell one that also holds `&`, which
+/// cmd runs inside single ones. Any other shell is taken for bash, where
+/// `\` needs quoting too and only `'` ends single quotes.
 fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, bool) {
     use crate::shell::Kind::{Cmd, Other, PowerShell};
     let plain =
@@ -6440,14 +6441,15 @@ fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, bool) {
             if s.chars().all(plain) {
                 return s.into_owned();
             }
-            // What PowerShell runs, or ends at, inside double quotes.
-            let runs = s.contains("$(") || s.contains(['\u{201c}', '\u{201d}', '\u{201e}']);
+            // What PowerShell runs, or ends at, inside double quotes; a
+            // backtick last escapes the closing one.
+            let runs = s.contains("$(") || s.contains(['`', '\u{201c}', '\u{201d}', '\u{201e}']);
             let single = match shell {
-                Cmd => runs && !s.contains('&'),
-                PowerShell => runs || s.contains(['$', '`']),
+                Cmd => false,
+                PowerShell => runs || s.contains('$'),
                 Other => true,
             };
-            asks |= shell != Other && s.contains('&') && (single || runs);
+            asks |= shell == Cmd && runs || shell == PowerShell && single && s.contains('&');
             if !single {
                 return format!("\"{s}\"");
             }
@@ -9689,10 +9691,20 @@ mod tests {
         assert_eq!(one(r"\\srv\c$\a.txt", Cmd), r#""\\srv\c$\a.txt""#);
         assert_eq!(one(r"C:\x$&calc&.txt", Cmd), r#""C:\x$&calc&.txt""#);
         assert!(!asks(r"C:\x$&calc&.txt", Cmd));
-        // What PowerShell would run inside double quotes gets single ones,
-        // which cmd reads as text too.
-        assert_eq!(one(r"C:\$(calc).txt", Cmd), r"'C:\$(calc).txt'");
-        assert_eq!(one(r"C:\a”;calc;”.txt", Cmd), r"'C:\a”;calc;”.txt'");
+        // cmd reads `'` as text, so it keeps double quotes, and asks for
+        // what PowerShell started inside it would run, end or escape in
+        // them.
+        for name in [
+            r"C:\$(calc).txt",
+            r"C:\a”;calc;”.txt",
+            r"C:\Report “final” v2.docx",
+            r"C:\it's $(x).txt",
+            r"C:\d\a`",
+        ] {
+            assert_eq!(one(name, Cmd), format!("\"{name}\""));
+            assert!(asks(name, Cmd), "{name}");
+        }
+        assert!(asks(r"C:\a`&b.txt", Cmd));
         // PowerShell expands `$` and ends a string at a typographic quote
         // inside double quotes, but nothing ends single ones but a single
         // quote mark, doubled.
@@ -9704,7 +9716,6 @@ mod tests {
             r"'C:\x$’’;calc;’’.txt'"
         );
         assert_eq!(one("C:\\a`b‚‛.txt", PowerShell), "'C:\\a`b‚‚‛‛.txt'");
-        assert_eq!(one(r"C:\it's $(x).txt", Cmd), r"'C:\it''s $(x).txt'");
         // No quoting suits both cmd and PowerShell: asked first, quoted for
         // the shell the pane started.
         assert_eq!(one(r"C:\x$&calc&.txt", PowerShell), r"'C:\x$&calc&.txt'");
