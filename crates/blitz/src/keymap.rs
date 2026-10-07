@@ -35,6 +35,10 @@ pub enum Action {
     ReopenClosed,
     /// Next (1) or previous (-1) tab.
     CycleTab(i8),
+    /// Move the tab right (1) or left (-1).
+    MoveTab(i8),
+    /// Take the focused pane out of its tab into a new one.
+    PaneToNewTab,
     /// Tab 1 to 8, 0-based. With no such tab the key does nothing.
     GoToTab(u8),
     LastTab,
@@ -106,6 +110,9 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::ReopenClosed, "reopen_closed", "Reopen the last closed pane"),
     (Action::CycleTab(1), "next_tab", "Next tab"),
     (Action::CycleTab(-1), "previous_tab", "Previous tab"),
+    (Action::MoveTab(-1), "move_tab_left", "Move the tab left"),
+    (Action::MoveTab(1), "move_tab_right", "Move the tab right"),
+    (Action::PaneToNewTab, "move_pane_to_new_tab", "Move the pane to a new tab"),
     (Action::SplitRight, "split_right", "Split right"),
     (Action::SplitDown, "split_down", "Split down"),
     (Action::Focus(Dir::Left), "focus_left", "Focus the pane on the left"),
@@ -176,6 +183,8 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, b'W' as u16, Action::ClosePane),
     (CTRL, 0x09, Action::CycleTab(1)),
     (CTRL | SHIFT, 0x09, Action::CycleTab(-1)),
+    (CTRL | SHIFT, 0x21, Action::MoveTab(-1)),
+    (CTRL | SHIFT, 0x22, Action::MoveTab(1)),
     (CTRL | SHIFT, b'R' as u16, Action::SplitRight),
     (CTRL | SHIFT, b'D' as u16, Action::SplitDown),
     (CTRL | ALT, 0x25, Action::Focus(Dir::Left)),
@@ -471,6 +480,7 @@ pub fn repeats(k: &KeyInput, user: &[Binding], panel: bool) -> bool {
             a,
             Action::ScrollPage(_)
                 | Action::CycleTab(_)
+                | Action::MoveTab(_)
                 | Action::Focus(_)
                 | Action::Resize(_)
                 | Action::Swap(_)
@@ -1100,6 +1110,8 @@ mod msg_to_key_tests {
         assert_eq!(press(0x44, &[0xa3, LSHIFT]), Some(Action::SplitDown));
         assert_eq!(press(0x42, &[LCTRL, LSHIFT]), Some(Action::ToggleSidebar));
         assert_eq!(press(0x09, &[LCTRL, LSHIFT]), Some(Action::CycleTab(-1)));
+        assert_eq!(press(0x21, &[LCTRL, LSHIFT]), Some(Action::MoveTab(-1)));
+        assert_eq!(press(0x22, &[LCTRL, LSHIFT]), Some(Action::MoveTab(1)));
         assert_eq!(press(0x33, &[LCTRL]), Some(Action::GoToTab(2)));
         assert_eq!(press(0x25, &[LCTRL, LALT]), Some(Action::Focus(Dir::Left)));
         assert_eq!(press(0x26, &[LALT, LSHIFT]), Some(Action::Resize(Dir::Up)));
@@ -1419,6 +1431,7 @@ mod msg_to_key_tests {
         for (vk, held) in [
             (0x21, &[0xa0][..]),         // ScrollPage
             (0x09, &[0xa2]),             // CycleTab
+            (0x22, &[0xa2, 0xa0]),       // MoveTab
             (0x25, &[0xa2, 0xa4]),       // Focus
             (0x26, &[0xa4, 0xa0]),       // Resize
             (0x27, &[0xa2, 0xa4, 0xa0]), // Swap

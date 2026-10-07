@@ -2855,6 +2855,26 @@ impl App {
                     self.focus_moved(before);
                 }
             }
+            Action::MoveTab(by) => {
+                if !self.win.move_tab(by.into()) {
+                    return false;
+                }
+                self.request_redraw();
+            }
+            Action::PaneToNewTab => {
+                let Some(id) = before else {
+                    return false;
+                };
+                let cwd = (self.current()).map(|v| PathBuf::from(&v.pane.cwd));
+                let name = tab_name(cwd.as_deref().filter(|p| !p.as_os_str().is_empty()));
+                if !self.win.pane_to_new_tab(id, name) {
+                    return false;
+                }
+                // A divider being dragged is known by its place in the old
+                // layout.
+                self.mouse.divider = None;
+                self.request_redraw();
+            }
             Action::GoToTab(_) | Action::LastTab => {
                 let i = match a {
                     Action::GoToTab(i) => usize::from(i),
