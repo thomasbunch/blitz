@@ -3395,14 +3395,11 @@ impl App {
             return;
         }
         // A click on another pane only moves focus.
-        if pressed {
-            let (id, side) = self.hit(self.mouse.pos);
-            if side || id.is_some_and(|id| Some(id) != self.focus_id()) {
-                if let Some(id) = id {
-                    self.show(id);
-                }
-                return;
-            }
+        if pressed
+            && let Some(id) = (self.hit(self.mouse.pos).0).filter(|&id| Some(id) != self.focus_id())
+        {
+            self.show(id);
+            return;
         }
         let program = self.mouse_to_program(&mods).and(self.focus_id());
         if let Some(id) = route_button(&mut self.mouse.reported, b, pressed, program) {
