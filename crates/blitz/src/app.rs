@@ -440,11 +440,14 @@ enum Ask {
 impl Ask {
     /// Whether a key that runs `a`, if any, takes the notice away. `here`
     /// when the key goes to the notice's pane. Opening the palette does
-    /// not, since an action run from it confirms too.
+    /// not, since an action run from it confirms too. A question about its
+    /// own pane goes at any key aimed at another, so the same action there
+    /// cannot answer it later.
     fn gone(&self, a: Option<Action>, here: bool) -> bool {
         let by = match self {
             Ask::Nothing => return false,
             Ask::Key => return here,
+            Ask::Paste(_) | Ask::ClosePane | Ask::CloseTab if !here => return true,
             Ask::Paste(_) => Action::Paste,
             Ask::ClosePane => Action::ClosePane,
             Ask::CloseTab => Action::CloseTab,
@@ -452,6 +455,12 @@ impl Ask {
             Ask::Quit => return true,
         };
         a != Some(by) && a != Some(Action::Palette)
+    }
+
+    /// Whether the question is about its own pane, so focus leaving that
+    /// pane takes it away.
+    fn of_pane(&self) -> bool {
+        matches!(self, Ask::Paste(_) | Ask::ClosePane | Ask::CloseTab)
     }
 }
 
@@ -1490,6 +1499,9 @@ impl App {
         }
         self.selection = None;
         self.find = None;
+        if let Some(v) = before.and_then(|id| self.view_mut(id)) {
+            v.notice.take_if(|n| n.ask.of_pane());
+        }
         self.mouse.drag = None;
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
@@ -5815,28 +5827,37 @@ mod tests {
 
     /// A question stays until it is answered or another key is pressed,
     /// which then does what it always does; an error goes at the next key
-    /// in its pane; other notices stay.
+    /// in its pane; other notices stay. A question about its own pane goes
+    /// at any key aimed at another pane, its own action too.
     #[test]
     fn notices_go_at_the_next_key_that_does_not_answer_them() {
         let close = Some(Action::ClosePane);
+        for ask in [Ask::ClosePane, Ask::CloseTab, Ask::Paste("a\nb".into())] {
+            assert!(ask.of_pane());
+            for a in [close, Some(Action::CloseTab), Some(Action::Paste)] {
+                assert!(ask.gone(a, false), "{ask:?} at {a:?} elsewhere");
+            }
+            assert!(ask.gone(Some(Action::Palette), false));
+        }
+        assert!(!Ask::Update.of_pane() && !Ask::Quit.of_pane() && !Ask::Key.of_pane());
+        let paste = Ask::Paste("a\nb".into());
+        assert!(!paste.gone(Some(Action::Paste), true));
+        assert!(paste.gone(close, true));
+        assert!(!Ask::ClosePane.gone(close, true), "answered");
+        assert!(
+            !Ask::ClosePane.gone(Some(Action::Palette), true),
+            "answered from the palette"
+        );
+        assert!(!Ask::CloseTab.gone(Some(Action::CloseTab), true));
         for here in [true, false] {
             let ask = Ask::ClosePane;
-            assert!(!ask.gone(close, here), "answered");
-            assert!(
-                !ask.gone(Some(Action::Palette), here),
-                "answered from the palette"
-            );
             assert!(ask.gone(None, here), "typing");
             assert!(ask.gone(Some(Action::Update), here), "another shortcut");
-            let paste = Ask::Paste("a\nb".into());
-            assert!(!paste.gone(Some(Action::Paste), here));
-            assert!(paste.gone(close, here));
             assert!(!Ask::Update.gone(Some(Action::Update), here));
             assert!(Ask::Update.gone(Some(Action::Copy), here));
             assert_eq!(Ask::Key.gone(None, here), here, "an error, read");
             assert_eq!(Ask::Key.gone(close, here), here);
             assert!(!Ask::Nothing.gone(None, here));
-            assert!(!Ask::CloseTab.gone(Some(Action::CloseTab), here));
             assert!(Ask::CloseTab.gone(close, here), "not the whole tab");
             assert!(
                 Ask::Quit.gone(None, here),
