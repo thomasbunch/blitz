@@ -86,6 +86,8 @@ const HINT: Duration = Duration::from_secs(10);
 const HOOKS_QUIET: Duration = Duration::from_secs(45);
 /// How long a dim notice that only says something worked stays up.
 const BRIEF: Duration = Duration::from_secs(2);
+/// How long a shortcut with nothing to do says so.
+const NOTHING: Duration = Duration::from_secs(1);
 /// Frame times for blitz run, and for scenery and the spark, which move
 /// slowly.
 const GAME_FRAME: Duration = Duration::from_millis(16);
@@ -898,6 +900,9 @@ struct App {
     /// Files dropped on the window, one event each, handled together when
     /// the event loop has nothing more to deliver.
     dropped: Vec<PathBuf>,
+    /// Where the last jump to a session that needs you came from, and
+    /// where it went; see [`jump`].
+    jumped: Option<(PaneId, PaneId)>,
     /// A newer release: its version and the banner text.
     update: Option<(String, String)>,
     /// The installer is downloading, or Ctrl+Shift+U is looking for a
@@ -1163,6 +1168,7 @@ impl App {
             mouse: Mouse::default(),
             preedit: String::new(),
             dropped: Vec::new(),
+            jumped: None,
             update: None,
             updating: None,
             closed: None,
@@ -2869,8 +2875,15 @@ impl App {
                 let waiting = (self.views.iter())
                     .filter(|v| Some(v.pane.id) != before)
                     .map(|v| (v.pane.id, v.pane.attn));
-                if let Some(id) = crate::attention::jump_target(waiting) {
-                    self.show(id);
+                let target = crate::attention::jump_target(waiting);
+                match jump(before, target, &mut self.jumped).filter(|&id| self.view(id).is_some()) {
+                    Some(id) => self.show(id),
+                    None => {
+                        if let Some(id) = before {
+                            let until = Some(Instant::now() + NOTHING);
+                            self.set_notice(id, "Nothing needs you", until, true);
+                        }
+                    }
                 }
             }
             Action::Update => {
@@ -4392,6 +4405,27 @@ fn animations_on() -> bool {
         )
     };
     read.is_err() || on.as_bool()
+}
+
+/// Where a jump to the session that needs you goes from `at`: to
+/// `waiting`, or with nothing waiting back to where the last jump came
+/// from, unless that is `at`. `jumped` is the last jump, from and to. A
+/// jump from where the last one landed keeps where that one came from, so
+/// going round every waiting session still comes back to the start.
+fn jump(
+    at: Option<PaneId>,
+    waiting: Option<PaneId>,
+    jumped: &mut Option<(PaneId, PaneId)>,
+) -> Option<PaneId> {
+    let Some(to) = waiting else {
+        return jumped.take().map(|j| j.0).filter(|&from| Some(from) != at);
+    };
+    let from = match *jumped {
+        Some((from, to)) if Some(to) == at => Some(from),
+        _ => at,
+    };
+    *jumped = from.map(|from| (from, to));
+    Some(to)
 }
 
 /// Whether a shortcut pressed while the find bar is open runs, which
@@ -6437,6 +6471,26 @@ mod tests {
         f.search(&t, 3);
         f.step(1);
         assert_eq!((f.found.len(), f.cur), (0, None));
+    }
+
+    #[test]
+    fn app_jumps_come_back_when_nothing_waits() {
+        let (a, b, c, d) = (PaneId(1), PaneId(2), PaneId(3), PaneId(4));
+        let mut j = None;
+        assert_eq!(jump(Some(a), None, &mut j), None, "nothing waits");
+        // Round the waiting sessions, then back to the start.
+        assert_eq!(jump(Some(a), Some(b), &mut j), Some(b));
+        assert_eq!(jump(Some(b), Some(c), &mut j), Some(c));
+        assert_eq!(jump(Some(c), None, &mut j), Some(a));
+        assert_eq!(jump(Some(a), None, &mut j), None, "once");
+        // Moving away by hand starts over from there.
+        assert_eq!(jump(Some(a), Some(b), &mut j), Some(b));
+        assert_eq!(jump(Some(d), Some(c), &mut j), Some(c));
+        assert_eq!(jump(Some(c), None, &mut j), Some(d));
+        // Already back where it came from.
+        assert_eq!(jump(Some(a), Some(b), &mut j), Some(b));
+        assert_eq!(jump(Some(a), None, &mut j), None);
+        assert_eq!(j, None);
     }
 
     #[test]
