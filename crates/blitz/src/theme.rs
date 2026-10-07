@@ -73,6 +73,10 @@ pub struct Ui {
     pub accent: u32,
     /// Text on the accent; follows it.
     pub chip_fg: u32,
+    /// The accent as dots and rings draw it, which have no text to carry
+    /// them: moved away from the chrome's backgrounds until it stands out
+    /// from each by 3:1. Follows the accent.
+    pub mark: u32,
     pub track: u32,
     pub fill: u32,
     pub error: u32,
@@ -177,6 +181,26 @@ impl Ui {
         } else {
             0xffffff
         };
+        // Amber on a light background is about 1.6:1, too faint for a
+        // dot; darken it there, lighten it on a dark one.
+        let away = if luminance(self.term_bg) > 0.18 {
+            0x000000
+        } else {
+            0xffffff
+        };
+        let under = [
+            self.term_bg,
+            self.side_bg,
+            self.row_focus,
+            self.hdr_bg,
+            self.rail_focus,
+        ];
+        let mut t = 0.0;
+        self.mark = accent;
+        while under.iter().any(|&b| contrast(self.mark, b) < 3.0) && t < 1.0 {
+            t = (t + 0.05f32).min(1.0);
+            self.mark = mix(accent, away, t);
+        }
     }
 }
 
@@ -656,7 +680,30 @@ mod tests {
             }
             let chip = contrast(ui.chip_fg, ui.accent);
             assert!(chip >= 4.5, "{}: text on the accent {chip:.2}", t.name);
+            // Dots and rings sit on any of the chrome's backgrounds.
+            for (what, c) in [
+                ("pane", ui.term_bg),
+                ("sidebar", ui.side_bg),
+                ("focused row", ui.row_focus),
+                ("header", ui.hdr_bg),
+                ("rail row", ui.rail_focus),
+            ] {
+                let on = contrast(ui.mark, c);
+                assert!(on >= 3.0, "{}: mark on the {what} {on:.2}", t.name);
+            }
         }
+    }
+
+    #[test]
+    fn a_mark_that_stands_out_is_the_accent() {
+        let dark = blitz(false).ui;
+        assert_eq!(dark.mark, dark.accent);
+        // Light: the same amber, darker.
+        let light = blitz(true).ui;
+        assert_eq!(light.accent, ACCENT);
+        assert!(luminance(light.mark) < luminance(ACCENT));
+        let [_, r, g, b] = light.mark.to_be_bytes();
+        assert!(r > g && g > b, "still amber: {:06x}", light.mark);
     }
 
     #[test]

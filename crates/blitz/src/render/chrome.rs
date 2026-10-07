@@ -430,7 +430,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             }
             let cy = r.y + (hh - 1) / 2;
             match state {
-                Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, ring(sess), c.accent),
+                Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, ring(sess), c.mark),
                 Attn::DoneUnseen => mark(p, right - s(4.0), cy, 7.0, 1.5, c.name),
                 Attn::Error => mark(p, right - s(4.0), cy, 7.0, 0.0, c.error),
                 Attn::Working | Attn::Idle => {}
@@ -479,7 +479,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                         h: r.h - 2 * b,
                     },
                 ] {
-                    p.push(Prim::Rect(e, c.accent));
+                    p.push(Prim::Rect(e, c.mark));
                 }
             }
         }
@@ -635,7 +635,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let (mx, my) = (row.x + s(12.0), y + top + s(5.0) + s(4.0));
                 match x.state {
-                    Attn::NeedsYou => mark(p, mx, my, 8.0, ring(Some(x)), c.accent),
+                    Attn::NeedsYou => mark(p, mx, my, 8.0, ring(Some(x)), c.mark),
                     Attn::DoneUnseen => mark(p, mx, my, 8.0, 1.5, c.name),
                     Attn::Error => mark(p, mx, my, 8.0, 0.0, c.error),
                     Attn::Working | Attn::Idle => {}
@@ -792,7 +792,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let (cx, cy) = (row.w / 2, y + row.h / 2);
                 match x.state {
-                    Attn::NeedsYou => mark(p, cx, cy, 7.0, ring(Some(x)), c.accent),
+                    Attn::NeedsYou => mark(p, cx, cy, 7.0, ring(Some(x)), c.mark),
                     Attn::DoneUnseen => mark(p, cx, cy, 8.0, 1.5, c.name),
                     Attn::Error => mark(p, cx, cy, 7.0, 0.0, c.error),
                     Attn::Idle => mark(p, cx, cy, 3.0, 0.0, c.idle),
@@ -2152,7 +2152,10 @@ mod tests {
     #[test]
     fn collapsed_rail_is_dots_and_corner_labels() {
         let (win, sessions, now) = fleet(false);
-        let c = build(&model(&win, &sessions, now));
+        let mut m = model(&win, &sessions, now);
+        // Light, where marks are darker than the accent.
+        m.ui = crate::theme::blitz(true).ui;
+        let c = build(&m);
         assert_eq!(c.panes[0].1.x, 15 + 16);
         // No header strip, but a band for the pane's name above the grid.
         assert_eq!(c.panes[0].1.y, 15 + 6);
@@ -2166,12 +2169,13 @@ mod tests {
         assert!(c.side.rows.iter().all(|(_, r)| r.right() <= 15) && c.side.rows.len() == 3);
         let t = texts(&c);
         assert_eq!(t, ["api", "web"], "only the pane labels");
-        // The needs-you pane gets a 2 px accent ring.
-        let accent = crate::theme::blitz(false).ui.accent;
+        // The needs-you pane gets a 2 px ring.
+        let mark = m.ui.mark;
+        assert_ne!(mark, m.ui.accent);
         let ring = c
             .prims
             .iter()
-            .filter(|p| matches!(p, Prim::Rect(r, a) if *a == accent && (r.w == 2 || r.h == 2)))
+            .filter(|p| matches!(p, Prim::Rect(r, a) if *a == mark && (r.w == 2 || r.h == 2)))
             .count();
         assert_eq!(ring, 4);
         // Three rail marks: needs-you dot, working bar, idle dot.
