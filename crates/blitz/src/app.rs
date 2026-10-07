@@ -508,6 +508,8 @@ struct Mouse {
     tracker: vt::keys::MouseTracker,
     /// Wheel movement not yet turned into whole steps.
     wheel: f64,
+    /// When Ctrl and the wheel last changed the font size.
+    font_at: Option<Instant>,
     /// A left-button drag is moving this divider of the active tab; the
     /// second value is the smallest pane it may leave.
     divider: Option<(usize, (i32, i32))>,
@@ -2071,6 +2073,21 @@ impl App {
         self.request_redraw();
     }
 
+    /// Makes the font a point bigger or smaller, within the range the
+    /// font_size setting allows, or with 0 puts the setting's size back.
+    fn font_size(&mut self, by: i8) {
+        let set = self.config.font_size;
+        let now = set + self.font_zoom;
+        let pt = match by {
+            0 => set,
+            _ => (now + f32::from(by)).clamp(4.0, 72.0),
+        };
+        if pt != now {
+            self.font_zoom = pt - set;
+            self.reload_font();
+        }
+    }
+
     /// A key while the command palette is open: up and down choose an
     /// action, typing narrows the list, Enter runs the action and Esc
     /// closes the palette.
@@ -2985,19 +3002,7 @@ impl App {
                 }
                 self.request_redraw();
             }
-            // Within the range the font_size setting allows.
-            Action::FontSize(by) => {
-                let set = self.config.font_size;
-                let now = set + self.font_zoom;
-                let pt = match by {
-                    0 => set,
-                    _ => (now + f32::from(by)).clamp(4.0, 72.0),
-                };
-                if pt != now {
-                    self.font_zoom = pt - set;
-                    self.reload_font();
-                }
-            }
+            Action::FontSize(by) => self.font_size(by),
             // Borderless on the window's monitor. winit puts the window back
             // where it was; the session keeps that place, not the monitor's.
             Action::Fullscreen => {
@@ -3926,6 +3931,17 @@ impl App {
         if self.game.is_some() {
             return;
         }
+        // Ctrl and the wheel change the font size, unless the program takes
+        // the mouse.
+        let mods = mods_now();
+        if (mods.lctrl || mods.rctrl) && self.modes().mouse == MouseMode::Off {
+            let now = Instant::now();
+            if let Some(by) = wheel_font(steps, self.mouse.font_at, now) {
+                self.mouse.font_at = Some(now);
+                self.font_size(by);
+            }
+            return;
+        }
         // Over another pane, the wheel scrolls that pane's history without
         // moving focus.
         // Programs in unfocused panes never get wheel reports;
@@ -3945,7 +3961,6 @@ impl App {
             }
             return;
         }
-        let mods = mods_now();
         if let Some(id) = self.mouse_to_program(&mods).and(self.focus_id()) {
             let kind = if steps > 0.0 {
                 MouseKind::WheelUp
@@ -4449,6 +4464,17 @@ fn jump(
     };
     *jumped = from.map(|from| (from, to));
     Some(to)
+}
+
+/// Time a font size change from the wheel holds off the next, so a fast
+/// spin, each step of which sizes every session again, makes one step.
+const FONT_WHEEL: Duration = Duration::from_millis(100);
+
+/// The font size step for `steps` of the wheel with Ctrl held: one point
+/// up or down, unless the last step, `last`, was too recent.
+fn wheel_font(steps: f64, last: Option<Instant>, now: Instant) -> Option<i8> {
+    let ready = last.is_none_or(|t| now.saturating_duration_since(t) >= FONT_WHEEL);
+    (ready && steps != 0.0).then_some(if steps > 0.0 { 1 } else { -1 })
 }
 
 /// Whether a shortcut pressed while the find bar is open runs, which
@@ -6514,6 +6540,17 @@ mod tests {
         assert_eq!(jump(Some(a), Some(b), &mut j), Some(b));
         assert_eq!(jump(Some(a), None, &mut j), None);
         assert_eq!(j, None);
+    }
+
+    #[test]
+    fn app_ctrl_wheel_steps_the_font_a_point_at_a_time() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        assert_eq!(wheel_font(1.0, None, t0), Some(1));
+        assert_eq!(wheel_font(-3.0, None, t0), Some(-1), "one point a step");
+        assert_eq!(wheel_font(1.0, Some(t0), ms(99)), None, "a fast spin");
+        assert_eq!(wheel_font(1.0, Some(t0), ms(100)), Some(1));
+        assert_eq!(wheel_font(0.0, None, t0), None);
     }
 
     #[test]

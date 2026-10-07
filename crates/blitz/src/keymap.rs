@@ -178,11 +178,16 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     // VK_OEM_COMMA: the comma key on every layout.
     (CTRL, 0xbc, Action::Settings),
     (CTRL | SHIFT, b'Z' as u16, Action::Zoom),
-    // VK_OEM_PLUS and VK_OEM_MINUS. Ctrl+Shift+- still goes to the
-    // program: it is Claude Code's undo.
+    // VK_OEM_PLUS and VK_OEM_MINUS, with Shift too where + needs it, and
+    // the keypad's. Ctrl+Shift+- still goes to the program: it is Claude
+    // Code's undo.
     (CTRL, 0xbb, Action::FontSize(1)),
+    (CTRL | SHIFT, 0xbb, Action::FontSize(1)),
     (CTRL, 0xbd, Action::FontSize(-1)),
     (CTRL, b'0' as u16, Action::FontSize(0)),
+    (CTRL, 0x6b, Action::FontSize(1)),
+    (CTRL, 0x6d, Action::FontSize(-1)),
+    (CTRL, 0x60, Action::FontSize(0)),
     // F11.
     (0, 0x7a, Action::Fullscreen),
     (CTRL | SHIFT, b'P' as u16, Action::Palette),
@@ -193,8 +198,8 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
 ];
 
 /// Key names for chords, matched ignoring case. The first name of each
-/// key is the one the command palette shows. Letters, digits and F1 to F24
-/// need no entry.
+/// key is the one the command palette shows. Letters, digits, F1 to F24
+/// and Numpad0 to Numpad9 need no entry.
 const KEY_NAMES: &[(&str, u16)] = &[
     ("Backspace", 0x08),
     ("Tab", 0x09),
@@ -242,6 +247,12 @@ const KEY_NAMES: &[(&str, u16)] = &[
     ("BracketRight", 0xdd),
     ("'", 0xde),
     ("Quote", 0xde),
+    // The keypad's other keys with Num Lock on.
+    ("NumpadMultiply", 0x6a),
+    ("NumpadAdd", 0x6b),
+    ("NumpadSubtract", 0x6d),
+    ("NumpadDecimal", 0x6e),
+    ("NumpadDivide", 0x6f),
 ];
 
 /// A binding as `config.toml` writes it: a chord, `=`, and an action's
@@ -277,7 +288,10 @@ fn key_code(name: &str) -> Option<u16> {
         return Some(vk);
     }
     let f = (name.strip_prefix(['f', 'F'])).and_then(|n| n.parse::<u16>().ok());
+    let pad = (name.get(..6).filter(|p| p.eq_ignore_ascii_case("numpad")))
+        .and_then(|_| name[6..].parse::<u16>().ok());
     match (f, name.as_bytes()) {
+        _ if pad.is_some_and(|n| n <= 9) => pad.map(|n| 0x60 + n),
         (Some(n @ 1..=24), _) => Some(0x6f + n),
         (_, &[c]) if c.is_ascii_alphanumeric() => Some(c.to_ascii_uppercase().into()),
         _ => None,
@@ -294,6 +308,7 @@ fn chord_label(mods: u8, vk: u16) -> String {
     }
     match vk {
         0x30..=0x39 | 0x41..=0x5a => s.push(char::from(vk as u8)),
+        0x60..=0x69 => s.push_str(&format!("Numpad{}", vk - 0x60)),
         0x70..=0x87 => s.push_str(&format!("F{}", vk - 0x6f)),
         _ => s.push_str(KEY_NAMES.iter().find(|k| k.1 == vk).map_or("?", |k| k.0)),
     }
@@ -1026,6 +1041,11 @@ mod msg_to_key_tests {
         assert_eq!(press(0x25, &[LCTRL, LSHIFT]), None, "selects a word");
         assert_eq!(press(0xbd, &[LCTRL]), Some(Action::FontSize(-1)));
         assert_eq!(press(0xbd, &[LCTRL, LSHIFT]), None, "Claude Code's undo");
+        // Ctrl and + with Shift, as on a US layout, and on the keypad.
+        assert_eq!(press(0xbb, &[LCTRL, LSHIFT]), Some(Action::FontSize(1)));
+        assert_eq!(press(0x6b, &[LCTRL]), Some(Action::FontSize(1)));
+        assert_eq!(press(0x6d, &[LCTRL]), Some(Action::FontSize(-1)));
+        assert_eq!(press(0x60, &[LCTRL]), Some(Action::FontSize(0)));
         assert_eq!(press(0x30, &[LCTRL]), Some(Action::FontSize(0)));
         assert_eq!(press(0x52, &[LCTRL]), None);
         assert_eq!(press(0x43, &[LCTRL, LALT]), None, "AltGr is not Ctrl");
@@ -1088,6 +1108,22 @@ mod msg_to_key_tests {
         ] {
             assert_eq!(binding(bad), None, "{bad}");
         }
+        // The keypad by name.
+        assert_eq!(
+            binding("ctrl+numpad0=copy"),
+            Some((CTRL, 0x60, Some(Action::Copy)))
+        );
+        assert_eq!(
+            binding("ctrl+Numpad9=copy"),
+            Some((CTRL, 0x69, Some(Action::Copy)))
+        );
+        assert_eq!(
+            binding("ctrl+numpadadd=copy"),
+            Some((CTRL, 0x6b, Some(Action::Copy)))
+        );
+        assert_eq!(binding("ctrl+numpad10=copy"), None);
+        assert_eq!(chord_label(CTRL, 0x60), "Ctrl+Numpad0");
+        assert_eq!(chord_label(CTRL, 0x6d), "Ctrl+NumpadSubtract");
         assert_eq!(chord_label(CTRL | ALT | SHIFT, 0x25), "Ctrl+Alt+Shift+Left");
         assert_eq!(chord_label(CTRL, 0xbc), "Ctrl+,");
         assert_eq!(chord_label(0, 0x7a), "F11");
