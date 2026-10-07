@@ -136,25 +136,24 @@ impl Pane {
         let mut replies = Vec::new();
         let on_event = move |ev: PtyEvent<'_>, w: &crate::pty::Writer| match ev {
             PtyEvent::Data(_) if dead => {}
-            PtyEvent::Data(bytes) => {
-                let r = catch_unwind(AssertUnwindSafe(|| {
-                    for chunk in bytes.chunks(FEED_BYTES) {
-                        let mut term = lock(&t);
-                        term.feed(chunk);
-                        term.take_replies(&mut replies);
-                        // Replies go out in the order the queries came in,
-                        // and before the lock goes, so a focus report the
-                        // UI thread sends next follows any queued here.
-                        if !replies.is_empty() {
-                            w.reply(std::mem::take(&mut replies));
-                        }
-                        drop(term);
+            PtyEvent::Data(bytes) => feed_pieces(
+                bytes,
+                |piece| {
+                    let mut term = lock(&t);
+                    term.feed(piece);
+                    term.take_replies(&mut replies);
+                    // Replies go out in the order the queries came in, and
+                    // before the lock goes, so a focus report the UI thread
+                    // sends next follows any queued here.
+                    if !replies.is_empty() {
+                        w.reply(std::mem::take(&mut replies));
                     }
+                    drop(term);
                     if !d.swap(true, Ordering::AcqRel) {
                         notify(id, Note::Dirty);
                     }
-                }));
-                if r.is_err() {
+                },
+                || {
                     dead = gives_up(&mut panics, Instant::now());
                     // The panic may have left the screen half updated, and
                     // the UI thread reads it every frame. A fresh one the
@@ -164,6 +163,7 @@ impl Pane {
                     let mut term = lock(&t);
                     // Answers to queries parsed before the panic go out
                     // now: a program may wait on one before it prints more.
+                    let mut replies = Vec::new();
                     term.take_replies(&mut replies);
                     if dead {
                         *term = vt::Terminal::new(vt::Options {
@@ -172,18 +172,19 @@ impl Pane {
                             ..Default::default()
                         });
                     } else {
-                        term.reset();
+                        start_over(&mut term);
                     }
                     drop(term);
                     if !replies.is_empty() {
-                        w.reply(std::mem::take(&mut replies));
+                        w.reply(replies);
                     }
                     // The panic may have come before the UI heard of the
                     // output, which would then never be drawn.
                     d.store(false, Ordering::Release);
                     notify(id, if dead { Note::Dead } else { Note::Reset });
-                }
-            }
+                    dead
+                },
+            ),
             // Even a pane that gave up reports the exit, so it can close.
             PtyEvent::Exit(code) => {
                 let _ = catch_unwind(AssertUnwindSafe(|| lock(&t).on_child_exit()));
@@ -237,12 +238,15 @@ impl Pane {
         kept
     }
 
-    /// Has the console host send the whole `cols` by `rows` screen again,
-    /// as it does after a resize: it otherwise sends only what changes, so
-    /// a screen that started over would stay blank where the program does
-    /// not draw again. Only the one in Windows does; the bundled one sends
-    /// nothing again after a resize.
+    /// Has the console host and a screen that [`start_over`] agree again:
+    /// the host otherwise sends only what changes, so the screen would stay
+    /// blank where the program does not draw again. The one in Windows
+    /// sends the whole `cols` by `rows` screen after a resize. The bundled
+    /// one sends nothing then, but cleared, it keeps only the cursor's
+    /// line, at the top, as the screen does. Either way the resize has a
+    /// full-screen program draw its screen again.
     pub fn repaint(&self, cols: u16, rows: u16) {
+        self.pty.clear();
         let other = if rows > 1 { rows - 1 } else { rows + 1 };
         self.pty.resize(cols, other);
         self.pty.resize(cols, rows);
@@ -253,6 +257,35 @@ impl Pane {
         if !bytes.is_empty() {
             self.pty.writer().send(bytes);
         }
+    }
+}
+
+/// Feeds `bytes` to `feed` in pieces of at most [`FEED_BYTES`]. After a
+/// piece that panics, `recover` runs, and the pieces after it are fed
+/// still, unless it says the pane gave up.
+fn feed_pieces(bytes: &[u8], mut feed: impl FnMut(&[u8]), mut recover: impl FnMut() -> bool) {
+    for piece in bytes.chunks(FEED_BYTES) {
+        if catch_unwind(AssertUnwindSafe(|| feed(piece))).is_err() && recover() {
+            return;
+        }
+    }
+}
+
+/// Starts `term` over after a panic left it half updated. The cursor's
+/// line stays, as its text, at the top: where the bundled console host
+/// puts it once [`Pane::repaint`] clears it, and the line a shell's prompt
+/// is on.
+fn start_over(term: &mut vt::Terminal) {
+    // What the panic left may panic again.
+    let line = catch_unwind(AssertUnwindSafe(|| {
+        let (col, row, _) = term.cursor();
+        let text = term.screen_text();
+        let line = text.lines().nth(usize::from(row)).unwrap_or_default();
+        format!("{}\r\x1b[{}G", line.trim_end(), col + 1)
+    }));
+    term.reset();
+    if let Ok(line) = line {
+        term.feed(line.as_bytes());
     }
 }
 
@@ -520,20 +553,16 @@ mod tests {
         assert!(text.contains("pane-two"), "screen: {text:?}");
     }
 
-    /// A screen that started over gets what the console host shows back
-    /// once asked, not only what the program prints after.
+    /// A screen that started over keeps the prompt, and what is typed
+    /// there next lands beside it, whichever console host runs the pane.
     #[test]
-    fn pane_gets_its_screen_again_after_starting_over() {
-        if std::env::var_os("BLITZ_CONPTY_DIR").is_some() {
-            eprintln!("SKIPPED: the bundled ConPTY sends nothing again after a resize");
-            return;
-        }
+    fn pane_keeps_its_prompt_after_starting_over() {
         let (tx, rx) = mpsc::channel();
         let pane = Pane::spawn(
             PaneId(9),
             &Spawn {
                 cmdline: "cmd.exe /d /k echo pane-one",
-                env: &[],
+                env: &[("PROMPT".into(), "pane-two$G".into())],
                 cwd: None,
                 cols: 40,
                 rows: 5,
@@ -561,11 +590,12 @@ mod tests {
             }
             false
         };
-        assert!(shows("pane-one"));
-        // As the reader does after a panic.
-        lock(&pane.term).reset();
+        assert!(shows("pane-two>"));
+        // As the reader and the UI do after a panic.
+        start_over(&mut lock(&pane.term));
         pane.repaint(40, 5);
-        let again = shows("pane-one");
+        pane.send("echo pane-three\r");
+        let again = shows("pane-two>echo pane-three");
         let text = lock(&pane.term).screen_text();
         pane.send("exit\r");
         assert!(again, "screen: {text:?}");
@@ -581,6 +611,40 @@ mod tests {
         assert_eq!(notes, [Note::Reset, Note::Reset, Note::Dead, Note::Exit(0)]);
         let text = lock(&pane.term).screen_text();
         assert!(!text.contains("pane-"), "screen: {text:?}");
+    }
+
+    /// A panic in one piece of a read leaves the pieces after it to be
+    /// parsed, until the pane gives up.
+    #[test]
+    fn pane_feeds_the_rest_of_a_read_after_a_panic() {
+        let bytes = vec![b'x'; FEED_BYTES * 3];
+        for (gives_up, want) in [(false, 3), (true, 1)] {
+            let (mut fed, mut recovered) = (0, 0);
+            let feed = |_: &[u8]| {
+                fed += 1;
+                if fed == 1 {
+                    panic!("test panic");
+                }
+            };
+            feed_pieces(&bytes, feed, || {
+                recovered += 1;
+                gives_up
+            });
+            assert_eq!((fed, recovered), (want, 1));
+        }
+    }
+
+    #[test]
+    fn pane_starts_over_with_the_cursors_line_at_the_top() {
+        let mut term = vt::Terminal::new(vt::Options {
+            cols: 20,
+            rows: 4,
+            ..Default::default()
+        });
+        term.feed(b"\x1b[31mone\r\ntwo\r\nC:\\>dir");
+        start_over(&mut term);
+        assert_eq!(term.screen_text().trim_end(), "C:\\>dir");
+        assert_eq!(term.cursor(), (7, 0, true));
     }
 
     #[test]

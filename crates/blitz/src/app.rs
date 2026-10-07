@@ -4207,8 +4207,9 @@ impl App {
             }
             // The selection and link under the pointer end with the line
             // numbers they used; matches are found again.
-            // The console host sends the screen again, and events parsed
-            // before the panic, such as a notification, are taken now.
+            // The console host draws what the fresh screen lacks, and
+            // events parsed before the panic, such as a notification, are
+            // taken now.
             Note::Reset => {
                 v.pane.repaint(v.grid.0, v.grid.1);
                 if let Some(f) = self.find.as_mut().filter(|f| f.pane == id) {
