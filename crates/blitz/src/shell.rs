@@ -518,12 +518,16 @@ pub const POWERSHELL_INTEGRATION: &str = r"if (-not (Test-Path variable:global:_
 /// The same marks, reset and folder for bash, in Git Bash or WSL, which
 /// `blitz setup shell bash` prints for `~/.bashrc`. It runs last among the
 /// prompt commands, so a prompt they set still gets its B mark. Only a
-/// Windows folder is reported: Git Bash's, or one under WSL's `/mnt`.
-/// Needs bash 4.4 for `PS0`.
+/// Windows folder is reported: Git Bash's, or one under WSL's `/mnt`. A
+/// drive's folder is worked out without starting `pwd -W`, which takes
+/// tens of milliseconds under MSYS. Read again, as by `source ~/.bashrc`,
+/// it adds its hooks back where that took them away, and never twice.
+/// Needs bash 4.4 for `PS0`; from bash 5.1 `PROMPT_COMMAND` may be an
+/// array, each of whose commands runs.
 pub const BASH_INTEGRATION: &str = r#"# blitz shell integration: marks each prompt and reports the folder.
 # It does nothing outside blitz.
-if [ -n "$BLITZ_PANE_TOKEN" ] && [ -z "$__blitz_code" ]; then
-  __blitz_code=0
+if [ -n "$BLITZ_PANE_TOKEN" ]; then
+  __blitz_code=${__blitz_code:-0}
   __blitz_status() { __blitz_code=$?; return $__blitz_code; }
   __blitz_prompt() {
     local dir=
@@ -533,16 +537,31 @@ if [ -n "$BLITZ_PANE_TOKEN" ] && [ -z "$__blitz_code" ]; then
     printf '\e]133;A;blitz=%s\a' "$BLITZ_PANE_TOKEN"
     case $PWD in
       /mnt/[a-z]|/mnt/[a-z]/*) dir=${PWD:5:1}:/${PWD:7} ;;
+      # As `pwd -W` says it, with the drive in capitals.
+      /[a-z]|/[a-z]/*) [ -n "$MSYSTEM" ] && dir=${PWD:1:1} && dir=${dir^}:/${PWD:3} ;;
       *) [ -n "$MSYSTEM" ] && dir=$(pwd -W) ;;
     esac
     [ -n "$dir" ] && printf '\e]7;file:///%s\a' "${dir//\%/%25}"
     case $PS1 in *'\e]133;B'*) ;; *) PS1=$PS1'\[\e]133;B\a\]' ;; esac
     return $__blitz_code
   }
-  # Lines, not `;`, as the commands there may end with one.
-  PROMPT_COMMAND=__blitz_status$'\n'${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__blitz_prompt
+  # First and last. Lines, not `;`, as the commands there may end with one.
+  if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then
+    case " ${PROMPT_COMMAND[*]} " in
+      *' __blitz_prompt '*) ;;
+      *) PROMPT_COMMAND=(__blitz_status "${PROMPT_COMMAND[@]}" __blitz_prompt) ;;
+    esac
+  else
+    case $PROMPT_COMMAND in
+      *__blitz_prompt*) ;;
+      *) PROMPT_COMMAND=__blitz_status$'\n'${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__blitz_prompt ;;
+    esac
+  fi
   # When a command starts. The arithmetic sets the flag and prints nothing.
-  PS0=$PS0'\e]133;C\a${__blitz_ran:0:$((__blitz_ran = 1, 0))}'
+  case $PS0 in
+    *'133;C'*) ;;
+    *) PS0=$PS0'\e]133;C\a${__blitz_ran:0:$((__blitz_ran = 1, 0))}' ;;
+  esac
 fi
 "#;
 
@@ -560,6 +579,7 @@ if [[ -n $BLITZ_PANE_TOKEN && -z $__blitz_ran ]]; then
     print -n "\e]133;A;blitz=$BLITZ_PANE_TOKEN\a"
     case $PWD in
       /mnt/[a-z]|/mnt/[a-z]/*) dir=${PWD[6]}:/${PWD[8,-1]} ;;
+      /[a-z]|/[a-z]/*) [[ -n $MSYSTEM ]] && dir=${(U)PWD[2]}:/${PWD[4,-1]} ;;
       *) [[ -n $MSYSTEM ]] && dir=$(cygpath -m $PWD) ;;
     esac
     [[ -n $dir ]] && print -n "\e]7;file:///${dir//\%/%25}\a"
@@ -857,6 +877,35 @@ mod tests {
                 assert!(script.contains(mark), "{sh}: {mark}");
             }
         }
+    }
+
+    /// `source ~/.bashrc` sets PROMPT_COMMAND anew, and bash 5.1 runs
+    /// every command of an array.
+    #[test]
+    #[cfg(windows)]
+    fn bash_hooks_come_back_once_and_run_last() {
+        let Some(bash) = git_bash(|k| std::env::var_os(k)) else {
+            eprintln!("SKIPPED: no Git Bash, so the bash integration is untested");
+            return;
+        };
+        let file = std::env::temp_dir().join(format!("blitz-rc-{}.sh", std::process::id()));
+        std::fs::write(&file, BASH_INTEGRATION).unwrap();
+        let script = r#"PROMPT_COMMAND='history -a'; . "$1"; . "$1"; PROMPT_COMMAND='history -a'; . "$1"
+declare -p PROMPT_COMMAND; unset PROMPT_COMMAND; PROMPT_COMMAND=(one two); . "$1"; . "$1"
+declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""#;
+        let out = std::process::Command::new(bash)
+            .args(["--norc", "-c", script, "x"])
+            .arg(&file)
+            .env("BLITZ_PANE_TOKEN", "t")
+            .output()
+            .expect("bash");
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "declare -- PROMPT_COMMAND=$'__blitz_status\\nhistory -a\\n__blitz_prompt'\n\
+             declare -a PROMPT_COMMAND=([0]=\"__blitz_status\" [1]=\"one\" [2]=\"two\" [3]=\"__blitz_prompt\")\n\
+             C\n"
+        );
     }
 
     #[test]
