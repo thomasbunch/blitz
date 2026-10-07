@@ -1950,7 +1950,9 @@ mod tests {
         let c = build(&m);
         let (x, y) = (c.prims.iter())
             .find_map(|p| match p {
-                Prim::Text { text, x, y, .. } if text == "api \u{b7} needs you" => Some((*x, *y)),
+                Prim::Text { text, x, y, .. } if text == "api \u{b7} needs you \u{b7} 1m" => {
+                    Some((*x, *y))
+                }
                 _ => None,
             })
             .expect("label");
