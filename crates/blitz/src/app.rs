@@ -1910,7 +1910,8 @@ impl App {
     /// it changes to something the user should see while looking away.
     /// Returns true when the state changed.
     fn attention(&mut self, id: PaneId, ev: Ev) -> bool {
-        let attended = self.focused && self.focus_id() == Some(id);
+        // blitz run covers the panes, so the focused one is not in view.
+        let attended = self.focused && self.game.is_none() && self.focus_id() == Some(id);
         let away = !self.focused && self.config.flash;
         let Some(v) = self.view_mut(id) else {
             return false;
