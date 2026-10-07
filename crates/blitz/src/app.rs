@@ -510,7 +510,6 @@ struct Mouse {
     /// For the left, middle and right button, the pane whose program was
     /// sent its press.
     reported: [Option<PaneId>; 3],
-    tracker: vt::keys::MouseTracker,
     /// Wheel movement not yet turned into whole steps.
     wheel: f64,
     /// When Ctrl and the wheel last changed the font size.
@@ -904,6 +903,8 @@ fn line_at(term: &vt::Terminal, at: Pos) -> (Pos, Pos) {
 struct View {
     pane: Pane,
     snap: Snapshot,
+    /// Mouse reports to its program, one per cell crossed.
+    tracker: vt::keys::MouseTracker,
     /// The terminal's size in cells.
     grid: (u16, u16),
     /// When the terminal last took a new size, and when its pane's new
@@ -1850,6 +1851,7 @@ impl App {
         lock(&pane.term).set_cell_px(cw as u16, ch as u16);
         pane.name = program_name(&launch.cmdline);
         self.views.push(View {
+            tracker: Default::default(),
             pane,
             snap: Snapshot::default(),
             grid,
@@ -4163,7 +4165,7 @@ impl App {
     /// own mouse mode.
     fn mouse_report(&mut self, id: PaneId, kind: MouseKind, button: u8, mods: Mods) {
         let (col, row) = self.cell_in(id, self.mouse.pos);
-        let Some(v) = self.views.iter().find(|v| v.pane.id == id) else {
+        let Some(v) = self.views.iter_mut().find(|v| v.pane.id == id) else {
             return;
         };
         let m = lock(&v.pane.term).input_modes();
@@ -4175,7 +4177,7 @@ impl App {
             mods,
         };
         let mut out = Vec::new();
-        if self.mouse.tracker.encode(ev, &m, &mut out) {
+        if v.tracker.encode(ev, &m, &mut out) {
             v.pane.send(out);
         }
     }
