@@ -473,6 +473,15 @@ mod gpu {
             }
         }
 
+        /// Runs `draw`, keeping what it queues inside `r`.
+        pub fn clipped(&mut self, r: crate::layout::Rect, draw: impl FnOnce(&mut Self)) {
+            let first = self.quads.len();
+            draw(self);
+            for q in &mut self.quads[first..] {
+                clip(q, r.x, r.y, r.right(), r.bottom());
+            }
+        }
+
         /// Queues the lines `attrs` asks for across a cell, or both of a wide
         /// character's, `w` pixels wide with its top-left corner at (`x`,
         /// `y`): the underline in `ul`, overline and strikethrough in `fg`.
@@ -1167,6 +1176,35 @@ mod tests {
     fn pixel(px: &[u8], w: u32, x: u32, y: u32) -> u32 {
         let i = ((y * w + x) * 4) as usize;
         u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+    }
+
+    /// A terminal not yet resized to its smaller pane draws only inside the
+    /// pane, never over its neighbour.
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_clipped_keeps_a_grid_inside_its_pane() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let snap = text_snapshot("\u{2588}\u{2588}\u{2588}", 3, 1, &p);
+        let (cw, ch) = r.cell();
+        let (w, h) = (3 * cw, ch);
+        let t = r.gpu.offscreen(w, h).expect("target");
+        let pane = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 2 * cw as i32,
+            h: ch as i32,
+        };
+        r.begin();
+        // The neighbour first, so a grid that spills over would cover it.
+        r.rect(2 * cw as i32, 0, cw, ch, 0x00ff00);
+        r.clipped(pane, |r| r.snapshot(&snap, &p, 0, 0));
+        r.draw(&t.rtv, w, h, p.bg).expect("draw");
+        let px = r.gpu.read(&t).expect("read");
+        let mid = ch / 2;
+        assert_eq!(pixel(&px, w, cw / 2, mid), p.fg);
+        assert_eq!(pixel(&px, w, 2 * cw - 1, mid), p.fg, "up to the edge");
+        assert_eq!(pixel(&px, w, 2 * cw + cw / 2, mid), 0x00ff00, "not past it");
     }
 
     #[cfg(windows)]

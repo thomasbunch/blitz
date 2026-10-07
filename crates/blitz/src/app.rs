@@ -114,6 +114,10 @@ const GFX_RETRY: Duration = Duration::from_secs(1);
 const AUTOSCROLL: Duration = Duration::from_millis(50);
 /// How long a new window stays hidden waiting for its first frame.
 const FIRST_FRAME: Duration = Duration::from_millis(500);
+/// How often at most a terminal takes a new size while its pane keeps
+/// changing size, as in a live resize or a divider drag: each new size
+/// makes the program redraw its whole screen.
+const RESIZE_GAP: Duration = Duration::from_millis(80);
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -135,6 +139,8 @@ pub enum UserEvent {
     Handoff(crate::handoff::Ask),
     /// Something in `%APPDATA%\blitz` was written: settings or a theme.
     Settings,
+    /// The user let go of the window after moving or sizing it.
+    Sized,
 }
 
 /// Command-line options of the GUI.
@@ -756,6 +762,10 @@ struct View {
     snap: Snapshot,
     /// The terminal's size in cells.
     grid: (u16, u16),
+    /// When the terminal last took a new size, and when its pane's new
+    /// size goes to it; see [`resize_wait`].
+    resized: Option<Instant>,
+    resize_at: Option<Instant>,
     /// Where the grid went in the last frame; `None` while its tab is
     /// hidden.
     rect: Option<Rect>,
@@ -1444,6 +1454,8 @@ impl App {
             pane,
             snap: Snapshot::default(),
             grid,
+            resized: None,
+            resize_at: None,
             rect: None,
             notice: None,
             flashed: None,
@@ -3284,6 +3296,7 @@ impl App {
             return;
         }
         if b == 0 && !pressed && self.mouse.divider.take().is_some() {
+            self.settle();
             return;
         }
         if let Some((i, _)) = self
@@ -3611,7 +3624,7 @@ impl App {
     }
 
     /// Draws a frame. Resizes each visible session first when its pane
-    /// changed size, at most once per frame.
+    /// changed size, at most once per [`RESIZE_GAP`].
     fn redraw(&mut self) {
         let Some(window) = &self.window else {
             return;
@@ -3662,6 +3675,7 @@ impl App {
         let mut dimmed = Vec::new();
         for v in &mut self.views {
             v.rect = None;
+            v.resize_at = None;
         }
         for &(id, rect) in &chrome.panes {
             let Some(v) = self.views.iter_mut().find(|v| v.pane.id == id) else {
@@ -3671,12 +3685,16 @@ impl App {
             let grid = (fit(rect.w, cw), fit(rect.h, ch));
             let mut find = self.find.as_mut().filter(|f| f.pane == id);
             if grid != v.grid {
-                v.grid = grid;
-                v.pane.resize(grid.0, grid.1);
-                lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
-                // A new width rewraps the lines that matched.
-                if let Some(f) = &mut find {
-                    f.stale = true;
+                v.resize_at = resize_wait(v.resized, started);
+                if v.resize_at.is_none() {
+                    v.grid = grid;
+                    v.resized = Some(started);
+                    v.pane.resize(grid.0, grid.1);
+                    lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
+                    // A new width rewraps the lines that matched.
+                    if let Some(f) = &mut find {
+                        f.stale = true;
+                    }
                 }
             }
             v.rect = Some(rect);
@@ -3692,7 +3710,7 @@ impl App {
                 // frame with new output, ~50 ms for 100,000 full rows; keep
                 // the matches in scrollback rows if that ever shows.
                 if f.stale {
-                    f.search(&term, grid.1);
+                    f.search(&term, v.grid.1);
                 }
                 v.snap.highlight(&f.found, f.cur);
             }
@@ -3743,10 +3761,15 @@ impl App {
                     };
                     let dim = dimmed.contains(&v.pane.id);
                     let hollow = dim || !self.focused;
-                    g.r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
-                    if let Some(n) = &v.notice {
-                        draw_notice(&mut g.r, &pal, at, v.grid, n);
-                    }
+                    // A terminal still at its old size until it is resized
+                    // shows only what fits its pane.
+                    let rows = v.grid.1.min((at.h / ch as i32) as u16);
+                    g.r.clipped(at, |r| {
+                        r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
+                        if let Some(n) = &v.notice {
+                            draw_notice(r, &pal, at, (v.grid.0, rows), n);
+                        }
+                    });
                 }
                 g.r.chrome(&chrome);
                 let rtv = g.chain.rtv(&g.r.gpu)?;
@@ -3810,6 +3833,15 @@ impl App {
                 w.set_ime_cursor_area(PhysicalPosition::new(at.0, at.1), PhysicalSize::new(cw, ch));
             }
         }
+    }
+
+    /// Gives each shown terminal its pane's size in the next frame, without
+    /// waiting out [`RESIZE_GAP`]: the window or a divider was let go.
+    fn settle(&mut self) {
+        for v in &mut self.views {
+            v.resized = None;
+        }
+        self.request_redraw();
     }
 
     /// Shows the hidden window when [`shows`] says so.
@@ -3925,6 +3957,7 @@ impl App {
         let resume = (self.views.iter())
             .filter_map(|v| Some(v.resume.as_ref()?.1))
             .min();
+        let resize = self.views.iter().filter_map(|v| v.resize_at).min();
         // A changed layout waiting to be saved, and a renderer to retry.
         // A minimized window draws nothing, so it has nothing to retry.
         let shown = (self.window.as_ref())
@@ -3943,6 +3976,7 @@ impl App {
             notice,
             timer,
             resume,
+            resize,
             self.save_after,
             gfx,
             anim,
@@ -4317,6 +4351,15 @@ fn tab_grids(
         })
         .map(|(id, r)| (id, (r.w / cw as i32, r.h / ch as i32)))
         .collect()
+}
+
+/// When a pane whose size changed gives its terminal the new size: now
+/// (`None`), unless the terminal `last` took one within [`RESIZE_GAP`],
+/// then that long after it. The first change goes at once and the last
+/// always lands.
+fn resize_wait(last: Option<Instant>, now: Instant) -> Option<Instant> {
+    let due = last? + RESIZE_GAP;
+    (now < due).then_some(due)
 }
 
 /// Whether a window kept hidden `until` then shows now: once a frame was
@@ -4835,6 +4878,7 @@ impl ApplicationHandler<UserEvent> for App {
                 None if self.picker.is_none() => self.set_theme_from_config(),
                 None => {}
             },
+            UserEvent::Sized => self.settle(),
             UserEvent::Installed(Ok(())) => el.exit(),
             UserEvent::Installed(Err(e)) => {
                 eprintln!("blitz: update: {e}");
@@ -5778,6 +5822,18 @@ mod tests {
         assert!(!c.matches().is_empty());
         let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
         assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
+    }
+
+    /// A live resize or a divider drag gives each program a new size at
+    /// most every 80 ms: the first change at once, the last one always.
+    #[test]
+    fn app_programs_take_a_new_size_at_most_every_80_ms() {
+        let t0 = Instant::now();
+        assert_eq!(resize_wait(None, t0), None, "the first at once");
+        let ms = Duration::from_millis;
+        assert_eq!(resize_wait(Some(t0), t0 + ms(30)), Some(t0 + RESIZE_GAP));
+        assert_eq!(resize_wait(Some(t0), t0 + RESIZE_GAP), None);
+        assert_eq!(RESIZE_GAP, ms(80));
     }
 
     /// Restored panes in tabs not shown start at their real size, so Claude

@@ -18,7 +18,7 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, HTCLIENT, SMTO_ABORTIFHUNG,
-    SendMessageTimeoutW, WM_COPYDATA, WM_MOUSEACTIVATE,
+    SendMessageTimeoutW, WM_COPYDATA, WM_EXITSIZEMOVE, WM_MOUSEACTIVATE,
 };
 use windows::core::{GUID, HSTRING};
 use winit::event_loop::EventLoopProxy;
@@ -228,6 +228,9 @@ unsafe extern "system" fn proc(
     let sub = unsafe { &*(sub as *const Sub) };
     if activating(msg, lparam) {
         ACTIVATING.store(true, Ordering::Relaxed);
+    }
+    if msg == WM_EXITSIZEMOVE {
+        let _ = sub.proxy.send_event(UserEvent::Sized);
     }
     if msg == WM_COPYDATA && sub.launches {
         // SAFETY: WM_COPYDATA carries a COPYDATASTRUCT; the system copied
