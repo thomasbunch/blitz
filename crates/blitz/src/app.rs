@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vt::grid::Found;
 use vt::{
     Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
 };
@@ -19,7 +20,14 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DwmSetWindowAttribute,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetKeyState, GetKeyboardState,
+};
+use windows::Win32::UI::Shell::{
+    ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
+    TaskbarList,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage, WM_CHAR,
     WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -32,7 +40,7 @@ use winit::platform::windows::{
     EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorIcon, Icon, UserAttentionType, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowId};
 
 use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev};
@@ -40,6 +48,7 @@ use crate::config::{Config, Kind};
 use crate::debug::Counters;
 use crate::keymap::{self, Action};
 use crate::layout::{self, Axis, Dir, PaneId, Rect, Tab};
+use crate::links::{Link, Target};
 use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
 use crate::render::chrome::{self, ChromeModel};
 use crate::render::d3d11::{Gpu, Swapchain, is_device_lost};
@@ -62,6 +71,7 @@ const VK_DOWN: u16 = 0x28;
 const VK_DELETE: u16 = 0x2e;
 const VK_SPACE: u16 = 0x20;
 const VK_W: u16 = 0x57;
+const VK_F3: u16 = 0x72;
 const VK_F4: u16 = 0x73;
 
 /// How long a multi-line paste waits for a second Ctrl+V, and closing a
@@ -95,6 +105,9 @@ const WHEEL_LINES: isize = 3;
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// How long to wait before building the renderer again after it failed.
 const GFX_RETRY: Duration = Duration::from_secs(1);
+/// Time between the steps a drag scrolls while the pointer is held above
+/// or below its pane.
+const AUTOSCROLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -413,13 +426,258 @@ struct Mouse {
     tracker: vt::keys::MouseTracker,
     /// Wheel movement not yet turned into whole steps.
     wheel: f64,
-    /// A left-button drag is making a selection from this cell.
-    anchor: Option<(u16, u16)>,
     /// A left-button drag is moving this divider of the active tab; the
     /// second value is the smallest pane it may leave.
     divider: Option<(usize, (i32, i32))>,
     /// The pointer is over a divider along this axis and shows it.
     over_divider: Option<Axis>,
+    /// A left-button drag is making a selection.
+    drag: Option<Drag>,
+    /// When the drag next scrolls, while the pointer is outside its pane.
+    scroll_at: Option<Instant>,
+    /// The last press that went to selection: when, on which cell, and
+    /// how many clicks it made.
+    click: Option<(Instant, Pos, u8)>,
+}
+
+/// A cell as a line number and a column. Line numbers stay with their
+/// text while output scrolls it into scrollback; see [`vt::Terminal::lines`].
+type Pos = vt::terminal::LineCol;
+
+/// Characters a double click takes as part of a word besides letters and
+/// digits, so it takes a whole path or URL.
+const WORD: &str = "_-./\\:~@?=&%+#";
+
+/// Rows either side of a cell that [`Logical`] reads at most.
+const LOGICAL_ROWS: usize = 64;
+
+/// How a selection grows while the button is held, fixed by the press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Drag {
+    /// [`vt::Terminal::line_epoch`] at the press: line numbers from
+    /// another epoch name other text.
+    epoch: u32,
+    /// What the press took, first and last cell: the cell pressed, or the
+    /// word or line around it.
+    anchor: (Pos, Pos),
+    /// Clicks of the press: 1 grows the selection by cells, 2 by words, 3
+    /// by lines.
+    unit: u8,
+    /// Alt was held: the same columns of every row between the corners.
+    block: bool,
+}
+
+impl Drag {
+    /// A press on `at` that made `unit` clicks.
+    fn new(term: &vt::Terminal, pal: &Palette, at: Pos, unit: u8, block: bool) -> Drag {
+        let anchor = match unit {
+            2 => word_at(term, pal, at),
+            3 => line_at(term, at),
+            _ => char_at(term, pal, at),
+        };
+        Drag {
+            epoch: term.line_epoch(),
+            anchor,
+            unit,
+            block,
+        }
+    }
+}
+
+/// Clicks a press on `at` makes: one more than the last press when that
+/// was on the same cell within the double-click time `within`, and after
+/// three, one again.
+fn clicks(last: Option<(Instant, Pos, u8)>, at: Pos, now: Instant, within: Duration) -> u8 {
+    match last {
+        Some((t, p, n)) if p == at && now.saturating_duration_since(t) <= within => n % 3 + 1,
+        _ => 1,
+    }
+}
+
+/// Selected cells in the focused pane.
+struct Selection {
+    drag: Drag,
+    /// The first and last cell in reading order; a block's top-left and
+    /// bottom-right corners.
+    start: Pos,
+    end: Pos,
+    /// The screen's top line at the last look, and the selected text from
+    /// there on. Only lines that were on the screen can have been
+    /// rewritten since.
+    seen: (usize, String),
+}
+
+impl Selection {
+    /// What `drag` selects with the pointer on `head`.
+    fn new(term: &vt::Terminal, pal: &Palette, drag: Drag, head: Pos) -> Selection {
+        let (a, b) = drag.anchor;
+        let (start, end) = if drag.block {
+            let (top, bottom) = (a.0.min(head.0), a.0.max(head.0));
+            ((top, a.1.min(head.1)), (bottom, a.1.max(head.1)))
+        } else {
+            let h = Drag::new(term, pal, head, drag.unit, false).anchor;
+            (a.min(h.0), b.max(h.1))
+        };
+        let mut s = Selection {
+            drag,
+            start,
+            end,
+            seen: (0, String::new()),
+        };
+        s.look(term, pal);
+        s
+    }
+
+    /// Whether the lines are still the ones picked: none dropped off the
+    /// top of scrollback and the numbers did not start over.
+    fn kept(&self, term: &vt::Terminal) -> bool {
+        term.line_epoch() == self.drag.epoch && term.lines().contains(&self.start.0)
+    }
+
+    /// Catches up with output since the last look. False when it rewrote
+    /// selected text, which ends the selection, so a copy never takes text
+    /// the user did not pick.
+    fn still(&mut self, term: &vt::Terminal, pal: &Palette) -> bool {
+        if !self.kept(term) || selection_text(term, pal, self, self.seen.0) != self.seen.1 {
+            return false;
+        }
+        self.look(term, pal);
+        true
+    }
+
+    fn look(&mut self, term: &vt::Terminal, pal: &Palette) {
+        let top = term.screen_top();
+        self.seen = (top, selection_text(term, pal, self, top));
+    }
+}
+
+/// The cells from `start` to `end`, or the block they are the corners
+/// of, that a view of `cols` by `rows` cells from line `top` shows, as
+/// (column, row) of the first and last.
+fn in_view(
+    start: Pos,
+    end: Pos,
+    block: bool,
+    top: usize,
+    (cols, rows): (u16, u16),
+) -> Option<((u16, u16), (u16, u16))> {
+    let bottom = top + usize::from(rows);
+    if end.0 < top || start.0 >= bottom || cols == 0 {
+        return None;
+    }
+    let row = |n: usize| (n - top) as u16;
+    let a = match start.0 < top {
+        true if block => (start.1, 0),
+        true => (0, 0),
+        false => (start.1, row(start.0)),
+    };
+    let b = match end.0 >= bottom {
+        true if block => (end.1, rows - 1),
+        true => (cols - 1, rows - 1),
+        false => (end.1, row(end.0)),
+    };
+    Some((a, b))
+}
+
+/// The drawn text of a logical line, its rows joined where they wrap.
+struct Logical {
+    text: String,
+    /// Each cell's place in `text`, the cell, and its width.
+    cells: Vec<(usize, Pos, u8)>,
+}
+
+impl Logical {
+    /// The logical line through line `n`, at most [`LOGICAL_ROWS`] rows
+    /// either side of it.
+    fn new(term: &vt::Terminal, pal: &Palette, n: usize) -> Logical {
+        let first = term.lines().start;
+        let mut top = n;
+        while top > first && n - top < LOGICAL_ROWS && term.wraps(top - 1) {
+            top -= 1;
+        }
+        let mut l = Logical {
+            text: String::new(),
+            cells: Vec::new(),
+        };
+        let mut row = Vec::new();
+        let mut line = top;
+        while let Some(wraps) = term.line_cells(line, pal, &mut row) {
+            for (col, c) in row.iter().enumerate().filter(|(_, c)| c.width > 0) {
+                l.cells.push((l.text.len(), (line, col as u16), c.width));
+                push_cells(&mut l.text, &row, col, col);
+            }
+            if !wraps || line >= n + LOGICAL_ROWS {
+                break;
+            }
+            line += 1;
+        }
+        l
+    }
+
+    /// Which of `cells` covers `at`.
+    fn index(&self, at: Pos) -> Option<usize> {
+        (self.cells.iter())
+            .position(|&(_, (n, c), w)| n == at.0 && (c..c + u16::from(w)).contains(&at.1))
+    }
+
+    /// The first and last cell that hold `text[range]`; the last cell's
+    /// last column for a wide one.
+    fn span(&self, range: std::ops::Range<usize>) -> (Pos, Pos) {
+        let i = self.cells.partition_point(|c| c.0 <= range.start);
+        let j = self.cells.partition_point(|c| c.0 < range.end);
+        let (_, (n, c), w) = self.cells[j.max(1) - 1];
+        (self.cells[i.max(1) - 1].1, (n, c + u16::from(w) - 1))
+    }
+}
+
+/// The cells of the character at `at`: both halves of a wide one, so
+/// what is highlighted is what is copied.
+fn char_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
+    let mut cells = Vec::new();
+    if term.line_cells(at.0, pal, &mut cells).is_none() {
+        return (at, at);
+    }
+    let width = |x: u16| cells.get(usize::from(x)).map(|c| c.width);
+    match width(at.1) {
+        Some(0) if at.1 > 0 => ((at.0, at.1 - 1), at),
+        Some(2) if width(at.1 + 1).is_some() => (at, (at.0, at.1 + 1)),
+        _ => (at, at),
+    }
+}
+
+/// The word around `at`, following soft wraps: a run of word characters
+/// or of blanks, or any other character alone.
+fn word_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
+    let l = Logical::new(term, pal, at.0);
+    let Some(i) = l.index(at) else {
+        return (at, at);
+    };
+    let class = |k: usize| match l.text[l.cells[k].0..].chars().next() {
+        Some(c) if c.is_alphanumeric() || WORD.contains(c) => 1,
+        Some(' ') => 2,
+        _ => 0,
+    };
+    let (mut a, mut b, me) = (i, i, class(i));
+    while me != 0 && a > 0 && class(a - 1) == me {
+        a -= 1;
+    }
+    while me != 0 && b + 1 < l.cells.len() && class(b + 1) == me {
+        b += 1;
+    }
+    l.span(l.cells[a].0..l.cells[b].0 + 1)
+}
+
+/// The logical line through `at`: every row joined to it by soft wraps.
+fn line_at(term: &vt::Terminal, at: Pos) -> (Pos, Pos) {
+    let lines = term.lines();
+    let (mut a, mut b) = (at.0, at.0);
+    while a > lines.start && term.wraps(a - 1) {
+        a -= 1;
+    }
+    while b + 1 < lines.end && term.wraps(b) {
+        b += 1;
+    }
+    ((a, 0), (b, u16::MAX))
 }
 
 /// A session and what the window keeps to draw it.
@@ -444,6 +702,8 @@ struct View {
     sync_until: Option<Instant>,
     /// Names the session's saved output; kept across restarts.
     key: String,
+    /// The progress the program last reported, and when.
+    progress: Option<(chrome::Progress, Instant)>,
 }
 
 struct App {
@@ -467,6 +727,16 @@ struct App {
     game_ended: Option<Instant>,
     /// Windows shows animations; scenery and the spark keep still if not.
     motion: bool,
+    /// The command palette, while it is open.
+    commands: Option<Commands>,
+    /// Where the command palette and its rows were in the last frame, for
+    /// clicks.
+    commands_hits: Option<(Rect, Vec<(usize, Rect)>)>,
+    /// Points Ctrl+= and Ctrl+- add to the font size in the settings.
+    /// Never saved, and dropped when that setting changes.
+    font_zoom: f32,
+    /// The find bar of the focused pane, while it is open.
+    find: Option<Find>,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -477,7 +747,13 @@ struct App {
     next_id: u32,
     focused: bool,
     /// A selection in the focused pane.
-    selection: Option<((u16, u16), (u16, u16))>,
+    selection: Option<Selection>,
+    /// The link under the pointer while Ctrl is held, drawn underlined:
+    /// the line epoch and its first and last cell.
+    hover: Option<(u32, Pos, Pos)>,
+    /// The last path word looked for while Ctrl is held, the pane's folder
+    /// and what was found; see [`Self::resolve`].
+    resolved: RefCell<Option<(String, String, Option<PathBuf>)>>,
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
@@ -511,13 +787,18 @@ struct App {
     save_after: Option<Instant>,
     /// No renderer could be built; the next try is not before this.
     gfx_retry: Option<Instant>,
-    /// Where the window last was while neither minimized nor maximized.
+    /// Where the window last was while not minimized, maximized or full
+    /// screen.
     placed: Geometry,
     /// The terminal a running self-test reads: the focused pane's.
     watched: Option<Arc<selftest::Focus>>,
     started: Instant,
     /// The device started at launch, until the first renderer takes it.
     gpu: Option<std::thread::JoinHandle<windows::core::Result<Gpu>>>,
+    /// The taskbar button, for progress; made the first time it is needed.
+    taskbar: Option<ITaskbarList3>,
+    /// The progress the taskbar button shows.
+    taskbar_shows: Option<chrome::Progress>,
     counters: Counters,
     code: i32,
 }
@@ -562,6 +843,86 @@ impl Picker {
             _ => return false,
         }
         true
+    }
+}
+
+/// The open command palette.
+#[derive(Default)]
+struct Commands {
+    /// Typed text; actions whose label or `config.toml` name holds every
+    /// typed word, ignoring case, match.
+    filter: String,
+    /// The highlighted action, among the matching ones.
+    sel: usize,
+}
+
+impl Commands {
+    /// The matching actions and their labels, in [`keymap::ACTIONS`] order.
+    /// The palette leaves itself out.
+    fn matches(&self) -> Vec<(Action, &'static str)> {
+        let words: Vec<String> = (self.filter.split_whitespace())
+            .map(str::to_lowercase)
+            .collect();
+        (keymap::ACTIONS.iter())
+            .filter(|a| a.0 != Action::Palette)
+            .filter(|a| {
+                let text = format!("{} {}", a.2, a.1).to_lowercase();
+                words.iter().all(|w| text.contains(w.as_str()))
+            })
+            .map(|a| (a.0, a.2))
+            .collect()
+    }
+
+    /// Moves the highlight `by` rows, stopping at either end.
+    fn move_by(&mut self, by: isize) {
+        let last = self.matches().len().saturating_sub(1);
+        self.sel = self.sel.saturating_add_signed(by).min(last);
+    }
+}
+
+/// The open find bar.
+struct Find {
+    /// The pane it searches, which has focus.
+    pane: PaneId,
+    query: String,
+    /// Every match, oldest first.
+    found: Vec<Found>,
+    /// The current match; `None` when there are none.
+    cur: Option<usize>,
+    /// Output came since the last search.
+    stale: bool,
+}
+
+impl Find {
+    fn new(pane: PaneId) -> Find {
+        Find {
+            pane,
+            query: String::new(),
+            found: Vec::new(),
+            cur: None,
+            stale: false,
+        }
+    }
+
+    /// Searches `term` again. The current match stays on the one that
+    /// starts where it did, or else the nearest one above it; with none
+    /// yet, it is the nearest one above the bottom of the `rows` high view.
+    /// With nothing above, it is the first one below.
+    fn search(&mut self, term: &vt::Terminal, rows: u16) {
+        let anchor = match self.cur.and_then(|i| self.found.get(i)) {
+            Some(m) => m.start,
+            None => (term.view_top() + usize::from(rows.max(1)) - 1, u16::MAX),
+        };
+        self.found = term.find(&self.query);
+        self.stale = false;
+        let above = self.found.partition_point(|m| m.start <= anchor);
+        self.cur = (!self.found.is_empty()).then(|| above.saturating_sub(1));
+    }
+
+    /// Moves `by` matches, down when positive, wrapping at either end.
+    fn step(&mut self, by: isize) {
+        let n = self.found.len() as isize;
+        self.cur = (self.cur).map(|i| (i as isize + by).rem_euclid(n) as usize);
     }
 }
 
@@ -633,6 +994,10 @@ impl App {
             game: None,
             game_ended: None,
             motion: animations_on(),
+            commands: None,
+            commands_hits: None,
+            font_zoom: 0.0,
+            find: None,
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -640,6 +1005,8 @@ impl App {
             next_id: 1,
             focused: false,
             selection: None,
+            hover: None,
+            resolved: RefCell::new(None),
             mouse: Mouse::default(),
             preedit: String::new(),
             paste: None,
@@ -660,13 +1027,15 @@ impl App {
             watched: None,
             started: Instant::now(),
             gpu: None,
+            taskbar: None,
+            taskbar_shows: None,
             counters: Counters::default(),
             code: 0,
         }
     }
 
     fn font_px(&self) -> f32 {
-        self.config.font_size * 96.0 / 72.0 * self.scale as f32
+        (self.config.font_size + self.font_zoom) * 96.0 / 72.0 * self.scale as f32
     }
 
     /// Creates the window and starts the first session.
@@ -925,6 +1294,7 @@ impl App {
             resume: None,
             sync_until: None,
             key,
+            progress: None,
         });
         self.find_branch(id);
         self.next_id = id.0 + 1;
@@ -969,6 +1339,7 @@ impl App {
         self.mouse.divider = None;
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
+        self.taskbar_progress();
         if self.views.is_empty() {
             // Nothing is left open, so there is nothing to restore.
             if self.persist {
@@ -982,7 +1353,7 @@ impl App {
     }
 
     /// Catches up after the focused pane may have changed: focus reports,
-    /// attention, the selection and the window title.
+    /// attention, the selection, the find bar and the window title.
     fn focus_moved(&mut self, before: Option<PaneId>) {
         self.request_redraw();
         let now = self.focus_id();
@@ -990,9 +1361,11 @@ impl App {
             return;
         }
         self.selection = None;
-        self.mouse.anchor = None;
+        self.find = None;
+        self.mouse.drag = None;
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
+        self.set_hover(None);
         self.ime_at = None;
         if self.focused {
             for (id, f) in [(before, false), (now, true)] {
@@ -1100,6 +1473,20 @@ impl App {
                 sel: p.sel,
                 top: p.top,
                 error: p.error.as_deref(),
+            }),
+            commands: self.commands.as_ref().map(|cm| chrome::Commands {
+                filter: &cm.filter,
+                items: (cm.matches().into_iter())
+                    .map(|(a, label)| {
+                        let keys = keymap::keys_for(a, &self.config.keys);
+                        (label, keys.unwrap_or_default())
+                    })
+                    .collect(),
+                sel: cm.sel,
+            }),
+            find: self.find.as_ref().map(|f| chrome::FindBar {
+                query: &f.query,
+                count: f.cur.map(|i| (i + 1, f.found.len())),
             }),
             spark: self.config.mascot.then(|| self.anim_time()),
             game: self.game.as_ref().map(|g| &g.0),
@@ -1385,6 +1772,9 @@ impl App {
     fn apply_config(&mut self, c: Config) {
         let font =
             (&c.font_family, c.font_size) != (&self.config.font_family, self.config.font_size);
+        if c.font_size != self.config.font_size {
+            self.font_zoom = 0.0;
+        }
         self.config = c;
         if font {
             self.reload_font();
@@ -1396,8 +1786,8 @@ impl App {
         self.request_redraw();
     }
 
-    /// Loads the configured font at the size the window's DPI needs, and
-    /// tells each terminal its new cell size.
+    /// Loads the configured font at the size the window's DPI and the font
+    /// zoom need, and tells each terminal its new cell size.
     fn reload_font(&mut self) {
         let px = self.font_px();
         if let Some(g) = &mut self.gfx
@@ -1412,11 +1802,129 @@ impl App {
         self.request_redraw();
     }
 
-    /// Typed text for the filter of the theme picker or the settings
-    /// panel. False when neither is open.
+    /// A key while the command palette is open: up and down choose an
+    /// action, typing narrows the list, Enter runs the action and Esc
+    /// closes the palette.
+    fn commands_key(&mut self, el: &ActiveEventLoop, k: &KeyInput) {
+        let Some(cm) = &mut self.commands else {
+            return;
+        };
+        let m = &k.mods;
+        // Ctrl and Alt together are AltGr when the layout gives a character.
+        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+        let chord = ctrl != alt || (ctrl && k.uc == 0);
+        let page = chrome::PICKER_ROWS as isize;
+        match k.vk {
+            VK_ESCAPE => self.commands = None,
+            VK_RETURN => {
+                let picked = cm.matches().get(cm.sel).map(|a| a.0);
+                self.commands = None;
+                if let Some(a) = picked {
+                    self.act(el, a);
+                }
+            }
+            VK_UP => cm.move_by(-1),
+            VK_DOWN => cm.move_by(1),
+            VK_PRIOR => cm.move_by(-page),
+            VK_NEXT => cm.move_by(page),
+            VK_BACK if cm.filter.pop().is_some() => cm.sel = 0,
+            VK_BACK => return,
+            _ if !chord && !k.text.is_empty() => {
+                cm.filter.push_str(k.text);
+                cm.sel = 0;
+            }
+            _ => return,
+        }
+        self.request_redraw();
+    }
+
+    /// A left click while the command palette is open: one on an action
+    /// runs it, and one outside the palette closes it.
+    fn commands_click(&mut self, el: &ActiveEventLoop) {
+        let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
+        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let Some((panel, rows)) = &self.commands_hits else {
+            return;
+        };
+        if !inside(panel) {
+            self.commands = None;
+            self.request_redraw();
+            return;
+        }
+        let Some(&(i, _)) = rows.iter().find(|r| inside(&r.1)) else {
+            return;
+        };
+        let picked = (self.commands.as_ref()).and_then(|cm| cm.matches().get(i).map(|a| a.0));
+        self.commands = None;
+        self.request_redraw();
+        if let Some(a) = picked {
+            self.act(el, a);
+        }
+    }
+
+    /// A key while the find bar is open: typing searches as it goes, Enter
+    /// or F3 goes to the next match up, with Shift the next one down, and
+    /// Esc closes the bar, leaving the view where it is.
+    fn find_key(&mut self, k: &KeyInput) {
+        let Some(f) = &mut self.find else {
+            return;
+        };
+        let m = &k.mods;
+        // Ctrl and Alt together are AltGr when the layout gives a character.
+        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+        let chord = ctrl != alt || (ctrl && k.uc == 0);
+        // Matches are oldest first, so up is back through the list.
+        let by = if m.lshift || m.rshift { 1 } else { -1 };
+        match k.vk {
+            VK_ESCAPE => {
+                self.find = None;
+                self.request_redraw();
+            }
+            VK_RETURN | VK_F3 => self.find_go(false, by),
+            VK_BACK if f.query.pop().is_some() => self.find_go(true, 0),
+            VK_BACK => {}
+            _ if !chord && !k.text.is_empty() => {
+                f.query.push_str(k.text);
+                self.find_go(true, 0);
+            }
+            _ => {}
+        }
+    }
+
+    /// Searches the find bar's pane again when `search` is set or output
+    /// came since the last search, moves `by` matches, and scrolls the
+    /// current one into view.
+    fn find_go(&mut self, search: bool, by: isize) {
+        let text_h = self.gfx.as_ref().map_or(12, |g| g.r.small_cell().1);
+        let covered = bar_rows(text_h, self.scale, self.cell().1);
+        let Some(f) = &mut self.find else {
+            return;
+        };
+        let Some(v) = self.views.iter().find(|v| v.pane.id == f.pane) else {
+            return;
+        };
+        let mut term = lock(&v.pane.term);
+        if search || f.stale {
+            f.search(&term, v.grid.1);
+        }
+        f.step(by);
+        let shown = f.cur.map(|i| f.found[i]);
+        if let Some(m) = shown {
+            reveal(&mut term, m, v.grid.1, covered);
+        }
+        drop(term);
+        self.request_redraw();
+    }
+
+    /// Typed text for the filter of the command palette, the theme picker
+    /// or the settings panel, or for the find bar. False when none is open.
     fn filter_text(&mut self, t: &str) -> bool {
         if self.game.is_some() {
             // The game takes keys, not text.
+        } else if let Some(cm) = &mut self.commands {
+            cm.filter.push_str(t);
+            cm.sel = 0;
+            self.request_redraw();
         } else if let Some(p) = &mut self.picker {
             p.filter.push_str(t);
             p.sel = 0;
@@ -1425,6 +1933,9 @@ impl App {
             p.filter.push_str(t);
             p.sel = 0;
             self.request_redraw();
+        } else if let Some(f) = &mut self.find {
+            f.query.push_str(t);
+            self.find_go(true, 0);
         } else {
             return false;
         }
@@ -1461,7 +1972,7 @@ impl App {
                     } else {
                         p.msg.clone()
                     },
-                    progress: None,
+                    progress: v.progress.map(|p| p.0),
                     exit_code: p.exit_code,
                 }
             })
@@ -1525,7 +2036,8 @@ impl App {
     fn scroll(&mut self, lines: isize) {
         if let Some(v) = self.current() {
             lock(&v.pane.term).scroll_viewport(lines);
-            self.selection = None;
+            // The pointer is over other text now.
+            self.extend_drag();
             self.request_redraw();
         }
     }
@@ -1578,14 +2090,22 @@ impl App {
 
     /// A key transition; `held` when it is the auto-repeat of a held key.
     fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput, held: bool) {
+        if matches!(k.key, vt::Key::Control | vt::Key::Shift) {
+            self.update_hover();
+        }
         if !k.down && self.eaten.release(k.vk) {
             return;
         }
         // A repeat of a key blitz took goes where its press went, and only
         // some keys do anything again; see `keymap::drops_repeat`. blitz
         // run takes keys as a panel does, so a held jump keeps jumping.
-        let panel = self.picker.is_some() || self.settings.is_some() || self.game.is_some();
-        if held && k.down && keymap::drops_repeat(k, self.eaten.0.contains(&k.vk), panel) {
+        let panel = self.commands.is_some()
+            || self.picker.is_some()
+            || self.settings.is_some()
+            || self.find.is_some()
+            || self.game.is_some();
+        let taken = self.eaten.0.contains(&k.vk);
+        if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
             return;
         }
         // Every key pressed while blitz run is open is the game's, and so is
@@ -1593,7 +2113,7 @@ impl App {
         // program, as with the picker.
         if let Some((g, _)) = self.game.as_mut().filter(|_| k.down) {
             // Every key is the game's, but a shortcut closes it and runs.
-            if keymap::action(k).is_some() {
+            if keymap::action(k, &self.config.keys).is_some() {
                 self.close_game();
             } else {
                 self.eaten.press(k.vk);
@@ -1606,13 +2126,24 @@ impl App {
                 return;
             }
         }
+        // The same for the command palette.
+        if self.commands.is_some() && k.down {
+            self.eaten.press(k.vk);
+            if keymap::action(k, &self.config.keys) == Some(Action::Palette) {
+                self.commands = None;
+                self.request_redraw();
+            } else {
+                self.commands_key(el, k);
+            }
+            return;
+        }
         // Every key pressed while the picker is open is the picker's, and
         // so is its release. A key pressed before it opened, such as the
         // Ctrl of the shortcut that opened it, is released to the program,
         // which saw the press.
         if self.picker.is_some() && k.down {
             self.eaten.press(k.vk);
-            if keymap::action(k) == Some(Action::ThemePicker) {
+            if keymap::action(k, &self.config.keys) == Some(Action::ThemePicker) {
                 self.picker = None;
                 self.set_theme_from_config();
             } else {
@@ -1623,7 +2154,7 @@ impl App {
         // The same for the panel, but the theme picker opens over it.
         if self.settings.is_some() && k.down {
             self.eaten.press(k.vk);
-            match keymap::action(k) {
+            match keymap::action(k, &self.config.keys) {
                 Some(Action::Settings) => {
                     self.settings = None;
                     self.request_redraw();
@@ -1633,7 +2164,18 @@ impl App {
             }
             return;
         }
-        if let Some(a) = keymap::action(k)
+        // And for the find bar.
+        if self.find.is_some() && k.down {
+            self.eaten.press(k.vk);
+            if keymap::action(k, &self.config.keys) == Some(Action::Find) {
+                self.find = None;
+                self.request_redraw();
+            } else {
+                self.find_key(k);
+            }
+            return;
+        }
+        if let Some(a) = keymap::action(k, &self.config.keys)
             && self.act(el, a)
         {
             self.eaten.press(k.vk);
@@ -1694,10 +2236,15 @@ impl App {
         let before = self.focus_id();
         match a {
             Action::Copy => {
-                let (Some(sel), Some(v)) = (self.selection, self.current()) else {
+                let Some(v) = self.current() else {
                     return false;
                 };
-                let text = selection_text(&v.snap, sel);
+                let term = lock(&v.pane.term);
+                let Some(sel) = self.selection.as_ref().filter(|s| s.kept(&term)) else {
+                    return false;
+                };
+                let text = selection_text(&term, &self.theme.pal, sel, 0);
+                drop(term);
                 if !crate::clipboard::set_text(Some(HWND(self.hwnd as *mut c_void)), &text) {
                     eprintln!("blitz: could not copy to the clipboard");
                 }
@@ -1814,6 +2361,10 @@ impl App {
             }
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
+            Action::Palette => {
+                self.commands = Some(Commands::default());
+                self.request_redraw();
+            }
             Action::Focus(dir) => {
                 let (area, active) = (self.tab_area(), self.win.active);
                 if let Some(t) = self.win.tabs.get_mut(active) {
@@ -1907,6 +2458,64 @@ impl App {
                     let _ = proxy.send_event(UserEvent::Installed(done));
                 });
             }
+            // The next frame sizes each pane's session to its new place, as
+            // it does after a split.
+            Action::Zoom => {
+                let active = self.win.active;
+                let Some(t) = self.win.tabs.get_mut(active) else {
+                    return false;
+                };
+                if t.zoom.is_none() && t.panes().len() < 2 {
+                    return false;
+                }
+                t.toggle_zoom();
+                self.request_redraw();
+            }
+            Action::Equalize => {
+                let active = self.win.active;
+                if let Some(t) = self.win.tabs.get_mut(active) {
+                    t.zoom = None;
+                    t.equalize();
+                }
+                self.request_redraw();
+            }
+            // Within the range the font_size setting allows.
+            Action::FontSize(by) => {
+                let set = self.config.font_size;
+                let now = set + self.font_zoom;
+                let pt = match by {
+                    0 => set,
+                    _ => (now + f32::from(by)).clamp(4.0, 72.0),
+                };
+                if pt != now {
+                    self.font_zoom = pt - set;
+                    self.reload_font();
+                }
+            }
+            // Borderless on the window's monitor. winit puts the window back
+            // where it was; the session keeps that place, not the monitor's.
+            Action::Fullscreen => {
+                self.note_place();
+                if let Some(w) = &self.window {
+                    let full = w.fullscreen().is_none();
+                    w.set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
+                }
+            }
+            Action::JumpToPrompt(dir) => {
+                let moved =
+                    (self.current()).is_some_and(|v| lock(&v.pane.term).jump_to_prompt(dir > 0));
+                if !moved {
+                    return false;
+                }
+                self.request_redraw();
+            }
+            Action::Find => {
+                let Some(id) = before else {
+                    return false;
+                };
+                self.find = Some(Find::new(id));
+                self.request_redraw();
+            }
         }
         true
     }
@@ -1929,6 +2538,9 @@ impl App {
                 for e in events {
                     self.on_term_event(id, e);
                 }
+                if let Some(f) = self.find.as_mut().filter(|f| f.pane == id) {
+                    f.stale = true;
+                }
                 if !self.checked_conpty {
                     self.checked_conpty = true;
                     if let Some(text) = crate::pty::inbox_notice() {
@@ -1943,6 +2555,8 @@ impl App {
             }
             Note::Exit(code) => {
                 v.pane.exit_code = Some(code);
+                v.progress = None;
+                self.taskbar_progress();
                 self.attention(id, Ev::from_exit(code));
                 // A clean exit or Ctrl+C closes the session; anything else
                 // stays up so the output can be read.
@@ -2009,6 +2623,12 @@ impl App {
                     }
                 }
             }
+            Event::Progress { state, pct } => {
+                let next = chrome::Progress::next(v.progress.map(|p| p.0), state, pct);
+                v.progress = next.map(|p| (p, Instant::now()));
+                self.taskbar_progress();
+                self.request_redraw();
+            }
             // Like a question from Claude Code: it needs the user, unless
             // they are already looking at the pane.
             Event::Bell if self.config.bell_attention => {
@@ -2047,6 +2667,48 @@ impl App {
             self.request_redraw();
         } else {
             self.find_branch(id);
+        }
+    }
+
+    /// Shows on the taskbar button the progress of the session that
+    /// reported last, of those still reporting one, or clears it.
+    fn taskbar_progress(&mut self) {
+        let latest = (self.views.iter())
+            .filter_map(|v| v.progress)
+            .max_by_key(|p| p.1)
+            .map(|p| p.0);
+        if latest == self.taskbar_shows {
+            return;
+        }
+        if self.taskbar.is_none() {
+            // SAFETY: COM calls on the window's thread, where winit has
+            // started OLE for drag and drop.
+            self.taskbar = unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) }
+                .ok()
+                .filter(|t: &ITaskbarList3| unsafe { t.HrInit() }.is_ok());
+        }
+        let Some(t) = &self.taskbar else {
+            return;
+        };
+        self.taskbar_shows = latest;
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        let (flag, pct) = match latest {
+            None => (TBPF_NOPROGRESS, None),
+            Some(p) => match p.state {
+                2 => (TBPF_ERROR, p.pct),
+                3 => (TBPF_INDETERMINATE, None),
+                4 => (TBPF_PAUSED, p.pct),
+                _ => (TBPF_NORMAL, p.pct),
+            },
+        };
+        // SAFETY: a live window. A value set after the state keeps its
+        // error or pause colour; with none known the bar is full, as in
+        // the sidebar.
+        unsafe {
+            let _ = t.SetProgressState(hwnd, flag);
+            if flag != TBPF_NOPROGRESS && flag != TBPF_INDETERMINATE {
+                let _ = t.SetProgressValue(hwnd, u64::from(pct.unwrap_or(100)), 100);
+            }
         }
     }
 
@@ -2195,8 +2857,14 @@ impl App {
         };
         let mods = mods_now();
         let pressed = state == ElementState::Pressed;
-        // Presses go to the settings panel; a release still goes wherever
-        // its press went.
+        // Presses go to the command palette or the settings panel; a
+        // release still goes wherever its press went.
+        if pressed && self.commands.is_some() {
+            if b == 0 {
+                self.commands_click(el);
+            }
+            return;
+        }
         if pressed && self.settings.is_some() && self.picker.is_none() {
             if b == 0 {
                 self.settings_click();
@@ -2248,12 +2916,198 @@ impl App {
             return;
         }
         if pressed {
-            self.mouse.anchor = Some(self.cell_at(self.mouse.pos));
-            if self.selection.take().is_some() {
-                self.request_redraw();
+            // Ctrl+click opens a link; with mouse reporting on, the click
+            // got here because Shift was held too.
+            if (mods.lctrl || mods.rctrl)
+                && let Some((target, _)) = self.link_under(self.mouse.pos)
+            {
+                self.open_link(&target);
+                return;
             }
+            // With mouse reporting on, Shift is what brought the click
+            // here, so it does not extend.
+            let shift = mods.lshift || mods.rshift;
+            let extend = shift && self.modes().mouse == MouseMode::Off;
+            self.press(&mods, extend);
         } else {
-            self.mouse.anchor = None;
+            self.mouse.drag = None;
+            self.mouse.scroll_at = None;
+        }
+    }
+
+    /// The cell under `pos` in the focused pane, and the terminal's line
+    /// epoch.
+    fn line_cell(&self, pos: PhysicalPosition<f64>) -> Option<(u32, Pos)> {
+        let v = self.current()?;
+        let (col, row) = self.cell_at(pos);
+        let t = lock(&v.pane.term);
+        Some((t.line_epoch(), (t.view_top() + usize::from(row), col)))
+    }
+
+    /// A left press that goes to selection. Starts a drag from the cell
+    /// under the pointer: by words after a double click, by lines after a
+    /// triple click, and a block with Alt held. With `extend`, moves the
+    /// end of the selection there instead.
+    fn press(&mut self, mods: &Mods, extend: bool) {
+        let Some((epoch, here)) = self.line_cell(self.mouse.pos) else {
+            return;
+        };
+        let held = self.selection.as_ref().map(|s| s.drag);
+        if let Some(drag) = held.filter(|d| extend && d.epoch == epoch) {
+            self.mouse.drag = Some(drag);
+            self.extend_drag();
+            return;
+        }
+        // SAFETY: a plain query.
+        let within = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+        let now = Instant::now();
+        let n = clicks(self.mouse.click, here, now, within);
+        self.mouse.click = Some((now, here, n));
+        let block = mods.lalt || mods.ralt;
+        let unit = if block { 1 } else { n };
+        let Some(v) = self.current() else {
+            return;
+        };
+        let drag = Drag::new(&lock(&v.pane.term), &self.theme.pal, here, unit, block);
+        self.mouse.drag = Some(drag);
+        if self.selection.take().is_some() {
+            self.request_redraw();
+        }
+        // A double or triple click selects at once.
+        self.extend_drag();
+    }
+
+    /// Grows the selection being dragged to the cell under the pointer. A
+    /// single click shows nothing until the pointer leaves its cell.
+    fn extend_drag(&mut self) {
+        let Some(drag) = self.mouse.drag else {
+            return;
+        };
+        let Some(v) = self.current() else {
+            return;
+        };
+        let (col, row) = self.cell_at(self.mouse.pos);
+        let term = lock(&v.pane.term);
+        if term.line_epoch() != drag.epoch {
+            drop(term);
+            self.mouse.drag = None;
+            return;
+        }
+        let head = (term.view_top() + usize::from(row), col);
+        if self.selection.is_none() && drag.unit == 1 && head == drag.anchor.0 {
+            return;
+        }
+        let s = Selection::new(&term, &self.theme.pal, drag, head);
+        drop(term);
+        if self.selection.as_ref().map(|o| (o.start, o.end)) != Some((s.start, s.end)) {
+            self.selection = Some(s);
+            self.request_redraw();
+        }
+    }
+
+    /// While a drag holds the pointer above or below the focused pane,
+    /// scrolls toward it, faster the farther out it is, and grows the
+    /// selection; then waits for the next step. The alternate screen has
+    /// no scrollback to scroll.
+    fn autoscroll(&mut self) {
+        self.mouse.scroll_at = None;
+        let Some(v) = self.current().filter(|_| self.mouse.drag.is_some()) else {
+            return;
+        };
+        let (Some(r), false) = (v.rect, v.snap.alt_screen) else {
+            return;
+        };
+        let y = self.mouse.pos.y as i32;
+        let out = if y < r.y {
+            r.y - y
+        } else if y >= r.bottom() {
+            r.bottom() - 1 - y
+        } else {
+            return;
+        };
+        let ch = self.cell().1 as i32;
+        let lines = (out.abs() / ch + 1).min(10) * out.signum();
+        self.scroll(lines as isize);
+        self.mouse.scroll_at = Some(Instant::now() + AUTOSCROLL);
+    }
+
+    /// The link under `pos` in the focused pane, with the cells it
+    /// covers: an OSC 8 hyperlink, else a URL or the path of a file or
+    /// folder that exists in the text around it.
+    fn link_under(&self, pos: PhysicalPosition<f64>) -> Option<(Target, (Pos, Pos))> {
+        let v = self
+            .current()
+            .filter(|v| self.hit(pos).0 == Some(v.pane.id))?;
+        let (col, row) = self.cell_at(pos);
+        let t = lock(&v.pane.term);
+        let at = (t.view_top() + usize::from(row), col);
+        if let Some((uri, a, b)) = t.link_at(at.0, at.1) {
+            return Some((Target::Uri(uri.to_owned()), (a, b)));
+        }
+        let l = Logical::new(&t, &self.theme.pal, at.0);
+        // Output goes on while the line is scanned and the disk looked at.
+        drop(t);
+        let here = l.cells[l.index(at)?].0;
+        let (range, found) =
+            (crate::links::scan(&l.text).into_iter()).find(|(r, _)| r.contains(&here))?;
+        let target = match found {
+            Link::Url(u) => Target::Uri(u),
+            Link::Path(p) => Target::Path(self.resolve(&p, &v.pane.cwd)?),
+        };
+        Some((target, l.span(range)))
+    }
+
+    /// [`crate::links::resolve`], answered again without looking at the
+    /// disk while Ctrl stays held over one path: each move of the pointer
+    /// and each repeat of a held key asks, and a slow drive would make
+    /// every one of them wait.
+    fn resolve(&self, word: &str, cwd: &str) -> Option<PathBuf> {
+        let last = &mut self.resolved.borrow_mut();
+        resolve_again(last, word, cwd, crate::links::resolve)
+    }
+
+    /// Underlines the link under the pointer, and shows the hand, while
+    /// Ctrl is held; with mouse reporting on, Ctrl and Shift.
+    fn update_hover(&mut self) {
+        let mods = mods_now();
+        let ctrl = (mods.lctrl || mods.rctrl) && self.mouse_to_program(&mods).is_none();
+        // A file made since Ctrl was last held counts.
+        if !ctrl {
+            *self.resolved.get_mut() = None;
+        }
+        let hover = (ctrl && self.mouse.drag.is_none())
+            .then(|| self.link_under(self.mouse.pos))
+            .flatten()
+            .and_then(|(_, (a, b))| {
+                let epoch = lock(&self.current()?.pane.term).line_epoch();
+                Some((epoch, a, b))
+            });
+        self.set_hover(hover);
+    }
+
+    fn set_hover(&mut self, hover: Option<(u32, Pos, Pos)>) {
+        if hover == self.hover {
+            return;
+        }
+        if let Some(w) = &self.window
+            && hover.is_some() != self.hover.is_some()
+        {
+            w.set_cursor(if hover.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            });
+        }
+        self.hover = hover;
+        self.request_redraw();
+    }
+
+    /// Opens a link, or says in the pane why not.
+    fn open_link(&mut self, target: &Target) {
+        if let Err(e) = crate::links::open(target)
+            && let Some(id) = self.focus_id()
+        {
+            self.set_notice(id, e, Some(Instant::now() + NOTICE), false);
         }
     }
 
@@ -2268,12 +3122,10 @@ impl App {
             }
             return;
         }
-        if let Some(anchor) = self.mouse.anchor {
-            let here = self.cell_at(pos);
-            let sel = Some((anchor, here));
-            if (self.selection.is_some() || here != anchor) && self.selection != sel {
-                self.selection = sel;
-                self.request_redraw();
+        if self.mouse.drag.is_some() {
+            self.extend_drag();
+            if self.mouse.scroll_at.is_none() {
+                self.autoscroll();
             }
             return;
         }
@@ -2292,6 +3144,7 @@ impl App {
         if self.game.is_some() {
             return;
         }
+        self.update_hover();
         let mods = mods_now();
         // A drag goes where its press went, like the release will.
         let held = (0..3).find_map(|b| Some((b, self.mouse.reported[b]?)));
@@ -2313,6 +3166,11 @@ impl App {
         let steps = self.mouse.wheel.trunc();
         self.mouse.wheel -= steps;
         if steps == 0.0 {
+            return;
+        }
+        if let Some(cm) = &mut self.commands {
+            cm.move_by(-steps as isize);
+            self.request_redraw();
             return;
         }
         if let Some(p) = self.settings.as_mut().filter(|_| self.picker.is_none()) {
@@ -2352,7 +3210,12 @@ impl App {
             for _ in 0..steps.abs() as u32 {
                 self.mouse_report(id, kind, 0, mods);
             }
-        } else if !self.modes().alt_screen {
+        } else if self.modes().alt_screen {
+            // As in xterm's alternateScroll: pagers such as less and man
+            // have no scrollback to show, but scroll by the arrow keys.
+            let keys = wheel_keys(steps as isize * WHEEL_LINES, &self.modes());
+            self.send(keys);
+        } else {
             self.scroll(steps as isize * WHEEL_LINES);
         }
     }
@@ -2400,6 +3263,7 @@ impl App {
         self.rows = std::mem::take(&mut chrome.rows);
         self.banner = chrome.banner;
         self.settings_hits = chrome.settings.take();
+        self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
             p.top = h.top;
         }
@@ -2415,20 +3279,41 @@ impl App {
             };
             let fit = |n: i32, cell: u32| (n / cell as i32).clamp(1, i32::from(u16::MAX)) as u16;
             let grid = (fit(rect.w, cw), fit(rect.h, ch));
+            let mut find = self.find.as_mut().filter(|f| f.pane == id);
             if grid != v.grid {
                 v.grid = grid;
                 v.pane.resize(grid.0, grid.1);
                 lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
+                // A new width rewraps the lines that matched.
+                if let Some(f) = &mut find {
+                    f.stale = true;
+                }
             }
             v.rect = Some(rect);
-            let sel = self.selection.filter(|_| Some(id) == focus);
+            let sel = self.selection.as_mut().filter(|_| Some(id) == focus);
             let mut term = lock(&v.pane.term);
             v.sync_until = term.sync_deadline();
             if !refresh(&mut term, &mut v.snap, &self.theme.pal, sel) {
                 self.selection = None;
             }
+            v.snap.highlights.clear();
+            if let Some(f) = find {
+                // ponytail: searches all of the scrollback again on each
+                // frame with new output, ~50 ms for 100,000 full rows; keep
+                // the matches in scrollback rows if that ever shows.
+                if f.stale {
+                    f.search(&term, grid.1);
+                }
+                v.snap.highlight(&f.found, f.cur);
+            }
             if Some(id) == focus {
-                v.snap.selection = self.selection.map(|s| whole_chars(&v.snap, s));
+                let (top, size) = (term.view_top(), (v.snap.cols, v.snap.rows));
+                let sel = self.selection.as_ref();
+                v.snap.selection =
+                    sel.and_then(|s| in_view(s.start, s.end, s.drag.block, top, size));
+                v.snap.block = sel.is_some_and(|s| s.drag.block);
+                let hover = self.hover.filter(|h| h.0 == term.line_epoch());
+                v.snap.hover = hover.and_then(|(_, a, b)| in_view(a, b, false, top, size));
             } else if split {
                 dimmed.push(id);
             }
@@ -2467,7 +3352,8 @@ impl App {
                         continue;
                     };
                     let dim = dimmed.contains(&v.pane.id);
-                    g.r.grid(&v.snap, &pal, at.x, at.y, dim, scenery.is_none());
+                    let hollow = dim || !self.focused;
+                    g.r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
                     if let Some(n) = &v.notice {
                         draw_notice(&mut g.r, &pal, at, v.grid, n);
                     }
@@ -2535,6 +3421,28 @@ impl App {
         }
     }
 
+    /// Notes where the window is, unless it is minimized, maximized or full
+    /// screen, none of which is a place to go back to.
+    fn note_place(&mut self) {
+        let Some(w) = &self.window else {
+            return;
+        };
+        if !w.is_maximized()
+            && w.is_minimized() != Some(true)
+            && w.fullscreen().is_none()
+            && let Ok(p) = w.outer_position()
+        {
+            let size = w.inner_size();
+            self.placed = Geometry {
+                x: p.x,
+                y: p.y,
+                w: size.width,
+                h: size.height,
+                maximized: false,
+            };
+        }
+    }
+
     /// Saves the session when its tabs, splits or folders changed since
     /// the last save, or always with `force`. The window's place alone
     /// does not count, so dragging the window writes nothing until exit.
@@ -2559,23 +3467,10 @@ impl App {
             return;
         }
         self.save_after = None;
+        self.note_place();
         if let Some(w) = &self.window {
-            let maximized = w.is_maximized();
-            if !maximized
-                && w.is_minimized() != Some(true)
-                && let Ok(p) = w.outer_position()
-            {
-                let size = w.inner_size();
-                self.placed = Geometry {
-                    x: p.x,
-                    y: p.y,
-                    w: size.width,
-                    h: size.height,
-                    maximized: false,
-                };
-            }
             s.window = Geometry {
-                maximized,
+                maximized: w.is_maximized(),
                 ..self.placed
             };
         }
@@ -2652,10 +3547,19 @@ impl App {
             (true, false, false) => Some(now + SCENERY_FRAME),
             _ => None,
         };
-        [sync, notice, timer, resume, self.save_after, gfx, anim]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            sync,
+            notice,
+            timer,
+            resume,
+            self.save_after,
+            gfx,
+            anim,
+            self.mouse.scroll_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }
 
@@ -2772,6 +3676,73 @@ fn flash_kind(state: Attn, last: &mut Option<Instant>, now: Instant) -> Option<U
     Some(kind)
 }
 
+/// How many rows of `cell_h` pixels the find bar covers at the top of a
+/// pane, as the chrome draws it: a line of `text_h` pixel text, with 5
+/// pixels at `scale` above and below.
+fn bar_rows(text_h: u32, scale: f64, cell_h: u32) -> u16 {
+    let bar = f64::from(text_h) + (10.0 * scale).round();
+    (bar / f64::from(cell_h.max(1))).ceil() as u16
+}
+
+/// `look` at path `word` in folder `cwd`, unless `last` was the same
+/// question; then its answer.
+fn resolve_again(
+    last: &mut Option<(String, String, Option<PathBuf>)>,
+    word: &str,
+    cwd: &str,
+    look: impl FnOnce(&str, &str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some((w, c, found)) = last
+        && (w.as_str(), c.as_str()) == (word, cwd)
+    {
+        return found.clone();
+    }
+    let found = look(word, cwd);
+    *last = Some((word.to_owned(), cwd.to_owned(), found.clone()));
+    found
+}
+
+/// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
+/// unless it shows already below the `covered` rows at its top, which the
+/// find bar hides. Returns whether the view moved.
+fn reveal(term: &mut vt::Terminal, m: Found, rows: u16, covered: u16) -> bool {
+    let (top, rows) = (term.view_top(), usize::from(rows));
+    if (top + usize::from(covered)..top + rows).contains(&m.start.0) {
+        return false;
+    }
+    term.scroll_to(m.start.0.saturating_sub(rows / 2));
+    term.view_top() != top
+}
+
+/// `n` presses of Up, or of Down for a negative `n`, each with its
+/// release, as the program asked keys to be sent.
+fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
+    let (vk, scan, key) = if n > 0 {
+        (VK_UP, 0x48, vt::Key::Up)
+    } else {
+        (VK_DOWN, 0x50, vt::Key::Down)
+    };
+    let mut out = Vec::new();
+    for down in std::iter::repeat_n([true, false], n.unsigned_abs()).flatten() {
+        let k = KeyInput {
+            vk,
+            scan,
+            extended: true,
+            down,
+            repeat: 1,
+            mods: Mods::default(),
+            locks: vt::Locks::default(),
+            text: "",
+            uc: 0,
+            cs: 0,
+            key,
+            us_base: None,
+        };
+        vt::encode_key(&k, m, &mut out);
+    }
+    out
+}
+
 /// Draws a notice over the bottom row of the pane whose grid is at `at`.
 fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), n: &Notice) {
     let (_, ch) = r.cell();
@@ -2881,63 +3852,46 @@ fn tab_name(cwd: Option<&Path>) -> String {
 }
 
 /// Takes a fresh snapshot of `term` into `snap`. Returns false when that
-/// changed the text under `sel`: output that scrolls or rewrites selected
-/// text ends the selection, so a copy never takes text the user did not
-/// pick.
+/// found output rewrote the text under `sel`; see [`Selection::still`].
 fn refresh(
     term: &mut vt::Terminal,
     snap: &mut Snapshot,
     pal: &Palette,
-    sel: Option<((u16, u16), (u16, u16))>,
+    sel: Option<&mut Selection>,
 ) -> bool {
     // Only a terminal with news can change the selected text.
-    let before = sel
-        .filter(|_| term.is_changed())
-        .map(|s| selection_text(snap, s));
-    !term.snapshot(snap, pal) || sel.map(|s| selection_text(snap, s)) == before
+    !term.snapshot(snap, pal) || sel.is_none_or(|s| s.still(term, pal))
 }
 
-/// The text of the cells between two (column, row) points, inclusive, in
-/// reading order: trailing blanks trimmed, rows joined by CRLF unless one
-/// wraps into the next.
-pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String {
-    let (a, b) = whole_chars(snap, sel);
-    let cols = usize::from(snap.cols);
-    let last = b.1.min(snap.rows.saturating_sub(1));
+/// The text of the selected cells from line `from` on, in reading order:
+/// trailing blanks trimmed, rows joined by CRLF unless one wraps into the
+/// next. A block takes the same columns of each row.
+fn selection_text(term: &vt::Terminal, pal: &Palette, sel: &Selection, from: usize) -> String {
+    let (a, b) = (sel.start, sel.end);
     let mut out = String::new();
-    for row in a.1..=last {
-        let from = if row == a.1 { usize::from(a.0) } else { 0 };
-        let to = if row == b.1 {
-            usize::from(b.0).min(cols.saturating_sub(1))
-        } else {
-            cols.saturating_sub(1)
+    let mut cells = Vec::new();
+    for n in a.0.max(from)..=b.0 {
+        let Some(wraps) = term.line_cells(n, pal, &mut cells) else {
+            break;
+        };
+        let (first, last) = match (sel.drag.block, n == a.0, n == b.0) {
+            (true, ..) => (a.1, b.1),
+            (false, first, last) => (
+                if first { a.1 } else { 0 },
+                if last { b.1 } else { u16::MAX },
+            ),
         };
         let mut line = String::new();
-        let mut text_end = 0;
-        for c in from..=to {
-            let Some(cell) = snap.cells.get(usize::from(row) * cols + c) else {
-                break;
-            };
-            match cell.len {
-                // The right half of a wide character.
-                0 if cell.width == 0 => {}
-                // A blank, or hidden text: a space for each column.
-                0 => line.extend(std::iter::repeat_n(' ', usize::from(cell.width))),
-                n => {
-                    let text = std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" ");
-                    push_drawn(&mut line, text, cell.width);
-                    text_end = line.len();
-                }
-            }
-        }
+        let text_end = push_cells(&mut line, &cells, first.into(), last.into());
         // A row that wraps runs on into the next one: no line break, and
-        // only the empty cells at its end are dropped.
-        if row < last && snap.wrapped.get(usize::from(row)) == Some(&true) {
+        // only the empty cells at its end are dropped. A block's rows
+        // always break.
+        if n < b.0 && wraps && !sel.drag.block {
             line.truncate(text_end);
             out.push_str(&line);
         } else {
             out.push_str(line.trim_end());
-            if row < last {
+            if n < b.0 {
                 out.push_str("\r\n");
             }
         }
@@ -2945,26 +3899,24 @@ pub fn selection_text(snap: &Snapshot, sel: ((u16, u16), (u16, u16))) -> String 
     out
 }
 
-/// `sel` in reading order, grown to take in the whole of a wide character
-/// it ends on half of, so what is highlighted is what is copied.
-fn whole_chars(snap: &Snapshot, (a, b): ((u16, u16), (u16, u16))) -> ((u16, u16), (u16, u16)) {
-    let (mut a, mut b) = if (a.1, a.0) <= (b.1, b.0) {
-        (a, b)
-    } else {
-        (b, a)
-    };
-    let width = |(c, r): (u16, u16)| {
-        let i = usize::from(r) * usize::from(snap.cols) + usize::from(c);
-        snap.cells.get(i).map(|c| c.width)
-    };
-    // The right half of a wide character starts at its left half.
-    if a.0 > 0 && width(a) == Some(0) && width((a.0 - 1, a.1)) == Some(2) {
-        a.0 -= 1;
+/// Adds the text of `cells[first..=last]` as the screen shows it. Returns
+/// the length of `line` after the last cell that holds text.
+fn push_cells(line: &mut String, cells: &[vt::RenderCell], first: usize, last: usize) -> usize {
+    let mut text_end = line.len();
+    for cell in cells.iter().take(last.saturating_add(1)).skip(first) {
+        match cell.len {
+            // The right half of a wide character.
+            0 if cell.width == 0 => {}
+            // A blank, or hidden text: a space for each column.
+            0 => line.extend(std::iter::repeat_n(' ', usize::from(cell.width))),
+            n => {
+                let text = std::str::from_utf8(&cell.text[..usize::from(n)]).unwrap_or(" ");
+                push_drawn(line, text, cell.width);
+                text_end = line.len();
+            }
+        }
     }
-    if width(b) == Some(2) && b.0 + 1 < snap.cols {
-        b.0 += 1;
-    }
-    (a, b)
+    text_end
 }
 
 /// Adds a cell's text as the screen shows it, so a copy carries nothing
@@ -3037,6 +3989,9 @@ impl ApplicationHandler<UserEvent> for App {
                     v.pane.send(line);
                 }
             }
+            if self.mouse.scroll_at.is_some_and(|t| t <= now) {
+                self.autoscroll();
+            }
             // A synchronized update timed out, a notice expired, or a
             // working timer ticked.
             self.request_redraw();
@@ -3068,7 +4023,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if !f {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
-                    self.mouse.anchor = None;
+                    self.mouse.drag = None;
+                    self.mouse.scroll_at = None;
                     let mods = mods_now();
                     for b in 0..3 {
                         if let Some(id) = route_button(&mut self.mouse.reported, b, false, None) {
@@ -3076,6 +4032,10 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                // Ctrl may be let go while another window has the keys.
+                self.set_hover(None);
+                // The cursor is hollow while the window is in the background.
+                self.request_redraw();
                 let mut out = Vec::new();
                 vt::encode_focus(f, &self.modes(), &mut out);
                 self.send(out);
@@ -3508,69 +4468,76 @@ mod selftest {
 mod tests {
     use super::*;
 
-    #[test]
-    fn app_selection_text_reads_cells_in_order() {
-        let pal = crate::theme::dark();
-        let s = text_snapshot("ab  \nc\u{4e2d}d\nxyz", 4, 3, &pal);
-        // Given end first; spans three rows.
-        assert_eq!(
-            selection_text(&s, ((1, 2), (1, 0))),
-            "b\r\nc\u{4e2d}d\r\nxy"
-        );
-        assert_eq!(selection_text(&s, ((0, 1), (3, 1))), "c\u{4e2d}d");
-        assert_eq!(selection_text(&s, ((2, 0), (3, 0))), "");
-    }
-
-    /// A snapshot of a `cols` x `rows` terminal fed `bytes`.
-    fn fed(cols: u16, rows: u16, bytes: &str) -> Snapshot {
+    /// A `cols` x `rows` terminal fed `bytes`.
+    fn fed(cols: u16, rows: u16, bytes: &str) -> vt::Terminal {
         let mut t = vt::Terminal::new(vt::Options {
             cols,
             rows,
             ..vt::Options::default()
         });
         t.feed(bytes.as_bytes());
-        let mut s = Snapshot::default();
-        t.snapshot(&mut s, &crate::theme::dark());
-        s
+        t
+    }
+
+    /// A selection dragged from `a` to `b` after `unit` clicks.
+    fn drag(t: &vt::Terminal, a: Pos, b: Pos, unit: u8, block: bool) -> Selection {
+        let pal = crate::theme::dark();
+        Selection::new(t, &pal, Drag::new(t, &pal, a, unit, block), b)
+    }
+
+    /// A selection dragged from `a` to `b`.
+    fn select(t: &vt::Terminal, a: Pos, b: Pos) -> Selection {
+        drag(t, a, b, 1, false)
+    }
+
+    /// What a copy of the selection dragged from `a` to `b` takes.
+    fn copy(t: &vt::Terminal, a: Pos, b: Pos) -> String {
+        selection_text(t, &crate::theme::dark(), &select(t, a, b), 0)
+    }
+
+    #[test]
+    fn app_selection_text_reads_cells_in_order() {
+        let t = fed(4, 3, "ab  \r\nc\u{4e2d}d\r\nxyz");
+        // Dragged from the end; spans three rows.
+        assert_eq!(copy(&t, (2, 1), (0, 1)), "b\r\nc\u{4e2d}d\r\nxy");
+        assert_eq!(copy(&t, (1, 0), (1, 3)), "c\u{4e2d}d");
+        assert_eq!(copy(&t, (0, 2), (0, 3)), "");
     }
 
     #[test]
     fn app_selection_leaves_out_hidden_text() {
-        let s = fed(
+        let t = fed(
             30,
             2,
             "git status\x1b[8m; iwr x|iex\x1b[28m!\r\n\x1b[38;2;19;20;23mcalc\x1b[0m",
         );
-        assert_eq!(
-            selection_text(&s, ((0, 0), (29, 1))),
-            "git status           !\r\n"
-        );
-        let s = fed(4, 1, "\x1b[8m\u{4e2d}\x1b[0mx");
-        assert_eq!(selection_text(&s, ((0, 0), (3, 0))), "  x");
+        assert_eq!(copy(&t, (0, 0), (1, 29)), "git status           !\r\n");
+        let t = fed(4, 1, "\x1b[8m\u{4e2d}\x1b[0mx");
+        assert_eq!(copy(&t, (0, 0), (0, 3)), "  x");
     }
 
     #[test]
     fn app_selection_joins_wrapped_rows() {
-        let two = ((0, 0), (3, 1));
-        assert_eq!(selection_text(&fed(4, 3, "ab  cd"), two), "ab  cd");
-        assert_eq!(selection_text(&fed(4, 3, "ab\r\ncd"), two), "ab\r\ncd");
+        let two = |t| copy(&t, (0, 0), (1, 3));
+        assert_eq!(two(fed(4, 3, "ab  cd")), "ab  cd");
+        assert_eq!(two(fed(4, 3, "ab\r\ncd")), "ab\r\ncd");
         // A wide character that did not fit leaves an empty cell behind.
-        assert_eq!(selection_text(&fed(3, 3, "ab\u{4e2d}"), two), "ab\u{4e2d}");
+        assert_eq!(two(fed(3, 3, "ab\u{4e2d}")), "ab\u{4e2d}");
     }
 
     #[test]
     fn app_selection_copies_only_what_is_drawn() {
-        let copy = |bytes: &str| selection_text(&fed(40, 1, bytes), ((0, 0), (39, 0)));
-        assert_eq!(copy("ls\u{E0069}\u{E0067}\u{E006E}x"), "lsx", "tags");
-        assert_eq!(copy("a\u{E0100}\u{FE00}b"), "ab", "variation selectors");
+        let drawn = |bytes: &str| copy(&fed(40, 1, bytes), (0, 0), (0, 39));
+        assert_eq!(drawn("ls\u{E0069}\u{E0067}\u{E006E}x"), "lsx", "tags");
+        assert_eq!(drawn("a\u{E0100}\u{FE00}b"), "ab", "variation selectors");
         assert_eq!(
-            copy("a\u{200D}\u{301}\u{302}b"),
+            drawn("a\u{200D}\u{301}\u{302}b"),
             "ab",
             "marks after a joiner"
         );
-        assert_eq!(copy("a\u{200D}b"), "ab", "a lone joiner");
-        assert_eq!(copy("x\u{3164}y\u{2800}z\u{A0}w"), "x  y z w", "fillers");
-        assert_eq!(copy("x\u{AD}y"), "x y", "soft hyphen");
+        assert_eq!(drawn("a\u{200D}b"), "ab", "a lone joiner");
+        assert_eq!(drawn("x\u{3164}y\u{2800}z\u{A0}w"), "x  y z w", "fillers");
+        assert_eq!(drawn("x\u{AD}y"), "x y", "soft hyphen");
         for s in [
             "a\u{200C}\u{200C}\u{200C}b",
             "a\u{34F}b",
@@ -3579,9 +4546,9 @@ mod tests {
             "a\u{FE0E}\u{FE0F}b",
             "a\u{2060}\u{FEFF}b",
         ] {
-            assert_eq!(copy(s), "ab", "{s:?}");
+            assert_eq!(drawn(s), "ab", "{s:?}");
         }
-        assert_eq!(copy("\u{2764}\u{FE0F}\u{FE0F}"), "\u{2764}\u{FE0F}");
+        assert_eq!(drawn("\u{2764}\u{FE0F}\u{FE0F}"), "\u{2764}\u{FE0F}");
         // Text that draws keeps everything.
         for s in [
             "e\u{301}",
@@ -3591,66 +4558,221 @@ mod tests {
             "\u{1F468}\u{200D}\u{1F469}",
             "\u{4e2d}",
         ] {
-            assert_eq!(copy(s), s);
+            assert_eq!(drawn(s), s);
         }
     }
 
     #[test]
-    fn app_output_that_moves_selected_text_ends_the_selection() {
+    fn app_copy_reaches_into_scrollback() {
+        let t = fed(4, 2, "one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(t.screen_top(), 3);
+        assert_eq!(copy(&t, (1, 1), (4, 1)), "wo\r\nthree\r\nfo");
+    }
+
+    #[test]
+    fn app_selection_stays_on_its_text_until_output_rewrites_it() {
+        let pal = crate::theme::dark();
+        let mut t = fed(10, 3, "a\r\nb\r\nc");
+        let mut s = Snapshot::default();
+        let mut sel = select(&t, (1, 0), (1, 9));
+        assert!(refresh(&mut t, &mut s, &pal, None));
+        assert!(refresh(&mut t, &mut s, &pal, Some(&mut sel)), "nothing new");
+        t.feed(b"\x1b[1;5Hx");
+        assert!(
+            refresh(&mut t, &mut s, &pal, Some(&mut sel)),
+            "another row changed"
+        );
+        t.feed(b"\x1b[3;1H\r\nd");
+        assert!(refresh(&mut t, &mut s, &pal, Some(&mut sel)), "scrolled");
+        assert_eq!(selection_text(&t, &pal, &sel, 0), "b");
+        t.feed(b"\x1b[1;1Hz");
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)), "rewritten");
+        let mut sel = select(&t, (2, 0), (2, 9));
+        t.feed(b"\x1b[2;1Hq\x1b[3;1H\r\n\r\n");
+        assert!(
+            !refresh(&mut t, &mut s, &pal, Some(&mut sel)),
+            "rewritten, then scrolled out of the screen"
+        );
+    }
+
+    #[test]
+    fn app_selection_ends_when_its_lines_are_gone() {
         let pal = crate::theme::dark();
         let mut t = vt::Terminal::new(vt::Options {
             cols: 10,
-            rows: 3,
+            rows: 2,
+            scrollback_lines: 2,
             ..vt::Options::default()
         });
-        t.feed(b"a\r\nb\r\nc");
+        t.feed(b"a\r\nb");
         let mut s = Snapshot::default();
-        let sel = Some(((0, 1), (9, 1)));
-        assert!(refresh(&mut t, &mut s, &pal, None));
-        assert!(refresh(&mut t, &mut s, &pal, sel), "nothing new");
-        t.feed(b"\x1b[1;5Hx");
-        assert!(refresh(&mut t, &mut s, &pal, sel), "another row changed");
-        t.feed(b"\x1b[3;1H\r\nd");
-        assert!(!refresh(&mut t, &mut s, &pal, sel), "scrolled");
-        t.feed(b"\x1b[2;1Hz");
-        assert!(!refresh(&mut t, &mut s, &pal, sel), "rewritten");
+        let mut sel = select(&t, (0, 0), (0, 0));
+        t.feed(b"\r\n1\r\n2");
+        assert!(
+            refresh(&mut t, &mut s, &pal, Some(&mut sel)),
+            "in scrollback"
+        );
+        t.feed(b"\r\n3");
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)), "dropped");
+        let mut sel = select(&t, (3, 0), (3, 0));
+        t.resize(8, 2);
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)), "rewrapped");
+    }
+
+    #[test]
+    fn app_selection_shows_the_part_in_view() {
+        let size = (10, 3);
+        let view = |a, b| in_view(a, b, false, 5, size);
+        assert_eq!(view((5, 2), (6, 4)), Some(((2, 0), (4, 1))));
+        assert_eq!(
+            view((1, 2), (9, 4)),
+            Some(((0, 0), (9, 2))),
+            "past both ends"
+        );
+        assert_eq!(view((1, 2), (4, 4)), None, "above");
+        assert_eq!(view((8, 0), (9, 4)), None, "below");
+        let block = in_view((1, 2), (9, 4), true, 5, size);
+        assert_eq!(block, Some(((2, 0), (4, 2))), "a block keeps its columns");
+    }
+
+    #[test]
+    fn app_double_click_takes_a_word_or_a_path() {
+        let t = fed(12, 3, "see src/foo.rs:42, (x)  y");
+        let pal = crate::theme::dark();
+        let word = |at| Drag::new(&t, &pal, at, 2, false).anchor;
+        assert_eq!(word((0, 8)), ((0, 4), (1, 4)), "a path, across the wrap");
+        assert_eq!(word((0, 1)), ((0, 0), (0, 2)));
+        assert_eq!(word((1, 7)), ((1, 7), (1, 7)), "punctuation alone");
+        assert_eq!(word((1, 10)), ((1, 10), (1, 11)), "a run of blanks");
+        let by_words = drag(&t, (0, 1), (1, 1), 2, false);
+        assert_eq!(selection_text(&t, &pal, &by_words, 0), "see src/foo.rs:42");
+        let t = fed(10, 1, "\u{4e2d}\u{6587} x");
+        let word = |at| Drag::new(&t, &pal, at, 2, false).anchor;
+        assert_eq!(word((0, 1)), ((0, 0), (0, 3)), "wide characters");
+    }
+
+    #[test]
+    fn app_triple_click_takes_the_logical_line() {
+        let t = fed(4, 4, "abcdef\r\ngh");
+        let pal = crate::theme::dark();
+        let line = |at| Drag::new(&t, &pal, at, 3, false).anchor;
+        assert_eq!(line((1, 0)), ((0, 0), (1, u16::MAX)));
+        assert_eq!(line((2, 1)), ((2, 0), (2, u16::MAX)));
+        let by_lines = drag(&t, (0, 2), (2, 0), 3, false);
+        assert_eq!(selection_text(&t, &pal, &by_lines, 0), "abcdef\r\ngh");
+    }
+
+    #[test]
+    fn app_block_copy_takes_the_same_columns_of_each_row() {
+        let pal = crate::theme::dark();
+        let t = fed(6, 3, "abcdef\r\ngh  \r\nijklmn");
+        let block = drag(&t, (0, 4), (2, 1), 1, true);
+        assert_eq!((block.start, block.end), ((0, 1), (2, 4)));
+        assert_eq!(selection_text(&t, &pal, &block, 0), "bcde\r\nh\r\njklm");
+        // Rows a wrap joined stay apart.
+        let t = fed(3, 2, "abcdef");
+        let block = drag(&t, (0, 0), (1, 1), 1, true);
+        assert_eq!(selection_text(&t, &pal, &block, 0), "ab\r\nde");
+    }
+
+    #[test]
+    fn app_a_held_ctrl_looks_at_a_path_once() {
+        let mut looks = 0;
+        let mut last = None;
+        for word in ["a.txt", "a.txt", "b.txt"] {
+            resolve_again(&mut last, word, "C:/x", |w, _| {
+                looks += 1;
+                Some(PathBuf::from(w))
+            });
+        }
+        assert_eq!(looks, 2);
+        let again = resolve_again(&mut last, "b.txt", "C:/x", |_, _| None);
+        assert_eq!(again, Some(PathBuf::from("b.txt")));
+        assert_eq!(resolve_again(&mut last, "b.txt", "C:/y", |_, _| None), None);
+    }
+
+    #[test]
+    fn app_links_map_back_to_their_cells() {
+        let t = fed(10, 3, "go https://e.com/abc now");
+        let l = Logical::new(&t, &crate::theme::dark(), 1);
+        assert_eq!(l.index((1, 4)).map(|i| l.cells[i].0), Some(14));
+        let (range, found) = crate::links::scan(&l.text).remove(0);
+        assert_eq!(found, Link::Url("https://e.com/abc".into()));
+        assert_eq!(l.span(range), ((0, 3), (1, 9)), "across the wrap");
+    }
+
+    #[test]
+    fn app_wheel_on_the_alternate_screen_sends_arrow_keys() {
+        let legacy = InputModes::default();
+        assert_eq!(wheel_keys(3, &legacy), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(wheel_keys(-1, &legacy), b"\x1b[B");
+        let app = InputModes {
+            decckm: true,
+            ..legacy
+        };
+        assert_eq!(wheel_keys(2, &app), b"\x1bOA\x1bOA", "DECCKM");
+        // Kitty flags 1 and 2: releases are reported too.
+        let kitty = InputModes { kitty: 3, ..legacy };
+        assert_eq!(wheel_keys(1, &kitty), b"\x1b[A\x1b[1;1:3A");
+    }
+
+    #[test]
+    fn app_clicks_count_on_the_same_cell_in_time() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let within = ms(500);
+        assert_eq!(clicks(None, (3, 1), t0, within), 1);
+        let last = Some((t0, (3, 1), 1));
+        assert_eq!(clicks(last, (3, 1), t0 + ms(400), within), 2);
+        assert_eq!(
+            clicks(last, (3, 2), t0 + ms(400), within),
+            1,
+            "another cell"
+        );
+        assert_eq!(clicks(last, (3, 1), t0 + ms(600), within), 1, "too late");
+        let third = Some((t0, (3, 1), 3));
+        assert_eq!(clicks(third, (3, 1), t0, within), 1, "after a triple click");
     }
 
     #[test]
     fn app_selection_takes_whole_wide_characters() {
-        let pal = crate::theme::dark();
-        let s = text_snapshot("a\u{4e2d}b", 4, 1, &pal);
-        assert_eq!(selection_text(&s, ((0, 0), (1, 0))), "a\u{4e2d}");
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 4,
+            rows: 1,
+            ..vt::Options::default()
+        });
+        t.feed("a\u{4e2d}b".as_bytes());
+        let ends = |a, b| {
+            let s = select(&t, a, b);
+            (s.start, s.end)
+        };
+        assert_eq!(copy(&t, (0, 0), (0, 1)), "a\u{4e2d}");
         // Starting on the right half takes the whole character, which is
         // also what is highlighted.
-        assert_eq!(selection_text(&s, ((2, 0), (3, 0))), "\u{4e2d}b");
-        assert_eq!(whole_chars(&s, ((2, 0), (3, 0))), ((1, 0), (3, 0)));
-        assert_eq!(selection_text(&s, ((2, 0), (2, 0))), "\u{4e2d}");
-        assert_eq!(whole_chars(&s, ((2, 0), (2, 0))), ((1, 0), (2, 0)));
-        // Ending on the left half highlights the right half too.
-        assert_eq!(whole_chars(&s, ((1, 0), (0, 0))), ((0, 0), (2, 0)));
-        assert_eq!(whole_chars(&s, ((3, 0), (3, 0))), ((3, 0), (3, 0)));
-        // A wide character in the last column cannot reach past it.
-        let edge = text_snapshot("ab\u{4e2d}", 4, 1, &pal);
-        assert_eq!(whole_chars(&edge, ((2, 0), (2, 0))), ((2, 0), (3, 0)));
+        assert_eq!(copy(&t, (0, 2), (0, 3)), "\u{4e2d}b");
+        assert_eq!(ends((0, 2), (0, 3)), ((0, 1), (0, 3)));
+        assert_eq!(copy(&t, (0, 2), (0, 2)), "\u{4e2d}");
+        assert_eq!(ends((0, 2), (0, 2)), ((0, 1), (0, 2)));
+        // Ending on the left half takes the right half too.
+        assert_eq!(ends((0, 1), (0, 0)), ((0, 0), (0, 2)));
+        assert_eq!(ends((0, 3), (0, 3)), ((0, 3), (0, 3)));
     }
 
     #[test]
-    fn app_selection_text_of_short_or_empty_snapshots() {
-        let pal = crate::theme::dark();
-        // A pane whose terminal is smaller than its grid, as after a
-        // session stopped updating.
-        let mut short = text_snapshot("ab\ncd", 2, 2, &pal);
-        short.cells.truncate(1);
-        assert_eq!(selection_text(&short, ((0, 0), (1, 1))), "a\r\n");
-        assert_eq!(selection_text(&Snapshot::default(), ((0, 0), (3, 3))), "");
-        // Past the last row and column.
-        let s = text_snapshot("ab\ncd", 2, 2, &pal);
-        assert_eq!(selection_text(&s, ((0, 0), (9, 9))), "ab\r\ncd");
+    fn app_selection_text_past_the_last_column_or_not_utf8() {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 2,
+            rows: 2,
+            ..vt::Options::default()
+        });
+        t.feed(b"ab\r\ncd");
+        assert_eq!(copy(&t, (0, 0), (1, 9)), "ab\r\ncd", "past the last column");
         // Text that is not UTF-8 copies as a space.
-        let mut bad = text_snapshot("ab", 2, 1, &pal);
-        bad.cells[0].text[0] = 0xff;
-        assert_eq!(selection_text(&bad, ((0, 0), (1, 0))), " b");
+        let mut cells = text_snapshot("ab", 2, 1, &crate::theme::dark()).cells;
+        cells[0].text[0] = 0xff;
+        let mut line = String::new();
+        push_cells(&mut line, &cells, 0, usize::MAX);
+        assert_eq!(line, " b");
     }
 
     #[test]
@@ -3856,6 +4978,60 @@ mod tests {
     }
 
     #[test]
+    fn app_find_starts_below_the_view_when_nothing_above_matches() {
+        let mut t = fed(10, 2, "a\r\nb\r\nc\r\nmatch\r\nmatch");
+        t.scroll_viewport(9);
+        assert_eq!(t.view_top(), 0);
+        let mut f = Find::new(PaneId(1));
+        f.query = "match".into();
+        f.search(&t, 2);
+        assert_eq!((f.found.len(), f.cur), (2, Some(0)));
+    }
+
+    #[test]
+    fn app_find_keeps_its_place_as_output_goes_on() {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 20,
+            rows: 3,
+            scrollback_lines: 100,
+            ..vt::Options::default()
+        });
+        for i in 0..10 {
+            t.feed(format!("match {i}\r\n").as_bytes());
+        }
+        let mut f = Find::new(PaneId(1));
+        f.query = "match".into();
+        f.search(&t, 3);
+        // The nearest match above the bottom of the view.
+        assert_eq!((f.found.len(), f.cur), (10, Some(9)));
+        f.step(-1);
+        assert_eq!(f.cur, Some(8));
+        // Output scrolls the matches up; the current one stays on its line.
+        t.feed(b"match 10\r\nmatch 11\r\n");
+        f.search(&t, 3);
+        assert_eq!(f.found.len(), 12);
+        assert_eq!(f.cur.map(|i| f.found[i].start), Some((8, 0)));
+        // Up from the oldest goes round to the newest.
+        f.cur = Some(0);
+        f.step(-1);
+        assert_eq!(f.cur, Some(11));
+        // A match out of view comes into the middle of it.
+        assert!(reveal(&mut t, f.found[2], 3, 0));
+        assert_eq!(t.view_top(), 1);
+        assert!(!reveal(&mut t, f.found[2], 3, 1), "already in view");
+        // Not under the find bar, which covers the top row.
+        assert!(reveal(&mut t, f.found[1], 3, 1));
+        assert_eq!(t.view_top(), 0);
+        assert_eq!(bar_rows(17, 1.0, 20), 2);
+        assert_eq!(bar_rows(17, 1.0, 27), 1);
+
+        f.query = "zzz".into();
+        f.search(&t, 3);
+        f.step(1);
+        assert_eq!((f.found.len(), f.cur), (0, None));
+    }
+
+    #[test]
     fn app_new_panes_start_in_the_focused_directory() {
         let here = std::env::temp_dir();
         assert_eq!(start_dir(here.display().to_string()), Some(here.clone()));
@@ -4016,6 +5192,20 @@ mod tests {
         ] {
             assert_eq!(resume_line(true, Some(bad)), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn palette_matches_every_word_of_the_label_or_name() {
+        let mut c = Commands::default();
+        assert_eq!(c.matches().len(), keymap::ACTIONS.len() - 1, "not itself");
+        c.filter = "Split R".into();
+        assert_eq!(c.matches(), [(Action::SplitRight, "Split right")]);
+        c.filter = "font_size_up".into();
+        assert_eq!(c.matches(), [(Action::FontSize(1), "Bigger font")]);
+        c.move_by(5);
+        assert_eq!(c.sel, 0, "one match");
+        c.filter = "zzz".into();
+        assert!(c.matches().is_empty());
     }
 
     #[test]

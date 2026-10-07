@@ -2,13 +2,14 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::ops::Range;
 use std::time::Instant;
 
-use crate::grid::{Cell, Grid, Row, cf, rf};
+use crate::grid::{Cell, Found, Grid, Row, cf, rf};
 use crate::modes::{InputModes, KittyStack, Modes};
 use crate::osc::{self, Osc9};
 use crate::parser::{Handler, Params, Parser};
-use crate::snapshot::{self, CursorShape, Palette, RenderCell, Snapshot};
+use crate::snapshot::{CursorShape, Palette, RenderCell, Snapshot};
 use crate::style::{Color, Style, Styles, attr};
 use crate::width::{chars_width, joins};
 
@@ -31,6 +32,9 @@ impl Default for Options {
         }
     }
 }
+
+/// A cell as a line number and a column; see [`Terminal::lines`].
+pub type LineCol = (usize, u16);
 
 /// OSC 133 shell-integration marks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +137,8 @@ pub struct Terminal {
     viewport: usize,
     /// The main screen's view while the alternate screen is up.
     other_viewport: usize,
+    /// Counts the times line numbers started over; see [`Self::line_epoch`].
+    line_epoch: u32,
     changed: bool,
     modes: Modes,
     /// Dark or light system theme, for `CSI ? 996 n`.
@@ -176,6 +182,10 @@ const REPLY_CREDIT: usize = 16 * MAX_REPLIES;
 /// Most events queued between [`Terminal::take_events`] calls.
 const MAX_EVENTS: usize = 1024;
 
+/// Farthest [`Terminal::link_at`] follows a link either way: a program
+/// could link all of scrollback.
+const MAX_LINK_CELLS: usize = 4096;
+
 impl Terminal {
     pub fn new(o: Options) -> Self {
         let (cols, rows) = (o.cols.max(1), o.rows.max(1));
@@ -205,6 +215,7 @@ impl Terminal {
             cluster: None,
             viewport: 0,
             other_viewport: 0,
+            line_epoch: 0,
             changed: true,
             modes: Modes::default(),
             dark: true,
@@ -274,6 +285,7 @@ impl Terminal {
             (c.x, c.y, c.pending_wrap) = other_at;
         }
         if cols != self.cols() {
+            self.line_epoch = self.line_epoch.wrapping_add(1);
             self.cur.pending_wrap &= reflow && !self.alt;
             self.cur.x = self.cur.x.min(cols - 1);
             self.tabs = default_tabs(cols);
@@ -296,6 +308,54 @@ impl Terminal {
         // Every keystroke asks to follow the cursor; only a move redraws.
         self.changed |= v != self.viewport;
         self.viewport = v;
+    }
+
+    /// The line at the top of the view, numbered as [`Grid::dropped`]
+    /// numbers them.
+    pub fn view_top(&self) -> usize {
+        let g = &self.screen.grid;
+        g.dropped() + g.scrollback_len() - self.viewport
+    }
+
+    /// Scrolls the view so `line` is at its top, or as close as it gets.
+    pub fn scroll_to(&mut self, line: usize) {
+        let g = &self.screen.grid;
+        let v = (g.dropped() + g.scrollback_len()).saturating_sub(line);
+        self.scroll_viewport(v.min(g.scrollback_len()) as isize - self.viewport as isize);
+    }
+
+    /// Where `query` appears on the screen shown and, on the main screen,
+    /// in its scrollback; see [`Grid::find`].
+    pub fn find(&self, query: &str) -> Vec<Found> {
+        self.screen.grid.find(query)
+    }
+
+    /// Scrolls the main screen so a prompt of blitz's own shell integration
+    /// starts the view: with `up` the nearest one above its top row, else
+    /// the nearest one below it, and down from the last prompt back to the
+    /// bottom. Returns false, leaving the view alone, on the alternate
+    /// screen or with no prompt that way.
+    pub fn jump_to_prompt(&mut self, up: bool) -> bool {
+        if self.alt {
+            return false;
+        }
+        let g = &self.screen.grid;
+        let (live, top) = (g.scrollback_len(), g.scrollback_len() - self.viewport);
+        let prompt = |i: &usize| g.line(*i).is_some_and(|r| r.flags & rf::PROMPT != 0);
+        let to = if up {
+            (0..top).rev().find(prompt)
+        } else if top < live && (top..live + usize::from(g.lines())).any(|i| prompt(&i)) {
+            // A prompt on the bottom screenful cannot be at the top.
+            (top + 1..live).find(prompt).or(Some(live))
+        } else {
+            None
+        };
+        let Some(to) = to else {
+            return false;
+        };
+        let line = g.dropped() + to;
+        self.scroll_to(line);
+        true
     }
 
     pub fn input_modes(&self) -> InputModes {
@@ -348,32 +408,24 @@ impl Terminal {
         }
         self.changed = false;
         self.pal = [pal.fg, pal.bg, pal.cursor];
-        let [fg, bg, cursor] = self.colors;
-        let pal = &Palette {
-            fg: fg.unwrap_or(pal.fg),
-            bg: bg.unwrap_or(pal.bg),
-            cursor: cursor.unwrap_or(pal.cursor),
-            ..*pal
-        };
+        let cursor = self.colors[2];
+        let pal = &self.shown_pal(pal);
         out.cols = cols;
         out.rows = rows;
+        out.cursor_color = cursor;
         out.alt_screen = self.alt;
         out.cells.clear();
         out.cells.reserve(n);
         out.wrapped.clear();
         let g = &self.screen.grid;
         let first = g.scrollback_len().saturating_sub(self.viewport);
+        out.top = g.dropped() + first;
         let empty = Row::default();
         for i in first..first + rows as usize {
             let row = g.line(i).unwrap_or(&empty);
             out.wrapped.push(row.flags & rf::WRAPPED != 0);
             for x in 0..cols {
-                let mut cell = row.cells.get(x as usize).copied().unwrap_or_default();
-                // Scrollback is not rewrapped for a one-column screen, so
-                // a wide character there can end past the edge.
-                if cell.flags & cf::WIDE != 0 && x + 1 == cols {
-                    cell = Cell::blank(cell.style);
-                }
+                let cell = shown_cell(row, x, cols);
                 out.cells
                     .push(render_cell(cell, row, x, self.styles.get(cell.style), pal));
             }
@@ -447,12 +499,101 @@ impl Terminal {
         rows_text((0..g.scrollback_len()).filter_map(|i| g.line(i)))
     }
 
+    /// The numbers of the lines kept on the screen being shown, scrollback
+    /// first. A line keeps its number while output scrolls it into
+    /// scrollback, until it drops off the top, so the host can point at
+    /// text that is out of view.
+    pub fn lines(&self) -> Range<usize> {
+        let g = &self.screen.grid;
+        let first = g.dropped();
+        first..first + g.scrollback_len() + usize::from(g.lines())
+    }
+
+    /// The number of the screen's top row.
+    pub fn screen_top(&self) -> usize {
+        let g = &self.screen.grid;
+        g.dropped() + g.scrollback_len()
+    }
+
+    /// Changes whenever line numbers start over and name other text: the
+    /// width changed and the lines were wrapped again, the other screen is
+    /// shown, the whole screen scrolled up under scrollback that stayed put
+    /// or scrolled down, or the terminal was reset.
+    pub fn line_epoch(&self) -> u32 {
+        self.line_epoch
+    }
+
+    /// Line `n` of the screen being shown, scrollback included, as
+    /// [`Self::snapshot`] draws it: fills `out` with one cell per column
+    /// and returns whether the line's text runs on into the next line.
+    /// `None` when the line is not kept.
+    pub fn line_cells(&self, n: usize, pal: &Palette, out: &mut Vec<RenderCell>) -> Option<bool> {
+        let row = self.line(n)?;
+        let pal = &self.shown_pal(pal);
+        out.clear();
+        out.extend((0..self.cols()).map(|x| {
+            let cell = shown_cell(row, x, self.cols());
+            render_cell(cell, row, x, self.styles.get(cell.style), pal)
+        }));
+        Some(row.flags & rf::WRAPPED != 0)
+    }
+
+    /// Whether line `n`'s text runs on into the next line.
+    pub fn wraps(&self, n: usize) -> bool {
+        self.line(n).is_some_and(|r| r.flags & rf::WRAPPED != 0)
+    }
+
+    /// The OSC 8 hyperlink in column `col` of line `n`: its URI, and the
+    /// first and last cell it covers, following soft wraps.
+    pub fn link_at(&self, n: usize, col: u16) -> Option<(&str, LineCol, LineCol)> {
+        let cell = |(n, x): LineCol| self.line(n)?.cells.get(usize::from(x)).copied();
+        let link = |p| cell(p).map(|c| self.styles.get(c.style).link);
+        // The blank a wide character left at the end of a row when it
+        // wrapped early carries no link, but the link goes on past it.
+        let gap = |p| cell(p).is_some_and(|c| c.flags & cf::SPACER_HEAD != 0);
+        let id = link((n, col)).filter(|&l| l != 0)?;
+        let last = self.cols() - 1;
+        let back = |&(n, x): &LineCol| match x {
+            0 => (n > 0 && self.wraps(n - 1)).then(|| (n - 1, last)),
+            x => Some((n, x - 1)),
+        };
+        let fwd = |&(n, x): &LineCol| match x {
+            x if x < last => Some((n, x + 1)),
+            _ => self.wraps(n).then_some((n + 1, 0)),
+        };
+        let end = |step: &dyn Fn(&LineCol) -> Option<LineCol>| {
+            std::iter::successors(Some((n, col)), step)
+                .take(MAX_LINK_CELLS)
+                .take_while(|&p| link(p) == Some(id) || gap(p))
+                .filter(|&p| !gap(p))
+                .last()
+        };
+        Some((&self.styles.link(id)?.uri, end(&back)?, end(&fwd)?))
+    }
+
     fn cols(&self) -> u16 {
         self.opts.cols
     }
 
+    /// `pal` with the colours the program set in their place.
+    fn shown_pal(&self, pal: &Palette) -> Palette {
+        let [fg, bg, cursor] = self.colors;
+        Palette {
+            fg: fg.unwrap_or(pal.fg),
+            bg: bg.unwrap_or(pal.bg),
+            cursor: cursor.unwrap_or(pal.cursor),
+            ..*pal
+        }
+    }
+
     fn rows(&self) -> u16 {
         self.opts.rows
+    }
+
+    /// Line `n` of the screen being shown; see [`Self::lines`].
+    fn line(&self, n: usize) -> Option<&Row> {
+        let g = &self.screen.grid;
+        g.line(n.checked_sub(g.dropped())?)
     }
 
     /// The kitty keyboard stack of the screen being shown.
@@ -630,10 +771,7 @@ impl Terminal {
             // screen go to scrollback. Full-screen programs draw their
             // transcript this way above a fixed status area.
             let keep = self.top == 0 && !self.alt;
-            let blank = self.blank();
-            self.screen
-                .grid
-                .scroll_up(self.top, self.bottom, 1, blank, keep);
+            self.scroll_up(self.top, 1, keep);
             if keep && self.viewport > 0 {
                 // Keep a scrolled-back view on the same text. Once the
                 // scrollback is full its length stays put while every row
@@ -649,10 +787,7 @@ impl Terminal {
     fn reverse_index(&mut self) {
         self.cur.pending_wrap = false;
         if self.cur.y == self.top {
-            let blank = self.blank();
-            self.screen
-                .grid
-                .scroll_down(self.top, self.bottom, 1, blank);
+            self.scroll_down(self.top, 1);
         } else if self.cur.y > 0 {
             self.cur.y -= 1;
         }
@@ -774,6 +909,25 @@ impl Terminal {
         self.cur.pending_wrap = false;
     }
 
+    /// Scrolls rows `top` to the bottom margin up by `n`; see
+    /// [`Grid::scroll_up`]. Line numbers start over when the screen's rows
+    /// moved under them.
+    fn scroll_up(&mut self, top: u16, n: u16, keep: bool) {
+        let blank = self.blank();
+        if (self.screen.grid).scroll_up(top, self.bottom, n, blank, keep) {
+            self.line_epoch = self.line_epoch.wrapping_add(1);
+        }
+    }
+
+    /// Scrolls rows `top` to the bottom margin down by `n`, as
+    /// [`Self::scroll_up`] does up.
+    fn scroll_down(&mut self, top: u16, n: u16) {
+        let blank = self.blank();
+        if (self.screen.grid).scroll_down(top, self.bottom, n, blank) {
+            self.line_epoch = self.line_epoch.wrapping_add(1);
+        }
+    }
+
     /// IL (`down`) or DL: shifts the rows from the cursor to the bottom
     /// margin. Does nothing outside the scroll region.
     fn shift_lines(&mut self, n: u16, down: bool) {
@@ -781,11 +935,10 @@ impl Terminal {
         if y < self.top || y > self.bottom {
             return;
         }
-        let blank = self.blank();
         if down {
-            self.screen.grid.scroll_down(y, self.bottom, n, blank);
+            self.scroll_down(y, n);
         } else {
-            self.screen.grid.scroll_up(y, self.bottom, n, blank, false);
+            self.scroll_up(y, n, false);
         }
         self.cur.x = 0;
         self.cur.pending_wrap = false;
@@ -816,6 +969,7 @@ impl Terminal {
         t.reply_credit = self.reply_credit;
         std::mem::swap(&mut t.events, &mut self.events);
         std::mem::swap(&mut t.prompt_token, &mut self.prompt_token);
+        t.line_epoch = self.line_epoch.wrapping_add(1);
         t.dark = self.dark;
         t.cell_px = self.cell_px;
         t.pal = self.pal;
@@ -933,6 +1087,7 @@ impl Terminal {
         if alt != self.alt {
             std::mem::swap(&mut self.screen, &mut self.other);
             self.alt = alt;
+            self.line_epoch = self.line_epoch.wrapping_add(1);
             // The main screen's view comes back on the text it showed.
             std::mem::swap(&mut self.viewport, &mut self.other_viewport);
             self.viewport = self.viewport.min(self.screen.grid.scrollback_len());
@@ -1291,16 +1446,9 @@ impl Handler for Terminal {
                 self.row().delete(x, n(0) as usize, blank);
                 self.cur.pending_wrap = false;
             }
-            ([], b'S') => self
-                .screen
-                .grid
-                .scroll_up(self.top, self.bottom, n(0), blank, false),
+            ([], b'S') => self.scroll_up(self.top, n(0), false),
             // With more parameters this is xterm's mouse highlight tracking.
-            ([], b'T') if p.len() <= 1 => {
-                self.screen
-                    .grid
-                    .scroll_down(self.top, self.bottom, n(0), blank);
-            }
+            ([], b'T') if p.len() <= 1 => self.scroll_down(self.top, n(0)),
             ([], b'X') => {
                 self.row().fill(x..x + n(0) as usize, blank);
                 self.cur.pending_wrap = false;
@@ -1456,6 +1604,8 @@ impl Handler for Terminal {
                 Some(m @ PromptMark::A { blitz: true }) => {
                     self.prompt_reset();
                     self.at_prompt = true;
+                    // A place for prompt jumps to go back to.
+                    self.row().flags |= rf::PROMPT;
                     Event::Prompt(m)
                 }
                 Some(m) => {
@@ -1517,6 +1667,28 @@ fn dec_graphics(c: char) -> char {
     }
 }
 
+/// Style bits a [`RenderCell`] keeps; [`crate::snapshot::attr`] uses the
+/// same.
+const RENDER_ATTRS: u16 = attr::BOLD
+    | attr::DIM
+    | attr::ITALIC
+    | attr::UNDERLINE
+    | attr::INVERSE
+    | attr::STRIKE
+    | attr::OVERLINE;
+
+/// Cell `x` of `row` as a `cols` wide screen shows it. Scrollback is not
+/// rewrapped for a one-column screen, so a wide character there can end
+/// past the edge; it shows as a blank.
+fn shown_cell(row: &Row, x: u16, cols: u16) -> Cell {
+    let cell = row.cells.get(usize::from(x)).copied().unwrap_or_default();
+    if cell.flags & cf::WIDE != 0 && x + 1 == cols {
+        Cell::blank(cell.style)
+    } else {
+        cell
+    }
+}
+
 fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> RenderCell {
     let a = style.attrs;
     let mut fg = pal.resolve(style.fg, pal.fg);
@@ -1524,22 +1696,10 @@ fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> R
     if a & attr::INVERSE != 0 {
         std::mem::swap(&mut fg, &mut bg);
     }
+    let mut ul = pal.resolve(style.ul, fg);
     if a & attr::INVISIBLE != 0 {
-        fg = bg;
-    }
-    let mut attrs = 0;
-    for (from, to) in [
-        (attr::BOLD, snapshot::attr::BOLD),
-        (attr::ITALIC, snapshot::attr::ITALIC),
-        (attr::UNDERLINE, snapshot::attr::UNDERLINE),
-        (attr::INVERSE, snapshot::attr::INVERSE),
-        (attr::DIM, snapshot::attr::DIM),
-        (attr::STRIKE, snapshot::attr::STRIKE),
-        (attr::OVERLINE, snapshot::attr::OVERLINE),
-    ] {
-        if a & from != 0 {
-            attrs |= to;
-        }
+        // Concealed text takes its lines with it.
+        (fg, ul) = (bg, bg);
     }
     let mut rc = RenderCell {
         width: match cell.flags {
@@ -1549,7 +1709,8 @@ fn render_cell(cell: Cell, row: &Row, x: u16, style: &Style, pal: &Palette) -> R
         },
         fg,
         bg,
-        attrs,
+        ul,
+        attrs: a & RENDER_ATTRS,
         ..RenderCell::default()
     };
     // Text drawn in its own background, concealed or not, is left out, so

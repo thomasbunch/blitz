@@ -12,9 +12,15 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   Ctrl+Shift+B collapses it to a narrow rail of status dots.
 - Claude Code hooks tell blitz when a session needs input or has
   finished, and the taskbar button flashes if blitz is in the background.
+- Progress a program reports (OSC 9;4) shows in the sidebar and on the
+  taskbar button.
 - Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
   format.
 - A settings panel on Ctrl+, for the font, shell, sessions and more.
+- A command palette on Ctrl+Shift+P lists every action with its keys,
+  and `config.toml` can bind any of them to other keys.
+- Selections that reach into scrollback, and Ctrl+click on links and
+  file paths.
 - Direct3D 11 and DirectWrite rendering, with a software fallback.
 
 ## Install
@@ -113,6 +119,7 @@ writes it.
 | `bell_attention` | `true` | Treat a bell in a background pane as needing you |
 | `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
 | `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
+| `keybind` | | Binds a key to an action; one line per key. See [Key bindings](#key-bindings) |
 
 blitz run, the last row of the panel, is a game rather than a setting:
 Enter starts it, and it keeps its best score in
@@ -160,6 +167,48 @@ and `top-track`. The
 [blitz dark](crates/blitz/themes/blitz-dark) file sets every key and is a
 good place to start.
 
+## Selection and links
+
+| Mouse | Action |
+|---|---|
+| Drag | Select; past the top or bottom of the pane it scrolls |
+| Double-click, triple-click | Select a word, or the whole line as the program printed it |
+| Alt+drag | Select a block of columns |
+| Shift+click | Extend the selection |
+| Ctrl+click | Open a link |
+| Wheel | Scroll; in less, man and other full-screen programs, press the arrow keys |
+
+A selection can reach into scrollback and stays on its text while
+output scrolls; it ends when output rewrites the text. A double click
+takes a path or URL whole, and dragging after a double or triple click
+selects by words or lines.
+
+Holding Ctrl underlines the link under the pointer: a hyperlink a
+program printed, a web address, or the path of a file that exists,
+relative ones from the pane's folder. A path with spaces is a link only
+as a hyperlink, and a path through a symbolic link or junction is none.
+Only web and local file links open. Folders, text, source code, images
+and PDFs open with their program; any other file, such as a program,
+script, shortcut or installer, is shown selected in Explorer instead.
+
+When a program takes the mouse itself, as Claude Code does in
+fullscreen, clicks go to it. Hold Shift as well to use blitz's
+selection: Shift+drag selects, and Ctrl+Shift+click opens a link.
+
+## Find and prompts
+
+Ctrl+Shift+F opens a find bar at the top right of the focused pane. It
+searches the pane's scrollback and screen as you type, ignoring case
+unless what you type has a capital letter, and tints every match in
+view. Enter or F3 goes to the next match up, Shift+Enter or Shift+F3 to
+the next one down, and Esc closes the bar, leaving the view where it is.
+A full-screen program is searched on its screen only.
+
+With shell integration on, Ctrl+Shift+Up and Ctrl+Shift+Down scroll to
+the previous and next prompt; down from the last one goes back to the
+bottom. With no prompt that way, or in a full-screen program, the keys
+go to the program.
+
 ## Default keys
 
 | Keys | Action |
@@ -173,14 +222,59 @@ good place to start.
 | Ctrl+Alt+Arrows | Move focus between panes |
 | Alt+Shift+Arrows | Resize the focused pane (or drag the line between panes) |
 | Ctrl+Alt+Shift+Arrows | Swap the focused pane with its neighbour |
+| Ctrl+Shift+Z | Zoom the focused pane to fill the tab, or show every pane again |
 | Ctrl+Shift+J | Jump to the next session that needs you |
 | Ctrl+Shift+B | Expand or collapse the sidebar |
 | Ctrl+Shift+U | Update, or look for a newer release now |
 | Ctrl+Shift+K | Pick a theme |
 | Ctrl+, | Settings |
+| Ctrl+Shift+P | Command palette |
+| Ctrl+=, Ctrl+-, Ctrl+0 | Font size up, down, and back to the setting, until blitz restarts |
+| F11 | Full screen |
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
+| Ctrl+Shift+F | Find in the scrollback |
+| Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
+
+A zoomed pane stays zoomed until you zoom again, move focus to another
+pane, split or resize.
+
+The command palette lists every action with its keys. Typing narrows
+the list, the arrow keys choose, and Enter or a click runs the action;
+Esc closes it. Giving the panes equal space has no keys by default, so
+it is only in the palette.
+
+## Key bindings
+
+`keybind` lines in `config.toml` change the keys. Each binds a chord to
+an action, or with `none` gives a chord back to the program:
+
+```
+keybind = ctrl+shift+e=split_right
+keybind = ctrl+shift+r=none
+keybind = alt+f11=command_palette
+```
+
+A chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`:
+a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
+`end`, `pageup`, `pagedown`, `insert`, `delete`, `tab`, `enter`, `esc`,
+`space`, `backspace`, or a punctuation key by its character or its name,
+such as `,` or `comma` and `=` or `plus`. Case and spaces do not
+matter. The modifiers must match exactly. A binding replaces the
+default on the same chord, and the other defaults stay; Ctrl+1 to
+Ctrl+9 go to a tab unless a binding takes them. Lines blitz cannot read
+are skipped.
+
+The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
+`new_tab`, `close_pane`, `next_tab`, `previous_tab`, `split_right`,
+`split_down`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
+`jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
+`settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
+`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
+`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
+`fullscreen`, `command_palette`, `find`, `previous_prompt` and
+`next_prompt`. Typing a name in the command palette finds its action.
 
 A key with nothing to do goes to the program in the pane: Ctrl+C with no
 text selected, or a resize or swap with no split or neighbour that way.

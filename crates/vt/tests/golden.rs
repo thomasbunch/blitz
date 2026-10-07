@@ -103,8 +103,44 @@ fn sgr_colours() {
     assert_eq!(cell(&s, 10, 0).bg, 0xFFFF55);
     assert_eq!(cell(&s, 13, 0).fg, cell(&s, 13, 0).bg, "invisible");
     let attrs: Vec<u16> = (0..16).map(|x| cell(&s, x, 0).attrs).collect();
-    let (inv, ul) = (attr::INVERSE, attr::UNDERLINE);
-    assert_eq!(attrs, [0, 0, 0, 0, 0, 0, inv, ul, 0, 0, 0, 0, 0, 0, ul, 0]);
+    let inv = attr::INVERSE;
+    let (ul, curly) = (1 << attr::UNDERLINE_SHIFT, 3 << attr::UNDERLINE_SHIFT);
+    assert_eq!(
+        attrs,
+        [0, 0, 0, 0, 0, 0, inv, curly, 0, 0, 0, 0, 0, 0, ul, 0]
+    );
+}
+
+#[test]
+fn sgr_lines_and_underline_colour() {
+    let mut t = run(
+        10,
+        1,
+        concat!(
+            "\x1b[4:3;58:5:1ma\x1b[59;9mb\x1b[0;21;53;32mc\x1b[0;4:4md",
+            "\x1b[4:5;7me\x1b[0;8;4;58:5:1mf\x1b[0;5mg",
+        ),
+    );
+    let s = snap(&mut t);
+    let ul = |kind: u16| kind << attr::UNDERLINE_SHIFT;
+    let lines: Vec<(u16, u32)> = (0..7)
+        .map(|x| (cell(&s, x, 0).attrs, cell(&s, x, 0).ul))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (ul(3), PAL.ansi[1]),
+            (ul(3) | attr::STRIKE, PAL.fg),
+            (ul(2) | attr::OVERLINE, PAL.ansi[2]),
+            (ul(4), PAL.fg),
+            // The default underline colour follows the text, inverse too.
+            (ul(5) | attr::INVERSE, PAL.bg),
+            // Concealed: drawn in the background, colour or not.
+            (ul(1), PAL.bg),
+            // Blink is not drawn.
+            (0, PAL.fg),
+        ]
+    );
 }
 
 #[test]
@@ -235,6 +271,84 @@ fn erase_scrollback_with_csi_3_j() {
     }
     assert_eq!(t.scrollback_text(), "0\n1\n2");
     assert_eq!(t.screen_text(), "3\n4\n");
+}
+
+/// Line `n` as drawn, trailing blanks trimmed; `None` when it is gone.
+fn line_text(t: &Terminal, n: usize) -> Option<String> {
+    let mut cells = Vec::new();
+    t.line_cells(n, &PAL, &mut cells)?;
+    Some(cells.iter().map(text).collect::<String>().trim_end().into())
+}
+
+#[test]
+fn lines_keep_their_numbers_until_they_leave_scrollback() {
+    let mut t = Terminal::new(Options {
+        cols: 10,
+        rows: 3,
+        scrollback_lines: 5,
+        ambiguous_wide: false,
+    });
+    feed(&mut t, "a\r\nb\r\nc");
+    assert_eq!((t.lines(), t.screen_top(), t.view_top()), (0..3, 0, 0));
+    let epoch = t.line_epoch();
+    for i in 0..4 {
+        feed(&mut t, &format!("\r\n{i}"));
+    }
+    assert_eq!((t.lines(), t.screen_top()), (0..7, 4));
+    assert_eq!(line_text(&t, 1).as_deref(), Some("b"));
+    t.scroll_viewport(3);
+    assert_eq!(t.view_top(), 1);
+    for i in 4..7 {
+        feed(&mut t, &format!("\r\n{i}"));
+    }
+    // Scrollback keeps five lines, so a and b are gone.
+    assert_eq!(t.lines(), 2..10);
+    assert_eq!(line_text(&t, 1), None);
+    assert_eq!(line_text(&t, 2).as_deref(), Some("c"));
+    assert_eq!(line_text(&t, 9).as_deref(), Some("6"));
+    assert_eq!(t.line_epoch(), epoch, "scrolling keeps the numbers");
+    t.resize(10, 4);
+    assert_eq!(t.line_epoch(), epoch, "so does a new height");
+    t.resize(8, 4);
+    assert_ne!(t.line_epoch(), epoch, "a new width wraps the lines again");
+    let epoch = t.line_epoch();
+    feed(&mut t, "\x1b[?1049h");
+    assert_ne!(t.line_epoch(), epoch, "the other screen");
+    assert_eq!(t.lines(), 0..4, "has no scrollback");
+    let epoch = t.line_epoch();
+    feed(&mut t, "\x1bc");
+    assert_ne!(t.line_epoch(), epoch, "a reset");
+}
+
+#[test]
+fn line_cells_read_scrollback_as_drawn() {
+    let t = run(4, 2, "abcdef\r\n\x1b[8mhid\x1b[0m\r\nx");
+    assert!(t.wraps(0));
+    assert!(!t.wraps(1));
+    assert_eq!(line_text(&t, 0).as_deref(), Some("abcd"));
+    assert_eq!(line_text(&t, 1).as_deref(), Some("ef"));
+    assert_eq!(
+        line_text(&t, 2).as_deref(),
+        Some(""),
+        "hidden text is left out"
+    );
+    assert_eq!(line_text(&t, 3).as_deref(), Some("x"));
+    assert_eq!(line_text(&t, 4), None);
+}
+
+#[test]
+fn line_cells_leave_out_a_wide_character_past_the_edge_as_drawn() {
+    // In scrollback, which a one-column screen leaves as it was.
+    let mut t = run(4, 2, "中\r\n\r\nx");
+    t.resize(1, 2);
+    t.scroll_viewport(9);
+    assert_eq!(t.view_top(), 0);
+    let mut snap = vt::Snapshot::default();
+    t.snapshot(&mut snap, &PAL);
+    let mut cells = Vec::new();
+    t.line_cells(0, &PAL, &mut cells);
+    assert_eq!(cells, snap.cells[..1]);
+    assert_eq!(line_text(&t, 0).as_deref(), Some(""));
 }
 
 #[test]
@@ -625,9 +739,11 @@ fn rare_renditions_and_malformed_colours() {
         ),
     );
     let s = snap(&mut t);
+    // SGR 21 is a double underline.
+    let double = 2 << attr::UNDERLINE_SHIFT;
     assert_eq!(
         [0, 1, 2, 3, 4].map(|x| cell(&s, x, 0).attrs),
-        [attr::ITALIC, 0, 0, attr::UNDERLINE, 0]
+        [attr::ITALIC, 0, 0, double, 0]
     );
     assert_eq!((cell(&s, 5, 0).fg, cell(&s, 6, 0).fg), (0x080808, 0xEEEEEE));
     // A malformed colour and an unknown code leave the colour alone.

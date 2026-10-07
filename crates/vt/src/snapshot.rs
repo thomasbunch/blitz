@@ -1,5 +1,6 @@
 //! A resolved, render-ready copy of the visible screen.
 
+use crate::grid::Found;
 use crate::style::Color;
 
 /// Colours as `0xRRGGBB`.
@@ -34,25 +35,31 @@ impl Palette {
     }
 }
 
-/// [`RenderCell::attrs`] bits. Inverse and invisible are already applied
-/// to the cell's colours, and a cell whose text would not show has none;
-/// `INVERSE` is only informational.
+/// [`RenderCell::attrs`] bits, the same as the style's. Inverse and
+/// invisible are already applied to the cell's colours, and a cell whose
+/// text would not show has none; `INVERSE` is only informational. Blink
+/// is left out: nothing blitz draws moves.
 pub mod attr {
-    pub const BOLD: u16 = 1 << 0;
-    pub const ITALIC: u16 = 1 << 1;
-    pub const UNDERLINE: u16 = 1 << 2;
-    pub const INVERSE: u16 = 1 << 3;
-    pub const DIM: u16 = 1 << 4;
-    pub const STRIKE: u16 = 1 << 5;
-    pub const OVERLINE: u16 = 1 << 6;
+    use crate::style::attr as s;
 
-    // Each is a bit of its own, or the build fails.
+    pub const BOLD: u16 = s::BOLD;
+    pub const DIM: u16 = s::DIM;
+    pub const ITALIC: u16 = s::ITALIC;
+    /// Underline kind as in SGR `4:x`: 0 none, 1 single, 2 double,
+    /// 3 curly, 4 dotted, 5 dashed.
+    pub const UNDERLINE: u16 = s::UNDERLINE;
+    pub const UNDERLINE_SHIFT: u16 = s::UNDERLINE_SHIFT;
+    pub const INVERSE: u16 = s::INVERSE;
+    pub const STRIKE: u16 = s::STRIKE;
+    pub const OVERLINE: u16 = s::OVERLINE;
+
+    // Each field is its own, or the build fails.
     const _: () = {
-        let bits = [BOLD, ITALIC, UNDERLINE, INVERSE, DIM, STRIKE, OVERLINE];
+        let fields = [BOLD, ITALIC, UNDERLINE, INVERSE, DIM, STRIKE, OVERLINE];
         let (mut all, mut i) = (0u16, 0);
-        while i < bits.len() {
-            assert!(bits[i].count_ones() == 1 && all & bits[i] == 0);
-            all |= bits[i];
+        while i < fields.len() {
+            assert!(fields[i] != 0 && all & fields[i] == 0);
+            all |= fields[i];
             i += 1;
         }
     };
@@ -72,14 +79,29 @@ pub struct RenderCell {
     pub width: u8,
     pub fg: u32,
     pub bg: u32,
+    /// Underline colour; `fg` unless the program chose one.
+    pub ul: u32,
     pub attrs: u16,
 }
+
+// Snapshots are rebuilt every frame something changes; keep cells small.
+const _: () = assert!(size_of::<RenderCell>() == 48);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorShape {
     Block,
     Bar,
     Underline,
+}
+
+/// A search match to mark on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Highlight {
+    /// First and last (column, row), inclusive.
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+    /// The current match, marked more strongly than the rest.
+    pub current: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -92,9 +114,54 @@ pub struct Snapshot {
     pub wrapped: Vec<bool>,
     /// Column, row and shape; `None` when hidden or scrolled out of view.
     pub cursor: Option<(u16, u16, CursorShape)>,
+    /// The cursor colour the program set with OSC 12, if any.
+    pub cursor_color: Option<u32>,
     pub alt_screen: bool,
     /// Start and end (column, row), inclusive.
     pub selection: Option<((u16, u16), (u16, u16))>,
+    /// The first row's line, numbered as [`crate::grid::Grid::dropped`]
+    /// numbers them.
+    pub top: usize,
+    /// Search matches to mark, in reading order.
+    pub highlights: Vec<Highlight>,
+    /// The selection is a block: start and end are its corners, and it
+    /// takes the same columns of every row between them.
+    pub block: bool,
+    /// A link under the pointer, drawn underlined: start and end (column,
+    /// row), inclusive.
+    pub hover: Option<((u16, u16), (u16, u16))>,
+}
+
+impl Snapshot {
+    /// Sets [`Self::highlights`] to the matches of `found` that show, with
+    /// match `cur` as the current one. `found` is in order, as
+    /// [`crate::grid::Grid::find`] gives it.
+    pub fn highlight(&mut self, found: &[Found], cur: Option<usize>) {
+        self.highlights.clear();
+        let (top, bottom) = (self.top, self.top + usize::from(self.rows));
+        let last = (self.cols.saturating_sub(1), self.rows.saturating_sub(1));
+        let row = |line: usize| (line - top) as u16;
+        let first = found.partition_point(|f| f.end.0 < top);
+        for (i, f) in found.iter().enumerate().skip(first) {
+            if f.start.0 >= bottom {
+                break;
+            }
+            // A match can run off the top or the bottom of the view.
+            let start = match f.start {
+                (line, x) if line >= top => (x, row(line)),
+                _ => (0, 0),
+            };
+            let end = match f.end {
+                (line, x) if line < bottom => (x, row(line)),
+                _ => last,
+            };
+            self.highlights.push(Highlight {
+                start,
+                end,
+                current: Some(i) == cur,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -120,7 +187,9 @@ mod tests {
         let mut s = Snapshot::default();
         t.snapshot(&mut s, &pal);
         let attrs: Vec<u16> = s.cells.iter().map(|c| c.attrs).collect();
-        let (st, ov, ul) = (attr::STRIKE, attr::OVERLINE, attr::UNDERLINE);
+        // A plain SGR 4 is a single underline.
+        let ul = 1 << attr::UNDERLINE_SHIFT;
+        let (st, ov) = (attr::STRIKE, attr::OVERLINE);
         assert_eq!(attrs, [st, st | ov, ov, ul, st | ov | ul, 0]);
     }
 }

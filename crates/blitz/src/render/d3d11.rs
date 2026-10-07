@@ -75,6 +75,11 @@ pub const SOLID: u32 = 0;
 pub const GLYPH: u32 = 1;
 /// A procedural glyph: atlas coverage used as is.
 pub const MASK: u32 = 2;
+/// Curly, dotted and dashed lines, drawn by the shader. [`Quad::uv`] holds
+/// the cell width and the line thickness.
+pub const CURLY: u32 = 3;
+pub const DOTTED: u32 = 4;
+pub const DASHED: u32 = 5;
 
 /// One instanced rectangle, 20 bytes.
 #[repr(C)]
@@ -82,7 +87,8 @@ pub const MASK: u32 = 2;
 pub struct Quad {
     pub pos: [i16; 2],
     pub size: [u16; 2],
-    /// Atlas position of the top-left corner; unused for [`SOLID`].
+    /// Atlas position of the top-left corner; unused for [`SOLID`], and
+    /// line sizes for [`CURLY`] and the other lines.
     pub uv: [u16; 2],
     /// R, G, B, A with straight alpha.
     pub color: [u8; 4],

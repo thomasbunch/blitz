@@ -215,6 +215,38 @@ fn hyperlinks_do_not_print() {
 }
 
 #[test]
+fn link_at_covers_the_link_across_a_wrap() {
+    let mut t = Terminal::new(Options {
+        cols: 6,
+        rows: 3,
+        ..Options::default()
+    });
+    t.feed(b"ab\x1b]8;;https://e.com/x\x1b\\linktext\x1b]8;;\x1b\\ z");
+    t.feed(b"\r\n\x1b]8;;https://e.com/y\x1b\\y\x1b]8;;\x1b\\");
+    let link = Some(("https://e.com/x", (0, 2), (1, 3)));
+    assert_eq!(t.link_at(0, 2), link);
+    assert_eq!(t.link_at(1, 1), link);
+    assert_eq!(t.link_at(0, 1), None);
+    assert_eq!(t.link_at(1, 4), None);
+    assert_eq!(t.link_at(2, 0), Some(("https://e.com/y", (2, 0), (2, 0))));
+    assert_eq!(t.link_at(9, 0), None);
+}
+
+#[test]
+fn link_at_goes_on_past_a_wide_character_that_wrapped_early() {
+    let mut t = Terminal::new(Options {
+        cols: 6,
+        rows: 3,
+        ..Options::default()
+    });
+    t.feed("\x1b]8;;u\x1b\\abcde中f\x1b]8;;\x1b\\".as_bytes());
+    let link = Some(("u", (0, 0), (1, 2)));
+    assert_eq!(t.link_at(0, 0), link);
+    assert_eq!(t.link_at(1, 0), link);
+    assert_eq!(t.link_at(0, 5), None, "the blank it left");
+}
+
+#[test]
 fn ignored_strings_leave_no_trace() {
     let mut t = Terminal::new(Options::default());
     t.feed(b"\x1b]52;c;aGk=\x07\x1b]104\x07\x1b]1337;SetUserVar=a=b\x07\x1bP+q544e\x1b\\ok");
@@ -276,13 +308,14 @@ fn programs_can_set_and_reset_colours() {
     let mut s = Snapshot::default();
     t.snapshot(&mut s, &PAL);
     assert_eq!((s.cells[0].fg, s.cells[0].bg), (PAL.fg, 0x102030));
+    assert_eq!(s.cursor_color, Some(0xff0000));
     assert_eq!(
         replies(&mut t, "\x1b]11;?\x07\x1b]12;?\x07"),
         "\x1b]11;rgb:1010/2020/3030\x07\x1b]12;rgb:ffff/0000/0000\x07"
     );
     t.feed(b"\x1b]111\x07\x1b]112\x07");
     assert!(t.snapshot(&mut s, &PAL));
-    assert_eq!(s.cells[0].bg, PAL.bg);
+    assert_eq!((s.cells[0].bg, s.cursor_color), (PAL.bg, None));
     assert_eq!(
         replies(&mut t, "\x1b]11;?\x07"),
         "\x1b]11;rgb:2222/2222/2222\x07"

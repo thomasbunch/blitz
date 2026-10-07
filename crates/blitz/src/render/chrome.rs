@@ -22,9 +22,33 @@ pub struct Session {
     pub since: Instant,
     /// Latest one-line message: the hook message, else the title.
     pub msg: String,
-    /// Percent done, when the program reports it.
-    pub progress: Option<u8>,
+    /// What the program last reported of its progress.
+    pub progress: Option<Progress>,
     pub exit_code: Option<u32>,
+}
+
+/// A program's progress, as OSC 9;4 reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    /// 1 normal, 2 error, 3 indeterminate, 4 paused or warning.
+    pub state: u8,
+    /// Percent done, when known.
+    pub pct: Option<u8>,
+}
+
+impl Progress {
+    /// The progress after a report of `state` and `pct`, which was `prev`.
+    /// State 0 removes it. As in ConEmu, an error or a pause without a
+    /// value keeps the last one, and an indeterminate state has none.
+    pub fn next(prev: Option<Progress>, state: u8, pct: Option<u8>) -> Option<Progress> {
+        let pct = match state {
+            0 => return None,
+            1 => Some(pct.unwrap_or(0)),
+            3 => None,
+            _ => pct.or(prev.and_then(|p| p.pct)),
+        };
+        Some(Progress { state, pct })
+    }
 }
 
 pub struct ChromeModel<'a> {
@@ -53,6 +77,17 @@ pub struct ChromeModel<'a> {
     pub spark: Option<f64>,
     /// blitz run, while it is open.
     pub game: Option<&'a crate::arcade::run::Run>,
+    pub commands: Option<Commands<'a>>,
+    pub find: Option<FindBar<'a>>,
+}
+
+/// The find bar, drawn at the top right of the focused pane.
+pub struct FindBar<'a> {
+    /// What was typed.
+    pub query: &'a str,
+    /// The current match, counting from 1, and how many there are; `None`
+    /// when nothing matches.
+    pub count: Option<(usize, usize)>,
 }
 
 /// The theme picker, drawn over everything.
@@ -65,7 +100,17 @@ pub struct Picker<'a> {
     pub sel: usize,
 }
 
-/// Rows the picker shows at once.
+/// The command palette, drawn over everything.
+pub struct Commands<'a> {
+    /// What was typed to narrow the list.
+    pub filter: &'a str,
+    /// The actions that match it, each with the keys that run it, if any.
+    pub items: Vec<(&'a str, String)>,
+    /// The highlighted item.
+    pub sel: usize,
+}
+
+/// Rows the theme picker and the command palette show at once.
 pub const PICKER_ROWS: usize = 12;
 
 /// The settings panel, drawn over everything but the theme picker.
@@ -148,6 +193,8 @@ pub struct Chrome {
     /// The banner strip, for clicks.
     pub banner: Option<Rect>,
     pub settings: Option<SettingsHits>,
+    /// The command palette and each row it shows, by index, for clicks.
+    pub commands: Option<(Rect, Vec<(usize, Rect)>)>,
 }
 
 /// Width of the expanded sidebar and of the collapsed rail at 96 DPI,
@@ -236,11 +283,21 @@ pub fn build(m: &ChromeModel) -> Chrome {
             color,
         });
     };
-    // A 2 px line: the track, then `pct` of it filled.
-    let progress = |p: &mut Vec<Prim>, r: Rect, pct: Option<u8>, track: Option<u32>, fill| {
+    // A 2 px line: the track, then the part done filled, or all of it
+    // when the program has not said. An error or a pause colours it, and
+    // a program that cannot tell how far it is gets a dimmer full line:
+    // nothing here moves.
+    let progress = |p: &mut Vec<Prim>, r: Rect, pr: Option<Progress>, track: Option<u32>, fill| {
         if let Some(track) = track {
             p.push(Prim::Rect(r, track));
         }
+        let (pct, fill) = match pr {
+            Some(Progress { state: 2, pct }) => (pct, c.error),
+            Some(Progress { state: 3, .. }) => (None, super::mix(track.unwrap_or(c.track), fill)),
+            Some(Progress { state: 4, pct }) => (pct, c.accent),
+            Some(Progress { pct, .. }) => (pct, fill),
+            None => (None, fill),
+        };
         let pct = i32::from(pct.unwrap_or(100).min(100));
         p.push(Prim::Rect(
             Rect {
@@ -259,6 +316,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
     for &(id, r) in &rects {
         let sess = session(id);
         let state = sess.map_or(Attn::Idle, |x| x.state);
+        let reported = sess.and_then(|x| x.progress);
         let focused = id == tab.focus;
         if multi && expanded {
             let hh = s(HEADER_H);
@@ -293,21 +351,20 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 Attn::NeedsYou => mark(p, right - s(4.0), cy, 7.0, 0.0, c.accent),
                 Attn::DoneUnseen => mark(p, right - s(4.0), cy, 7.0, 1.5, c.name),
                 Attn::Error => mark(p, right - s(4.0), cy, 7.0, 0.0, c.error),
-                Attn::Working => {
-                    let line = Rect {
-                        y: r.y + hh - 2,
-                        h: s(2.0),
-                        ..r
-                    };
-                    progress(p, line, sess.and_then(|x| x.progress), None, c.fill);
-                }
-                Attn::Idle => {}
+                Attn::Working | Attn::Idle => {}
+            }
+            if state == Attn::Working || reported.is_some() {
+                let line = Rect {
+                    y: r.y + hh - 2,
+                    h: s(2.0),
+                    ..r
+                };
+                progress(p, line, reported, None, c.fill);
             }
         }
-        if fleet && !expanded && state == Attn::Working {
+        if fleet && !expanded && (state == Attn::Working || reported.is_some()) {
             let line = Rect { h: s(2.0), ..r };
-            let pct = sess.and_then(|x| x.progress);
-            progress(p, line, pct, Some(c.top_track), c.rail_work);
+            progress(p, line, reported, Some(c.top_track), c.rail_work);
         }
         if multi && !expanded {
             if let Some(x) = sess {
@@ -402,7 +459,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let focused = ti == m.win.active && x.id == t.focus;
                 let (l1, l2, l3, gap) = (s(18.0).max(th), s(16.0).max(th), s(17.0).max(th), s(2.0));
-                let working = x.state == Attn::Working;
+                let bar = x.state == Attn::Working || x.progress.is_some();
                 // Every row has room for a message and a progress bar, so
                 // output that changes a title or state cannot move the
                 // rows below it under the pointer.
@@ -497,7 +554,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                     text(p, left, ly + (l3 - th) / 2, &msg, c.msg, false);
                 }
                 ly += l3;
-                if working {
+                if bar {
                     let line = Rect {
                         x: left,
                         y: ly + gap + s(5.0),
@@ -620,6 +677,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
         };
         extra.push(Prim::Rect(line, c.term_fg));
     }
+    if let (Some(f), Some(r)) = (&m.find, pane(tab.focus)) {
+        find_bar(&mut extra, f, c, r, s, (tw, th));
+    }
     if let Some(st) = &m.settings {
         out.settings = Some(settings(&mut extra, st, c, m.size, s, (tw, th)));
     }
@@ -629,17 +689,20 @@ pub fn build(m: &ChromeModel) -> Chrome {
     if let Some(g) = m.game {
         g.draw(&mut extra, area, m.scale, c, (tw, th));
     }
+    if let Some(cm) = &m.commands {
+        out.commands = Some(commands(&mut extra, cm, c, m.size, s, (tw, th)));
+    }
     out.prims.extend(extra);
     out
 }
 
-/// The theme picker: a panel near the top with the filter, a window of
-/// matching themes, each with a strip of its colours, and a key hint.
-fn picker(
+/// The find bar: one line at the top right of pane `r` with the query and
+/// which match is current, or that nothing matches.
+fn find_bar(
     p: &mut Vec<Prim>,
-    pk: &Picker,
+    f: &FindBar,
     c: &Ui,
-    (w, h): (i32, i32),
+    r: Rect,
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
 ) {
@@ -653,9 +716,84 @@ fn picker(
             term: false,
         });
     };
+    let (pad, one) = (s(10.0), s(1.0).max(1));
+    let (w, h) = (s(300.0).min(r.w).max(0), th + s(10.0));
+    let panel = Rect {
+        x: r.right() - w,
+        y: r.y,
+        w,
+        h,
+    };
+    p.push(Prim::Rect(panel, c.border));
+    let inner = Rect {
+        x: panel.x + one,
+        y: panel.y + one,
+        w: (w - 2 * one).max(0),
+        h: (h - 2 * one).max(0),
+    };
+    p.push(Prim::Rect(inner, c.side_bg));
+    let (left, right, ty) = (inner.x + pad, inner.right() - pad, panel.y + (h - th) / 2);
+    text(p, left, ty, "Find".into(), c.name, true);
+    let (count, color) = match f.count {
+        Some((at, of)) => (format!("{at}/{of}"), c.dim),
+        None if f.query.is_empty() => (String::new(), c.dim),
+        None => ("no matches".into(), c.error),
+    };
+    let cx = right - text_w(&count, tw);
+    let qx = left + 6 * tw;
+    let (query, qc) = if f.query.is_empty() {
+        ("type to find", c.dim)
+    } else {
+        (f.query, c.msg)
+    };
+    // The end of a long query is the part being typed.
+    text(p, qx, ty, fit_left(query, cx - s(8.0) - qx, tw), qc, false);
+    if !count.is_empty() {
+        text(p, cx, ty, count, color, false);
+    }
+}
+
+/// What the theme picker and the command palette have in common.
+struct List<'a> {
+    title: &'a str,
+    /// What was typed to narrow the list.
+    filter: &'a str,
+    /// The names that match it, and the highlighted one.
+    names: Vec<&'a str>,
+    sel: usize,
+    /// Shown when nothing matches.
+    empty: &'a str,
+    hint: &'a str,
+    /// Panel width at 96 DPI.
+    width: f32,
+}
+
+/// A list panel near the top: the title and the filter, a window of rows
+/// that follows the highlight, and a key hint. `side(p, i, row, right)`
+/// draws the right end of row `i` up to `right` and returns where the name
+/// must end. Returns the panel and each row shown, by index.
+fn list(
+    p: &mut Vec<Prim>,
+    l: &List,
+    c: &Ui,
+    (w, h): (i32, i32),
+    s: impl Fn(f32) -> i32,
+    (tw, th): (i32, i32),
+    mut side: impl FnMut(&mut Vec<Prim>, usize, Rect, i32) -> i32,
+) -> (Rect, Vec<(usize, Rect)>) {
+    let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
+        p.push(Prim::Text {
+            x,
+            y,
+            text: t,
+            color,
+            bold,
+            term: false,
+        });
+    };
     let (pad, row_h, one) = (s(12.0), th + s(10.0), s(1.0).max(1));
-    let shown = pk.items.len().clamp(1, PICKER_ROWS) as i32;
-    let pw = s(380.0).min(w - s(32.0)).max(0);
+    let shown = l.names.len().clamp(1, PICKER_ROWS) as i32;
+    let pw = s(l.width).min(w - s(32.0)).max(0);
     let ph = 2 * row_h + shown * row_h + s(12.0);
     let panel = Rect {
         x: (w - pw) / 2,
@@ -663,25 +801,19 @@ fn picker(
         w: pw,
         h: ph,
     };
-    let inset = |r: Rect| Rect {
-        x: r.x + one,
-        y: r.y + one,
-        w: (r.w - 2 * one).max(0),
-        h: (r.h - 2 * one).max(0),
-    };
     p.push(Prim::Rect(panel, c.border));
-    let inner = inset(panel);
+    let inner = inset(panel, one);
     p.push(Prim::Rect(inner, c.side_bg));
     let (left, right) = (inner.x + pad, inner.right() - pad);
     let ty = |row_y: i32| row_y + (row_h - th) / 2;
 
     let mut y = inner.y + s(4.0);
-    text(p, left, ty(y), "Theme".into(), c.name, true);
-    let fx = left + 7 * tw;
-    let (filter, color) = if pk.filter.is_empty() {
+    text(p, left, ty(y), l.title.into(), c.name, true);
+    let fx = left + text_w(l.title, tw) + 2 * tw;
+    let (filter, color) = if l.filter.is_empty() {
         ("type to filter", c.dim)
     } else {
-        (pk.filter, c.msg)
+        (l.filter, c.msg)
     };
     text(p, fx, ty(y), fit(filter, right - fx, tw), color, false);
     y += row_h;
@@ -694,36 +826,73 @@ fn picker(
     p.push(Prim::Rect(rule, c.rule));
     y += s(4.0);
 
-    if pk.items.is_empty() {
-        text(p, left, ty(y), "no theme matches".into(), c.dim, false);
+    if l.names.is_empty() {
+        text(p, left, ty(y), l.empty.into(), c.dim, false);
     }
-    // Six of the theme's colours on its own background.
-    let (sq, gap) = (s(8.0), s(4.0));
-    let strip_w = 6 * sq + 7 * gap;
-    let first = (pk.sel + 1).saturating_sub(PICKER_ROWS);
-    for (i, t) in pk.items.iter().enumerate().skip(first).take(PICKER_ROWS) {
+    let mut rows = Vec::new();
+    let first = (l.sel + 1).saturating_sub(PICKER_ROWS);
+    for (i, name) in l.names.iter().enumerate().skip(first).take(PICKER_ROWS) {
         let row = Rect {
             x: inner.x,
             y,
             w: inner.w,
             h: row_h,
         };
-        let sel = i == pk.sel;
+        let sel = i == l.sel;
         if sel {
             p.push(Prim::Rect(row, c.row_focus));
             p.push(Prim::Rect(Rect { w: s(2.0), ..row }, c.accent));
         }
+        let end = side(p, i, row, right);
+        let color = if sel { c.name } else { c.msg };
+        text(
+            p,
+            left,
+            ty(y),
+            fit(name, end - s(8.0) - left, tw),
+            color,
+            sel,
+        );
+        rows.push((i, row));
+        y += row_h;
+    }
+
+    let hy = panel.bottom() - row_h - s(2.0);
+    text(p, left, ty(hy), fit(l.hint, right - left, tw), c.dim, false);
+    (panel, rows)
+}
+
+/// The theme picker: the matching themes, each with a strip of its colours.
+fn picker(
+    p: &mut Vec<Prim>,
+    pk: &Picker,
+    c: &Ui,
+    size: (i32, i32),
+    s: impl Fn(f32) -> i32,
+    cells: (i32, i32),
+) {
+    let l = List {
+        title: "Theme",
+        filter: pk.filter,
+        names: pk.items.iter().map(|t| t.name.as_str()).collect(),
+        sel: pk.sel,
+        empty: "no theme matches",
+        hint: "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel",
+        width: 380.0,
+    };
+    // Six of the theme's colours on its own background.
+    let (sq, gap, one) = (s(8.0), s(4.0), s(1.0).max(1));
+    let strip_w = 6 * sq + 7 * gap;
+    list(p, &l, c, size, &s, cells, |p, i, row, right| {
+        let t = pk.items[i];
         let strip = Rect {
             x: right - strip_w,
-            y: y + (row_h - sq - 2 * gap) / 2,
+            y: row.y + (row.h - sq - 2 * gap) / 2,
             w: strip_w,
             h: sq + 2 * gap,
         };
-        let color = if sel { c.name } else { c.msg };
-        let name = fit(&t.name, strip.x - s(8.0) - left, tw);
-        text(p, left, ty(y), name, color, sel);
         p.push(Prim::Rect(strip, c.border));
-        p.push(Prim::Rect(inset(strip), t.pal.bg));
+        p.push(Prim::Rect(inset(strip, one), t.pal.bg));
         for (k, &col) in t.pal.ansi[1..7].iter().enumerate() {
             let x = strip.x + gap + k as i32 * (sq + gap);
             let r = Rect {
@@ -734,12 +903,51 @@ fn picker(
             };
             p.push(Prim::Rect(r, col));
         }
-        y += row_h;
-    }
+        strip.x
+    });
+}
 
-    let hint = "\u{2191}\u{2193} preview  \u{b7}  Enter keep  \u{b7}  Esc cancel";
-    let hy = panel.bottom() - row_h - s(2.0);
-    text(p, left, ty(hy), fit(hint, right - left, tw), c.dim, false);
+/// The command palette: the matching actions, each with its keys.
+fn commands(
+    p: &mut Vec<Prim>,
+    cm: &Commands,
+    c: &Ui,
+    size: (i32, i32),
+    s: impl Fn(f32) -> i32,
+    (tw, th): (i32, i32),
+) -> (Rect, Vec<(usize, Rect)>) {
+    let l = List {
+        title: "Commands",
+        filter: cm.filter,
+        names: cm.items.iter().map(|i| i.0).collect(),
+        sel: cm.sel,
+        empty: "no command matches",
+        hint: "\u{2191}\u{2193} choose  \u{b7}  Enter run  \u{b7}  Esc close",
+        width: 460.0,
+    };
+    list(p, &l, c, size, s, (tw, th), |p, i, row, right| {
+        let keys = &cm.items[i].1;
+        let x = right - text_w(keys, tw);
+        p.push(Prim::Text {
+            x,
+            y: row.y + (row.h - th) / 2,
+            text: keys.clone(),
+            color: c.dim,
+            bold: false,
+            term: false,
+        });
+        x
+    })
+}
+
+/// `r` shrunk by `by` on every side.
+fn inset(r: Rect, by: i32) -> Rect {
+    Rect {
+        x: r.x + by,
+        y: r.y + by,
+        w: (r.w - 2 * by).max(0),
+        h: (r.h - 2 * by).max(0),
+    }
 }
 
 /// The settings panel: a search line, the settings under group headings,
@@ -1195,6 +1403,8 @@ mod tests {
             settings: None,
             spark: None,
             game: None,
+            commands: None,
+            find: None,
         }
     }
 
@@ -1261,6 +1471,55 @@ mod tests {
         let c = build(&model(&win, &sessions, now));
         // Needs you, working with no message, idle with one.
         assert!(c.rows.windows(2).all(|w| w[0].1.h == w[1].1.h));
+    }
+
+    #[test]
+    fn progress_reports_keep_or_drop_their_value() {
+        let p = |state, pct| Some(Progress { state, pct });
+        let steps = [
+            (1, Some(40), p(1, Some(40))),
+            // An error without a value keeps the last one.
+            (2, None, p(2, Some(40))),
+            (3, Some(9), p(3, None)),
+            (4, None, p(4, None)),
+            (1, None, p(1, Some(0))),
+            (0, None, None),
+        ];
+        let mut now = None;
+        for (state, pct, want) in steps {
+            now = Progress::next(now, state, pct);
+            assert_eq!(now, want, "{state} {pct:?}");
+        }
+    }
+
+    #[test]
+    fn reported_progress_shows_on_any_session_and_stands_still() {
+        let (win, mut sessions, now) = fleet(true);
+        let ui = crate::theme::blitz(false).ui;
+        sessions[0].progress = Some(Progress {
+            state: 2,
+            pct: Some(50),
+        });
+        // Idle, in the other tab.
+        sessions[2].progress = Some(Progress {
+            state: 3,
+            pct: None,
+        });
+        let c = build(&model(&win, &sessions, now));
+        let bars = |color| -> Vec<i32> {
+            (c.prims.iter())
+                .filter_map(|p| match p {
+                    Prim::Rect(r, rgb) if *rgb == color && r.h == 2 => Some(r.w),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Half of the header line and of the sidebar row's track.
+        let half = bars(ui.error);
+        assert!(half.len() == 2 && half.contains(&94), "{half:?}");
+        // No telling how far: the whole track, dimmer than progress.
+        let dim = crate::render::mix(ui.track, ui.fill);
+        assert_eq!(bars(dim), [188]);
     }
 
     #[test]
@@ -1338,6 +1597,36 @@ mod tests {
             c.prims
                 .contains(&Prim::Rect(line, crate::theme::blitz(false).ui.term_fg))
         );
+    }
+
+    #[test]
+    fn find_bar_sits_at_the_top_right_of_the_focused_pane() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.find = Some(FindBar {
+            query: "needle",
+            count: Some((3, 17)),
+        });
+        let c = build(&m);
+        let t = texts(&c);
+        assert!(t.contains(&"Find") && t.contains(&"needle") && t.contains(&"3/17"));
+        let focus = c.panes.iter().find(|p| p.0 == PaneId(2)).map(|p| p.1);
+        let focus = focus.expect("focused pane");
+        let border = m.ui.border;
+        let corner = |p: &Prim| {
+            matches!(p, Prim::Rect(r, c)
+                if *c == border && r.right() == focus.right() && r.y == focus.y && r.w < focus.w)
+        };
+        assert!(c.prims.iter().any(corner));
+
+        m.find = Some(FindBar {
+            query: "zzz",
+            count: None,
+        });
+        let c = build(&m);
+        let error = m.ui.error;
+        let none = |p: &Prim| matches!(p, Prim::Text { text, color, .. } if text == "no matches" && *color == error);
+        assert!(c.prims.iter().any(none));
     }
 
     fn setting_rows() -> Vec<SettingRow> {
@@ -1425,6 +1714,29 @@ mod tests {
         assert_eq!(up.top, last.top);
         // Going back to the top shows the first heading again.
         assert_eq!(show(0, up.top).top, 0);
+    }
+
+    #[test]
+    fn command_palette_follows_the_highlight() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let items = (0..20)
+            .map(|i| ("Split right", format!("Ctrl+{i}")))
+            .collect();
+        m.commands = Some(Commands {
+            filter: "",
+            items,
+            sel: 15,
+        });
+        let c = build(&m);
+        let (panel, rows) = c.commands.clone().expect("palette hits");
+        let shown: Vec<usize> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(shown, (4..16).collect::<Vec<_>>());
+        let inside = |r: Rect| r.y >= panel.y && r.bottom() <= panel.bottom();
+        assert!(rows.iter().all(|&(_, r)| inside(r)));
+        let t = texts(&c);
+        assert!(t.contains(&"Commands") && t.contains(&"Ctrl+15"));
+        assert!(!t.contains(&"Ctrl+3"), "scrolled out");
     }
 
     #[test]
