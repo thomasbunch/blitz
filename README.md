@@ -156,13 +156,16 @@ when two share a name. A tab goes by the folder of its focused pane.
 yourself; an empty name goes back to the automatic one.
 
 Closing the window keeps its tabs, splits and folders, and blitz opens
-them again the next time it starts; so does an update. Names you gave
-and results you had not seen yet come back too. A pane that was
-running Claude Code reopens the conversation with `claude --resume`
-once its shell is ready (this needs the hooks above). Typing `exit` in
-the last pane ends it all, and the next start is fresh. **Open in blitz**
-adds a tab to the running window, or to the reopened one; **Open in new
-blitz window** opens a separate window that is never saved.
+them again the next time it starts; so does an update, of blitz or of
+Windows. Names you gave and results you had not seen yet come back too.
+A pane that was running Claude Code reopens the conversation with
+`claude --resume` once its shell is ready (this needs the hooks above).
+Typing `exit` in the last pane ends it all, and the next start is fresh.
+Starting blitz while it runs brings its window to the front, on the
+virtual desktop you are on. **Open in blitz** adds a tab to the running
+window, or to the reopened one; **Open in new blitz window** opens a
+separate window that is never saved. So does blitz run as
+administrator, which says so in its title.
 
 Closing a pane, a tab or the window ends what runs in it, so blitz asks
 first while a session there is busy: Claude Code working or waiting for
@@ -330,7 +333,8 @@ the list, the arrow keys choose, and Enter or a click runs the action;
 Esc closes it. Giving the panes equal space, closing a whole tab,
 reopening the last closed pane, renaming a session or a tab and Claude
 Code setup have no keys by default, so they are only in the palette;
-renaming takes the name on the palette's line.
+renaming takes the name on the palette's line. Double-clicking the line
+between panes also gives them equal space.
 
 ## Key bindings
 
