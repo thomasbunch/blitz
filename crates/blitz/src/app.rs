@@ -5618,15 +5618,21 @@ fn untoasts(attended: bool, state: Attn) -> bool {
     attended || state < Attn::DoneUnseen
 }
 
-/// The lines of a notification about session `s`: its name and what it
-/// wants, its last message, and its folder.
+/// The lines of a notification about session `s`: its name, numbered as
+/// the sidebar numbers it, and what it wants, its last message, and its
+/// folder.
 fn toast_text(s: &chrome::Session) -> [String; 3] {
     let what = match s.state {
         Attn::NeedsYou => "needs you",
         Attn::Error => "failed",
         _ => "finished",
     };
-    [format!("{} {what}", s.name), s.msg.clone(), s.cwd.clone()]
+    let num = s.num.map(|n| format!(" {n}")).unwrap_or_default();
+    [
+        format!("{}{num} {what}", s.name),
+        s.msg.clone(),
+        s.cwd.clone(),
+    ]
 }
 
 /// Scrolls `term` so match `m` shows in the middle of its `rows` high view,
@@ -8416,6 +8422,13 @@ mod tests {
         );
         assert_eq!(toast_text(&s(Attn::Error))[0], "pwsh 3 failed");
         assert_eq!(toast_text(&s(Attn::DoneUnseen))[0], "pwsh 3 finished");
+        // A session that shares its name has its number, as in the sidebar.
+        let twin = chrome::Session {
+            name: "claude".into(),
+            num: Some(2),
+            ..s(Attn::NeedsYou)
+        };
+        assert_eq!(toast_text(&twin)[0], "claude 2 needs you");
     }
 
     #[test]
