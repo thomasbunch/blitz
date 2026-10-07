@@ -1059,10 +1059,18 @@ mod tests {
             "the block shows through"
         );
         assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), p.fg);
-        // An underline cursor leaves the glyph its colour.
+        // An underline cursor leaves the glyph its colour, and on a blank
+        // cell sits on the cell's bottom edge, as wide as the cell.
         snap.cursor = Some((0, 0, vt::CursorShape::Underline));
         let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
         assert_eq!(pixel(&px, w, cw / 2, ch / 2), p.fg);
+        let mut blank = text_snapshot("  ", 2, 1, &p);
+        blank.cursor = Some((1, 0, vt::CursorShape::Underline));
+        let (w, _, px) = render_offscreen(&mut r, &blank, &p).expect("render");
+        assert_eq!(pixel(&px, w, cw, ch - 1), p.cursor);
+        assert_eq!(pixel(&px, w, 2 * cw - 1, ch - 1), p.cursor);
+        assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), p.bg, "only the bottom");
+        assert_eq!(pixel(&px, w, cw - 1, ch - 1), p.bg, "only its cell");
         // A cursor off the grid is not drawn.
         snap.cursor = Some((5, 0, vt::CursorShape::Block));
         let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
@@ -1277,6 +1285,10 @@ mod tests {
                     bold: true,
                     term: false,
                 },
+                Prim::Rect(rect(0, 12, 8, 4), 0x0000ff),
+                // Negative sizes draw nothing rather than wrap around.
+                Prim::Rect(rect(10, 12, -5, 4), 0xff0000),
+                Prim::Branch(rect(20, 10, 10, 10), 0xff00ff),
             ],
             ..Chrome::default()
         };
@@ -1296,6 +1308,29 @@ mod tests {
         let (sw, sh) = r.small_cell();
         let ink = (0..sh).any(|y| (60..60 + sw).any(|x| at(x, y) != p.bg));
         assert!(ink, "chrome text is drawn");
+        assert_eq!(at(4, 14), 0x0000ff, "rect");
+        assert!((0..w).all(|x| at(x, 14) != 0xff0000), "a negative rect");
+        let branch = (10..20).any(|y| (20..30).any(|x| at(x, y) == 0xff00ff));
+        assert!(branch, "branch icon");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_italic_text_draws_another_face() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("ll", 2, 1, &p);
+        snap.cells[1].attrs = vt::snapshot::attr::ITALIC;
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let cell = |c: u32| -> Vec<u32> {
+            (0..ch)
+                .flat_map(|y| (0..cw).map(move |x| (x, y)))
+                .map(|(x, y)| pixel(&px, w, c * cw + x, y))
+                .collect()
+        };
+        assert!(cell(1).iter().any(|&c| c != p.bg), "italic has ink");
+        assert_ne!(cell(0), cell(1), "italic is not the upright glyph");
     }
 
     #[cfg(windows)]

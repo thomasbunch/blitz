@@ -552,6 +552,37 @@ mod tests {
     }
 
     #[test]
+    fn clusters_without_a_drawable_first_character() {
+        let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        // Variation selectors alone draw nothing.
+        assert!(font.raster("\u{FE0F}", 0, 1).expect("raster").is_none());
+        assert!(
+            font.raster("\u{FE0E}\u{FE0F}", 0, 1)
+                .expect("raster")
+                .is_none()
+        );
+        assert!(font.raster("", 0, 1).expect("raster").is_none());
+        // A joined emoji sequence draws its first emoji, within its cells.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let r = font.raster(family, 0, 2).expect("raster").expect("ink");
+        assert!(r.dx >= -1 && r.dx + r.w as i32 <= 2 * font.cell_w as i32 + 1);
+        // A character no font has comes out as the font's missing-glyph
+        // box, or nothing, but never an error.
+        assert!(font.raster("\u{10FFFD}", 0, 1).is_ok());
+        assert!(font.raster("\u{E000}", ITALIC | BOLD, 1).is_ok());
+        // Italic is a face of its own.
+        let (a, i) = (font.raster("l", 0, 1), font.raster("l", ITALIC, 1));
+        let (a, i) = (
+            a.expect("raster").expect("ink"),
+            i.expect("raster").expect("ink"),
+        );
+        assert!(
+            a.alpha != i.alpha || a.dx != i.dx || a.w != i.w,
+            "italic differs"
+        );
+    }
+
+    #[test]
     fn fallback_lookups_wait_when_none_are_left() {
         let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
         font.lookups = 1;
