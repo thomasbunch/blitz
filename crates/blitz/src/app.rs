@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetKeyState, GetKeyboardState,
+    GetDoubleClickTime, GetKeyState, GetKeyboardState, GetLastInputInfo, LASTINPUTINFO,
 };
 use windows::Win32::UI::Shell::{
     ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
@@ -91,6 +91,9 @@ const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const INTERNAL: &str = "blitz stopped after an internal error";
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
+/// After this long with no key or mouse input anywhere, the user counts as
+/// away from the screen, even with blitz in front.
+const AWAY_AFTER: Duration = Duration::from_secs(30);
 /// How long a restored pane waits for its shell's first prompt before it
 /// types the Claude Code resume command anyway.
 const RESUME_AFTER: Duration = Duration::from_secs(3);
@@ -2746,9 +2749,11 @@ impl App {
             self.close_game();
             self.game_ended = Some(now);
         }
-        // While it is open, it covers the panes: the focused one is not in view.
-        let attended = self.focused && self.game.is_none() && self.focus_id() == Some(id);
-        let away = !self.focused && self.config.flash;
+        // While it is open, it covers the panes: the focused one is not in
+        // view. Nor is anything while the user is away from the screen.
+        let here = present(self.focused, idle_for());
+        let attended = here && self.game.is_none() && self.focus_id() == Some(id);
+        let away = !here && self.config.flash;
         let Some(v) = self.view_mut(id) else {
             return false;
         };
@@ -3676,6 +3681,31 @@ fn note_hook(
         *claude = Some(id.to_owned());
     }
     *msg = body;
+}
+
+/// Whether the user is at the window: it is in front, and they touched a
+/// key or the mouse in the last `AWAY_AFTER`, `idle` being how long ago.
+/// Walking away from blitz must not let a question pass as seen.
+fn present(focused: bool, idle: Duration) -> bool {
+    focused && idle < AWAY_AFTER
+}
+
+/// How long ago the last key or mouse input anywhere was; zero when
+/// Windows cannot say.
+fn idle_for() -> Duration {
+    let mut info = LASTINPUTINFO {
+        cbSize: size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    // SAFETY: `info` is a LASTINPUTINFO with its size set, as the call
+    // requires.
+    if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        return Duration::ZERO;
+    }
+    // SAFETY: plain Win32 call with no arguments.
+    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
+    // Both are milliseconds since boot, kept in 32 bits, so they wrap.
+    Duration::from_millis(u64::from(now.wrapping_sub(info.dwTime)))
 }
 
 /// Whether a bell, or a notification without the pane's token, needs the
@@ -5021,6 +5051,15 @@ mod tests {
         // The session ended: nothing to show or resume.
         note_hook(&mut msg, &mut claude, Ev::Idle, Some(id), String::new());
         assert_eq!((msg.as_str(), claude), ("", None));
+    }
+
+    #[test]
+    fn app_a_user_away_from_the_screen_is_not_watching() {
+        let s = Duration::from_secs;
+        assert!(present(true, s(0)));
+        assert!(present(true, s(29)));
+        assert!(!present(true, s(30)), "walked away with blitz in front");
+        assert!(!present(false, s(0)), "another window is in front");
     }
 
     #[test]
