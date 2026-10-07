@@ -420,7 +420,8 @@ pub fn setup(args: &[String]) -> i32 {
             return 2;
         }
     };
-    eprintln!("Add the lines below to {rc}, in Git Bash or WSL.\n");
+    // Last, so its prompt command runs after those set before it.
+    eprintln!("Add the lines below to the end of {rc}, in Git Bash or WSL.\n");
     print!("{script}");
     0
 }

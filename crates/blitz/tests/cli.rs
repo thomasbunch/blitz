@@ -112,7 +112,9 @@ fn cli_setup_shell_prints_the_integration() {
         let out = blitz(Path::new(BLITZ), &["setup", "shell", sh], &tmp("cli"));
         assert_eq!(out.status.code(), Some(0), "{sh}");
         assert_eq!(text(&out.stdout), script);
-        assert!(text(&out.stderr).contains(rc), "{sh}");
+        // Last, so it marks the prompt the lines before it set.
+        let at = format!("the end of {rc}");
+        assert!(text(&out.stderr).contains(&at), "{sh}");
     }
 }
 
