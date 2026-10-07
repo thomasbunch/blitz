@@ -208,6 +208,11 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // Run as administrator, blitz is a window of its own: it takes no
+    // launches, gives none away, and leaves the saved session to the
+    // normal one, whose Claude Code sessions it would resume elevated.
+    let admin = elevated();
+    args.new_window |= admin;
     // A launch brings the blitz already running to the front, and a folder
     // opens as a tab there. Scripted and test launches always get a window
     // of their own.
@@ -237,6 +242,7 @@ pub fn run(args: &[String]) -> i32 {
     };
     let mut app = App::new(args, keys, event_loop.create_proxy());
     app.gpu = Some(gpu);
+    app.admin = admin;
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("blitz: {e}");
         return 1;
@@ -855,6 +861,8 @@ struct App {
     /// This is the main window, whose layout is saved for the next start.
     /// Separate windows and scripted runs leave the saved one alone.
     persist: bool,
+    /// blitz runs as administrator, and its title says so.
+    admin: bool,
     /// The session as last saved.
     saved: Option<session::State>,
     /// When a changed layout is saved, unless it changes back first.
@@ -1103,6 +1111,7 @@ impl App {
             checked_conpty: false,
             capture_then_exit: false,
             persist,
+            admin: false,
             saved: None,
             save_after: None,
             gfx_retry: None,
@@ -1126,7 +1135,7 @@ impl App {
     /// Creates the window and starts the first session.
     fn start(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
         let mut attrs = Window::default_attributes()
-            .with_title("blitz")
+            .with_title(window_title("", self.admin))
             .with_inner_size(LogicalSize::new(980.0, 620.0))
             // Icon group 1, which build.rs links in.
             .with_window_icon(Icon::from_resource(1, Some(small_icon_size())).ok())
@@ -1527,7 +1536,7 @@ impl App {
 
     fn set_title(&self, t: &str) {
         if let Some(w) = &self.window {
-            w.set_title(if t.is_empty() { "blitz" } else { t });
+            w.set_title(&window_title(t, self.admin));
         }
     }
 
@@ -4318,6 +4327,45 @@ fn split(dir: Dir) -> impl FnOnce(&mut layout::Window, PaneId) -> bool {
         (win.tabs.get_mut(active)).is_some_and(|t| t.split(dir, id, any, (0, 0)))
     }
 }
+/// The window title for the focused pane's title `t`, marked the way
+/// Windows marks its own consoles when blitz runs as administrator.
+fn window_title(t: &str, admin: bool) -> String {
+    let t = if t.is_empty() { "blitz" } else { t };
+    if admin {
+        format!("Administrator: {t}")
+    } else {
+        t.to_string()
+    }
+}
+
+/// Whether blitz runs elevated, as administrator.
+fn elevated() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
+    let mut e = TOKEN_ELEVATION::default();
+    let mut len = 0;
+    // SAFETY: the out value is as large as the call is told; the token is
+    // closed after use.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&raw mut e).cast()),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && e.TokenIsElevated != 0
+    }
+}
 
 /// Where the first pane starts when no folder was given: `cwd`, where
 /// blitz was started, unless that is one of `avoid`; else the user's
@@ -5602,6 +5650,14 @@ mod tests {
         assert!(!c.matches().is_empty());
         let names: Vec<_> = (keymap::ACTIONS.iter()).map(|a| a.1).collect();
         assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
+    }
+
+    #[test]
+    fn app_an_elevated_window_says_so_in_its_title() {
+        assert_eq!(window_title("", false), "blitz");
+        assert_eq!(window_title("~/shop", false), "~/shop");
+        assert_eq!(window_title("", true), "Administrator: blitz");
+        assert_eq!(window_title("~/shop", true), "Administrator: ~/shop");
     }
 
     /// Started from the Start menu, a pin or Win+R, blitz runs in its own
