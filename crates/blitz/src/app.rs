@@ -701,6 +701,9 @@ struct View {
     /// A restored Claude Code session: the line to type at the shell's
     /// first prompt, and when to type it anyway.
     resume: Option<(String, Instant)>,
+    /// The shell has shown blitz's prompt mark, so the next one means
+    /// what ran in it has ended.
+    prompted: bool,
     /// When the program's open synchronized update times out, as of the
     /// last look at its terminal.
     sync_until: Option<Instant>,
@@ -1291,6 +1294,7 @@ impl App {
             flashed: None,
             finding_branch: false,
             resume: None,
+            prompted: false,
             sync_until: None,
             key,
             progress: None,
@@ -2684,18 +2688,16 @@ impl App {
                 v.pane.cwd = dir;
                 self.find_branch(id);
             }
-            // The shell is ready for input: bring back its Claude session.
-            // Otherwise whatever ran has ended, Claude Code too, even one
-            // that crashed or was killed and could tell no hook. A resume
-            // that failed is not tried again at the next start either.
             Event::Prompt(PromptMark::A { blitz: true }) => {
-                if let Some((line, _)) = v.resume.take() {
-                    v.pane.send(line);
-                } else {
-                    v.pane.claude = None;
-                    v.pane.claude_title = None;
-                    v.pane.hooked = false;
-                    self.attention(id, Ev::Exited);
+                match prompt_back(&mut v.prompted, &mut v.resume) {
+                    Prompt::Resume(line) => v.pane.send(line),
+                    Prompt::First => {}
+                    Prompt::Exited => {
+                        v.pane.claude = None;
+                        v.pane.claude_title = None;
+                        v.pane.hooked = false;
+                        self.attention(id, Ev::Exited);
+                    }
                 }
             }
             Event::Notify { title, body } => match Ev::from_notify(&title, &v.pane.token) {
@@ -3752,6 +3754,29 @@ fn note_hook(
         *claude = Some(id.to_owned());
     }
     *msg = body;
+}
+
+/// What blitz's own prompt coming back in a pane means.
+#[derive(Debug, PartialEq, Eq)]
+enum Prompt {
+    /// The shell is ready: bring back its Claude Code session.
+    Resume(String),
+    /// The shell's first prompt: nothing ran in it yet, though a resume
+    /// the timer typed ahead of it is about to.
+    First,
+    /// Whatever ran has ended, Claude Code too, even one that crashed or
+    /// was killed and could tell no hook. A resume that failed is not
+    /// tried again at the next start either.
+    Exited,
+}
+
+fn prompt_back(prompted: &mut bool, resume: &mut Option<(String, Instant)>) -> Prompt {
+    let first = !std::mem::replace(prompted, true);
+    match resume.take() {
+        Some((line, _)) => Prompt::Resume(line),
+        None if first => Prompt::First,
+        None => Prompt::Exited,
+    }
 }
 
 /// Tells the program in `v` whether its pane has keyboard focus: now if it
@@ -5198,6 +5223,24 @@ mod tests {
         // The session ended: nothing to show or resume.
         note_hook(&mut msg, &mut claude, Ev::Idle, Some(id), String::new());
         assert_eq!((msg.as_str(), claude), ("", None));
+    }
+
+    /// A slow shell's first prompt can come after the timer typed the
+    /// resume: Claude Code is starting then, not gone.
+    #[test]
+    fn app_only_a_later_prompt_ends_claude() {
+        let line = || Some(("claude --resume x".to_owned(), Instant::now()));
+        let (mut prompted, mut resume) = (false, line());
+        assert_eq!(
+            prompt_back(&mut prompted, &mut resume),
+            Prompt::Resume("claude --resume x".into())
+        );
+        assert_eq!(prompt_back(&mut prompted, &mut resume), Prompt::Exited);
+        // The timer typed it before the shell was ready.
+        let (mut prompted, mut resume) = (false, None);
+        assert_eq!(prompt_back(&mut prompted, &mut resume), Prompt::First);
+        assert_eq!(prompt_back(&mut prompted, &mut resume), Prompt::Exited);
+        assert_eq!(prompt_back(&mut prompted, &mut resume), Prompt::Exited);
     }
 
     #[test]
