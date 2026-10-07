@@ -1601,7 +1601,11 @@ impl App {
         if self.views.is_empty() || self.args.cwd.is_some() {
             let cwd = match &self.args.cwd {
                 Some(dir) => start_dir(dir),
-                None => first_dir(std::env::current_dir().ok(), &not_a_start()),
+                None => first_dir(
+                    std::env::current_dir().ok(),
+                    &not_a_start(),
+                    std::env::var_os("SystemRoot").map(PathBuf::from).as_deref(),
+                ),
             };
             let id = PaneId(self.next_id);
             win.tabs.push(Tab::new(String::new(), id));
@@ -6385,12 +6389,18 @@ fn elevated() -> bool {
 }
 
 /// Where the first pane starts when no folder was given: `cwd`, where
-/// blitz was started, unless that is one of `avoid`; else the user's
-/// profile folder.
-fn first_dir(cwd: Option<PathBuf>, avoid: &[PathBuf]) -> Option<PathBuf> {
+/// blitz was started, unless that is one of `avoid` or inside Windows' own
+/// folder, `system_root`, as for blitz started when the user signs in;
+/// else the user's profile folder.
+fn first_dir(
+    cwd: Option<PathBuf>,
+    avoid: &[PathBuf],
+    system_root: Option<&Path>,
+) -> Option<PathBuf> {
     let key = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    let inside = |d: &Path| system_root.is_some_and(|r| Path::new(&key(d)).starts_with(key(r)));
     match cwd {
-        Some(d) if !avoid.iter().any(|a| key(a) == key(&d)) => Some(d),
+        Some(d) if !avoid.iter().any(|a| key(a) == key(&d)) && !inside(&d) => Some(d),
         _ => start_dir(""),
     }
 }
@@ -8687,14 +8697,14 @@ mod tests {
             .iter()
             .find(|d| d.ends_with("System32") || d.ends_with("system32"));
         let system = system.expect("System32").clone();
-        assert_eq!(first_dir(Some(own), &avoid), home);
-        assert_eq!(first_dir(Some(system.clone()), &avoid), home);
+        assert_eq!(first_dir(Some(own), &avoid, None), home);
+        assert_eq!(first_dir(Some(system.clone()), &avoid, None), home);
         // However Windows spells it.
         let shouted = PathBuf::from(format!("{}\\", system.display()).to_uppercase());
-        assert_eq!(first_dir(Some(shouted), &avoid), home);
+        assert_eq!(first_dir(Some(shouted), &avoid, None), home);
         let dev = PathBuf::from(r"C:\dev\shop");
-        assert_eq!(first_dir(Some(dev.clone()), &avoid), Some(dev));
-        assert_eq!(first_dir(None, &avoid), home);
+        assert_eq!(first_dir(Some(dev.clone()), &avoid, None), Some(dev));
+        assert_eq!(first_dir(None, &avoid, None), home);
     }
 
     #[test]
@@ -9157,6 +9167,27 @@ mod tests {
             first_hint(&user),
             "Alt+P every action \u{b7} Ctrl+, settings"
         );
+    }
+
+    #[test]
+    fn a_launch_from_the_windows_folder_starts_at_home() {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let root = Some(Path::new(r"C:\Windows"));
+        // Started at sign-in, the folder is System32, in any case.
+        for at in [
+            r"C:\Windows\system32",
+            r"C:\WINDOWS\System32",
+            r"C:\Windows",
+        ] {
+            assert_eq!(first_dir(Some(at.into()), &[], root), home, "{at}");
+        }
+        assert_eq!(first_dir(None, &[], root), home);
+        for at in [r"C:\src\blitz", r"C:\WindowsApps", r"D:\Windows"] {
+            let at = Some(PathBuf::from(at));
+            assert_eq!(first_dir(at.clone(), &[], root), at);
+        }
+        let at = Some(PathBuf::from(r"C:\Windows\system32"));
+        assert_eq!(first_dir(at.clone(), &[], None), at);
     }
 
     #[test]
