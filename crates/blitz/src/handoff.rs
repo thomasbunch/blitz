@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, HTCLIENT, SMTO_ABORTIFHUNG,
     SendMessageTimeoutW, WM_COPYDATA, WM_MOUSEACTIVATE,
 };
-use windows::core::HSTRING;
+use windows::core::{GUID, HSTRING};
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::UserEvent;
@@ -118,6 +118,58 @@ pub fn send(dir: Option<&Path>) -> Option<bool> {
         )
     };
     Some(sent.0 != 0 && took == 1)
+}
+
+/// Moves `hwnd` to the virtual desktop the user is on, so a launch from
+/// another desktop brings blitz over rather than switching desktops. That
+/// desktop is known by a window on it: the one in front, or failing that
+/// (the taskbar and the Start menu are on every desktop) the next one
+/// down that is.
+pub fn to_current_desktop(hwnd: HWND) {
+    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+    use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GW_HWNDNEXT, GetForegroundWindow, GetWindow, IsWindowVisible,
+    };
+    // SAFETY: COM is set up on this thread, which winit's window lives on;
+    // the calls take window handles, and a stale one only fails.
+    unsafe {
+        let Ok(desktops) =
+            CoCreateInstance::<_, IVirtualDesktopManager>(&VirtualDesktopManager, None, CLSCTX_ALL)
+        else {
+            return;
+        };
+        if desktops
+            .IsWindowOnCurrentVirtualDesktop(hwnd)
+            .is_ok_and(|b| b.as_bool())
+        {
+            return;
+        }
+        let mut windows = Vec::new();
+        let mut w = GetForegroundWindow();
+        // ponytail: looks at the first 64 windows down from the front.
+        while !w.is_invalid() && windows.len() < 64 {
+            if w != hwnd && IsWindowVisible(w).as_bool() {
+                let here = desktops.IsWindowOnCurrentVirtualDesktop(w);
+                let id = desktops.GetWindowDesktopId(w).unwrap_or_default();
+                windows.push((here.is_ok_and(|b| b.as_bool()), id));
+            }
+            w = GetWindow(w, GW_HWNDNEXT).unwrap_or_default();
+        }
+        if let Some(id) = current_desktop(windows.into_iter()) {
+            let _ = desktops.MoveWindowToDesktop(hwnd, &id);
+        }
+    }
+}
+
+/// The current virtual desktop, from windows in front-to-back order, each
+/// with whether it shows on the current desktop and the desktop it is on:
+/// none for one on every desktop.
+fn current_desktop(windows: impl Iterator<Item = (bool, GUID)>) -> Option<GUID> {
+    windows
+        .filter(|&(here, id)| here && id != GUID::zeroed())
+        .map(|(_, id)| id)
+        .next()
 }
 
 /// A press of a mouse button on the window while it was in the
@@ -227,6 +279,21 @@ mod tests {
         ACTIVATING.store(true, Ordering::Relaxed);
         forget_activating_click();
         assert!(!take_activating_click());
+    }
+
+    /// A launch from another virtual desktop brings blitz to that one,
+    /// which the taskbar and other windows on every desktop do not name.
+    #[test]
+    fn handoff_finds_the_desktop_the_user_is_on() {
+        let (a, b) = (GUID::from_u128(1), GUID::from_u128(2));
+        let everywhere = (true, GUID::zeroed());
+        assert_eq!(current_desktop([(true, a)].into_iter()), Some(a));
+        assert_eq!(
+            current_desktop([everywhere, (false, b), (true, a)].into_iter()),
+            Some(a)
+        );
+        assert_eq!(current_desktop([everywhere].into_iter()), None);
+        assert_eq!(current_desktop(std::iter::empty()), None);
     }
 
     /// A second launch without a folder only brings blitz to the front.

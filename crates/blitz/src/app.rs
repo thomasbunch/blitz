@@ -4774,13 +4774,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Handoff(ask) => {
+                let hwnd = HWND(self.hwnd as *mut c_void);
+                crate::handoff::to_current_desktop(hwnd);
                 // First, since a minimized window has no room for a pane.
                 if let Some(w) = &self.window {
                     w.set_minimized(false);
                 }
                 // SAFETY: our own window; the launch that sent this allowed
                 // this process to take the foreground.
-                let _ = unsafe { SetForegroundWindow(HWND(self.hwnd as *mut c_void)) };
+                let _ = unsafe { SetForegroundWindow(hwnd) };
                 if let crate::handoff::Ask::Open(dir) = ask {
                     self.add(Some(dir), new_tab);
                 }
