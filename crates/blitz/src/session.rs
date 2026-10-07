@@ -3,7 +3,7 @@
 
 use std::fmt::Write;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::hook::{Json, escape_json};
 use crate::layout::{self, Axis, Node, PaneId, Rect, Split, Tab};
@@ -197,6 +197,25 @@ pub fn dir() -> Option<PathBuf> {
 
 fn file() -> Option<PathBuf> {
     dir().map(|d| d.join("session.json"))
+}
+
+/// Whether hint `name` shows for the first time, noting in `dir` that it
+/// has: the `hints` file there lists those shown, one a line. One that
+/// cannot be noted does not show, so it never shows on every start.
+pub fn first_time_in(dir: &Path, name: &str) -> bool {
+    let file = dir.join("hints");
+    let shown = std::fs::read_to_string(&file).unwrap_or_default();
+    if shown.lines().any(|l| l == name) {
+        return false;
+    }
+    let noted = std::fs::create_dir_all(dir).and_then(|()| {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file)?;
+        writeln!(f, "{name}")
+    });
+    noted.is_ok()
 }
 
 /// The saved session. A missing or broken file reads as none. A byte order
@@ -524,6 +543,22 @@ mod tests {
         w: 1001,
         h: 601,
     };
+
+    #[test]
+    fn a_hint_shows_once_ever() {
+        let dir = std::env::temp_dir().join(format!("blitz-hints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            first_time_in(&dir, "keys"),
+            "the first time, folder and all"
+        );
+        assert!(!first_time_in(&dir, "keys"));
+        assert!(first_time_in(&dir, "other"), "each hint is its own");
+        assert!(!first_time_in(&dir, "other") && !first_time_in(&dir, "keys"));
+        // With nowhere to note it, it never shows.
+        assert!(!first_time_in(&dir.join("hints").join("x"), "keys"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn pane(cwd: &str, claude: Option<&str>) -> NodeState {
         NodeState::Pane(PaneMeta {

@@ -88,7 +88,8 @@ const VK_F4: u16 = 0x73;
 
 /// How long a notice that is neither a question nor an error stays up.
 const NOTICE: Duration = Duration::from_secs(5);
-/// How long a hint about setting something up stays up.
+/// How long a hint stays up: about setting something up, or the keys
+/// worth knowing on the first start.
 const HINT: Duration = Duration::from_secs(10);
 /// How long Claude Code may show it is working with no word from its
 /// hooks before blitz says they are not reporting. A turn's first hook
@@ -1619,6 +1620,14 @@ impl App {
                 std::thread::sleep(after);
                 let _ = proxy.send_event(UserEvent::Finish(0));
             });
+        }
+        // Once ever, a few keys worth knowing.
+        if !self.scripted()
+            && let Some(id) = self.focus_id()
+            && session::dir().is_some_and(|d| session::first_time_in(&d, "keys"))
+        {
+            let text = first_hint(&self.config.keys);
+            self.set_notice(id, text, Some(Instant::now() + HINT), true);
         }
         if !self.scripted() && !cfg!(debug_assertions) {
             let proxy = self.proxy.clone();
@@ -6202,6 +6211,22 @@ fn start_failed(e: &str, config: Option<&Path>) -> String {
     format!("blitz could not start: {e}{file}")
 }
 
+/// The hint the first start shows: the keys of the command palette and of
+/// a few actions worth knowing, as bound now. An action without keys is
+/// left out.
+fn first_hint(user: &[keymap::Binding]) -> String {
+    let keys = [
+        (Action::Palette, "every action"),
+        (Action::SplitRight, "split"),
+        (Action::JumpToAttention, "the session that needs you"),
+        (Action::Settings, "settings"),
+    ];
+    let parts: Vec<String> = (keys.iter())
+        .filter_map(|&(a, what)| Some(format!("{} {what}", keymap::keys_for(a, user)?)))
+        .collect();
+    parts.join(" \u{b7} ")
+}
+
 /// What a click on the banner does.
 #[derive(Debug, PartialEq)]
 enum BannerClick {
@@ -9043,6 +9068,24 @@ mod tests {
         assert!(a.handed_off(Some(true)), "taken");
         assert!(!a.handed_off(Some(false)), "hung or refused");
         assert!(a.new_window, "a window of its own");
+    }
+
+    #[test]
+    fn the_first_hint_names_the_keys_as_bound() {
+        assert_eq!(
+            first_hint(&[]),
+            "Ctrl+Shift+P every action \u{b7} Ctrl+Shift+R split \u{b7} \
+             Ctrl+Shift+J the session that needs you \u{b7} Ctrl+, settings"
+        );
+        let user = [
+            keymap::binding("alt+p=command_palette").expect("a binding"),
+            keymap::binding("ctrl+shift+r=none").expect("a binding"),
+            keymap::binding("ctrl+shift+j=none").expect("a binding"),
+        ];
+        assert_eq!(
+            first_hint(&user),
+            "Alt+P every action \u{b7} Ctrl+, settings"
+        );
     }
 
     #[test]
