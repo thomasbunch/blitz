@@ -41,7 +41,9 @@ use winit::platform::windows::{
     EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowId};
+use winit::window::{
+    CursorIcon, Fullscreen, Icon, UserAttentionType, Window, WindowAttributes, WindowId,
+};
 
 use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev, claude_title, exit_text};
@@ -51,7 +53,7 @@ use crate::keymap::{self, Action};
 use crate::layout::{self, Axis, Dir, PaneId, Rect, Tab};
 use crate::links::{Link, Target};
 use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
-use crate::render::chrome::{self, ChromeModel};
+use crate::render::chrome::{self, ChromeModel, Side};
 use crate::render::d3d11::{Gpu, Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
 use crate::session::{self, Geometry, PaneMeta};
@@ -115,6 +117,12 @@ const GFX_RETRY: Duration = Duration::from_secs(1);
 /// Time between the steps a drag scrolls while the pointer is held above
 /// or below its pane.
 const AUTOSCROLL: Duration = Duration::from_millis(50);
+/// How long a new window stays hidden waiting for its first frame.
+const FIRST_FRAME: Duration = Duration::from_millis(500);
+/// How often at most a terminal takes a new size while its pane keeps
+/// changing size, as in a live resize or a divider drag: each new size
+/// makes the program redraw its whole screen.
+const RESIZE_GAP: Duration = Duration::from_millis(80);
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -131,10 +139,13 @@ pub enum UserEvent {
     Checked(Result<Option<String>, String>),
     /// The installer started, so blitz exits; or why it did not.
     Installed(Result<(), String>),
-    /// Another launch handed this folder over to open in a new tab.
-    OpenHere(PathBuf),
+    /// Another launch asks the window to come to the front, and maybe to
+    /// open a tab in its folder.
+    Handoff(crate::handoff::Ask),
     /// Something in `%APPDATA%\blitz` was written: settings or a theme.
     Settings,
+    /// The user let go of the window after moving or sizing it.
+    Sized,
 }
 
 /// Command-line options of the GUI.
@@ -149,6 +160,8 @@ struct Args {
     exit_after: Option<Duration>,
     /// Open a window of its own, even if blitz is already running.
     new_window: bool,
+    /// blitz runs as administrator, and its title says so.
+    admin: bool,
 }
 
 impl Args {
@@ -180,29 +193,59 @@ impl Args {
         }
         Ok(a)
     }
+
+    /// A scripted or test run, which nobody watches.
+    fn scripted(&self) -> bool {
+        self.cmd.is_some()
+            || self.selftest.is_some()
+            || self.exit_after.is_some()
+            || self.capture.is_some()
+    }
+
+    /// A window of its own, which takes no launches. Run as administrator,
+    /// blitz is one too: it would otherwise take launches from programs
+    /// that are not, and resume the saved session's Claude Code sessions
+    /// elevated.
+    fn separate(&self) -> bool {
+        self.new_window || self.admin
+    }
+
+    /// The main window: this launch goes to a blitz already running first,
+    /// and the window restores and saves the session. Scripted and test
+    /// runs never are.
+    fn main(&self) -> bool {
+        !self.separate() && !self.scripted()
+    }
+
+    /// Takes what the blitz already running made of this launch, `None`
+    /// when none runs. True when it took the launch, which is then done.
+    /// One that runs but did not take it (it hung, or refused the folder)
+    /// keeps the saved session, so this launch gets a separate window: a
+    /// second main window would restore the same tabs and resume Claude
+    /// Code conversations that are live in the first.
+    fn handed_off(&mut self, sent: Option<bool>) -> bool {
+        self.new_window |= sent == Some(false);
+        sent == Some(true)
+    }
 }
 
 /// Runs the GUI until the window closes. Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
-    let args = match Args::parse(args) {
+    let mut args = match Args::parse(args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("blitz: {e}");
             return 2;
         }
     };
-    // A folder opens as a tab in the blitz already running. Scripted and
-    // test launches always get a window of their own.
-    let scripted = args.cmd.is_some()
-        || args.selftest.is_some()
-        || args.exit_after.is_some()
-        || args.capture.is_some();
-    if let Some(dir) = &args.cwd
-        && !args.new_window
-        && !scripted
-        && crate::handoff::send(dir)
-    {
-        return 0;
+    args.admin = elevated();
+    // A launch brings the blitz already running to the front, and a folder
+    // opens as a tab there.
+    if args.main() {
+        let sent = crate::handoff::send(args.cwd.as_deref());
+        if args.handed_off(sent) {
+            return 0;
+        }
     }
     // Loading the graphics driver is most of the time to the first
     // frame; it runs while the window is made.
@@ -486,6 +529,8 @@ struct Mouse {
     divider: Option<(usize, (i32, i32))>,
     /// The pointer is over a divider along this axis and shows it.
     over_divider: Option<Axis>,
+    /// What in the sidebar the pointer is over.
+    over_side: Option<Side>,
     /// A left-button drag is making a selection.
     drag: Option<Drag>,
     /// When the drag next scrolls, while the pointer is outside its pane.
@@ -493,6 +538,8 @@ struct Mouse {
     /// The last press that went to selection: when, on which cell, and
     /// how many clicks it made.
     click: Option<(Instant, Pos, u8)>,
+    /// The same for the last press on a divider, by its index.
+    divider_click: Option<(Instant, Pos, u8)>,
 }
 
 /// A cell as a line number and a column. Line numbers stay with their
@@ -547,6 +594,15 @@ fn clicks(last: Option<(Instant, Pos, u8)>, at: Pos, now: Instant, within: Durat
         Some((t, p, n)) if p == at && now.saturating_duration_since(t) <= within => n % 3 + 1,
         _ => 1,
     }
+}
+
+/// Whether a press on divider `i` double-clicks it, which gives the panes
+/// equal space. `last` holds the last press on a divider and takes this
+/// one.
+fn evens(last: &mut Option<(Instant, Pos, u8)>, i: usize, now: Instant, within: Duration) -> bool {
+    let n = clicks(*last, (i, 0), now, within);
+    *last = Some((now, (i, 0), n));
+    n == 2
 }
 
 /// Selected cells in the focused pane.
@@ -741,6 +797,10 @@ struct View {
     snap: Snapshot,
     /// The terminal's size in cells.
     grid: (u16, u16),
+    /// When the terminal last took a new size, and when its pane's new
+    /// size goes to it; see [`resize_wait`].
+    resized: Option<Instant>,
+    resize_at: Option<Instant>,
     /// Where the grid went in the last frame; `None` while its tab is
     /// hidden.
     rect: Option<Rect>,
@@ -762,6 +822,9 @@ struct View {
     key: String,
     /// The command line it runs in place of the shell.
     cmd: Option<String>,
+    /// The number after the session's name, which tells look-alike
+    /// sessions apart; kept across restarts.
+    num: u32,
     /// The progress the program last reported, and when.
     progress: Option<(chrome::Progress, Instant)>,
     /// When the title first showed Claude Code working.
@@ -814,11 +877,14 @@ struct App {
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
-    /// Every session, oldest first, which is the order the sidebar lists.
+    /// Every session, oldest first. The sidebar lists them as their panes
+    /// sit.
     views: Vec<View>,
-    /// Each session's sidebar row in the last frame, for clicks.
-    rows: Vec<(PaneId, Rect)>,
+    /// What a click in the sidebar acted on in the last frame.
+    side: chrome::SideHits,
     next_id: u32,
+    /// The number the next new session shows after its name.
+    next_num: u32,
     focused: bool,
     /// A session changed while the user was away from the screen; the
     /// focused pane counts as seen once they are back.
@@ -837,23 +903,34 @@ struct App {
     /// A newer release: its version and the banner text.
     update: Option<(String, String)>,
     /// The installer is downloading, or Ctrl+Shift+U is looking for a
-    /// release; this pane shows that.
+    /// release; this pane hears how it went.
     updating: Option<PaneId>,
     /// The folder and Claude Code session of the pane closed last, which
     /// the palette can reopen.
     closed: Option<(String, Option<String>)>,
+    /// Said in the banner in place of the offer for now: the question that
+    /// running Update again answers, or that the update is downloading.
+    banner_note: Option<(String, Ask)>,
     /// The banner strip in the last frame, for clicks.
     banner: Option<Rect>,
+    /// The chips on panes scrolled back in the last frame, for clicks.
+    below: Vec<(PaneId, Rect)>,
     /// Keys whose releases belong to a shortcut or a panel and are not sent.
     eaten: Eaten,
     /// Where the IME was last told the cursor is, in client pixels.
     ime_at: Option<(i32, i32)>,
+    /// What the title bar shows.
+    title: String,
     /// Checked once the first output shows which ConPTY is running.
     checked_conpty: bool,
     capture_then_exit: bool,
     /// This is the main window, whose layout is saved for the next start.
     /// Separate windows and scripted runs leave the saved one alone.
     persist: bool,
+    /// The window is hidden until its first frame, or until this time.
+    hidden_until: Option<Instant>,
+    /// The window shows maximized, as the saved session left it.
+    maximize: bool,
     /// The session as last saved.
     saved: Option<session::State>,
     /// When a changed layout is saved, unless it changes back first.
@@ -1064,12 +1141,7 @@ impl App {
     fn new(args: Args, keys: Rc<RefCell<Keys>>, proxy: EventLoopProxy<UserEvent>) -> App {
         let config = Config::load();
         let theme = crate::theme::current(&config.theme);
-        let a = &args;
-        let persist = !a.new_window
-            && a.cmd.is_none()
-            && a.selftest.is_none()
-            && a.exit_after.is_none()
-            && a.capture.is_none();
+        let persist = args.main();
         App {
             args,
             config,
@@ -1092,8 +1164,9 @@ impl App {
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
-            rows: Vec::new(),
+            side: chrome::SideHits::default(),
             next_id: 1,
+            next_num: 1,
             focused: false,
             away: false,
             selection: None,
@@ -1104,12 +1177,17 @@ impl App {
             update: None,
             updating: None,
             closed: None,
+            banner_note: None,
             banner: None,
+            below: Vec::new(),
             eaten: Eaten::default(),
             ime_at: None,
+            title: "blitz".into(),
             checked_conpty: false,
             capture_then_exit: false,
             persist,
+            hidden_until: None,
+            maximize: false,
             saved: None,
             save_after: None,
             gfx_retry: None,
@@ -1126,20 +1204,28 @@ impl App {
         }
     }
 
-    fn font_px(&self) -> f32 {
-        (self.config.font_size + self.font_zoom) * 96.0 / 72.0 * self.scale as f32
+    /// The terminal font's size in pixels, zoomed, and the size the
+    /// settings give it, which the chrome follows.
+    fn font_px(&self) -> (f32, f32) {
+        let px = |pt: f32| pt * 96.0 / 72.0 * self.scale as f32;
+        let set = self.config.font_size;
+        (px(set + self.font_zoom), px(set))
     }
 
     /// Creates the window and starts the first session.
     fn start(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
+        // Hidden until its first frame, which would otherwise come after a
+        // flash of white or black.
+        self.hidden_until = Some(Instant::now() + FIRST_FRAME);
         let mut attrs = Window::default_attributes()
-            .with_title("blitz")
+            .with_title(window_title(0, "", self.args.admin))
+            .with_visible(false)
             .with_inner_size(LogicalSize::new(980.0, 620.0))
             // Icon group 1, which build.rs links in.
             .with_window_icon(Icon::from_resource(1, Some(small_icon_size())).ok())
             .with_taskbar_icon(Icon::from_resource(1, None).ok());
         // Only the main window takes folders from other launches.
-        if !self.args.new_window {
+        if !self.args.separate() {
             attrs = attrs.with_class_name(crate::handoff::CLASS);
         }
         let saved = (self.persist && self.config.restore_session)
@@ -1152,10 +1238,8 @@ impl App {
         {
             let g = on_screen(el, g);
             self.placed = g;
-            attrs = attrs
-                .with_position(PhysicalPosition::new(g.x, g.y))
-                .with_inner_size(PhysicalSize::new(g.w, g.h))
-                .with_maximized(g.maximized);
+            self.maximize = g.maximized;
+            attrs = placed_at(attrs, g);
         }
         let window = el.create_window(attrs).map_err(|e| e.to_string())?;
         window.set_ime_allowed(true);
@@ -1165,14 +1249,15 @@ impl App {
         {
             self.hwnd = h.hwnd.get();
         }
-        if !self.args.new_window {
-            crate::handoff::install(self.hwnd, self.proxy.clone());
-        }
+        crate::handoff::install(self.hwnd, self.proxy.clone(), !self.args.separate());
         watch_settings(self.proxy.clone());
         self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
         self.frame_theme();
         self.window = Some(window);
         self.ensure_gfx();
+        // The background, before sessions start, so the window shows at
+        // once however long they take.
+        self.redraw();
 
         let mut win = layout::Window::default();
         let mut lost = None;
@@ -1192,7 +1277,7 @@ impl App {
         if self.views.is_empty() || self.args.cwd.is_some() {
             let cwd = match &self.args.cwd {
                 Some(dir) => start_dir(dir),
-                None => std::env::current_dir().ok(),
+                None => first_dir(std::env::current_dir().ok(), &not_a_start()),
             };
             let id = PaneId(self.next_id);
             win.tabs.push(Tab::new(String::new(), id));
@@ -1209,6 +1294,11 @@ impl App {
             }
         }
 
+        // A dev build is left alone; a scripted run and a separate window
+        // have nothing to come back to.
+        if self.persist && !cfg!(debug_assertions) {
+            restart_after_reboot();
+        }
         if let Some(script) = self.args.selftest.clone() {
             self.start_selftest(script);
         }
@@ -1261,11 +1351,7 @@ impl App {
         cwd: Option<PathBuf>,
     ) -> Result<(), String> {
         let grids = self.grids(&win);
-        let split = self.focus_id();
-        let small = |&(p, (c, r)): &(PaneId, (i32, i32))| {
-            (p == id || Some(p) == split) && (c < layout::MIN_COLS || r < layout::MIN_ROWS)
-        };
-        if !self.views.is_empty() && grids.iter().any(small) {
+        if !self.views.is_empty() && no_room(&win, &grids, id, self.focus_id()) {
             return Err("no room for another pane".into());
         }
         self.spawn(id, &grids, cmd, cwd, None)?;
@@ -1280,7 +1366,8 @@ impl App {
     fn restore(&mut self, s: &session::State) -> Result<(), String> {
         let (win, panes) = s.layout(self.next_id);
         let grids = self.grids(&win);
-        for (id, meta) in panes {
+        let (nums, next) = session::numbers(&panes.iter().map(|p| p.1.num).collect::<Vec<_>>());
+        for ((id, meta), num) in panes.into_iter().zip(nums) {
             // A session saved before panes had keys filed output by tab
             // and leaf; the pane's fresh key files it anew at the next exit.
             let old = (self.config.restore_scrollback)
@@ -1301,12 +1388,14 @@ impl App {
                 });
             if let Err(e) = started {
                 self.views.clear();
+                self.next_num = 1;
                 return Err(e);
             }
-            if let Some(v) = self.views.last_mut()
-                && session::is_key(&meta.key)
-            {
-                v.key = meta.key.clone();
+            if let Some(v) = self.views.last_mut() {
+                v.num = num;
+                if session::is_key(&meta.key) {
+                    v.key = meta.key.clone();
+                }
             }
             // A result the user had not seen before blitz closed.
             if let Some(msg) = &meta.done
@@ -1320,6 +1409,8 @@ impl App {
             }
             self.resume(id, meta.claude.clone());
         }
+        // New sessions take their numbers after the restored ones.
+        self.next_num = next;
         self.install(win);
         Ok(())
     }
@@ -1366,8 +1457,8 @@ impl App {
     }
 
     /// Starts a session for pane `id`, sized as `grids` lays it out (or
-    /// 80x24 while hidden), running `cmd` or else the shell, below `old`,
-    /// output saved by [`session::save_output`].
+    /// 80x24 when it has no place there), running `cmd` or else the shell,
+    /// below `old`, output saved by [`session::save_output`].
     fn spawn(
         &mut self,
         id: PaneId,
@@ -1389,41 +1480,64 @@ impl App {
         let token = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
         // Not the token, which is a secret between the pane and its child.
         let key = crate::pty::pane_token().map_err(|e| format!("cannot start a session: {e}"))?;
+        let shell =
+            |program: &str| crate::shell::launch(program, self.config.shell_integration, &token);
         let mut launch = match cmd {
             Some(c) => crate::shell::Launch {
                 cmdline: c.to_string(),
                 env: Vec::new(),
             },
-            None => crate::shell::launch(&self.config.shell, self.config.shell_integration, &token),
+            None => shell(&self.config.shell),
         };
         // Claude Code loads blitz's hooks from there, with nothing pasted
         // into its settings.
-        if let Some(dir) = &self.plugin {
+        let plugin = self.plugin.as_ref().map(|dir| {
             let inherited = std::env::var("CLAUDE_CODE_PLUGIN_DIRS").ok();
             let dirs = crate::hook::plugin_dirs(inherited.as_deref(), dir);
-            launch.env.push(("CLAUDE_CODE_PLUGIN_DIRS".into(), dirs));
-        }
-        let proxy = self.proxy.clone();
-        let mut pane = Pane::spawn(
-            id,
-            &Spawn {
-                cmdline: &launch.cmdline,
-                env: &launch.env,
-                cwd: cwd.as_deref(),
-                cols: grid.0,
-                rows: grid.1,
-                scrollback: self.config.scrollback_lines,
-                dark: !self.theme.light,
-                pal: self.theme.pal,
-                parent: Some(self.hwnd),
-                token: &token,
-                restored: &restored,
-            },
-            move |id, note| {
-                let _ = proxy.send_event(UserEvent::Pane(id, note));
-            },
-        )
-        .map_err(|e| format!("cannot start {}: {e}", launch.cmdline))?;
+            ("CLAUDE_CODE_PLUGIN_DIRS".to_owned(), dirs)
+        });
+        launch.env.extend(plugin.clone());
+        let start = |launch: &crate::shell::Launch| {
+            let proxy = self.proxy.clone();
+            Pane::spawn(
+                id,
+                &Spawn {
+                    cmdline: &launch.cmdline,
+                    env: &launch.env,
+                    cwd: cwd.as_deref(),
+                    cols: grid.0,
+                    rows: grid.1,
+                    scrollback: self.config.scrollback_lines,
+                    dark: !self.theme.light,
+                    pal: self.theme.pal,
+                    parent: Some(self.hwnd),
+                    token: &token,
+                    restored: &restored,
+                },
+                move |id, note| {
+                    let _ = proxy.send_event(UserEvent::Pane(id, note));
+                },
+            )
+        };
+        let mut fell_back = None;
+        let mut pane = match start(&launch) {
+            Ok(p) => p,
+            // A shell setting that names a missing or mistyped program would
+            // fail every pane, and blitz would close as it opened. The shell
+            // blitz finds runs instead, and the pane says why.
+            Err(e) if cmd.is_none() && !self.config.shell.is_empty() => {
+                let mut auto = shell("");
+                auto.env.extend(plugin);
+                let p =
+                    (start(&auto)).map_err(|e| format!("cannot start {}: {e}", auto.cmdline))?;
+                let keys = keymap::keys_for(Action::Settings, &self.config.keys);
+                let using = program_name(&auto.cmdline);
+                fell_back = Some(shell_failed(&self.config.shell, &e, &using, keys));
+                launch = auto;
+                p
+            }
+            Err(e) => return Err(format!("cannot start {}: {e}", launch.cmdline)),
+        };
         let (cw, ch) = self.cell();
         lock(&pane.term).set_cell_px(cw as u16, ch as u16);
         pane.name = program_name(&launch.cmdline);
@@ -1431,6 +1545,8 @@ impl App {
             pane,
             snap: Snapshot::default(),
             grid,
+            resized: None,
+            resize_at: None,
             rect: None,
             notice: None,
             flashed: None,
@@ -1440,12 +1556,19 @@ impl App {
             sync_until: None,
             key,
             cmd: cmd.map(str::to_owned),
+            num: self.next_num,
             progress: None,
             claude_working: None,
             hooks_seen: false,
         });
+        if let Some(text) = fell_back {
+            // It covers the pane's last row, so it stays only until the
+            // next key there, having been seen.
+            self.error(id, text);
+        }
         self.find_branch(id);
         self.next_id = self.next_id.max(id.0 + 1);
+        self.next_num = self.next_num.saturating_add(1);
         Ok(())
     }
 
@@ -1455,6 +1578,7 @@ impl App {
         self.win = win;
         // A divider being dragged is known by its place in the old layout.
         self.mouse.divider = None;
+        self.fit_min_size();
         self.focus_moved(before);
     }
 
@@ -1534,16 +1658,24 @@ impl App {
                 self.attention(id, Ev::Attended);
             }
         }
-        let title = self.current().map(|v| v.pane.title.clone());
-        self.set_title(&title.unwrap_or_default());
         if let (Some(w), Some(v)) = (&self.watched, self.current()) {
             *lock(w) = v.pane.term.clone();
         }
     }
 
-    fn set_title(&self, t: &str) {
-        if let Some(w) = &self.window {
-            w.set_title(if t.is_empty() { "blitz" } else { t });
+    /// Puts the focused pane's title and the number of sessions that need
+    /// you in the title bar, when either changed.
+    fn sync_title(&mut self) {
+        let waiting = (self.views.iter())
+            .filter(|v| v.pane.attn.state == Attn::NeedsYou)
+            .count();
+        let pane = self.current().map_or("", |v| v.pane.title.as_str());
+        let title = window_title(waiting, pane, self.args.admin);
+        if title != self.title
+            && let Some(w) = &self.window
+        {
+            w.set_title(&title);
+            self.title = title;
         }
     }
 
@@ -1595,6 +1727,11 @@ impl App {
         self.gfx.as_ref().map_or((8, 16), |g| g.r.cell())
     }
 
+    /// Cell size of the chrome font.
+    fn text_cell(&self) -> (u32, u32) {
+        self.gfx.as_ref().map_or((6, 12), |g| g.r.small_cell())
+    }
+
     /// What the chrome needs to lay out `win` in the window as it is now.
     fn model<'a>(
         &'a self,
@@ -1609,13 +1746,17 @@ impl App {
         ChromeModel {
             win,
             sessions,
+            hover: match self.mouse.over_side {
+                Some(Side::Session(id)) => Some(id),
+                _ => None,
+            },
             ui: self.theme.ui,
             size: (size.width as i32, size.height as i32),
             scale: self.scale as f32,
-            text_cell: self.gfx.as_ref().map_or((6, 12), |g| g.r.small_cell()),
+            text_cell: self.text_cell(),
             term_cell: self.cell(),
             now: Instant::now(),
-            banner: self.update.as_ref().map(|u| u.1.as_str()),
+            banner: self.banner(),
             preedit,
             picker: self.picker.as_ref().map(|p| chrome::Picker {
                 filter: &p.filter,
@@ -1689,7 +1830,8 @@ impl App {
 
     /// Window frame in the theme's colours: dark or light everywhere, and
     /// on Windows 11 the title bar, title text and border too (older
-    /// Windows refuses those and keeps the dark or light frame).
+    /// Windows refuses those and keeps the dark or light frame). So is what
+    /// a live resize shows past the last frame.
     fn frame_theme(&self) {
         let hwnd = HWND(self.hwnd as *mut c_void);
         let dark = windows::core::BOOL::from(!self.theme.light);
@@ -1714,6 +1856,9 @@ impl App {
             let _ = unsafe {
                 DwmSetWindowAttribute(hwnd, attr, (&raw const c).cast(), size_of_val(&c) as u32)
             };
+        }
+        if let Some(g) = &self.gfx {
+            g.chain.set_background(self.theme.pal.bg);
         }
     }
 
@@ -1927,8 +2072,9 @@ impl App {
     /// Takes new settings and shows the font and theme they pick. The
     /// rest are read where they are used.
     fn apply_config(&mut self, c: Config) {
-        let font =
-            (&c.font_family, c.font_size) != (&self.config.font_family, self.config.font_size);
+        let old = &self.config;
+        let font = (&c.font_family, c.font_size, c.line_height)
+            != (&old.font_family, old.font_size, old.line_height);
         if c.font_size != self.config.font_size {
             self.font_zoom = 0.0;
         }
@@ -1946,16 +2092,19 @@ impl App {
     /// Loads the configured font at the size the window's DPI and the font
     /// zoom need, and tells each terminal its new cell size.
     fn reload_font(&mut self) {
-        let px = self.font_px();
-        if let Some(g) = &mut self.gfx
-            && let Err(e) = g.r.set_font(&self.config.font_family, px)
-        {
-            eprintln!("blitz: font: {e}");
+        let (px, base) = self.font_px();
+        if let Some(g) = &mut self.gfx {
+            let (scale, c) = (self.scale as f32, &self.config);
+            if let Err(e) = g.r.set_font(&c.font_family, px, base, scale, c.line_height) {
+                eprintln!("blitz: font: {e}");
+            }
+            g.r.set_scale(scale);
         }
         let (cw, ch) = self.cell();
         for v in &self.views {
             lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
         }
+        self.fit_min_size();
         self.request_redraw();
     }
 
@@ -2120,18 +2269,18 @@ impl App {
         true
     }
 
-    /// The size in cells of each pane `win` would show now.
+    /// The size in cells of each pane of `win` in the window as it is now.
     fn grids(&self, win: &layout::Window) -> Vec<(PaneId, (i32, i32))> {
-        let (cw, ch) = self.cell();
-        let c = chrome::build(&self.model(win, &[], None));
-        c.panes
-            .iter()
-            .map(|&(id, r)| (id, (r.w / cw as i32, r.h / ch as i32)))
-            .collect()
+        tab_grids(win, self.cell(), |w| {
+            chrome::build(&self.model(w, &[], None)).panes
+        })
     }
 
     /// Every session as the sidebar shows it.
     fn sessions(&self) -> Vec<chrome::Session> {
+        // Only a pane on screen shows how far it is scrolled back; the
+        // others' terminals are left to their output.
+        let shown = (self.win.tabs.get(self.win.active)).map_or_else(Vec::new, |t| t.panes());
         let mut list: Vec<chrome::Session> = (self.views.iter())
             .map(|v| {
                 let p = &v.pane;
@@ -2140,7 +2289,7 @@ impl App {
                 chrome::Session {
                     id: p.id,
                     name,
-                    num: None,
+                    num: Some(v.num),
                     cwd: p.cwd.clone(),
                     branch: p.branch.clone(),
                     state: p.attn.state,
@@ -2151,6 +2300,11 @@ impl App {
                     msg,
                     progress: v.progress.map(|p| p.0),
                     exit_code: p.exit_code,
+                    below: if shown.contains(&p.id) {
+                        lock(&p.term).viewport()
+                    } else {
+                        0
+                    },
                 }
             })
             .collect();
@@ -2170,21 +2324,24 @@ impl App {
         };
         let size = window.inner_size();
         let early = self.gpu.take().and_then(|h| h.join().ok()?.ok());
-        let (family, px) = (&self.config.font_family, self.font_px());
+        let (c, (px, base), scale) = (&self.config, self.font_px(), self.scale as f32);
         let built = match early {
             Some(gpu) => Ok(gpu),
             None => Gpu::new(false),
         }
-        .and_then(|gpu| Renderer::with_gpu(gpu, family, px));
-        let built = built.and_then(|r| {
+        .and_then(|gpu| Renderer::with_gpu(gpu, &c.font_family, px, base, scale, c.line_height));
+        let built = built.and_then(|mut r| {
+            r.set_scale(scale);
             let hwnd = HWND(self.hwnd as *mut c_void);
             let chain = Swapchain::new(&r.gpu, hwnd, size.width, size.height)?;
+            chain.set_background(self.theme.pal.bg);
             Ok(Gfx { r, chain })
         });
         match built {
             Ok(g) => {
                 self.gfx = Some(g);
                 self.gfx_retry = None;
+                self.fit_min_size();
             }
             Err(e) => {
                 eprintln!("blitz: renderer: {e}");
@@ -2316,6 +2473,8 @@ impl App {
             let here = Some(v.pane.id) == focus;
             gone |= v.notice.take_if(|n| n.ask.gone(a, here)).is_some();
         }
+        // The update's question in the banner goes the same way.
+        gone |= (self.banner_note.take_if(|n| n.1.gone(a, true))).is_some();
         if gone {
             self.request_redraw();
         }
@@ -2633,10 +2792,7 @@ impl App {
                     self.closed = Some((cwd, claude));
                 }
             }
-            Action::ToggleSidebar => {
-                self.win.sidebar_expanded = !self.win.sidebar_expanded;
-                self.request_redraw();
-            }
+            Action::ToggleSidebar => return self.toggle_sidebar(),
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
             Action::Palette => {
@@ -2709,7 +2865,8 @@ impl App {
                 }
                 // Updating restarts blitz, which ends every session.
                 let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
-                if busy > 0 && !self.confirmed(id, &Ask::Update) {
+                let asked = self.banner_note.take_if(|n| n.1 == Ask::Update);
+                if busy > 0 && asked.is_none() {
                     let what = if busy == 1 {
                         "A session is"
                     } else {
@@ -2717,11 +2874,14 @@ impl App {
                     };
                     let again = again(a, &self.config.keys);
                     let text = format!("{what} busy, and updating restarts blitz. {again}");
-                    self.ask(id, text, Ask::Update);
+                    self.banner_note = Some((text, Ask::Update));
+                    self.request_redraw();
                     return true;
                 }
                 self.updating = Some(id);
-                self.set_notice(id, format!("Downloading blitz {v}\u{2026}"), None, true);
+                let text = format!("Downloading blitz {v}\u{2026}");
+                self.banner_note = Some((text, Ask::Nothing));
+                self.request_redraw();
                 let proxy = self.proxy.clone();
                 std::thread::spawn(move || {
                     let done = std::panic::catch_unwind(move || crate::update::install(&v))
@@ -2766,7 +2926,6 @@ impl App {
             // Borderless on the window's monitor. winit puts the window back
             // where it was; the session keeps that place, not the monitor's.
             Action::Fullscreen => {
-                self.note_place();
                 if let Some(w) = &self.window {
                     let full = w.fullscreen().is_none();
                     w.set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
@@ -2837,6 +2996,21 @@ impl App {
                 });
                 self.request_redraw();
             }
+            // Windows opens it on Alt+Space itself, but blitz takes every
+            // key before Windows sees it.
+            Action::SystemMenu => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    PostMessageW, SC_KEYMENU, WM_SYSCOMMAND,
+                };
+                let (menu, space) = (
+                    WPARAM(SC_KEYMENU as usize),
+                    LPARAM(i32::from(b' ') as isize),
+                );
+                let hwnd = HWND(self.hwnd as *mut c_void);
+                // SAFETY: our own window, and a message that carries no pointers.
+                let _ = unsafe { PostMessageW(Some(hwnd), WM_SYSCOMMAND, menu, space) };
+            }
         }
         true
     }
@@ -2906,7 +3080,6 @@ impl App {
     /// it needs the user, what to show and which session it is, and
     /// blitz's own prompt coming back says it has exited.
     fn on_term_event(&mut self, id: PaneId, e: Event) {
-        let focus = self.focus_id() == Some(id);
         let bell = self.config.bell_attention;
         let Some(v) = self.view_mut(id) else {
             return;
@@ -2920,10 +3093,6 @@ impl App {
                 let (was, now) = (v.pane.claude_title, claude_title(&t).map(|c| c.0));
                 v.pane.claude_title = now;
                 v.pane.title = t;
-                if focus {
-                    let t = v.pane.title.clone();
-                    self.set_title(&t);
-                }
                 // This needs no hooks, and it sees a turn the user
                 // interrupted end, which runs no hook at all.
                 match (was, now) {
@@ -3141,7 +3310,17 @@ impl App {
             .as_ref()
             .map_or(PhysicalSize::new(0, 0), |w| w.inner_size());
         let size = (size.width as i32, size.height as i32);
-        chrome::area(&self.win, size, self.scale as f32, self.update.is_some())
+        let tw = self.text_cell().0 as i32;
+        chrome::area(&self.win, size, self.scale as f32, self.banner(), tw)
+    }
+
+    /// The text of the update strip or cue, which also decides whether
+    /// the strip takes room under the panes.
+    fn banner(&self) -> Option<&str> {
+        banner_text(
+            self.update.as_ref(),
+            self.banner_note.as_ref().map(|n| n.0.as_str()),
+        )
     }
 
     /// The session under a point in the window: a pane of the active tab,
@@ -3151,7 +3330,7 @@ impl App {
         let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
         let area = self.tab_area();
         let (rects, side) = match self.win.tabs.get(self.win.active) {
-            Some(_) if x < area.x => (self.rows.clone(), true),
+            Some(_) if x < area.x => (self.side.rows.clone(), true),
             Some(t) => (t.rects(area), false),
             None => (Vec::new(), false),
         };
@@ -3171,12 +3350,33 @@ impl App {
     /// `MIN_ROWS` cells in a tab of several panes, which is what dragging
     /// and resizing work on.
     fn min_pane(&self) -> (i32, i32) {
-        let (cw, ch) = self.cell();
-        let frame = chrome::pane_frame(self.scale as f32, self.win.sidebar_expanded, true);
-        (
-            layout::MIN_COLS * cw as i32 + frame.0,
-            layout::MIN_ROWS * ch as i32 + frame.1,
+        let th = self.text_cell().1 as i32;
+        pane_min(
+            self.cell(),
+            th,
+            self.scale as f32,
+            self.win.sidebar_expanded,
         )
+    }
+
+    /// Expands or collapses the sidebar, and with it the smallest the
+    /// window may get. False when there is none to change.
+    fn toggle_sidebar(&mut self) -> bool {
+        if !self.win.toggle_sidebar() {
+            return false;
+        }
+        self.fit_min_size();
+        self.request_redraw();
+        true
+    }
+
+    /// Keeps the window from getting smaller than [`min_window`] for the
+    /// layout, font and scale in use.
+    fn fit_min_size(&self) {
+        if let Some(w) = &self.window {
+            let min = min_window(&self.win, self.cell(), self.text_cell(), self.scale as f32);
+            w.set_min_inner_size(Some(min));
+        }
     }
 
     /// Brings a session to the front: its tab becomes the active one and
@@ -3188,6 +3388,16 @@ impl App {
             self.win.tabs[i].focus(id);
         }
         self.focus_moved(before);
+    }
+
+    /// Shows one of `ids`, the sessions the sidebar has no room for (see
+    /// [`hidden_target`]).
+    fn show_hidden(&mut self, ids: &[PaneId]) {
+        let states = (ids.iter()).filter_map(|&id| self.view(id));
+        let hidden: Vec<_> = states.map(|v| (v.pane.id, v.pane.attn)).collect();
+        if let Some(id) = hidden_target(&hidden, self.focus_id()) {
+            self.show(id);
+        }
     }
 
     /// Whether mouse events go to the program rather than to selection.
@@ -3218,14 +3428,27 @@ impl App {
     }
 
     fn on_mouse_button(&mut self, el: &ActiveEventLoop, state: ElementState, button: MouseButton) {
+        let pressed = state == ElementState::Pressed;
+        // Asked for every press, so a click with another button never
+        // leaves it for the next one.
+        let activating = pressed && crate::handoff::take_activating_click();
         let b = match button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
             MouseButton::Right => 2,
             _ => return,
         };
+        // The click that brings blitz to the front only moves focus. Sent
+        // on, it could pick an option of a Claude Code prompt the user has
+        // not read yet.
+        if activating {
+            let open = self.commands.is_some() || self.settings.is_some() || self.game.is_some();
+            if let (Some(id), false) = (self.hit(self.mouse.pos).0, open) {
+                self.show(id);
+            }
+            return;
+        }
         let mods = mods_now();
-        let pressed = state == ElementState::Pressed;
         // Presses go to the command palette or the settings panel; a
         // release still goes wherever its press went.
         if pressed && self.commands.is_some() {
@@ -3251,25 +3474,58 @@ impl App {
             self.act(el, Action::Update);
             return;
         }
+        let chip = (self.below.iter())
+            .find(|(_, r)| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        if pressed
+            && b == 0
+            && let Some(&(id, _)) = chip
+        {
+            if let Some(v) = self.view_mut(id) {
+                lock(&v.pane.term).scroll_viewport(isize::MIN);
+            }
+            self.request_redraw();
+            return;
+        }
         if b == 0 && !pressed && self.mouse.divider.take().is_some() {
+            self.settle();
             return;
         }
         if let Some((i, _)) = self
             .divider_at(self.mouse.pos)
             .filter(|_| pressed && b == 0)
         {
-            self.mouse.divider = Some((i, self.min_pane()));
+            // SAFETY: a plain query.
+            let within = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+            if evens(&mut self.mouse.divider_click, i, Instant::now(), within) {
+                self.act(el, Action::Equalize);
+            } else {
+                self.mouse.divider = Some((i, self.min_pane()));
+            }
             return;
         }
-        // A click on another pane or in the sidebar only moves focus.
-        if pressed {
-            let (id, side) = self.hit(self.mouse.pos);
-            if side || id.is_some_and(|id| Some(id) != self.focus_id()) {
-                if let Some(id) = id {
-                    self.show(id);
+        // A click in the sidebar goes to what it is on.
+        if pressed && x < self.tab_area().x {
+            match self.side.at(x, y) {
+                Some(Side::Session(id)) => self.show(id),
+                Some(Side::Tab(i)) => {
+                    if let Some(id) = self.win.tabs.get(i).map(|t| t.focus) {
+                        self.show(id);
+                    }
                 }
-                return;
+                Some(Side::More(ids)) => self.show_hidden(&ids),
+                Some(Side::Rail) => {
+                    self.toggle_sidebar();
+                }
+                None => {}
             }
+            return;
+        }
+        // A click on another pane only moves focus.
+        if pressed
+            && let Some(id) = (self.hit(self.mouse.pos).0).filter(|&id| Some(id) != self.focus_id())
+        {
+            self.show(id);
+            return;
         }
         let program = self.mouse_to_program(&mods).and(self.focus_id());
         if let Some(id) = route_button(&mut self.mouse.reported, b, pressed, program) {
@@ -3410,7 +3666,7 @@ impl App {
     fn link_under(&self, pos: PhysicalPosition<f64>) -> Option<(Target, (Pos, Pos))> {
         let v = self
             .current()
-            .filter(|v| self.hit(pos).0 == Some(v.pane.id))?;
+            .filter(|v| self.hit(pos) == (Some(v.pane.id), false))?;
         let (col, row) = self.cell_at(pos);
         let t = lock(&v.pane.term);
         let at = (t.view_top() + usize::from(row), col);
@@ -3462,16 +3718,27 @@ impl App {
         if hover == self.hover {
             return;
         }
-        if let Some(w) = &self.window
-            && hover.is_some() != self.hover.is_some()
-        {
-            w.set_cursor(if hover.is_some() {
-                CursorIcon::Pointer
-            } else {
-                CursorIcon::Default
-            });
-        }
         self.hover = hover;
+        self.show_cursor();
+        self.request_redraw();
+    }
+
+    /// Shows the pointer for what is under it.
+    fn show_cursor(&self) {
+        if let Some(w) = &self.window {
+            let hand = self.hover.is_some() || self.mouse.over_side.is_some();
+            w.set_cursor(cursor_icon(self.mouse.over_divider, hand));
+        }
+    }
+
+    /// Notes what in the sidebar the pointer is over: the hand says a
+    /// click there does something, and a session's row lights up.
+    fn set_over_side(&mut self, over: Option<Side>) {
+        if over == self.mouse.over_side {
+            return;
+        }
+        self.mouse.over_side = over;
+        self.show_cursor();
         self.request_redraw();
     }
 
@@ -3505,18 +3772,16 @@ impl App {
         let over = self.divider_at(pos).map(|d| d.1);
         if over != self.mouse.over_divider {
             self.mouse.over_divider = over;
-            if let Some(w) = &self.window {
-                w.set_cursor(match over {
-                    Some(Axis::Row) => CursorIcon::ColResize,
-                    Some(Axis::Column) => CursorIcon::RowResize,
-                    None => CursorIcon::Default,
-                });
-            }
+            self.show_cursor();
         }
         // blitz run covers the panes, so programs see no motion under it.
         if self.game.is_some() {
             return;
         }
+        let (x, y) = (pos.x as i32, pos.y as i32);
+        let panel = self.commands.is_some() || self.settings.is_some();
+        let over = (x < self.tab_area().x && !panel).then(|| self.side.at(x, y));
+        self.set_over_side(over.flatten());
         self.update_hover();
         let mods = mods_now();
         // A drag goes where its press went, like the release will.
@@ -3594,7 +3859,7 @@ impl App {
     }
 
     /// Draws a frame. Resizes each visible session first when its pane
-    /// changed size, at most once per frame.
+    /// changed size, at most once per [`RESIZE_GAP`].
     fn redraw(&mut self) {
         let Some(window) = &self.window else {
             return;
@@ -3602,6 +3867,10 @@ impl App {
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return;
+        }
+        // A narrow window has no room for the sidebar.
+        if self.win.fit_width(size.width as f32 / self.scale as f32) {
+            self.fit_min_size();
         }
         self.ensure_gfx();
         let Some(g) = &self.gfx else {
@@ -3633,8 +3902,9 @@ impl App {
             .filter(|_| !self.preedit.is_empty())
             .map(|(c, r, _)| (c, r, self.preedit.as_str()));
         let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
-        self.rows = std::mem::take(&mut chrome.rows);
+        self.side = std::mem::take(&mut chrome.side);
         self.banner = chrome.banner;
+        self.below = std::mem::take(&mut chrome.below);
         self.settings_hits = chrome.settings.take();
         self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
@@ -3645,6 +3915,7 @@ impl App {
         let mut dimmed = Vec::new();
         for v in &mut self.views {
             v.rect = None;
+            v.resize_at = None;
         }
         for &(id, rect) in &chrome.panes {
             let Some(v) = self.views.iter_mut().find(|v| v.pane.id == id) else {
@@ -3654,12 +3925,16 @@ impl App {
             let grid = (fit(rect.w, cw), fit(rect.h, ch));
             let mut find = self.find.as_mut().filter(|f| f.pane == id);
             if grid != v.grid {
-                v.grid = grid;
-                v.pane.resize(grid.0, grid.1);
-                lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
-                // A new width rewraps the lines that matched.
-                if let Some(f) = &mut find {
-                    f.stale = true;
+                v.resize_at = resize_wait(v.resized, started);
+                if v.resize_at.is_none() {
+                    v.grid = grid;
+                    v.resized = Some(started);
+                    v.pane.resize(grid.0, grid.1);
+                    lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
+                    // A new width rewraps the lines that matched.
+                    if let Some(f) = &mut find {
+                        f.stale = true;
+                    }
                 }
             }
             v.rect = Some(rect);
@@ -3675,7 +3950,7 @@ impl App {
                 // frame with new output, ~50 ms for 100,000 full rows; keep
                 // the matches in scrollback rows if that ever shows.
                 if f.stale {
-                    f.search(&term, grid.1);
+                    f.search(&term, v.grid.1);
                 }
                 v.snap.highlight(&f.found, f.cur);
             }
@@ -3687,7 +3962,7 @@ impl App {
                 v.snap.block = sel.is_some_and(|s| s.drag.block);
                 let hover = self.hover.filter(|h| h.0 == term.line_epoch());
                 v.snap.hover = hover.and_then(|(_, a, b)| in_view(a, b, false, top, size));
-            } else if split {
+            } else if chrome::dims(split, v.pane.attn.state) {
                 dimmed.push(id);
             }
         }
@@ -3726,10 +4001,16 @@ impl App {
                     };
                     let dim = dimmed.contains(&v.pane.id);
                     let hollow = dim || !self.focused;
-                    g.r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
-                    if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code) {
-                        draw_notice(&mut g.r, &pal, at, v.grid, &text, dim);
-                    }
+                    // A terminal still at its old size until it is resized
+                    // shows only what fits its pane.
+                    let rows = v.grid.1.min((at.h / ch as i32) as u16);
+                    g.r.clipped(at, |r| {
+                        r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
+                        if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code)
+                        {
+                            draw_notice(r, &pal, at, (v.grid.0, rows), &text, dim);
+                        }
+                    });
                 }
                 g.r.chrome(&chrome);
                 let rtv = g.chain.rtv(&g.r.gpu)?;
@@ -3755,6 +4036,7 @@ impl App {
         self.counters.frame_cpu_ms += (started.elapsed() - waited).as_secs_f64() * 1000.0;
         match result {
             Ok(_) => {
+                self.reveal(true);
                 self.counters.frames += 1;
                 if self.counters.first_present_ms.is_none() {
                     self.counters.first_present_ms =
@@ -3794,31 +4076,53 @@ impl App {
         }
     }
 
-    /// Notes where the window is, unless it is minimized, maximized or full
-    /// screen, none of which is a place to go back to.
+    /// Gives each shown terminal its pane's size in the next frame, without
+    /// waiting out [`RESIZE_GAP`]: the window or a divider was let go.
+    fn settle(&mut self) {
+        for v in &mut self.views {
+            v.resized = None;
+        }
+        self.request_redraw();
+    }
+
+    /// Shows the hidden window when [`shows`] says so. One restored
+    /// maximized shows its first frame, then maximizes; the frame at the
+    /// new size follows.
+    fn reveal(&mut self, presented: bool) {
+        if shows(self.hidden_until, presented, Instant::now()) {
+            self.hidden_until = None;
+            if let Some(w) = &self.window {
+                w.set_visible(true);
+                if self.maximize {
+                    w.set_maximized(true);
+                }
+            }
+        }
+    }
+
+    /// Notes where the window is, each time it moves or changes size; see
+    /// [`placement`].
     fn note_place(&mut self) {
         let Some(w) = &self.window else {
             return;
         };
-        if !w.is_maximized()
-            && w.is_minimized() != Some(true)
-            && w.fullscreen().is_none()
-            && let Ok(p) = w.outer_position()
-        {
-            let size = w.inner_size();
-            self.placed = Geometry {
-                x: p.x,
-                y: p.y,
-                w: size.width,
-                h: size.height,
-                maximized: false,
-            };
-        }
+        let Ok(p) = w.outer_position() else {
+            return;
+        };
+        let size = w.inner_size();
+        let now = Geometry {
+            x: p.x,
+            y: p.y,
+            w: size.width,
+            h: size.height,
+            maximized: w.is_maximized(),
+        };
+        let (min, full) = (w.is_minimized() == Some(true), w.fullscreen().is_some());
+        self.placed = placement(self.placed, now, min, full);
     }
 
-    /// Saves the session when its tabs, splits or folders changed since
-    /// the last save, or always with `force`. The window's place alone
-    /// does not count, so dragging the window writes nothing until exit.
+    /// Saves the session when it [`changed`] since the last save, or always
+    /// with `force`.
     fn save_session(&mut self, force: bool) {
         if !self.persist || self.views.is_empty() {
             return;
@@ -3832,24 +4136,16 @@ impl App {
                 done: (v.filter(|v| v.pane.attn.state == Attn::DoneUnseen))
                     .map(|v| v.pane.msg.clone()),
                 name: v.and_then(|v| v.pane.named.clone()),
+                num: v.map_or(0, |v| v.num),
             }
         };
-        let mut s = session::State::capture(&self.win, self.placed, meta);
-        let same = self.saved.as_ref().is_some_and(|old| {
-            (old.sidebar_expanded, old.active, &old.tabs) == (s.sidebar_expanded, s.active, &s.tabs)
-        });
+        let s = session::State::capture(&self.win, self.placed, meta);
+        let changed = changed(self.saved.as_ref(), &s);
         let dragging = self.mouse.divider.is_some();
-        if !force && !save_now(!same, dragging, Instant::now(), &mut self.save_after) {
+        if !force && !save_now(changed, dragging, Instant::now(), &mut self.save_after) {
             return;
         }
         self.save_after = None;
-        self.note_place();
-        if let Some(w) = &self.window {
-            s.window = Geometry {
-                maximized: w.is_maximized(),
-                ..self.placed
-            };
-        }
         // Output, which changes all the time, is saved only at exit, and
         // only once the layout holding the keys it is filed by was written.
         match session::save(&s) {
@@ -3908,6 +4204,7 @@ impl App {
         let resume = (self.views.iter())
             .filter_map(|v| Some(v.resume.as_ref()?.1))
             .min();
+        let resize = self.views.iter().filter_map(|v| v.resize_at).min();
         // A changed layout waiting to be saved, and a renderer to retry.
         // A minimized window draws nothing, so it has nothing to retry.
         let shown = (self.window.as_ref())
@@ -3926,10 +4223,12 @@ impl App {
             notice,
             timer,
             resume,
+            resize,
             self.save_after,
             gfx,
             anim,
             self.mouse.scroll_at,
+            self.hidden_until,
         ]
         .into_iter()
         .flatten()
@@ -3981,6 +4280,35 @@ fn route_button(
     } else {
         reported[b].take()
     }
+}
+
+/// The pointer over a divider along `divider`, or with `hand` over a
+/// link or something in the sidebar a click acts on. Kept in one place,
+/// so leaving one of them cannot take the hand away from another.
+fn cursor_icon(divider: Option<Axis>, hand: bool) -> CursorIcon {
+    match divider {
+        Some(Axis::Row) => CursorIcon::ColResize,
+        Some(Axis::Column) => CursorIcon::RowResize,
+        None if hand => CursorIcon::Pointer,
+        None => CursorIcon::Default,
+    }
+}
+
+/// The one of `hidden`, sessions the sidebar has no room for, that a
+/// click on their count goes to: the one waiting longest for the user,
+/// else the one after `focus`, so clicks go round them all.
+fn hidden_target(
+    hidden: &[(PaneId, crate::attention::PaneAttn)],
+    focus: Option<PaneId>,
+) -> Option<PaneId> {
+    let others = (hidden.iter().copied()).filter(|h| Some(h.0) != focus);
+    crate::attention::jump_target(others).or_else(|| {
+        let next = (hidden.iter())
+            .position(|h| Some(h.0) == focus)
+            .map_or(0, |i| i + 1);
+        let h = hidden.get(next).or(hidden.first())?;
+        (Some(h.0) != focus).then_some(h.0)
+    })
 }
 
 /// Whether Windows shows animations; off under Accessibility, Visual
@@ -4201,6 +4529,28 @@ fn again(a: Action, keys: &[keymap::Binding]) -> String {
     }
 }
 
+/// The window title: the focused pane's, after how many sessions need you,
+/// so Alt+Tab, the taskbar and screen readers tell too, and marked the way
+/// Windows marks its own consoles when blitz runs as administrator.
+fn window_title(waiting: usize, pane: &str, admin: bool) -> String {
+    let pane = if pane.is_empty() { "blitz" } else { pane };
+    let pane = if admin {
+        format!("Administrator: {pane}")
+    } else {
+        pane.to_string()
+    };
+    match waiting {
+        0 => pane,
+        n => format!("({n}) {pane}"),
+    }
+}
+
+/// What the banner says about the update in hand: the note on it for now,
+/// else its offer; nothing without one.
+fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) -> Option<&'a str> {
+    update.map(|u| note.unwrap_or(&u.1))
+}
+
 /// How to flash the taskbar for a session that just changed to `state`
 /// while the window is in the background: urgently when it needs the
 /// user or failed, gently when it finished, and at most once per session
@@ -4340,6 +4690,154 @@ fn small_icon_size() -> PhysicalSize<u32> {
     PhysicalSize::new(n, n)
 }
 
+/// The smallest pane, frame included, that holds `MIN_COLS` by `MIN_ROWS`
+/// cells of `cw` by `ch` pixels in a tab of several panes, at `scale`,
+/// with chrome text `th` pixels high.
+fn pane_min((cw, ch): (u32, u32), th: i32, scale: f32, expanded: bool) -> (i32, i32) {
+    let frame = chrome::pane_frame(scale, expanded, true, th);
+    (
+        layout::MIN_COLS * cw as i32 + frame.0,
+        layout::MIN_ROWS * ch as i32 + frame.1,
+    )
+}
+
+/// The smallest the window may get: the sidebar or the rail as `win`
+/// shows them, and one smallest pane. Any smaller and a pane shrinks to a
+/// column or two, and a program such as Claude Code redraws everything at
+/// that width.
+fn min_window(
+    win: &layout::Window,
+    cell: (u32, u32),
+    (tw, th): (u32, u32),
+    scale: f32,
+) -> PhysicalSize<u32> {
+    let (w, h) = pane_min(cell, th as i32, scale, win.sidebar_expanded);
+    // The sidebar takes at most 2/5 of the window, so the pane's room
+    // grows by one pixel or none for each the window does.
+    let room = |x: i32| chrome::area(win, (x, h), scale, None, tw as i32).w;
+    let width = (w..).find(|&x| room(x) >= w).unwrap_or(w);
+    PhysicalSize::new(width as u32, h as u32)
+}
+
+/// The size in cells of `cw` by `ch` pixels of each pane in every tab of
+/// `win`, which `panes` lays out with a given tab shown. Hidden tabs count
+/// too: a pane restored in one would start at 80 columns, and Claude Code
+/// would draw its conversation at that width until the tab shows.
+fn tab_grids(
+    win: &layout::Window,
+    (cw, ch): (u32, u32),
+    panes: impl Fn(&layout::Window) -> Vec<(PaneId, Rect)>,
+) -> Vec<(PaneId, (i32, i32))> {
+    (0..win.tabs.len())
+        .flat_map(|active| {
+            panes(&layout::Window {
+                active,
+                ..win.clone()
+            })
+        })
+        .map(|(id, r)| (id, (r.w / cw as i32, r.h / ch as i32)))
+        .collect()
+}
+
+/// Whether `grids` leave pane `id`, new in `win`, or `split`, the pane it
+/// split, below the minimum size. Only the tab shown counts: a new tab
+/// splits nothing, and the pane focused before it may be one the window
+/// already made small.
+fn no_room(
+    win: &layout::Window,
+    grids: &[(PaneId, (i32, i32))],
+    id: PaneId,
+    split: Option<PaneId>,
+) -> bool {
+    let shown = win.tabs.get(win.active).map(Tab::panes).unwrap_or_default();
+    grids.iter().any(|&(p, (c, r))| {
+        (p == id || Some(p) == split)
+            && shown.contains(&p)
+            && (c < layout::MIN_COLS || r < layout::MIN_ROWS)
+    })
+}
+
+/// When a pane whose size changed gives its terminal the new size: now
+/// (`None`), unless the terminal `last` took one within [`RESIZE_GAP`],
+/// then that long after it. The first change goes at once and the last
+/// always lands.
+fn resize_wait(last: Option<Instant>, now: Instant) -> Option<Instant> {
+    let due = last? + RESIZE_GAP;
+    (now < due).then_some(due)
+}
+
+/// Whether a window kept hidden `until` then shows now: once a frame was
+/// `presented`, or at `until` without one, so a renderer that fails still
+/// leaves a window to see.
+fn shows(until: Option<Instant>, presented: bool, now: Instant) -> bool {
+    until.is_some_and(|t| presented || now >= t)
+}
+
+/// Asks Windows to start blitz again, with its saved session, after it
+/// restarts for an update or the user signs back in with "restart apps"
+/// on. Not after a crash or a hang, which could happen again at once,
+/// nor after an installer closes it: blitz's own starts it again itself,
+/// and one run as administrator would start it elevated.
+fn restart_after_reboot() {
+    use windows::Win32::System::Recovery::{
+        RESTART_NO_CRASH, RESTART_NO_HANG, RESTART_NO_PATCH, RegisterApplicationRestart,
+    };
+    let flags = RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_PATCH;
+    // SAFETY: no command line, so blitz starts with none.
+    let _ = unsafe { RegisterApplicationRestart(None, flags) };
+}
+
+/// Whether a session `now` differs from the one last `saved`. The window's
+/// place counts: Windows ends blitz for an update restart without the
+/// save at exit.
+fn changed(saved: Option<&session::State>, now: &session::State) -> bool {
+    saved != Some(now)
+}
+
+/// Where the window goes back to next time, after it moved or changed size
+/// from `was` to `now`. Minimized or full screen is no place to go back to.
+/// Maximized keeps the place it was maximized from, moved to the middle of
+/// the monitor it is maximized on when it is not there, as after
+/// Win+Shift+Arrow.
+fn placement(was: Geometry, now: Geometry, minimized: bool, fullscreen: bool) -> Geometry {
+    if minimized || fullscreen {
+        return was;
+    }
+    if !now.maximized {
+        return now;
+    }
+    // In i64: `was` can come from the session file, at any size.
+    let inside = |at: i32, size: u32, room_at: i32, room: u32| {
+        let (room_at, mid) = (i64::from(room_at), i64::from(at) + i64::from(size) / 2);
+        (room_at..room_at + i64::from(room)).contains(&mid)
+    };
+    let there = inside(was.x, was.w, now.x, now.w) && inside(was.y, was.h, now.y, now.h);
+    let was = Geometry {
+        maximized: true,
+        ..was
+    };
+    if there {
+        return was;
+    }
+    let mid = |at: i32, room: u32, size: u32| {
+        at.saturating_add(((i64::from(room) - i64::from(size)).max(0) / 2) as i32)
+    };
+    Geometry {
+        x: mid(now.x, now.w, was.w),
+        y: mid(now.y, now.h, was.h),
+        ..was
+    }
+}
+
+/// `attrs` for a window at `g`, the place it is restored to. Not
+/// maximized yet: winit shows a window as it maximizes it, which would be
+/// before its first frame, so [`App::reveal`] does.
+fn placed_at(attrs: WindowAttributes, g: Geometry) -> WindowAttributes {
+    attrs
+        .with_position(PhysicalPosition::new(g.x, g.y))
+        .with_inner_size(PhysicalSize::new(g.w, g.h))
+}
+
 /// `g`, moved onto the primary monitor when no monitor shows enough of it.
 fn on_screen(el: &ActiveEventLoop, g: Geometry) -> Geometry {
     let rect = |m: winit::monitor::MonitorHandle| Rect {
@@ -4378,6 +4876,28 @@ fn joined(first: String, then: String) -> String {
 fn resume_line(enabled: bool, claude: Option<&str>) -> Option<String> {
     let id = claude.filter(|id| enabled && crate::hook::is_session_id(id))?;
     Some(format!("claude --resume {id}\r"))
+}
+
+/// What a pane says after the `shell` setting failed to start with `err`
+/// and `using`, the shell blitz finds, started in its place. `keys` open
+/// the settings.
+fn shell_failed(
+    shell: &str,
+    err: &dyn std::fmt::Display,
+    using: &str,
+    keys: Option<String>,
+) -> String {
+    let fix = keys.map_or_else(String::new, |k| format!(" \u{b7} {k} settings"));
+    format!("The shell {shell} could not start ({err}); using {using}{fix}")
+}
+
+/// What blitz says when it cannot start at all, `e` being why: a GUI
+/// program has no console to print it to.
+fn start_failed(e: &str, config: Option<&Path>) -> String {
+    let file = config.map_or_else(String::new, |d| {
+        format!("\n\nSettings are in {}", d.join("config.toml").display())
+    });
+    format!("blitz could not start: {e}{file}")
 }
 
 /// The last `n` lines of `text`, without blank lines at either end.
@@ -4421,6 +4941,61 @@ fn split(dir: Dir) -> impl FnOnce(&mut layout::Window, PaneId) -> bool {
         let active = win.active;
         (win.tabs.get_mut(active)).is_some_and(|t| t.split(dir, id, any, (0, 0)))
     }
+}
+
+/// Whether blitz runs elevated, as administrator.
+fn elevated() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
+    let mut e = TOKEN_ELEVATION::default();
+    let mut len = 0;
+    // SAFETY: the out value is as large as the call is told; the token is
+    // closed after use.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&raw mut e).cast()),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && e.TokenIsElevated != 0
+    }
+}
+
+/// Where the first pane starts when no folder was given: `cwd`, where
+/// blitz was started, unless that is one of `avoid`; else the user's
+/// profile folder.
+fn first_dir(cwd: Option<PathBuf>, avoid: &[PathBuf]) -> Option<PathBuf> {
+    let key = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    match cwd {
+        Some(d) if !avoid.iter().any(|a| key(a) == key(&d)) => Some(d),
+        _ => start_dir(""),
+    }
+}
+
+/// Folders nobody means to work in that the Start menu, a pinned icon or
+/// Win+R start blitz in: its own folder and the Windows system folder.
+fn not_a_start() -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    // SAFETY: a buffer the call is told the length of.
+    let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    let system =
+        (n > 0 && n < buf.len()).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])));
+    let exe = std::env::current_exe().ok();
+    let own = exe.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+    [system, own].into_iter().flatten().collect()
 }
 
 /// Puts pane `id` in a new tab after the others and shows that tab. It
@@ -4584,6 +5159,19 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if let Err(e) = self.start(el) {
             eprintln!("blitz: {e}");
+            if !self.args.scripted() {
+                use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+                let text = start_failed(&e, crate::config::dir().as_deref());
+                // SAFETY: two strings that outlive the call, and no owner.
+                unsafe {
+                    MessageBoxW(
+                        None,
+                        &windows::core::HSTRING::from(text),
+                        &windows::core::HSTRING::from("blitz"),
+                        MB_OK | MB_ICONERROR,
+                    )
+                };
+            }
             self.code = 1;
             el.exit();
         }
@@ -4608,6 +5196,7 @@ impl ApplicationHandler<UserEvent> for App {
             if self.mouse.scroll_at.is_some_and(|t| t <= now) {
                 self.autoscroll();
             }
+            self.reveal(false);
             // A synchronized update timed out, a notice expired, or a
             // working timer ticked.
             self.request_redraw();
@@ -4642,7 +5231,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.drain_keys(el);
                 self.redraw();
             }
-            WindowEvent::Resized(_) => self.request_redraw(),
+            WindowEvent::Resized(_) => {
+                self.note_place();
+                self.request_redraw();
+            }
+            WindowEvent::Moved(_) => self.note_place(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;
                 // The cursor's cell stays, but its pixels move.
@@ -4659,6 +5252,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if !f {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
+                    crate::handoff::forget_activating_click();
                     self.mouse.drag = None;
                     self.mouse.scroll_at = None;
                     let mods = mods_now();
@@ -4698,6 +5292,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => self.on_mouse_move(position),
+            WindowEvent::CursorLeft { .. } => self.set_over_side(None),
             WindowEvent::MouseInput { state, button, .. } => {
                 self.on_mouse_button(el, state, button);
             }
@@ -4744,22 +5339,28 @@ impl ApplicationHandler<UserEvent> for App {
                 None if self.picker.is_none() => self.set_theme_from_config(),
                 None => {}
             },
+            UserEvent::Sized => self.settle(),
             UserEvent::Installed(Ok(())) => el.exit(),
             UserEvent::Installed(Err(e)) => {
                 eprintln!("blitz: update: {e}");
+                self.banner_note = None;
                 if let Some(id) = self.updating.take() {
                     self.error(id, format!("Update failed: {e}"));
                 }
             }
-            UserEvent::OpenHere(dir) => {
+            UserEvent::Handoff(ask) => {
+                let hwnd = HWND(self.hwnd as *mut c_void);
+                crate::handoff::to_current_desktop(hwnd);
                 // First, since a minimized window has no room for a pane.
                 if let Some(w) = &self.window {
                     w.set_minimized(false);
                 }
-                // SAFETY: our own window; the launch that sent the folder
-                // allowed this process to take the foreground.
-                let _ = unsafe { SetForegroundWindow(HWND(self.hwnd as *mut c_void)) };
-                self.add(Some(dir), new_tab);
+                // SAFETY: our own window; the launch that sent this allowed
+                // this process to take the foreground.
+                let _ = unsafe { SetForegroundWindow(hwnd) };
+                if let crate::handoff::Ask::Open(dir) = ask {
+                    self.add(Some(dir), new_tab);
+                }
             }
         }
     }
@@ -4775,6 +5376,9 @@ impl ApplicationHandler<UserEvent> for App {
             self.attention(id, Ev::Attended);
         }
         self.save_session(false);
+        // Here, after every batch of events, rather than at each change:
+        // a minimized window is not drawn.
+        self.sync_title();
         let flow = match self.next_deadline() {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,
@@ -5139,6 +5743,43 @@ mod tests {
     /// What a copy of the selection dragged from `a` to `b` takes.
     fn copy(t: &vt::Terminal, a: Pos, b: Pos) -> String {
         selection_text(t, &crate::theme::dark(), &select(t, a, b), 0)
+    }
+
+    #[test]
+    fn app_update_notes_take_the_banner_while_there_is_one() {
+        let update = ("0.2.0".to_string(), "blitz 0.2.0 is available".to_string());
+        assert_eq!(
+            banner_text(Some(&update), None),
+            Some("blitz 0.2.0 is available")
+        );
+        let note = Some("Downloading blitz 0.2.0\u{2026}");
+        assert_eq!(banner_text(Some(&update), note), note);
+        assert_eq!(banner_text(None, note), None);
+    }
+
+    /// Hit-testing and dividers see the strip the frame draws: a note too
+    /// long for the sidebar's foot takes a strip under the panes even when
+    /// the offer it stands for fit there.
+    #[test]
+    fn app_the_panes_make_room_for_a_note_the_offer_did_not_need() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("a".into(), PaneId(1)));
+        win.tabs.push(Tab::new("b".into(), PaneId(2)));
+        let offer = crate::update::banner(None, "0.2.0", None, true).expect("an offer");
+        let update = ("0.2.0".to_string(), offer);
+        let note = "Sessions are busy, and updating restarts blitz. Press Ctrl+Alt+Shift+F12 again";
+        let area = |note| chrome::area(&win, (1440, 900), 1.0, banner_text(Some(&update), note), 7);
+        assert_eq!(area(None).h, 900, "the offer sits at the sidebar's foot");
+        assert!(area(Some(note)).h < 900, "the note needs the strip");
+    }
+
+    #[test]
+    fn app_title_counts_the_sessions_that_need_you() {
+        assert_eq!(window_title(0, "pwsh", false), "pwsh");
+        assert_eq!(window_title(2, "pwsh", false), "(2) pwsh");
+        assert_eq!(window_title(0, "", false), "blitz");
+        assert_eq!(window_title(1, "", false), "(1) blitz");
+        assert_eq!(window_title(2, "pwsh", true), "(2) Administrator: pwsh");
     }
 
     #[test]
@@ -5743,6 +6384,293 @@ mod tests {
         assert!(names.contains(&"rename_session") && names.contains(&"rename_tab"));
     }
 
+    /// A live resize or a divider drag gives each program a new size at
+    /// most every 80 ms: the first change at once, the last one always.
+    #[test]
+    fn app_programs_take_a_new_size_at_most_every_80_ms() {
+        let t0 = Instant::now();
+        assert_eq!(resize_wait(None, t0), None, "the first at once");
+        let ms = Duration::from_millis;
+        assert_eq!(resize_wait(Some(t0), t0 + ms(30)), Some(t0 + RESIZE_GAP));
+        assert_eq!(resize_wait(Some(t0), t0 + RESIZE_GAP), None);
+        assert_eq!(RESIZE_GAP, ms(80));
+    }
+
+    /// A second press on the same divider in time gives the panes equal
+    /// space; one on another divider does not.
+    #[test]
+    fn app_a_double_click_on_a_divider_evens_the_panes() {
+        let (t0, ms, within) = (
+            Instant::now(),
+            Duration::from_millis,
+            Duration::from_millis(500),
+        );
+        let mut last = None;
+        assert!(!evens(&mut last, 1, t0, within), "a drag starts");
+        assert!(evens(&mut last, 1, t0 + ms(200), within), "the second");
+        assert!(!evens(&mut last, 1, t0 + ms(400), within), "a third drags");
+        assert!(
+            !evens(&mut last, 2, t0 + ms(500), within),
+            "another divider"
+        );
+        assert!(!evens(&mut last, 2, t0 + ms(1100), within), "too late");
+    }
+
+    /// A new tab has room even when the pane focused before it, now in a
+    /// tab not shown, is below the minimum; a split checks the pane it
+    /// splits.
+    #[test]
+    fn app_a_small_pane_in_another_tab_leaves_room_for_a_new_tab() {
+        let any = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 400,
+        };
+        let mut a = Tab::new("a".into(), PaneId(1));
+        assert!(a.split(Dir::Right, PaneId(3), any, (0, 0)));
+        let mut win = layout::Window::default();
+        win.tabs.push(a);
+        win.tabs.push(Tab::new("b".into(), PaneId(2)));
+        win.active = 1;
+        let grids = [
+            (PaneId(1), (4, 2)),
+            (PaneId(3), (4, 2)),
+            (PaneId(2), (80, 24)),
+        ];
+        assert!(!no_room(&win, &grids, PaneId(2), Some(PaneId(1))), "a tab");
+        win.active = 0;
+        assert!(no_room(&win, &grids, PaneId(3), Some(PaneId(1))), "a split");
+    }
+
+    /// Restored panes in tabs not shown start at their real size, so Claude
+    /// Code resumes at the width it will be seen at.
+    #[test]
+    fn app_panes_in_hidden_tabs_start_at_their_size() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("a".into(), PaneId(1)));
+        let mut b = Tab::new("b".into(), PaneId(2));
+        let any = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 400,
+        };
+        assert!(b.split(Dir::Right, PaneId(3), any, (0, 0)));
+        win.tabs.push(b);
+        let shown = |w: &layout::Window| w.tabs[w.active].rects(any);
+        let grids = tab_grids(&win, (10, 20), shown);
+        let ids: Vec<PaneId> = grids.iter().map(|g| g.0).collect();
+        assert_eq!(ids, [PaneId(1), PaneId(2), PaneId(3)], "every tab");
+        assert_eq!(grids[0].1, (80, 20));
+        assert!(
+            grids[1..].iter().all(|g| g.1.0 < 80 && g.1.1 == 20),
+            "{grids:?}"
+        );
+    }
+
+    /// The window shows with its first frame, never blank before it, and
+    /// shows anyway when no frame comes.
+    #[test]
+    fn app_the_window_shows_with_its_first_frame() {
+        let t0 = Instant::now();
+        let until = Some(t0 + FIRST_FRAME);
+        assert!(shows(until, true, t0), "a frame");
+        assert!(!shows(until, false, t0), "nothing to show yet");
+        assert!(shows(until, false, t0 + FIRST_FRAME), "no frame in time");
+        assert!(!shows(None, true, t0), "already shown");
+    }
+
+    /// Windows ends blitz for an update restart without the save at exit,
+    /// so a moved window is saved like a new split, and blitz asks to be
+    /// started again.
+    #[test]
+    fn app_a_restart_for_an_update_finds_the_window_where_it_was() {
+        use windows::Win32::System::Recovery::{
+            GetApplicationRestartSettings, RESTART_NO_CRASH, RESTART_NO_HANG, RESTART_NO_PATCH,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let win = layout::Window {
+            tabs: vec![Tab::new("a".into(), PaneId(1))],
+            ..Default::default()
+        };
+        let s = session::State::capture(&win, Geometry::default(), |_| PaneMeta::default());
+        assert!(changed(None, &s));
+        assert!(!changed(Some(&s), &s));
+        let mut moved = s.clone();
+        moved.window.x = 40;
+        assert!(changed(Some(&s), &moved), "the place alone");
+        restart_after_reboot();
+        let mut buf = [0u16; 64];
+        let (mut len, mut flags) = (buf.len() as u32, 0);
+        let line = windows::core::PWSTR(buf.as_mut_ptr());
+        // SAFETY: a buffer the call is told the length of, and a u32.
+        unsafe {
+            GetApplicationRestartSettings(
+                GetCurrentProcess(),
+                Some(line),
+                &mut len,
+                Some(&mut flags),
+            )
+        }
+        .expect("registered");
+        assert_eq!(
+            flags,
+            (RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_PATCH).0
+        );
+    }
+
+    /// A window moved to another monitor and maximized there opens
+    /// maximized on that monitor next time, not on the one it started on.
+    #[test]
+    fn app_the_window_comes_back_where_it_was() {
+        let at = |x, y, w, h, maximized| Geometry {
+            x,
+            y,
+            w,
+            h,
+            maximized,
+        };
+        let first = at(100, 100, 800, 600, false);
+        let moved = placement(first, at(2100, 100, 800, 600, false), false, false);
+        assert_eq!(moved, at(2100, 100, 800, 600, false));
+        let maxed = placement(moved, at(1912, -8, 2576, 1416, true), false, false);
+        assert_eq!(maxed, at(2100, 100, 800, 600, true));
+        // Minimized and full screen are no places to come back to.
+        let hidden = at(-32000, -32000, 160, 28, false);
+        assert_eq!(placement(maxed, hidden, true, false), maxed);
+        assert_eq!(
+            placement(maxed, at(1920, 0, 2560, 1440, false), false, true),
+            maxed
+        );
+        let back = placement(maxed, at(2100, 100, 800, 600, false), false, false);
+        assert_eq!(back, moved, "restored");
+        // Win+Shift+Left takes the maximized window to the first monitor.
+        let left = placement(maxed, at(-8, -8, 1936, 1056, true), false, false);
+        assert_eq!(left, at(560, 220, 800, 600, true));
+        let again = placement(left, at(-8, -8, 1936, 1056, true), false, false);
+        assert_eq!(again, left, "already there");
+        // A size from a damaged session file goes to the monitor too,
+        // without overflowing.
+        let huge = at(0, 0, 1 << 31, 600, true);
+        let now = at(2400, -8, 2576, 1416, true);
+        assert_eq!(
+            placement(huge, now, false, false),
+            at(2400, 400, 1 << 31, 600, true)
+        );
+        let far = at(-2_147_483_000, 0, 4_000_000_000, 600, true);
+        let now = at(-8, -8, 1936, 1056, true);
+        assert_eq!(
+            placement(far, now, false, false),
+            at(-8, 220, 4_000_000_000, 600, true)
+        );
+        let wide = at(i32::MAX, i32::MAX, u32::MAX, u32::MAX, true);
+        assert_eq!(
+            placement(wide, now, false, false),
+            at(-8, -8, u32::MAX, u32::MAX, true)
+        );
+    }
+
+    /// A window restored maximized is made at its restored place and
+    /// size, hidden, and is maximized only as it shows.
+    #[test]
+    fn app_a_maximized_window_is_not_made_maximized() {
+        let g = Geometry {
+            x: 10,
+            y: 20,
+            w: 800,
+            h: 600,
+            maximized: true,
+        };
+        let attrs = placed_at(Window::default_attributes().with_visible(false), g);
+        assert!(!attrs.maximized && !attrs.visible);
+        assert_eq!(attrs.inner_size, Some(PhysicalSize::new(800, 600).into()));
+    }
+
+    /// The smallest window still has room for the rail or the sidebar and
+    /// one pane of the smallest size, at any scale.
+    #[test]
+    fn app_the_window_never_gets_smaller_than_one_pane() {
+        for expanded in [false, true] {
+            let mut win = layout::Window {
+                sidebar_expanded: expanded,
+                ..Default::default()
+            };
+            win.tabs.push(Tab::new("a".into(), PaneId(1)));
+            win.tabs.push(Tab::new("b".into(), PaneId(2)));
+            for (cell, scale) in [((8, 16), 1.0), ((12, 24), 1.5), ((16, 32), 2.0)] {
+                let th = cell.1 as i32;
+                let min = min_window(&win, cell, (cell.0 / 2, cell.1), scale);
+                let size = (min.width as i32, min.height as i32);
+                let area = chrome::area(&win, size, scale, None, cell.0 as i32 / 2);
+                assert!(area.x > 0, "the side is shown");
+                let at = format!("{scale} {expanded}");
+                assert_eq!(
+                    (area.w, area.h),
+                    pane_min(cell, th, scale, expanded),
+                    "{at}"
+                );
+                let frame = chrome::pane_frame(scale, expanded, true, th).0;
+                assert_eq!((area.w - frame) / cell.0 as i32, layout::MIN_COLS, "{at}");
+            }
+        }
+        let one = layout::Window {
+            tabs: vec![Tab::new("a".into(), PaneId(1))],
+            ..Default::default()
+        };
+        let (w, h) = pane_min((8, 16), 16, 1.0, true);
+        let min = min_window(&one, (8, 16), (4, 16), 1.0);
+        assert_eq!(min, PhysicalSize::new(w as u32, h as u32), "no rail");
+    }
+
+    /// Expanding or collapsing the sidebar changes the smallest window,
+    /// which is why every way of toggling it goes through
+    /// `App::toggle_sidebar` and so `fit_min_size`.
+    #[test]
+    fn app_the_smallest_window_follows_the_sidebar() {
+        let mut win = layout::Window::default();
+        win.tabs.push(Tab::new("a".into(), PaneId(1)));
+        win.tabs.push(Tab::new("b".into(), PaneId(2)));
+        let min = |win: &layout::Window| min_window(win, (8, 16), (4, 16), 1.0).width;
+        let before = min(&win);
+        assert!(win.toggle_sidebar());
+        let after = min(&win);
+        assert_ne!(before, after);
+        assert!(win.toggle_sidebar());
+        assert_eq!(min(&win), before);
+    }
+
+    #[test]
+    fn app_an_elevated_window_says_so_in_its_title() {
+        assert_eq!(window_title(0, "", false), "blitz");
+        assert_eq!(window_title(0, "~/shop", false), "~/shop");
+        assert_eq!(window_title(0, "", true), "Administrator: blitz");
+        assert_eq!(window_title(0, "~/shop", true), "Administrator: ~/shop");
+    }
+
+    /// Started from the Start menu, a pin or Win+R, blitz runs in its own
+    /// folder or System32; the first pane opens in the profile instead.
+    #[test]
+    fn app_the_first_pane_never_opens_in_the_install_or_system_folder() {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let avoid = not_a_start();
+        let exe = std::env::current_exe().expect("exe");
+        let own = exe.parent().expect("folder").to_path_buf();
+        assert!(avoid.contains(&own), "{avoid:?}");
+        let system = avoid
+            .iter()
+            .find(|d| d.ends_with("System32") || d.ends_with("system32"));
+        let system = system.expect("System32").clone();
+        assert_eq!(first_dir(Some(own), &avoid), home);
+        assert_eq!(first_dir(Some(system.clone()), &avoid), home);
+        // However Windows spells it.
+        let shouted = PathBuf::from(format!("{}\\", system.display()).to_uppercase());
+        assert_eq!(first_dir(Some(shouted), &avoid), home);
+        let dev = PathBuf::from(r"C:\dev\shop");
+        assert_eq!(first_dir(Some(dev.clone()), &avoid), Some(dev));
+        assert_eq!(first_dir(None, &avoid), home);
+    }
+
     #[test]
     fn app_taskbar_flashes_once_per_session_every_ten_seconds() {
         let t0 = Instant::now();
@@ -5968,6 +6896,31 @@ mod tests {
         let a = parse(&["--cwd", r"C:\foo", "--new-window"]);
         assert!(a.new_window);
         assert_eq!(a.cwd, Some(r"C:\foo".into()));
+    }
+
+    /// A launch that a running blitz did not take must not open a second
+    /// main window, which would restore and resume the same sessions.
+    #[test]
+    fn a_launch_blitz_did_not_take_leaves_the_session_alone() {
+        let mut a = Args::default();
+        assert!(!a.handed_off(None), "none running");
+        assert!(!a.new_window, "the main window");
+        assert!(a.handed_off(Some(true)), "taken");
+        assert!(!a.handed_off(Some(false)), "hung or refused");
+        assert!(a.separate() && !a.main(), "a window of its own");
+    }
+
+    /// Run as administrator, blitz hands nothing off, takes no launches
+    /// and leaves the saved session alone.
+    #[test]
+    fn an_elevated_blitz_is_a_window_of_its_own() {
+        let a = Args::default();
+        assert!(a.main() && !a.separate());
+        let a = Args {
+            admin: true,
+            ..Args::default()
+        };
+        assert!(!a.main() && a.separate());
     }
 
     #[test]
@@ -6212,10 +7165,82 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_that_cannot_start_says_why_and_what_runs_instead() {
+        let err = std::io::Error::other("pwshh.exe is not on PATH");
+        let text = shell_failed("pwshh", &err, "pwsh", Some("Ctrl+,".into()));
+        assert_eq!(
+            text,
+            "The shell pwshh could not start (pwshh.exe is not on PATH); using pwsh \u{b7} Ctrl+, settings"
+        );
+        assert!(
+            !shell_failed("x", &err, "cmd", None).contains('\u{b7}'),
+            "unbound"
+        );
+    }
+
+    /// The note about a shell that could not start covers the pane's last
+    /// row, so typing there, having read it, puts it away; a note that a
+    /// session exited or stopped stays.
+    #[test]
+    fn typing_puts_away_only_the_note_it_ends() {
+        // The shell note is an error, which a key in its pane puts away.
+        assert!(Ask::Key.gone(None, true));
+        assert!(!Ask::Key.gone(None, false), "a key in another pane");
+        // A note that a session exited stays.
+        assert!(!Ask::Nothing.gone(None, true));
+    }
+
+    #[test]
+    fn a_failed_start_names_the_settings_file() {
+        let dir = Path::new(r"C:\Users\me\AppData\Roaming\blitz");
+        let text = start_failed("no window", Some(dir));
+        assert!(
+            text.starts_with("blitz could not start: no window"),
+            "{text}"
+        );
+        assert!(text.ends_with(r"blitz\config.toml"), "{text}");
+        assert_eq!(start_failed("x", None), "blitz could not start: x");
+    }
+
+    #[test]
     fn saved_output_keeps_the_last_lines() {
         assert_eq!(last_lines("\n\na\nb\nc\n\n\n", 2), "b\nc");
         assert_eq!(last_lines("a\n\nb", 10), "a\n\nb");
         assert_eq!(last_lines("  a\n", 10), "  a");
         assert_eq!(last_lines("\n\n", 10), "");
+    }
+
+    #[test]
+    fn the_count_of_hidden_sessions_goes_round_them() {
+        let now = Instant::now();
+        let ids = |v: &[u32]| -> Vec<(PaneId, crate::attention::PaneAttn)> {
+            let idle = crate::attention::PaneAttn::new(now);
+            v.iter().map(|&i| (PaneId(i), idle)).collect()
+        };
+        let hidden = ids(&[7, 8, 9]);
+        // Nothing waits: from a pane in view, the first; then each in turn.
+        assert_eq!(hidden_target(&hidden, Some(PaneId(1))), Some(PaneId(7)));
+        assert_eq!(hidden_target(&hidden, Some(PaneId(7))), Some(PaneId(8)));
+        assert_eq!(hidden_target(&hidden, Some(PaneId(8))), Some(PaneId(9)));
+        assert_eq!(hidden_target(&hidden, Some(PaneId(9))), Some(PaneId(7)));
+        // One that needs you comes first, unless it is already shown.
+        let mut waiting = hidden.clone();
+        waiting[2].1.state = Attn::NeedsYou;
+        assert_eq!(hidden_target(&waiting, Some(PaneId(7))), Some(PaneId(9)));
+        assert_eq!(hidden_target(&waiting, Some(PaneId(9))), Some(PaneId(7)));
+        // Only the focused one hidden: nowhere to go.
+        assert_eq!(hidden_target(&ids(&[7]), Some(PaneId(7))), None);
+        assert_eq!(hidden_target(&[], None), None);
+    }
+
+    #[test]
+    fn the_pointer_shows_what_is_under_it() {
+        assert_eq!(cursor_icon(None, false), CursorIcon::Default);
+        assert_eq!(cursor_icon(None, true), CursorIcon::Pointer);
+        assert_eq!(cursor_icon(Some(Axis::Row), true), CursorIcon::ColResize);
+        assert_eq!(
+            cursor_icon(Some(Axis::Column), false),
+            CursorIcon::RowResize
+        );
     }
 }

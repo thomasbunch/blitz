@@ -66,6 +66,8 @@ pub enum Action {
     /// Copy the hooks for Claude Code's settings, for a Claude Code that
     /// does not load blitz's own.
     ClaudeSetup,
+    /// Open the window menu, as Alt+Space does in other windows.
+    SystemMenu,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -114,6 +116,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::JumpToPrompt(-1), "next_prompt", "Scroll to the next prompt"),
     (Action::Find, "find", "Find in the scrollback"),
     (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
+    (Action::SystemMenu, "system_menu", "Window menu"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
@@ -173,6 +176,7 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, 0x26, Action::JumpToPrompt(1)),
     (CTRL | SHIFT, 0x28, Action::JumpToPrompt(-1)),
     (CTRL | SHIFT, b'F' as u16, Action::Find),
+    (ALT, 0x20, Action::SystemMenu),
 ];
 
 /// Key names for chords, matched ignoring case. The first name of each
@@ -1288,5 +1292,25 @@ mod msg_to_key_tests {
             Some(Action::JumpToPrompt(-1))
         );
         assert_eq!(press(0x26, &[LCTRL]), None);
+    }
+
+    /// Alt+Space opens the window menu, as everywhere else on Windows,
+    /// unless a binding gives it back to the program.
+    #[test]
+    fn keymap_alt_space_opens_the_window_menu() {
+        assert_eq!(press(0x20, &[0xa4]), Some(Action::SystemMenu));
+        assert_eq!(press(0x20, &[0xa5]), Some(Action::SystemMenu), "right Alt");
+        assert_eq!(press(0x20, &[]), None);
+        assert_eq!(press(0x20, &[0xa2, 0xa4]), None, "AltGr+Space");
+        let user: Vec<Binding> = binding("alt+space=none").into_iter().collect();
+        let mut t = String::new();
+        let k = msg_to_key(
+            0x20,
+            lp(0x39, false, true, 1),
+            &state(&[0xa4], &[]),
+            layout(US),
+            &mut t,
+        );
+        assert_eq!(action(&k, &user), None);
     }
 }

@@ -8,6 +8,9 @@ use vt::Palette;
 /// Attention accent of the blitz themes; text on it is near-black.
 pub const ACCENT: u32 = 0xf2b84b;
 
+/// The least contrast a divider has with the panes' background.
+const DIVIDER_CONTRAST: f64 = 1.3;
+
 /// The `theme` setting when there is none: follow the Windows app theme.
 pub const DEFAULT: &str = "light:blitz light,dark:blitz dark";
 
@@ -73,6 +76,10 @@ pub struct Ui {
     pub accent: u32,
     /// Text on the accent; follows it.
     pub chip_fg: u32,
+    /// The accent as dots and rings draw it, which have no text to carry
+    /// them: moved away from the chrome's backgrounds until it stands out
+    /// from each by 3:1. Follows the accent.
+    pub mark: u32,
     pub track: u32,
     pub fill: u32,
     pub error: u32,
@@ -177,16 +184,43 @@ impl Ui {
         } else {
             0xffffff
         };
+        // Amber on a light background is about 1.6:1, too faint for a
+        // dot; darken it there, lighten it on a dark one.
+        let away = if luminance(self.term_bg) > 0.18 {
+            0x000000
+        } else {
+            0xffffff
+        };
+        let under = [
+            self.term_bg,
+            self.side_bg,
+            self.row_focus,
+            self.hdr_bg,
+            self.rail_focus,
+        ];
+        let mut t = 0.0;
+        self.mark = accent;
+        while under.iter().any(|&b| contrast(self.mark, b) < 3.0) && t < 1.0 {
+            t = (t + 0.05f32).min(1.0);
+            self.mark = mix(accent, away, t);
+        }
     }
 }
 
-/// A theme file: `key = value` lines, `#` starts a comment line. Takes
-/// Ghostty's `background`, `foreground`, `cursor-color`,
-/// `selection-background` and `palette = N=#rrggbb`, plus the chrome keys
-/// of [`Ui::field`]. Anything else is skipped, so a Ghostty theme works
-/// as is, and colours a file leaves out come from the blitz theme of the
-/// same lightness.
-pub fn parse(name: &str, text: &str) -> Theme {
+/// The terminal colour keys of a theme file, Ghostty's, besides
+/// `palette`; [`Ui::field`] has the chrome's.
+const KEYS: &[&str] = &[
+    "background",
+    "foreground",
+    "cursor-color",
+    "cursor-text",
+    "selection-background",
+    "selection-foreground",
+];
+
+/// The `key = #rrggbb` lines of a theme file in order, and its
+/// `palette = N=#rrggbb` lines. `#` starts a comment line.
+fn lines(text: &str) -> (Vec<(&str, u32)>, [Option<u32>; 16]) {
     let mut colors = Vec::new();
     let mut ansi = [None; 16];
     for line in text.trim_start_matches('\u{feff}').lines() {
@@ -208,6 +242,23 @@ pub fn parse(name: &str, text: &str) -> Theme {
             colors.push((key, c));
         }
     }
+    (colors, ansi)
+}
+
+/// Whether `text` sets a colour a theme can, so a README or a picture
+/// left in the themes folder is not offered as a theme.
+fn is_theme(text: &str) -> bool {
+    let (colors, ansi) = lines(text);
+    ansi.iter().any(Option::is_some)
+        || (colors.iter()).any(|&(k, _)| KEYS.contains(&k) || Ui::default().field(k).is_some())
+}
+
+/// A theme file: the colours of [`KEYS`] and `palette = N=#rrggbb`, plus
+/// the chrome keys of [`Ui::field`]. Anything else is skipped, so a
+/// Ghostty theme works as is, and colours a file leaves out come from the
+/// blitz theme of the same lightness.
+pub fn parse(name: &str, text: &str) -> Theme {
+    let (colors, ansi) = lines(text);
     let get = |k: &str| colors.iter().rev().find(|c| c.0 == k).map(|c| c.1);
     let light = get("background").is_some_and(|bg| luminance(bg) > 0.18);
     let base = if light { self::light() } else { dark() };
@@ -219,8 +270,10 @@ pub fn parse(name: &str, text: &str) -> Theme {
         fg,
         bg,
         cursor: get("cursor-color").unwrap_or(fg),
+        cursor_text: get("cursor-text"),
         selection_bg: get("selection-background")
             .unwrap_or_else(|| mix(bg, fg, if light { 0.15 } else { 0.2 })),
+        selection_fg: get("selection-foreground").unwrap_or(fg),
         ansi: std::array::from_fn(|i| ansi[i].unwrap_or(base.ansi[i])),
     };
     let mut ui = Ui::derive(&pal, light);
@@ -228,6 +281,13 @@ pub fn parse(name: &str, text: &str) -> Theme {
         if let Some(f) = ui.field(key) {
             *f = c;
         }
+    }
+    // Between two panes that are not dimmed, such as one that needs you
+    // beside the focused one, the divider is all that parts them.
+    let (border, mut t) = (ui.border, 0.0);
+    while contrast(ui.border, ui.term_bg) < DIVIDER_CONTRAST && t < 1.0 {
+        t = (t + 0.05f32).min(1.0);
+        ui.border = mix(border, ui.term_fg, t);
     }
     ui.set_accent(ui.accent);
     Theme {
@@ -258,24 +318,61 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
     ch(16) | ch(8) | ch(0)
 }
 
+/// Each sRGB channel value in linear light, looked up rather than worked
+/// out, as the renderer asks for every cell.
+fn linear() -> &'static [f64; 256] {
+    static LINEAR: std::sync::LazyLock<[f64; 256]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|i| {
+            let c = i as f64 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    });
+    &LINEAR
+}
+
 /// WCAG 2 relative luminance of `0xRRGGBB`.
 fn luminance(rgb: u32) -> f64 {
     let [_, r, g, b] = rgb.to_be_bytes();
-    let lin = |c: u8| {
-        let c = f64::from(c) / 255.0;
-        if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    let lin = linear();
+    0.2126 * lin[usize::from(r)] + 0.7152 * lin[usize::from(g)] + 0.0722 * lin[usize::from(b)]
 }
 
 /// WCAG 2 contrast ratio between two `0xRRGGBB` colours.
-fn contrast(a: u32, b: u32) -> f64 {
+pub fn contrast(a: u32, b: u32) -> f64 {
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `fg`, or when it stands less than `min`:1 from `bg`, `fg` moved toward
+/// white or black, whichever has room, just far enough to. Moving in
+/// linear light keeps its hue.
+pub fn readable(fg: u32, bg: u32, min: f64) -> u32 {
+    let (f, b) = (luminance(fg), luminance(bg));
+    if (f.max(b) + 0.05) / (f.min(b) + 0.05) >= min {
+        return fg;
+    }
+    // The luminance `fg` needs, above `bg` or below it.
+    let (up, down) = (min * (b + 0.05) - 0.05, (b + 0.05) / min - 0.05);
+    let lighter = if f >= b { up <= 1.0 } else { down < 0.0 };
+    let lin = linear();
+    let ch = |s: u32| {
+        let c = lin[(fg >> s & 0xff) as usize];
+        // Each channel moves by the share luminance must, and rounds
+        // away from `bg`.
+        let i = if lighter {
+            let want = c + (1.0 - c) * (up - f) / (1.0 - f);
+            lin.partition_point(|&l| l < want).min(255)
+        } else {
+            let want = c * down / f;
+            lin.partition_point(|&l| l <= want).saturating_sub(1)
+        };
+        (i as u32) << s
+    };
+    ch(16) | ch(8) | ch(0)
 }
 
 /// `%APPDATA%\blitz\themes`.
@@ -305,33 +402,37 @@ pub fn all() -> Vec<Theme> {
 }
 
 fn all_in(dir: Option<&Path>) -> Vec<Theme> {
-    let mut files: Vec<(String, PathBuf)> = dir
+    // A file being saved may not be readable for a moment; the save that
+    // follows reloads it.
+    let mut files: Vec<(String, PathBuf, String)> = dir
         .and_then(|d| std::fs::read_dir(d).ok())
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file())
-        .filter_map(|p| Some((file_name(&p)?, p)))
+        .filter_map(|p| {
+            let name = file_name(&p)?;
+            let text = crate::config::decode(&std::fs::read(&p).ok()?);
+            is_theme(&text).then_some((name, p, text))
+        })
         .collect();
     files.sort_by(|a, b| (a.0.to_lowercase(), &a.1).cmp(&(b.0.to_lowercase(), &b.1)));
     // `X` and `X.conf` name one theme; the first in that order wins.
     files.dedup_by(|b, a| a.0.eq_ignore_ascii_case(&b.0));
-    // A file being saved may not be readable for a moment; the save that
-    // follows reloads it.
-    let read = |(name, p): (String, PathBuf)| {
-        let text = crate::config::decode(&std::fs::read(p).ok()?);
-        Some(parse(&name, &text))
-    };
     let mut out: Vec<Theme> = BUILTIN
         .iter()
-        .map(|&(name, text)| {
-            let i = files.iter().position(|f| f.0.eq_ignore_ascii_case(name));
-            i.and_then(|i| read(files.remove(i)))
-                .unwrap_or_else(|| parse(name, text))
-        })
+        .map(
+            |&(name, text)| match files.iter().position(|f| f.0.eq_ignore_ascii_case(name)) {
+                Some(i) => {
+                    let (name, _, text) = files.remove(i);
+                    parse(&name, &text)
+                }
+                None => parse(name, text),
+            },
+        )
         .collect();
-    out.extend(files.into_iter().filter_map(read));
+    out.extend((files.iter()).map(|(name, _, text)| parse(name, text)));
     out
 }
 
@@ -398,7 +499,9 @@ pub fn dark() -> Palette {
         fg: 0xd6d7d9,
         bg: 0x131417,
         cursor: 0xececea,
+        cursor_text: None,
         selection_bg: 0x2c2e33,
+        selection_fg: 0xd6d7d9,
         ansi: [
             0x26282d, 0xe5534b, 0x8cc39a, 0xf2b84b, 0x6aa1ff, 0xb392f0, 0x4fc1b0, 0xc8c9cc,
             0x63666d, 0xff7b72, 0xa6d6af, 0xf8d27a, 0x93bcff, 0xcbb3f6, 0x7fd8ca, 0xececea,
@@ -411,7 +514,9 @@ pub fn light() -> Palette {
         fg: 0x2f3135,
         bg: 0xfcfcfb,
         cursor: 0x141518,
+        cursor_text: None,
         selection_bg: 0xdfdfdb,
+        selection_fg: 0x2f3135,
         ansi: [
             0x141518, 0xc8382f, 0x2e7a45, 0x9a6700, 0x2160c4, 0x8250df, 0x1b7c83, 0x6f7278,
             0x5c5f65, 0xe5534b, 0x3a9157, 0xb07d00, 0x3b7be0, 0x9a6ae0, 0x2a9aa2, 0xa9acb1,
@@ -533,8 +638,11 @@ mod tests {
              font-size = 13\n\
              cursor-color = red\n\
              sidebar-background = #eee8d5\n\
-             accent = #2160c4\n",
+             accent = #2160c4\n\
+             selection-foreground = #000001\n\
+             cursor-text = #000002\n",
         );
+        assert_eq!((t.pal.selection_fg, t.pal.cursor_text), (1, Some(2)));
         assert!(t.light);
         assert_eq!((t.pal.bg, t.pal.fg), (0xfdf6e3, 0x657b83));
         assert_eq!(t.pal.ansi[1], 0xdc322f);
@@ -545,6 +653,9 @@ mod tests {
         assert_eq!(t.ui.term_bg, 0xfdf6e3);
         let (e, d) = (parse("e", "").pal, dark());
         assert_eq!((e.bg, e.fg, e.ansi), (d.bg, d.fg, d.ansi));
+        // Left out, selected text is the text colour and the cursor's
+        // text is picked to suit the cursor.
+        assert_eq!((e.selection_fg, e.cursor_text), (e.fg, None));
     }
 
     #[test]
@@ -588,13 +699,6 @@ mod tests {
 
     #[test]
     fn every_builtin_line_is_a_known_key_with_a_good_colour() {
-        let known = [
-            "background",
-            "foreground",
-            "cursor-color",
-            "selection-background",
-            "palette",
-        ];
         for &(name, text) in BUILTIN {
             for line in text
                 .lines()
@@ -616,7 +720,8 @@ mod tests {
                     "{name}: {line}"
                 );
                 let chrome = Ui::default().field(key).is_some();
-                assert!(known.contains(&key) || chrome, "{name}: unknown key {key}");
+                let known = key == "palette" || KEYS.contains(&key);
+                assert!(known || chrome, "{name}: unknown key {key}");
             }
         }
     }
@@ -656,7 +761,64 @@ mod tests {
             }
             let chip = contrast(ui.chip_fg, ui.accent);
             assert!(chip >= 4.5, "{}: text on the accent {chip:.2}", t.name);
+            // Dots and rings sit on any of the chrome's backgrounds.
+            for (what, c) in [
+                ("pane", ui.term_bg),
+                ("sidebar", ui.side_bg),
+                ("focused row", ui.row_focus),
+                ("header", ui.hdr_bg),
+                ("rail row", ui.rail_focus),
+            ] {
+                let on = contrast(ui.mark, c);
+                assert!(on >= 3.0, "{}: mark on the {what} {on:.2}", t.name);
+            }
+            // SGR 90, the grey of hints and Claude Code's tool results.
+            let grey = contrast(p.ansi[8], p.bg);
+            assert!(grey >= 1.5, "{}: palette 8 contrast {grey:.2}", t.name);
         }
+    }
+
+    #[test]
+    fn every_builtin_accent_is_an_attention_colour() {
+        // Palette 3 is brown in some themes, which reads as text rather
+        // than as a session that needs you; those set an accent of their
+        // own.
+        for t in all_in(None) {
+            let [_, r, g, b] = t.ui.accent.to_be_bytes();
+            assert!(
+                r > b && g > b && r >= 0x90,
+                "{}: accent {:06x}",
+                t.name,
+                t.ui.accent
+            );
+        }
+    }
+
+    #[test]
+    fn a_mark_that_stands_out_is_the_accent() {
+        let dark = blitz(false).ui;
+        assert_eq!(dark.mark, dark.accent);
+        // Light: the same amber, darker.
+        let light = blitz(true).ui;
+        assert_eq!(light.accent, ACCENT);
+        assert!(luminance(light.mark) < luminance(ACCENT));
+        let [_, r, g, b] = light.mark.to_be_bytes();
+        assert!(r > g && g > b, "still amber: {:06x}", light.mark);
+    }
+
+    #[test]
+    fn dividers_never_vanish_into_the_background() {
+        for t in all_in(None) {
+            let on = contrast(t.ui.border, t.ui.term_bg);
+            assert!(on >= DIVIDER_CONTRAST, "{}: divider {on:.2}", t.name);
+        }
+        // Even one a theme file sets to the background.
+        let t = parse("x", "background = #131417\nborder = #131417");
+        assert!(contrast(t.ui.border, t.ui.term_bg) >= DIVIDER_CONTRAST);
+        assert!(
+            luminance(t.ui.border) > luminance(0x131417),
+            "toward the text"
+        );
     }
 
     #[test]
@@ -718,6 +880,10 @@ mod tests {
                 ("Midnight~", b"background = #000004\n"),
                 (".hidden", b"background = #000005\n"),
                 ("Latin", b"# Th\xe8me\nbackground = #000006\n"),
+                ("README.md", b"# Themes\n\nGhostty themes go here.\n"),
+                ("logo.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
+                ("Nord", b"notes = for Nord\n"),
+                ("nord.conf", b"palette = 0=#000007\n"),
             ],
         );
         std::fs::create_dir(f.0.join("folder")).unwrap();
@@ -727,9 +893,19 @@ mod tests {
         let extra: Vec<(&str, u32)> = (t[BUILTIN.len()..].iter())
             .map(|t| (t.name.as_str(), t.pal.bg))
             .collect();
-        // `Alpha` and `alpha.CONF` are one theme; backups, hidden files
-        // and folders are none; a file that is not UTF-8 still reads.
-        assert_eq!(extra, [("Alpha", 3), ("Latin", 6), ("Zed", 0xffffff)]);
+        // `Alpha` and `alpha.CONF` are one theme; backups, hidden files,
+        // folders and files that set no colour are none, so `nord.conf`
+        // is the only Nord; a file that is not UTF-8 still reads.
+        let nord = dark().bg;
+        assert_eq!(
+            extra,
+            [
+                ("Alpha", 3),
+                ("Latin", 6),
+                ("nord", nord),
+                ("Zed", 0xffffff)
+            ]
+        );
         assert_eq!(all_in(None).len(), BUILTIN.len());
         assert_eq!(all_in(Some(&f.0.join("missing"))).len(), BUILTIN.len());
     }
@@ -749,6 +925,38 @@ mod tests {
             assert_eq!(current_of(all(), "light:x,dark:y", light).name, want);
             assert_eq!(current_of(Vec::new(), "nope", light).name, want);
         }
+    }
+
+    #[test]
+    fn readable_moves_text_just_far_enough_from_its_background() {
+        let d = dark();
+        // Palette 0 on the blitz dark background, near-black text on black
+        // and grey on white all come out at 1.3:1, a step past it at most.
+        for (fg, bg) in [
+            (d.ansi[0], d.bg),
+            (0x000000, 0x000001),
+            (0x101010, 0x000000),
+            (0xf0f0f0, 0xffffff),
+            (0x777777, 0x808080),
+            (0x808080, 0x777777),
+        ] {
+            let r = readable(fg, bg, 1.3);
+            let c = contrast(r, bg);
+            assert!(
+                (1.3..1.36).contains(&c),
+                "{fg:06x} on {bg:06x}: {r:06x} {c:.3}"
+            );
+        }
+        // Lighter text gets lighter and darker text darker, where there
+        // is room.
+        assert!(luminance(readable(0x101010, 0x000000, 1.3)) > luminance(0x101010));
+        assert!(luminance(readable(0xf0f0f0, 0xffffff, 1.3)) < luminance(0xf0f0f0));
+        assert!(luminance(readable(0x000000, 0x020202, 1.3)) > luminance(0x020202));
+        // Text that already shows keeps its colour; a dark red stays red.
+        assert_eq!(readable(d.fg, d.bg, 1.3), d.fg);
+        assert_eq!(readable(0x2e7a45, 0xfcfcfb, 1.3), 0x2e7a45);
+        let [_, r, g, b] = readable(0x300000, 0x000000, 1.3).to_be_bytes();
+        assert!(r > g && g == b, "{r} {g} {b}");
     }
 
     #[test]

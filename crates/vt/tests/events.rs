@@ -261,7 +261,9 @@ const PAL: Palette = Palette {
     fg: 0x111111,
     bg: 0x222222,
     cursor: 0x333333,
+    cursor_text: None,
     selection_bg: 0,
+    selection_fg: 0x111111,
     ansi: [0; 16],
 };
 

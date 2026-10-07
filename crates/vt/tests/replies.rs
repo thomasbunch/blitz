@@ -170,7 +170,9 @@ fn theme_query() {
         fg: 0,
         bg: 0xffffff,
         cursor: 0,
+        cursor_text: None,
         selection_bg: 0,
+        selection_fg: 0,
         ansi: [0; 16],
     };
     t.set_theme(false, &pal);
@@ -186,7 +188,9 @@ fn theme_change_reports() {
         fg: 0,
         bg: 0xffffff,
         cursor: 0,
+        cursor_text: None,
         selection_bg: 0,
+        selection_fg: 0,
         ansi: [0; 16],
     };
     t.set_theme(false, &light);

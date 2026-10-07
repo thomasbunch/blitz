@@ -75,7 +75,9 @@ fn modify_other_keys_is_not_sgr() {
         fg: 1,
         bg: 2,
         cursor: 3,
+        cursor_text: None,
         selection_bg: 4,
+        selection_fg: 1,
         ansi: [0; 16],
     };
     t.snapshot(&mut s, &pal);
@@ -105,7 +107,9 @@ const PAL: vt::Palette = vt::Palette {
     fg: 1,
     bg: 2,
     cursor: 3,
+    cursor_text: None,
     selection_bg: 4,
+    selection_fg: 1,
     ansi: [0; 16],
 };
 
@@ -217,8 +221,9 @@ fn blitz_prompt_resets_display_state() {
         ..Options::default()
     });
     // Colours, margins, origin, insert mode, no wrap, line drawing in G0
-    // and G1 with G1 shifted in, no tab stops.
+    // and G1 with G1 shifted in, no tab stops, a bar cursor.
     t.feed(b"\x1b]10;#123456\x07\x1b]11;#123456\x07\x1b[2;3r\x1b[?6h\x1b[4h\x1b[?7l");
+    t.feed(b"\x1b[6 q");
     t.feed(b"\x1b(0\x1b)0\x0e\x1b[3g");
     t.feed(b"\x1b]133;A;blitz=1\x07");
     t.feed(b"\x1b[H\tq\rx\r\n\n\n\n");
@@ -228,6 +233,7 @@ fn blitz_prompt_resets_display_state() {
     let mut s = vt::Snapshot::default();
     t.snapshot(&mut s, &PAL);
     assert_eq!((s.cells[0].fg, s.cells[0].bg), (PAL.fg, PAL.bg));
+    assert_eq!(s.cursor.map(|c| c.2), Some(vt::CursorShape::Block));
 }
 
 /// The prompt mark leaves the screen alone. conhost stays on its

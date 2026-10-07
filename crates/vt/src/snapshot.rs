@@ -9,7 +9,12 @@ pub struct Palette {
     pub fg: u32,
     pub bg: u32,
     pub cursor: u32,
+    /// Text on a block cursor of colour `cursor`. `None` takes `fg` or
+    /// `bg`, whichever stands out on it.
+    pub cursor_text: Option<u32>,
     pub selection_bg: u32,
+    /// Selected text, whatever its own colour.
+    pub selection_fg: u32,
     pub ansi: [u32; 16],
 }
 
@@ -175,7 +180,9 @@ mod tests {
             fg: 0xffffff,
             bg: 0,
             cursor: 0xff0000,
+            cursor_text: None,
             selection_bg: 0x00ff00,
+            selection_fg: 0xffffff,
             ansi: [0x808080; 16],
         };
         let mut t = Terminal::new(Options {

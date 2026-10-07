@@ -9,9 +9,14 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 - Tabs and splits; every pane is its own shell.
 - With two or more sessions, a sidebar lists them with their directory,
   git branch and state: *needs you*, *working*, *done*, *error*.
-  Ctrl+Shift+B collapses it to a narrow rail of status dots.
+  Ctrl+Shift+B collapses it to a narrow rail of status dots, and a click
+  on the rail expands it again; a window under 800 pixels wide (at 100%
+  scaling) shows the rail. Click a session or a tab's heading to go
+  there. Sessions that do not fit are counted at the foot, in the accent
+  colour when one of them needs you, and a click there goes to it.
 - Claude Code's title tells blitz when a session works and when it
-  stops, and its hooks, which blitz sets up itself, when it needs input;
+  stops, and its hooks, which blitz sets up itself, when it needs input.
+  The window title starts with how many need you, as in `(2) pwsh`, and
   the taskbar button flashes if blitz is in the background.
 - In PowerShell with PSReadLine (its default), a command that runs for 10
   seconds or more and ends in a pane you are not looking at marks it
@@ -46,13 +51,15 @@ Shift+right-click also offers **Open in new blitz window**. Untick the
 option during setup to leave the menu alone.
 
 blitz asks GitHub for the latest release when it starts and every six
-hours. If there is a newer one, a strip under the panes says so. Ctrl+Shift+U
-downloads the installer, checks it against the release's `SHA256SUMS.txt`
-and restarts blitz on the new version. That ends every session, so blitz
-asks you to press it twice if one is busy. A copy run from the zip opens
-the release page instead. If the installer fails, blitz starts again on
-the old version and the strip names the installer's log. With no strip,
-Ctrl+Shift+U asks GitHub right away and says what it found.
+hours. If there is a newer one, the foot of the sidebar says so, or a
+strip under the panes while the sidebar is collapsed or not shown.
+Ctrl+Shift+U downloads the installer, checks it against the release's
+`SHA256SUMS.txt` and restarts blitz on the new version. That ends every
+session, so blitz asks you to press it twice if one is busy. A copy run
+from the zip opens the release page instead. If the installer fails,
+blitz starts again on the old version and a strip under the panes names
+the installer's log. With nothing shown, Ctrl+Shift+U asks GitHub right
+away and says what it found.
 
 ## Build
 
@@ -116,7 +123,7 @@ Claude Code at all, which names the session after its task.
 | Dot in the accent colour, *needs you* | needs you | Claude Code asks for permission or a decision, or has a plan ready; a bell rings in a pane you are not looking at | you answer a question by typing, pasting or clicking in its pane (looking only outlines it), or the next hook says what it does now; a bell's mark clears when you look |
 | Thin bar under the session, *working · 4m* | working | a prompt is sent, or the title shows Claude Code working | the turn ends |
 | Hollow ring, *done* | done | a turn ends while you look elsewhere | you look at it |
-| Red dot, *error* | error | Claude Code stops on an error, or the program exits with a failure code | you look at it; a program that exited stays until its pane closes |
+| Red square, *error* | error | Claude Code stops on an error, or the program exits with a failure code | you look at it; a program that exited stays until its pane closes |
 | None | idle | nothing is running, or Claude Code has ended | |
 
 You look at a session when its pane has focus and blitz is the window in
@@ -159,13 +166,16 @@ when two share a name. A tab goes by the folder of its focused pane.
 yourself; an empty name goes back to the automatic one.
 
 Closing the window keeps its tabs, splits and folders, and blitz opens
-them again the next time it starts; so does an update. Names you gave
-and results you had not seen yet come back too. A pane that was
-running Claude Code reopens the conversation with `claude --resume`
-once its shell is ready (this needs the hooks above). Typing `exit` in
-the last pane ends it all, and the next start is fresh. **Open in blitz**
-adds a tab to the running window, or to the reopened one; **Open in new
-blitz window** opens a separate window that is never saved.
+them again the next time it starts; so does an update, of blitz or of
+Windows. Names you gave and results you had not seen yet come back too.
+A pane that was running Claude Code reopens the conversation with
+`claude --resume` once its shell is ready (this needs the hooks above).
+Typing `exit` in the last pane ends it all, and the next start is fresh.
+Starting blitz while it runs brings its window to the front, on the
+virtual desktop you are on. **Open in blitz** adds a tab to the running
+window, or to the reopened one; **Open in new blitz window** opens a
+separate window that is never saved. So does blitz run as
+administrator, which says so in its title.
 
 Closing a pane, a tab or the window ends what runs in it, so blitz asks
 first while a session there is busy: Claude Code working or waiting for
@@ -195,8 +205,9 @@ writes it.
 | Key | Default | |
 |---|---|---|
 | `theme` | `"light:blitz light,dark:blitz dark"` | A theme name, or a light and a dark one to follow the Windows app mode. See [Themes](#themes) |
-| `font_family` | `"Cascadia Mono"` | Falls back to Cascadia Mono, then Consolas, when not installed |
+| `font_family` | `"Cascadia Mono"` | Falls back to Cascadia Mono, then Consolas, when not installed. Icons the font lacks come from an installed Nerd Font |
 | `font_size` | `11` | In points, 4 to 72 |
+| `line_height` | `1` | Space between the lines in the panes, 0.8 to 2 times the font's own |
 | `shell` | `""` | Path of the program new panes run; empty picks PowerShell 7, then Windows PowerShell, then cmd |
 | `shell_integration` | `true` | Let PowerShell and cmd report their folder and prompts to blitz |
 | `scrollback_lines` | `10000` | Lines of history each new pane keeps, up to 100000 |
@@ -245,10 +256,13 @@ palette = 1=#e06c75
 accent = #f2b84b
 ```
 
-`palette` sets colours 0 to 15. Colours a file leaves out come from the
-blitz theme of the same lightness. The sidebar and pane headers are mixed
-from the background and foreground; to choose them yourself, add any of
-`accent` (marks sessions that need you), `sidebar-background`, `border`,
+`palette` sets colours 0 to 15, and `selection-foreground` and
+`cursor-text` the colour of selected text and of text on the cursor.
+Colours a file leaves out come from the blitz theme of the same
+lightness. The sidebar and pane headers are mixed from the background
+and foreground; to choose them yourself, add any of `accent` (marks
+sessions that need you; its dots are made darker or lighter until they
+stand out), `sidebar-background`, `border`,
 `rule`, `row-focus`, `title`, `dim`, `message`, `track`, `progress`,
 `error`, `header-background`, `header-line`, `header-title`,
 `header-cwd`, `rail-focus`, `rail-work`, `idle`, `label`, `label-focus`
@@ -288,15 +302,19 @@ selection: Shift+drag selects, and Ctrl+Shift+click opens a link.
 
 Ctrl+Shift+F opens a find bar at the top right of the focused pane. It
 searches the pane's scrollback and screen as you type, ignoring case
-unless what you type has a capital letter, and tints every match in
-view. Enter or F3 goes to the next match up, Shift+Enter or Shift+F3 to
-the next one down, and Esc closes the bar, leaving the view where it is.
-A full-screen program is searched on its screen only.
+unless what you type has a capital letter, and shows every match in
+view in the selection colour, the current one outlined. Enter or F3 goes
+to the next match up, Shift+Enter or Shift+F3 to the next one down, and
+Esc closes the bar, leaving the view where it is. A full-screen program
+is searched on its screen only.
 
 With shell integration on, Ctrl+Shift+Up and Ctrl+Shift+Down scroll to
 the previous and next prompt; down from the last one goes back to the
 bottom. With no prompt that way, or in a full-screen program, the keys
 go to the program.
+
+A pane scrolled back says how many lines are below the view; a click on
+that, or typing, goes back to the bottom.
 
 ## Default keys
 
@@ -320,6 +338,7 @@ go to the program.
 | Ctrl+Shift+P | Command palette |
 | Ctrl+=, Ctrl+-, Ctrl+0 | Font size up, down, and back to the setting, until blitz restarts |
 | F11 | Full screen |
+| Alt+Space | Window menu: move, size, minimize, close |
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
@@ -334,7 +353,8 @@ the list, the arrow keys choose, and Enter or a click runs the action;
 Esc closes it. Giving the panes equal space, closing a whole tab,
 reopening the last closed pane, renaming a session or a tab and Claude
 Code setup have no keys by default, so they are only in the palette;
-renaming takes the name on the palette's line.
+renaming takes the name on the palette's line. Double-clicking the line
+between panes also gives them equal space.
 
 ## Key bindings
 
@@ -358,16 +378,16 @@ Ctrl+9 go to a tab unless a binding takes them. Lines blitz cannot read
 are skipped.
 
 The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
-`new_tab`, `close_pane`, `close_tab`, `reopen_closed`,
-`rename_session`, `rename_tab`, `next_tab`, `previous_tab`,
-`split_right`, `split_down`, `focus_left`, `focus_right`, `focus_up`,
-`focus_down`, `jump_to_attention`, `toggle_sidebar`, `update`,
-`theme_picker`, `settings`, `zoom`, `resize_left`, `resize_right`,
-`resize_up`, `resize_down`, `swap_left`, `swap_right`, `swap_up`,
-`swap_down`, `equalize`, `font_size_up`, `font_size_down`,
-`font_size_reset`, `fullscreen`, `command_palette`, `find`,
-`previous_prompt`, `next_prompt` and `claude_setup`. Typing a name in
-the command palette finds its action.
+`new_tab`, `close_pane`, `close_tab`, `reopen_closed`, `rename_session`,
+`rename_tab`, `next_tab`, `previous_tab`, `split_right`, `split_down`,
+`focus_left`, `focus_right`, `focus_up`, `focus_down`,
+`jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
+`settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
+`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
+`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
+`fullscreen`, `command_palette`, `find`, `previous_prompt`,
+`next_prompt`, `system_menu` and `claude_setup`. Typing a name in the
+command palette finds its action.
 
 A key with nothing to do goes to the program in the pane: Ctrl+C with no
 text selected, or a resize or swap with no split or neighbour that way.

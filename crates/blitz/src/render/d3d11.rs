@@ -27,7 +27,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT,
-    DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_RGBA, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGISwapChain2,
 };
@@ -37,8 +37,10 @@ use windows::core::{Error, Interface, Result, s};
 static VS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shader.vs.dxbc"));
 static PS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shader.ps.dxbc"));
 
-/// Width and height of the glyph atlas texture.
-pub const ATLAS_SIZE: u32 = 2048;
+/// Width and height of the glyph atlas texture: room for a 4K screen of
+/// distinct wide glyphs, so a full one never clears it every frame.
+/// Feature level 10_0 allows 8192.
+pub const ATLAS_SIZE: u32 = 4096;
 
 /// The four alpha-correction constants the shader needs for a text
 /// `gamma`, as DirectWrite computes them for grayscale text.
@@ -531,6 +533,14 @@ impl Swapchain {
         Ok(())
     }
 
+    /// Sets what shows where the window is bigger than the last frame, as
+    /// while it is being resized: `bg` rather than black.
+    pub fn set_background(&self, bg: u32) {
+        let [r, g, b, a] = rgba(bg).map(|c| f32::from(c) / 255.0);
+        // SAFETY: COM call on a live swap chain; the colour outlives it.
+        let _ = unsafe { self.chain.SetBackgroundColor(&DXGI_RGBA { r, g, b, a }) };
+    }
+
     /// Waits until the swap chain can take another frame, at most `ms`.
     pub fn wait(&self, ms: u32) {
         // SAFETY: `waitable` stays open until drop.
@@ -569,12 +579,90 @@ mod tests {
     }
 
     #[test]
+    fn the_atlas_holds_a_4k_screen_of_distinct_wide_glyphs() {
+        use crate::render::atlas::{Atlas, GlyphKey};
+
+        // 3840x2160 at 200 %: 11 pt is 29 px, cells 17x34, so 225x63
+        // cells, or 7087 wide glyphs of about 30x30 px each. Terminal
+        // text keeps out of the last eighth, as the renderer does.
+        let n = ATLAS_SIZE as u16;
+        let mut atlas = Atlas::new(n, n);
+        for i in 0..225 * 63 / 2u32 {
+            let mut key = GlyphKey {
+                text: [0; vt::snapshot::CLUSTER_BYTES],
+                len: 4,
+                style: 0,
+                width: 2,
+            };
+            key.text[..4].copy_from_slice(&i.to_le_bytes());
+            let slot = atlas.insert_above(n - n / 8, key, 30, 30, 0, 0);
+            assert!(slot.is_some(), "full after {i} glyphs");
+        }
+    }
+
+    #[test]
     fn only_a_removed_or_reset_device_is_lost() {
         assert!(is_device_lost(&Error::from(DXGI_ERROR_DEVICE_REMOVED)));
         assert!(is_device_lost(&Error::from(DXGI_ERROR_DEVICE_RESET)));
         for other in [E_FAIL, DXGI_STATUS_OCCLUDED] {
             assert!(!is_device_lost(&Error::from(other)), "{other:?}");
         }
+    }
+
+    /// A live resize shows the theme's background beyond the last frame,
+    /// not black strips.
+    #[test]
+    fn warp_swap_chain_fills_past_the_frame_with_the_background() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE,
+            WNDCLASSW, WS_OVERLAPPEDWINDOW,
+        };
+        use windows::core::w;
+        unsafe extern "system" fn wndproc(
+            h: HWND,
+            m: u32,
+            w: windows::Win32::Foundation::WPARAM,
+            l: windows::Win32::Foundation::LPARAM,
+        ) -> windows::Win32::Foundation::LRESULT {
+            // SAFETY: the arguments the system passed.
+            unsafe { DefWindowProcW(h, m, w, l) }
+        }
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            lpszClassName: w!("blitz.test.swapchain"),
+            ..Default::default()
+        };
+        // SAFETY: a class with a static name; a hidden window of it that is
+        // destroyed at the end.
+        let hwnd = unsafe {
+            RegisterClassW(&class);
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class.lpszClassName,
+                w!(""),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("window");
+        let gpu = Gpu::new(true).expect("WARP device");
+        let chain = Swapchain::new(&gpu, hwnd, 64, 64).expect("swap chain");
+        chain.set_background(0x336699);
+        // SAFETY: COM call on a live swap chain.
+        let bg = unsafe { chain.chain.GetBackgroundColor() }.expect("colour");
+        drop(chain);
+        // SAFETY: the window made above.
+        let _ = unsafe { DestroyWindow(hwnd) };
+        let byte = |c: f32| (c * 255.0).round() as u32;
+        assert_eq!((byte(bg.r), byte(bg.g), byte(bg.b)), (0x33, 0x66, 0x99));
+        assert_eq!(bg.a, 1.0);
     }
 
     #[test]
