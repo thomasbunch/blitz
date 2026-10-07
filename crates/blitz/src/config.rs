@@ -38,9 +38,18 @@ pub struct Config {
     pub scenery: String,
     /// The spark at the foot of the sidebar.
     pub mascot: bool,
+    /// A right click copies the selection, or pastes without one.
+    pub right_click_paste: bool,
+    /// Ctrl+click opens a file at its line through this URI, with
+    /// `{path}`, `{line}` and `{col}` filled in, as in
+    /// `vscode://file/{path}:{line}:{col}`. Empty opens files with their
+    /// program.
+    pub editor_uri: String,
     /// Key bindings from `keybind` lines, one per chord, which take the
     /// place of the default for that chord; see [`keymap::binding`].
     pub keys: Vec<keymap::Binding>,
+    /// What `text:` bindings type, by [`keymap::Action::SendText`] index.
+    pub texts: Vec<Vec<u8>>,
 }
 
 impl Default for Config {
@@ -61,7 +70,10 @@ impl Default for Config {
             restore_scrollback: false,
             scenery: "off".into(),
             mascot: false,
+            right_click_paste: true,
+            editor_uri: String::new(),
             keys: Vec::new(),
+            texts: Vec::new(),
         }
     }
 }
@@ -184,6 +196,25 @@ pub const SETTINGS: &[Setting] = &[
         applies: NEW_PANES,
     },
     Setting {
+        key: "right_click_paste",
+        group: "Mouse",
+        label: "Right-click copy and paste",
+        help: "A right click copies the selection, or pastes when nothing is \
+               selected. Hold Shift when a program takes the mouse.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
+        key: "editor_uri",
+        group: "Mouse",
+        label: "Editor",
+        help: "Ctrl+click on a file path opens it at its line in this editor. \
+               Without one, a file opens with its program, or shows in \
+               Explorer when it has none.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
         key: "flash",
         group: "Notifications",
         label: "Flash taskbar",
@@ -274,6 +305,8 @@ impl Config {
             "check_updates" => flag(self.check_updates),
             "scenery" => quote(&self.scenery),
             "mascot" => flag(self.mascot),
+            "right_click_paste" => flag(self.right_click_paste),
+            "editor_uri" => quote(&self.editor_uri),
             _ => String::new(),
         }
     }
@@ -288,17 +321,28 @@ impl Config {
         let num = bare.and_then(number);
         let text = text.unwrap_or_else(|| value.to_string());
         match key {
-            "keybind" => match keymap::binding(&text) {
-                Some(b) => {
-                    self.keys.retain(|k| (k.0, k.1) != (b.0, b.1));
-                    self.keys.push(b);
-                }
-                None => return false,
-            },
+            "keybind" => {
+                let b = match keymap::text_binding(&text) {
+                    Some((mods, vk, t)) => {
+                        let Ok(i) = u16::try_from(self.texts.len()) else {
+                            return false;
+                        };
+                        self.texts.push(t);
+                        (mods, vk, Some(keymap::Action::SendText(i)))
+                    }
+                    None => match keymap::binding(&text) {
+                        Some(b) => b,
+                        None => return false,
+                    },
+                };
+                self.keys.retain(|k| (k.0, k.1) != (b.0, b.1));
+                self.keys.push(b);
+            }
             "theme" | "font_family" if text.is_empty() => return false,
             "theme" => self.theme = text,
             "font_family" => self.font_family = text,
             "shell" => self.shell = text,
+            "editor_uri" => self.editor_uri = text,
             "scenery" => match text.to_lowercase() {
                 s if crate::arcade::scenery::SCENES.contains(&s.as_str()) => self.scenery = s,
                 _ => return false,
@@ -333,6 +377,7 @@ impl Config {
             "bell_attention" => &mut self.bell_attention,
             "check_updates" => &mut self.check_updates,
             "mascot" => &mut self.mascot,
+            "right_click_paste" => &mut self.right_click_paste,
             _ => return None,
         })
     }
@@ -714,6 +759,22 @@ mod tests {
     }
 
     #[test]
+    fn config_reads_text_bindings() {
+        let c = Config::parse(
+            r#"keybind = ctrl+shift+e=text:claude\r # start it
+keybind = "ctrl+shift+y=text:a=b # not a comment\e"
+keybind = ctrl+shift+e=text:git status\r
+keybind = ctrl+shift+n=text:
+"#,
+        );
+        let send = |i| Some(keymap::Action::SendText(i));
+        assert_eq!(c.keys, [(3, 0x59, send(1)), (3, 0x45, send(2))]);
+        assert_eq!(c.texts[0], b"claude\r", "replaced, but kept");
+        assert_eq!(c.texts[1], b"a=b # not a comment\x1b");
+        assert_eq!(c.texts[2], b"git status\r");
+    }
+
+    #[test]
     fn every_setting_reads_back_what_it_writes() {
         let mut c = Config::default();
         for s in SETTINGS.iter().filter(|s| s.kind != Kind::Game) {
@@ -847,6 +908,8 @@ scenery = stars
             ("check_updates", "false"),
             ("scenery", "\"snow\""),
             ("mascot", "true"),
+            ("right_click_paste", "false"),
+            ("editor_uri", "\"cursor://file/{path}:{line}:{col}\""),
         ] {
             assert!(c.set(k, v), "{k} = {v}");
         }

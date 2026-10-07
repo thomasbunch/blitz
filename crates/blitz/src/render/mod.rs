@@ -1157,7 +1157,12 @@ mod gpu {
                 let cur = found.len().checked_sub(1);
                 snap.highlight(&found, cur);
                 let count = cur.map(|i| (i + 1, found.len()));
-                model.find = Some(chrome::FindBar { query, count });
+                model.find = Some(chrome::FindBar {
+                    query,
+                    count,
+                    fresh: false,
+                    screen_only: false,
+                });
             }
             snaps.push((id, rect, snap));
         }

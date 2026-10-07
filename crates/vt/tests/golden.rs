@@ -218,6 +218,29 @@ fn scrollback_is_capped() {
 }
 
 #[test]
+fn the_host_clears_the_scrollback() {
+    let mut t = run(20, 3, "");
+    for i in 1..=10 {
+        feed(&mut t, &format!("line {i}\r\n"));
+    }
+    t.scroll_viewport(4);
+    let top = t.lines().start;
+    t.clear_scrollback();
+    assert_eq!(t.scrollback_text(), "");
+    assert_eq!(t.screen_text(), format!("{}\n", lines(9..=10)));
+    assert_eq!(t.view_top(), t.screen_top(), "the view follows the screen");
+    assert!(t.lines().start > top, "line numbers go on");
+    // From the alternate screen it is the main screen's that goes.
+    for i in 11..=15 {
+        feed(&mut t, &format!("line {i}\r\n"));
+    }
+    feed(&mut t, "\x1b[?1049h");
+    t.clear_scrollback();
+    feed(&mut t, "\x1b[?1049l");
+    assert_eq!(t.scrollback_text(), "");
+}
+
+#[test]
 fn alt_screen_round_trip() {
     let mut t = run(20, 5, "hello\r\nworld\x1b[31m");
     feed(&mut t, "\x1b[?1049h");
@@ -283,6 +306,20 @@ fn line_text(t: &Terminal, n: usize) -> Option<String> {
 }
 
 #[test]
+fn a_held_view_stays_on_its_text() {
+    let mut t = run(10, 2, "a\r\nb");
+    t.hold(true);
+    feed(&mut t, "\r\nc\r\nd");
+    assert_eq!(t.view_top(), 0, "at the bottom, still");
+    t.hold(false);
+    feed(&mut t, "\r\ne");
+    assert_eq!(t.view_top(), 0, "scrolled back now, so it stays");
+    t.scroll_viewport(isize::MIN);
+    feed(&mut t, "\r\nf");
+    assert_eq!(t.view_top(), t.screen_top(), "follows output again");
+}
+
+#[test]
 fn lines_keep_their_numbers_until_they_leave_scrollback() {
     let mut t = Terminal::new(Options {
         cols: 10,
@@ -315,8 +352,14 @@ fn lines_keep_their_numbers_until_they_leave_scrollback() {
     assert_ne!(t.line_epoch(), epoch, "a new width wraps the lines again");
     let epoch = t.line_epoch();
     feed(&mut t, "\x1b[?1049h");
-    assert_ne!(t.line_epoch(), epoch, "the other screen");
+    let alt = t.line_epoch();
+    assert_ne!(alt, epoch, "the other screen");
     assert_eq!(t.lines(), 0..4, "has no scrollback");
+    feed(&mut t, "\x1b[H\x1bM");
+    assert_ne!(t.line_epoch(), alt, "its rows moved down");
+    feed(&mut t, "\x1b[?1049l");
+    assert_eq!(t.line_epoch(), epoch, "back on the main screen");
+    feed(&mut t, "\x1b[?1049h");
     let epoch = t.line_epoch();
     feed(&mut t, "\x1bc");
     assert_ne!(t.line_epoch(), epoch, "a reset");
@@ -979,6 +1022,42 @@ fn resize_rewraps_the_main_screen() {
     assert_eq!(t.cursor(), (2, 2, true));
     feed(&mut t, "x");
     assert_eq!(t.screen_text(), "efgh\nij\n$ x");
+}
+
+#[test]
+fn resize_moves_marks_with_their_text() {
+    // Line 0 wraps at 5 columns into line 1; line 2 is short.
+    let mut t = run(5, 4, "abcdefghij\r\nxy\r\n$ ");
+    // f, the end of the line taken whole, x, and the blank past y.
+    let mut marks = [(1, 0), (1, u16::MAX), (2, 0), (2, 4)];
+    assert!(t.resize_keeping(10, 4, &mut marks));
+    assert_eq!(marks, [(0, 5), (0, 9), (1, 0), (1, 4)]);
+    assert_eq!(line_text(&t, 0).as_deref(), Some("abcdefghij"));
+    // Narrower again: f is on the second row of three.
+    assert!(t.resize_keeping(4, 4, &mut marks));
+    assert_eq!(marks, [(1, 1), (2, 1), (3, 0), (3, 3)]);
+    // Only a new height keeps the numbers.
+    assert!(t.resize_keeping(4, 6, &mut marks));
+    assert_eq!(marks[0], (1, 1));
+}
+
+#[test]
+fn resize_loses_marks_whose_text_is_gone() {
+    let mut t = Terminal::new(Options {
+        cols: 5,
+        rows: 2,
+        scrollback_lines: 0,
+        ambiguous_wide: false,
+    });
+    feed(&mut t, "abcde\r\nfg");
+    // Narrower: a's line takes two rows, which leaves no room for a.
+    let mut marks = [(0, 0)];
+    assert!(!t.resize_keeping(3, 2, &mut marks));
+    // The program draws the alternate screen again at a new width.
+    feed(&mut t, "\x1b[?1049h");
+    let mut marks = [(0, 0)];
+    assert!(!t.resize_keeping(4, 2, &mut marks));
+    assert!(t.resize_keeping(4, 3, &mut marks), "a new height");
 }
 
 #[test]

@@ -145,6 +145,30 @@ fn is_format(c: char) -> bool {
         | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
 }
 
+/// Decodes standard base64, padded or not, as OSC 52 carries it. `None`
+/// when it holds anything else.
+pub fn base64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 2);
+    let (mut acc, mut bits) = (0u32, 0);
+    for b in s.trim_end_matches('=').bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6 | u32::from(v)) & 0xffff;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Parses an X11 colour spec: `#rgb`, `#rrggbb`, `#rrrgggbbb`,
 /// `#rrrrggggbbbb` or `rgb:r/g/b` with 1 to 4 hex digits per channel.
 /// Returns `0xRRGGBB`.
@@ -360,6 +384,21 @@ mod tests {
             out,
             b"\x1b]11;rgb:1313/1414/1717\x07\x1b]10;rgb:d6d6/d7d7/d9d9\x1b\\"
         );
+    }
+
+    #[test]
+    fn base64_decodes_padded_or_not() {
+        assert_eq!(base64("aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64("aGk").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64("YWJj").as_deref(), Some(&b"abc"[..]));
+        assert_eq!(base64("w6k=").as_deref(), Some("é".as_bytes()));
+        assert_eq!(base64("+/+/").as_deref(), Some(&[0xfb, 0xff, 0xbf][..]));
+        assert_eq!(base64("").as_deref(), Some(&[][..]));
+        for bad in ["?", "aG k", "a=b", "aGk=\n", "aGk-"] {
+            assert_eq!(base64(bad), None, "{bad:?}");
+        }
+        let long = "QUJD".repeat(1000);
+        assert_eq!(base64(&long), Some(b"ABC".repeat(1000)));
     }
 
     #[test]

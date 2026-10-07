@@ -30,6 +30,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   and `config.toml` can bind any of them to other keys.
 - Selections that reach into scrollback, and Ctrl+click on links and
   file paths.
+- Files dropped on a pane paste as their paths, and Ctrl+V pastes a
+  screenshot into Claude Code.
 - Direct3D 11 and DirectWrite rendering, with a software fallback.
 
 ## Install
@@ -217,6 +219,8 @@ writes it.
 | `check_updates` | `true` | Look for a newer release |
 | `flash` | `true` | Flash the taskbar button when a session needs you |
 | `bell_attention` | `true` | Treat a bell or a notification in a background pane as needing you |
+| `right_click_paste` | `true` | A right click copies the selection, or pastes when nothing is selected |
+| `editor_uri` | `""` | Ctrl+click on a file path opens it at its line through this URI, such as `"vscode://file/{path}:{line}:{col}"`. Empty opens the file with its program, or shows it in Explorer when it has none |
 | `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
 | `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
 | `keybind` | | Binds a key to an action; one line per key. See [Key bindings](#key-bindings) |
@@ -279,34 +283,102 @@ good place to start.
 | Alt+drag | Select a block of columns |
 | Shift+click | Extend the selection |
 | Ctrl+click | Open a link |
-| Wheel | Scroll; in less, man and other full-screen programs, press the arrow keys |
+| Right-click | Copy the selection, or paste when nothing is selected |
+| Wheel | Scroll the pane under the pointer, by as many lines as Windows is set to |
 
 A selection can reach into scrollback and stays on its text while
-output scrolls; it ends when output rewrites the text. A double click
-takes a path or URL whole, and dragging after a double or triple click
-selects by words or lines.
+output scrolls, or when the pane's width changes; it ends when output
+rewrites the text. Each pane keeps its own selection while another has
+focus, and the view holds still while you drag. A double click takes a
+path or URL whole, without the full stop after it, and dragging after
+a double or triple click selects by words or lines. The command palette
+can also select all of a pane's text, or the last command's output
+between two of blitz's prompts.
+
+Ctrl+Shift+Space labels each URL, file path and commit hash in view
+with a letter. Type the letter to copy what it marks, or Shift and the
+letter to open it; any other key puts the labels away.
+
+Ctrl+C copies the selection while it is in view; scrolled out of view,
+Ctrl+C goes to the program as usual. Ctrl+Shift+C and Ctrl+Insert copy
+it either way, and with nothing selected Ctrl+Shift+C never reaches the
+program as Ctrl+C. When output rewrites a selection, the next copy
+still takes the text as it was, and says so, though plain Ctrl+C goes
+to the program, as nothing shows; anything else you do drops it. A dim
+line says how many lines were copied; if another program is holding
+the clipboard, the selection stays so you can copy again. **Copy
+without indent** in the command palette leaves out the marks Claude
+Code puts before replies and tool output, and the indent the lines
+share.
 
 Holding Ctrl underlines the link under the pointer: a hyperlink a
 program printed, a web address, or the path of a file that exists,
-relative ones from the pane's folder. A path with spaces is a link only
-as a hyperlink, and a path through a symbolic link or junction is none.
-Only web and local file links open. Folders, text, source code, images
-and PDFs open with their program; any other file, such as a program,
-script, shortcut or installer, is shown selected in Explorer instead.
+relative ones from the pane's folder and `~` from your user folder. A
+path counts in Claude Code's `Update(src/app.rs)`, in a Markdown link,
+and as a bare `name.ext` when that file is in the pane's folder. A path
+with spaces is a link only as a hyperlink, and a path through a
+symbolic link or junction is none. Only web and local file links open.
+Folders, text, source code, images and PDFs open with their program;
+any other file, such as a program, script, shortcut or installer, is
+shown selected in Explorer instead, and so is one no program opens.
+
+With an editor set in `editor_uri`, Ctrl+click opens a file there at
+the line and column after its path, as in `src/app.rs:12:5` or
+`src/app.ts(12,5)`. This works in Claude Code's fullscreen too, where
+other clicks go to Claude Code.
 
 When a program takes the mouse itself, as Claude Code does in
-fullscreen, clicks go to it. Hold Shift as well to use blitz's
-selection: Shift+drag selects, and Ctrl+Shift+click opens a link.
+fullscreen, clicks and the wheel go to it, and the pointer is an arrow
+rather than an I-beam. Hold Shift as well to use blitz's: Shift+drag
+selects, Ctrl+Shift+click opens a link, and Shift+right-click copies or
+pastes. Over a full-screen program, such as less or man, the wheel
+presses the arrow keys unless the program turns that off, but never in
+Claude Code, where they would bring back an earlier prompt.
+
+## Paste and drop
+
+Ctrl+V pastes text. One line copied with its line break comes without
+it, so it is not run. More lines first show what they are and wait for
+a second Ctrl+V, until you confirm one while the program takes pastes
+as such (bracketed paste); so does a paste over 5 KiB into a program
+that does not. Claude Code never asks once its hooks have reported.
+Nothing is pasted into a pane whose program has exited.
+
+Files copied in Explorer paste as their paths, in quotes when they hold
+a space or anything else a shell would read, and so do files dropped on
+a pane: double quotes in cmd, single ones in PowerShell and Git Bash.
+As another shell started in the pane may read the line by its own
+rules, a name with anything but letters, digits, spaces and
+`._-\/:~()[]+,@=` shows in full and waits for a second Ctrl+V, in every
+pane, Claude Code's too. A folder dropped on the sidebar opens in a new
+tab. Windows does not let you drop from Explorer onto blitz running as
+administrator.
+With an image on the clipboard and no text, such as a screenshot,
+Ctrl+V in a Claude Code pane whose hooks have reported sends Alt+V,
+which pastes the image; other programs get Ctrl+V.
+
+In the find bar, the command palette, the theme picker and the settings
+panel, a paste adds the first line of the clipboard and Ctrl+Backspace
+deletes a word.
+
+Programs can copy to the clipboard with OSC 52, as tmux and Neovim do
+over SSH, and the pane says so. Only the pane you are in can, while
+blitz is in front, and no program can read the clipboard.
 
 ## Find and prompts
 
-Ctrl+Shift+F opens a find bar at the top right of the focused pane. It
-searches the pane's scrollback and screen as you type, ignoring case
-unless what you type has a capital letter, and shows every match in
-view in the selection colour, the current one outlined. Enter or F3 goes
-to the next match up, Shift+Enter or Shift+F3 to the next one down, and
-Esc closes the bar, leaving the view where it is. A full-screen program
-is searched on its screen only.
+Ctrl+Shift+F opens a find bar at the top right of the focused pane,
+holding the selected text or else what you last looked for, ready to
+type over. It searches the pane's scrollback and screen as you type,
+ignoring case unless what you type has a capital letter, and shows every
+match in view in the selection colour, the current one outlined. Enter
+or F3 goes to the next match up, Shift+Enter or Shift+F3 to the next one
+down, and Esc closes the bar, leaving the view where it is and the match
+selected, so Ctrl+C copies it. Esc before you type or move puts the view
+back and selects nothing. Any other shortcut does what it does and
+closes the bar, unless it scrolls, and a click in the pane closes it
+too. A full-screen program is searched on its screen only, as the bar
+says.
 
 With shell integration on, Ctrl+Shift+Up and Ctrl+Shift+Down scroll to
 the previous and next prompt; down from the last one goes back to the
@@ -323,26 +395,32 @@ that, or typing, goes back to the bottom.
 | Ctrl+Shift+T | New tab |
 | Ctrl+Shift+W | Close pane (the last pane closes its tab) |
 | Ctrl+Tab, Ctrl+Shift+Tab | Next, previous tab |
-| Ctrl+1 to Ctrl+9 | Go to tab |
+| Ctrl+Shift+PgUp, Ctrl+Shift+PgDn | Move the tab left, right |
+| Ctrl+1 to Ctrl+8, Ctrl+9 | Go to that tab, to the last tab |
 | Ctrl+Shift+R | Split right |
 | Ctrl+Shift+D | Split down |
 | Ctrl+Alt+Arrows | Move focus between panes |
 | Alt+Shift+Arrows | Resize the focused pane (or drag the line between panes) |
 | Ctrl+Alt+Shift+Arrows | Swap the focused pane with its neighbour |
 | Ctrl+Shift+Z | Zoom the focused pane to fill the tab, or show every pane again |
-| Ctrl+Shift+J | Jump to the next session that needs you |
+| Ctrl+Shift+J | Jump to the next session that needs you, or back when none does |
+| Ctrl+Shift+O | Go to a session, picked from a list you can type to narrow |
 | Ctrl+Shift+B | Expand or collapse the sidebar |
 | Ctrl+Shift+U | Update, or look for a newer release now |
 | Ctrl+Shift+K | Pick a theme |
 | Ctrl+, | Settings |
 | Ctrl+Shift+P | Command palette |
 | Ctrl+=, Ctrl+-, Ctrl+0 | Font size up, down, and back to the setting, until blitz restarts |
+| Ctrl+Shift+=, Ctrl+NumpadAdd, Ctrl+NumpadSubtract, Ctrl+Numpad0 | The same, with + typed with Shift and on the keypad |
+| Ctrl+wheel | Font size up or down, unless the program takes the mouse |
 | F11 | Full screen |
 | Alt+Space | Window menu: move, size, minimize, close |
-| Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
+| Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy the selection; Ctrl+C only while it is in view |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
+| Ctrl+Shift+Home, Ctrl+Shift+End | Scroll to the top, to the bottom |
 | Ctrl+Shift+F | Find in the scrollback |
+| Ctrl+Shift+Space | Quick select a link, path or hash to copy or open |
 | Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
 A zoomed pane stays zoomed until you zoom again, move focus to another
@@ -350,11 +428,20 @@ pane, split or resize.
 
 The command palette lists every action with its keys. Typing narrows
 the list, the arrow keys choose, and Enter or a click runs the action;
-Esc closes it. Giving the panes equal space, closing a whole tab,
-reopening the last closed pane, renaming a session or a tab and Claude
-Code setup have no keys by default, so they are only in the palette;
-renaming takes the name on the palette's line. Double-clicking the line
-between panes also gives them equal space.
+Esc closes it. When no action matches, Enter looks for what you typed in
+the settings instead. Starting a new Claude Code session in a split,
+giving the panes equal space, closing a whole tab, reopening the last
+closed pane, moving a pane to a new tab, renaming a session or a tab,
+copying without indent, selecting all, selecting the last command's
+output, clearing the scrollback, resetting the terminal and Claude Code
+setup have no keys by default, so they are only in the palette; renaming
+takes the name on the palette's line. Double-clicking the line between
+panes also gives them equal space. Clearing the scrollback also clears
+the screen above the line the cursor is on, which moves to the top, so
+nothing cleared comes back when the pane is resized. Resetting the
+terminal turns off what a program that crashed can leave on, such as
+mouse reports, a hidden cursor or keys sent as escape codes; the text
+stays.
 
 ## Key bindings
 
@@ -371,29 +458,47 @@ A chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`:
 a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
 `end`, `pageup`, `pagedown`, `insert`, `delete`, `tab`, `enter`, `esc`,
 `space`, `backspace`, or a punctuation key by its character or its name,
-such as `,` or `comma` and `=` or `plus`. Case and spaces do not
-matter. The modifiers must match exactly. A binding replaces the
-default on the same chord, and the other defaults stay; Ctrl+1 to
-Ctrl+9 go to a tab unless a binding takes them. Lines blitz cannot read
-are skipped.
+such as `,` or `comma` and `=` or `plus`, and on the keypad `numpad0` to
+`numpad9`, `numpadadd`, `numpadsubtract`, `numpadmultiply`,
+`numpaddivide` and `numpaddecimal`. Case and spaces do not matter. The
+modifiers must match exactly. A binding replaces the default on the
+same chord, and the other defaults stay. Ctrl+1 to Ctrl+9 go to a tab
+unless a binding takes them, on layouts where those keys type digits;
+on others, such as French AZERTY, they go to the program unless bound
+to `go_to_tab_1` to `go_to_tab_8` or `last_tab`.
+Lines blitz cannot read are skipped.
 
-The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
-`new_tab`, `close_pane`, `close_tab`, `reopen_closed`, `rename_session`,
-`rename_tab`, `next_tab`, `previous_tab`, `split_right`, `split_down`,
-`focus_left`, `focus_right`, `focus_up`, `focus_down`,
-`jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
-`settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
-`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
-`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
-`fullscreen`, `command_palette`, `find`, `previous_prompt`,
-`next_prompt`, `system_menu` and `claude_setup`. Typing a name in the
-command palette finds its action.
+The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
+`select_last_output`, `scroll_page_up`, `scroll_page_down`,
+`scroll_to_top`, `scroll_to_bottom`, `clear_scrollback`,
+`reset_terminal`, `new_tab`, `close_pane`, `close_tab`, `reopen_closed`,
+`rename_session`, `rename_tab`, `next_tab`, `previous_tab`,
+`move_tab_left`, `move_tab_right`, `move_pane_to_new_tab`,
+`split_right`, `split_down`, `new_claude`, `focus_left`, `focus_right`,
+`focus_up`, `focus_down`, `jump_to_attention`, `go_to_session`,
+`toggle_sidebar`, `update`, `theme_picker`, `settings`, `zoom`,
+`resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_left`,
+`swap_right`, `swap_up`, `swap_down`, `equalize`, `font_size_up`,
+`font_size_down`, `font_size_reset`, `fullscreen`, `command_palette`,
+`find`, `quick_select`, `previous_prompt`, `next_prompt`,
+`system_menu`, `claude_setup`, `go_to_tab_1` to `go_to_tab_8` and
+`last_tab`. Typing a name in the command palette finds its action.
+
+A binding can also type text into the focused pane: `text:` and the
+text, with `\e` for Esc, `\r` for Enter, `\n`, `\t`, `\s` for a space,
+`\\` for a backslash and `\xNN` for any byte. Put the line in single
+quotes to keep a `#` in the text.
+
+```
+keybind = ctrl+shift+g=text:git status\r
+keybind = 'alt+c=text:claude --continue # last session\r'
+```
 
 A key with nothing to do goes to the program in the pane: Ctrl+C with no
 text selected, or a resize or swap with no split or neighbour that way.
-Held down, the keys that move focus, switch tabs, scroll, resize and swap
-repeat; the others act once, so a held key never answers its own "press
-again".
+Held down, the keys that move focus, switch or move tabs, scroll, resize
+and swap repeat; the others act once, so a held key never answers its own
+"press again".
 
 ## License
 

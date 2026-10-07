@@ -12,6 +12,13 @@ const FONT_SIZES: &[f32] = &[
 const LINE_HEIGHTS: &[f32] = &[0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8, 2.0];
 /// Scrollback lengths offered.
 const SCROLLBACK: &[usize] = &[1000, 5000, 10_000, 20_000, 50_000, 100_000];
+/// Editors offered for Ctrl+click on a path, by the URI that opens a file
+/// at a line. Others can be set in `config.toml`.
+const EDITORS: &[(&str, &str)] = &[
+    ("Off", ""),
+    ("VS Code", "vscode://file/{path}:{line}:{col}"),
+    ("Cursor", "cursor://file/{path}:{line}:{col}"),
+];
 
 /// The open settings panel.
 #[derive(Debug, Default)]
@@ -84,6 +91,9 @@ impl Panel {
                 .collect(),
             "shell" => (self.shells.iter())
                 .map(|(name, path)| (name.clone(), quote(path)))
+                .collect(),
+            "editor_uri" => (EDITORS.iter())
+                .map(|(name, uri)| (name.to_string(), quote(uri)))
                 .collect(),
             _ => Vec::new(),
         };
@@ -352,6 +362,23 @@ mod tests {
         let game = setting("game");
         assert_eq!(p.shown(game, &c), "play");
         assert_eq!(p.step(game, &c, 1, true), None);
+    }
+
+    #[test]
+    fn editors_step_from_off_and_show_one_set_by_hand() {
+        let (p, mut c) = (panel(), Config::default());
+        let editor = setting("editor_uri");
+        assert_eq!(p.shown(editor, &c), "Off");
+        let next = p.step(editor, &c, 1, false).expect("an editor");
+        assert!(c.set("editor_uri", &next));
+        assert_eq!(c.editor_uri, "vscode://file/{path}:{line}:{col}");
+        assert_eq!(p.shown(editor, &c), "VS Code");
+        c.editor_uri = "zed://file/{path}:{line}".into();
+        assert_eq!(p.shown(editor, &c), "zed://file/{path}:{line}");
+        assert_eq!(
+            p.step(editor, &c, -1, false).as_deref(),
+            Some("\"cursor://file/{path}:{line}:{col}\"")
+        );
     }
 
     #[test]

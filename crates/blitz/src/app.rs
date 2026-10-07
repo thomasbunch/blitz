@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -16,11 +17,12 @@ use vt::grid::Found;
 use vt::{
     Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
 };
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DwmSetWindowAttribute,
 };
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, GetKeyboardState, GetLastInputInfo, LASTINPUTINFO,
@@ -30,8 +32,9 @@ use windows::Win32::UI::Shell::{
     TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage, WM_CHAR,
-    WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetCursorPos, GetSystemMetrics, MSG, SM_CXSMICON, SetForegroundWindow, TranslateMessage,
+    WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -85,6 +88,10 @@ const HINT: Duration = Duration::from_secs(10);
 /// hooks before blitz says they are not reporting. A turn's first hook
 /// lands within a second of it starting.
 const HOOKS_QUIET: Duration = Duration::from_secs(45);
+/// How long a dim notice that only says something worked stays up.
+const BRIEF: Duration = Duration::from_secs(2);
+/// How long a shortcut with nothing to do says so.
+const NOTHING: Duration = Duration::from_secs(1);
 /// Frame times for blitz run, and for scenery and the spark, which move
 /// slowly.
 const GAME_FRAME: Duration = Duration::from_millis(16);
@@ -106,8 +113,6 @@ const AWAY_AFTER: Duration = Duration::from_secs(30);
 const RESUME_AFTER: Duration = Duration::from_secs(3);
 /// Lines of output saved per pane when `restore_scrollback` is on.
 const SAVED_LINES: usize = 1000;
-/// Lines scrolled per wheel notch when the program takes no mouse input.
-const WHEEL_LINES: isize = 3;
 /// How long a changed layout waits before it is saved, so holding a resize
 /// key writes the file at most once this often rather than every step. A
 /// divider drag writes it once, after the drag.
@@ -123,6 +128,9 @@ const FIRST_FRAME: Duration = Duration::from_millis(500);
 /// changing size, as in a live resize or a divider drag: each new size
 /// makes the program redraw its whole screen.
 const RESIZE_GAP: Duration = Duration::from_millis(80);
+/// How often the find bar searches again while output streams into its
+/// pane: each search reads all of the scrollback.
+const FIND_EVERY: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -472,8 +480,12 @@ enum Ask {
     /// An error: the next key in its pane takes it away, read by then.
     Key,
     /// The action that showed it, run again in its pane, confirms. Any
-    /// other key takes it away and goes on to do what it does.
+    /// other key takes it away and goes on to do what it does. Pasting
+    /// confirms only while the clipboard still holds this text.
     Paste(String),
+    /// Files dropped on the pane, as their paths: pasting confirms them,
+    /// whatever the clipboard holds.
+    Drop(String),
     ClosePane,
     CloseTab,
     Update,
@@ -491,8 +503,8 @@ impl Ask {
         let by = match self {
             Ask::Nothing => return false,
             Ask::Key => return here,
-            Ask::Paste(_) | Ask::ClosePane | Ask::CloseTab if !here => return true,
-            Ask::Paste(_) => Action::Paste,
+            Ask::Paste(_) | Ask::Drop(_) | Ask::ClosePane | Ask::CloseTab if !here => return true,
+            Ask::Paste(_) | Ask::Drop(_) => Action::Paste,
             Ask::ClosePane => Action::ClosePane,
             Ask::CloseTab => Action::CloseTab,
             Ask::Update => Action::Update,
@@ -504,7 +516,10 @@ impl Ask {
     /// Whether the question is about its own pane, so focus leaving that
     /// pane takes it away.
     fn of_pane(&self) -> bool {
-        matches!(self, Ask::Paste(_) | Ask::ClosePane | Ask::CloseTab)
+        matches!(
+            self,
+            Ask::Paste(_) | Ask::Drop(_) | Ask::ClosePane | Ask::CloseTab
+        )
     }
 }
 
@@ -521,18 +536,24 @@ struct Mouse {
     /// For the left, middle and right button, the pane whose program was
     /// sent its press.
     reported: [Option<PaneId>; 3],
-    tracker: vt::keys::MouseTracker,
     /// Wheel movement not yet turned into whole steps.
     wheel: f64,
+    /// When Ctrl and the wheel last changed the font size.
+    font_at: Option<Instant>,
     /// A left-button drag is moving this divider of the active tab; the
     /// second value is the smallest pane it may leave.
     divider: Option<(usize, (i32, i32))>,
-    /// The pointer is over a divider along this axis and shows it.
-    over_divider: Option<Axis>,
     /// What in the sidebar the pointer is over.
     over_side: Option<Side>,
+    /// The pointer's shape; see [`pointer`].
+    icon: CursorIcon,
+    /// The pointer is hidden while typing.
+    hidden: bool,
     /// A left-button drag is making a selection.
     drag: Option<Drag>,
+    /// The pane the drag began in, and whether it showed the bottom of its
+    /// text then.
+    drag_in: Option<(PaneId, bool)>,
     /// When the drag next scrolls, while the pointer is outside its pane.
     scroll_at: Option<Instant>,
     /// The last press that went to selection: when, on which cell, and
@@ -540,6 +561,9 @@ struct Mouse {
     click: Option<(Instant, Pos, u8)>,
     /// The same for the last press on a divider, by its index.
     divider_click: Option<(Instant, Pos, u8)>,
+    /// The cell of the left press a program was sent, and whether a drag
+    /// from it may still show the Shift+drag hint.
+    program_press: Option<((u16, u16), bool)>,
 }
 
 /// A cell as a line number and a column. Line numbers stay with their
@@ -605,7 +629,7 @@ fn evens(last: &mut Option<(Instant, Pos, u8)>, i: usize, now: Instant, within: 
     n == 2
 }
 
-/// Selected cells in the focused pane.
+/// Selected cells in a pane.
 struct Selection {
     drag: Drag,
     /// The first and last cell in reading order; a block's top-left and
@@ -660,6 +684,118 @@ impl Selection {
         let top = term.screen_top();
         self.seen = (top, selection_text(term, pal, self, top));
     }
+
+    /// The text it held at the last look, once output rewrote it. Lines
+    /// above the screen were scrollback then, which output leaves alone;
+    /// `None` when some of them are gone.
+    fn last_text(&self, term: &vt::Terminal, pal: &Palette) -> Option<String> {
+        let (top, shown) = &self.seen;
+        if self.start.0 >= *top {
+            return Some(shown.clone());
+        }
+        if !self.kept(term) {
+            return None;
+        }
+        let all = selection_text(term, pal, self, 0);
+        let now = selection_text(term, pal, self, *top);
+        Some(all.strip_suffix(now.as_str())?.to_owned() + shown)
+    }
+
+    /// The cells that move with the text when a new width wraps the lines
+    /// again: its ends and its anchor. None for a block, whose columns
+    /// mean nothing at another width.
+    fn marks(&self) -> Vec<Pos> {
+        match self.drag.block {
+            true => Vec::new(),
+            false => vec![self.start, self.end, self.drag.anchor.0, self.drag.anchor.1],
+        }
+    }
+
+    /// Takes the cells [`Self::marks`] gave, moved to where `term` wrapped
+    /// their text again.
+    fn reflowed(&mut self, term: &vt::Terminal, pal: &Palette, marks: &[Pos]) {
+        if let &[start, end, a, b] = marks {
+            (self.start, self.end, self.drag.anchor) = (start, end, (a, b));
+            self.drag.epoch = term.line_epoch();
+            self.look(term, pal);
+        }
+    }
+}
+
+/// Ends a drag in `term`, whose view it held. A click that selected
+/// nothing puts a view that showed the bottom (`bottom`) back there, which
+/// output that came meanwhile moved it off.
+fn let_go(term: &mut vt::Terminal, bottom: bool, selected: bool) {
+    term.hold(false);
+    if bottom && !selected {
+        term.scroll_viewport(isize::MIN);
+    }
+}
+
+/// What a drag does to pane `id`'s `term`: its view holds still while the
+/// drag goes on in it, `held`, and when the drag has `ended`, the pane it
+/// began in lets go, wherever focus went meanwhile. True when it let go.
+fn drag_holds(
+    term: &mut vt::Terminal,
+    id: PaneId,
+    held: Option<PaneId>,
+    ended: Option<(PaneId, bool)>,
+    selected: bool,
+) -> bool {
+    match ended {
+        Some((began, bottom)) if began == id => {
+            let_go(term, bottom, selected);
+            true
+        }
+        _ => {
+            term.hold(held == Some(id));
+            false
+        }
+    }
+}
+
+/// A selection of the cells from `start` to `end`, as made in code.
+fn selection_of(term: &vt::Terminal, pal: &Palette, start: Pos, end: Pos) -> Selection {
+    let drag = Drag {
+        epoch: term.line_epoch(),
+        anchor: (start, end),
+        unit: 1,
+        block: false,
+    };
+    Selection::new(term, pal, drag, start)
+}
+
+/// The first and last line of the text in `term`: none blank at the end.
+fn all_text(term: &vt::Terminal, pal: &Palette) -> Option<(usize, usize)> {
+    let lines = term.lines();
+    let last = (lines.clone()).rev().find(|&n| !blank(term, pal, n))?;
+    Some((lines.start, last))
+}
+
+/// The first and last line of the last command's output: the lines from
+/// the end of the command at blitz's next to last prompt down to its last
+/// prompt, none blank at the end. The output starts where the shell marked
+/// it, below a prompt or command of more than one line; a shell that does
+/// not mark it, such as cmd, gets the line after the command's last row.
+fn last_output(term: &vt::Terminal, pal: &Palette) -> Option<(usize, usize)> {
+    let mut prompts = term.lines().rev().filter(|&n| term.starts_prompt(n));
+    let (now, before) = (prompts.next()?, prompts.next()?);
+    let first = (before..now).find(|&n| term.starts_output(n)).or_else(|| {
+        let mut end = before;
+        while end < now && term.wraps(end) {
+            end += 1;
+        }
+        Some(end + 1)
+    })?;
+    let last = (first..now).rev().find(|&n| !blank(term, pal, n))?;
+    Some((first, last))
+}
+
+/// Whether line `n` holds no text.
+fn blank(term: &vt::Terminal, pal: &Palette, n: usize) -> bool {
+    let mut cells = Vec::new();
+    term.line_cells(n, pal, &mut cells);
+    cells.iter().all(|c| c.len == 0)
 }
 
 /// The cells from `start` to `end`, or the block they are the corners
@@ -688,6 +824,16 @@ fn in_view(
         false => (end.1, row(end.0)),
     };
     Some((a, b))
+}
+
+/// Marks in `snap`, a view from line `top`, what is drawn over the text:
+/// its pane's selection, which every pane keeps while another has focus,
+/// and the link under the pointer.
+fn mark(snap: &mut Snapshot, top: usize, sel: Option<&Selection>, hover: Option<(Pos, Pos)>) {
+    let size = (snap.cols, snap.rows);
+    snap.selection = sel.and_then(|s| in_view(s.start, s.end, s.drag.block, top, size));
+    snap.block = sel.is_some_and(|s| s.drag.block);
+    snap.hover = hover.and_then(|(a, b)| in_view(a, b, false, top, size));
 }
 
 /// The drawn text of a logical line, its rows joined where they wrap.
@@ -756,14 +902,22 @@ fn char_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
     }
 }
 
-/// The word around `at`, following soft wraps: a run of word characters
-/// or of blanks, or any other character alone.
+/// The word around `at`, following soft wraps: a URL or path the link
+/// scanner finds there, else a run of word characters without the
+/// punctuation that ends a sentence, or of blanks, or any other character
+/// alone.
 fn word_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
     let l = Logical::new(term, pal, at.0);
     let Some(i) = l.index(at) else {
         return (at, at);
     };
-    let class = |k: usize| match l.text[l.cells[k].0..].chars().next() {
+    let here = l.cells[i].0;
+    let mut links = crate::links::scan(&l.text).into_iter();
+    if let Some((range, _)) = links.find(|(r, _)| r.contains(&here)) {
+        return l.span(range);
+    }
+    let char_at = |k: usize| l.text[l.cells[k].0..].chars().next();
+    let class = |k: usize| match char_at(k) {
         Some(c) if c.is_alphanumeric() || WORD.contains(c) => 1,
         Some(' ') => 2,
         _ => 0,
@@ -774,6 +928,9 @@ fn word_at(term: &vt::Terminal, pal: &Palette, at: Pos) -> (Pos, Pos) {
     }
     while me != 0 && b + 1 < l.cells.len() && class(b + 1) == me {
         b += 1;
+    }
+    while b > i && char_at(b).is_some_and(|c| ".,:;?!".contains(c)) {
+        b -= 1;
     }
     l.span(l.cells[a].0..l.cells[b].0 + 1)
 }
@@ -795,6 +952,8 @@ fn line_at(term: &vt::Terminal, at: Pos) -> (Pos, Pos) {
 struct View {
     pane: Pane,
     snap: Snapshot,
+    /// Mouse reports to its program, one per cell crossed.
+    tracker: vt::keys::MouseTracker,
     /// The terminal's size in cells.
     grid: (u16, u16),
     /// When the terminal last took a new size, and when its pane's new
@@ -809,8 +968,9 @@ struct View {
     flashed: Option<Instant>,
     /// A thread is reading the git branch of the session's directory.
     finding_branch: bool,
-    /// A restored Claude Code session: the line to type at the shell's
-    /// first prompt, and when to type it anyway.
+    /// A line to type at the shell's first prompt, and when to type it
+    /// anyway: what resumes a restored Claude Code session, or starts a
+    /// new one.
     resume: Option<(String, Instant)>,
     /// The shell has shown blitz's prompt mark, so the next one means
     /// what ran in it has ended.
@@ -831,6 +991,8 @@ struct View {
     claude_working: Option<Instant>,
     /// A hook notification came, so Claude Code's hooks report.
     hooks_seen: bool,
+    /// Selected text, kept while another pane has focus.
+    selection: Option<Selection>,
 }
 
 impl View {
@@ -864,6 +1026,8 @@ struct App {
     game_ended: Option<Instant>,
     /// Windows shows animations; scenery and the spark keep still if not.
     motion: bool,
+    /// Windows hides the pointer while typing.
+    vanish: bool,
     /// The command palette, while it is open.
     commands: Option<Commands>,
     /// Where the command palette and its rows were in the last frame, for
@@ -874,6 +1038,11 @@ struct App {
     font_zoom: f32,
     /// The find bar of the focused pane, while it is open.
     find: Option<Find>,
+    /// What was last searched for, which the find bar opens with when no
+    /// text is selected.
+    find_last: String,
+    /// Quick select's labels, while they show.
+    quick: Option<Quick>,
     scale: f64,
     /// Tabs and the split tree in each.
     win: layout::Window,
@@ -886,11 +1055,12 @@ struct App {
     /// The number the next new session shows after its name.
     next_num: u32,
     focused: bool,
+    /// The text of a selection in the focused pane that output rewrote,
+    /// which Copy still takes until the user does something else.
+    orphan: Option<String>,
     /// A session changed while the user was away from the screen; the
     /// focused pane counts as seen once they are back.
     away: bool,
-    /// A selection in the focused pane.
-    selection: Option<Selection>,
     /// The link under the pointer while Ctrl is held, drawn underlined:
     /// the line epoch and its first and last cell.
     hover: Option<(u32, Pos, Pos)>,
@@ -900,6 +1070,12 @@ struct App {
     mouse: Mouse,
     /// IME composition text, drawn at the cursor.
     preedit: String,
+    /// Files dropped on the window, one event each, handled together when
+    /// the event loop has nothing more to deliver.
+    dropped: Vec<PathBuf>,
+    /// Where the last jump to a session that needs you came from, and
+    /// where it went; see [`jump`].
+    jumped: Option<(PaneId, PaneId)>,
     /// A newer release: its version and the banner text.
     update: Option<(String, String)>,
     /// The installer is downloading, or Ctrl+Shift+U is looking for a
@@ -915,10 +1091,12 @@ struct App {
     banner: Option<Rect>,
     /// The chips on panes scrolled back in the last frame, for clicks.
     below: Vec<(PaneId, Rect)>,
+    /// The find bar in the last frame, for clicks.
+    find_bar: Option<Rect>,
     /// Keys whose releases belong to a shortcut or a panel and are not sent.
     eaten: Eaten,
-    /// Where the IME was last told the cursor is, in client pixels.
-    ime_at: Option<(i32, i32)>,
+    /// Where the IME was last told typing goes, in client pixels.
+    ime_at: Option<Rect>,
     /// What the title bar shows.
     title: String,
     /// Checked once the first output shows which ConPTY is running.
@@ -979,10 +1157,6 @@ impl Picker {
     /// list; typing narrows the list and Backspace widens it, each going
     /// back to the first match. Returns false for keys it has no use for.
     fn key(&mut self, k: &KeyInput) -> bool {
-        let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
         let (sel, last) = (self.sel as isize, self.matches().len().saturating_sub(1));
         let step = |by: isize| (sel + by).clamp(0, last as isize) as usize;
         match k.vk {
@@ -990,15 +1164,21 @@ impl Picker {
             VK_DOWN => self.sel = step(1),
             VK_PRIOR => self.sel = step(-(chrome::PICKER_ROWS as isize)),
             VK_NEXT => self.sel = step(chrome::PICKER_ROWS as isize),
-            VK_BACK if self.filter.pop().is_some() => self.sel = 0,
-            _ if !chord && !k.text.is_empty() => {
-                self.filter.push_str(k.text);
-                self.sel = 0;
-            }
+            _ if edit_field(&mut self.filter, k) => self.sel = 0,
             _ => return false,
         }
         true
     }
+}
+
+/// What a row of the command palette does when picked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pick {
+    Run(Action),
+    /// Bring this session to the front.
+    Show(PaneId),
+    /// Open the settings panel on what was typed.
+    Settings,
 }
 
 /// The open command palette.
@@ -1011,6 +1191,11 @@ struct Commands {
     sel: usize,
     /// What the typed text names instead, with no actions to pick.
     rename: Option<Rename>,
+    /// Actions left out, as they have nothing to do now.
+    hidden: Vec<Action>,
+    /// Sessions to go to, listed in place of the actions: each with its
+    /// row and its state.
+    sessions: Option<Vec<(PaneId, String, String)>>,
 }
 
 /// What the command palette's line names.
@@ -1022,23 +1207,39 @@ enum Rename {
 }
 
 impl Commands {
-    /// The matching actions and their labels, in [`keymap::ACTIONS`] order.
-    /// The palette leaves itself out.
-    fn matches(&self) -> Vec<(Action, &'static str)> {
+    /// The matching rows, each what it does and its label: the sessions
+    /// whose row or state holds every typed word, or else actions in
+    /// [`keymap::ACTIONS`] order, leaving out the palette itself, going to
+    /// a tab by number and the `hidden` actions. When none matches what
+    /// was typed, one row searches the settings for it instead.
+    fn matches(&self) -> Vec<(Pick, String)> {
         if self.rename.is_some() {
             return Vec::new();
         }
         let words: Vec<String> = (self.filter.split_whitespace())
             .map(str::to_lowercase)
             .collect();
-        (keymap::ACTIONS.iter())
-            .filter(|a| a.0 != Action::Palette)
-            .filter(|a| {
-                let text = format!("{} {}", a.2, a.1).to_lowercase();
-                words.iter().all(|w| text.contains(w.as_str()))
-            })
-            .map(|a| (a.0, a.2))
-            .collect()
+        let hit = |text: String| {
+            let text = text.to_lowercase();
+            words.iter().all(|w| text.contains(w.as_str()))
+        };
+        if let Some(list) = &self.sessions {
+            return (list.iter())
+                .filter(|s| hit(format!("{} {}", s.1, s.2)))
+                .map(|s| (Pick::Show(s.0), s.1.clone()))
+                .collect();
+        }
+        let mut rows: Vec<(Pick, String)> = (keymap::ACTIONS.iter())
+            .filter(|a| !matches!(a.0, Action::Palette | Action::GoToTab(_) | Action::LastTab))
+            .filter(|a| !self.hidden.contains(&a.0))
+            .filter(|a| hit(format!("{} {}", a.2, a.1)))
+            .map(|a| (Pick::Run(a.0), a.2.to_string()))
+            .collect();
+        let typed = self.filter.trim();
+        if rows.is_empty() && !typed.is_empty() {
+            rows.push((Pick::Settings, format!("Search settings for \"{typed}\"")));
+        }
+        rows
     }
 
     /// Moves the highlight `by` rows, stopping at either end.
@@ -1059,6 +1260,14 @@ struct Find {
     cur: Option<usize>,
     /// Output came since the last search.
     stale: bool,
+    /// When the last search ran; `None` asks for one at once.
+    searched: Option<Instant>,
+    /// The query was put there when the bar opened and is drawn selected:
+    /// typing replaces it.
+    fresh: bool,
+    /// The view's top line when the bar opened, and whether it showed the
+    /// bottom, until the bar searches or moves to another match.
+    back: Option<(usize, bool)>,
 }
 
 impl Find {
@@ -1069,7 +1278,51 @@ impl Find {
             found: Vec::new(),
             cur: None,
             stale: false,
+            searched: None,
+            fresh: false,
+            back: None,
         }
+    }
+
+    /// What closing the bar with Esc leaves selected in `term`, whose view
+    /// is `rows` high: the current match, or nothing when the bar did
+    /// nothing since it opened, which puts the view back where it was.
+    fn close(&mut self, term: &mut vt::Terminal, rows: u16) -> Option<Found> {
+        if let Some((top, bottom)) = self.back {
+            match bottom {
+                true => term.scroll_viewport(isize::MIN),
+                false => term.scroll_to(top),
+            }
+            return None;
+        }
+        if self.stale {
+            self.search(term, rows);
+        }
+        self.cur.map(|i| self.found[i])
+    }
+
+    /// Types `t` into the query, in place of a fresh one.
+    fn type_text(&mut self, t: &str) {
+        if std::mem::take(&mut self.fresh) {
+            self.query.clear();
+        }
+        self.query.push_str(t);
+    }
+
+    /// A key for the query, as [`edit_field`] takes it, except that the
+    /// first edit of a fresh query replaces all of it, and Backspace then
+    /// empties it. False when nothing changed.
+    fn edit(&mut self, k: &KeyInput) -> bool {
+        if !self.fresh {
+            return edit_field(&mut self.query, k);
+        }
+        let mut typed = String::new();
+        if k.vk != VK_BACK && !edit_field(&mut typed, k) {
+            return false;
+        }
+        self.fresh = false;
+        self.query = typed;
+        true
     }
 
     /// Searches `term` again. The current match stays on the one that
@@ -1083,6 +1336,7 @@ impl Find {
         };
         self.found = term.find(&self.query);
         self.stale = false;
+        self.searched = Some(Instant::now());
         let above = self.found.partition_point(|m| m.start <= anchor);
         self.cur = (!self.found.is_empty()).then(|| above.saturating_sub(1));
     }
@@ -1092,6 +1346,124 @@ impl Find {
         let n = self.found.len() as isize;
         self.cur = (self.cur).map(|i| (i as isize + by).rem_euclid(n) as usize);
     }
+
+    /// When output that came since the last search is searched: at once
+    /// after a quiet spell, else `FIND_EVERY` after the last search, so a
+    /// pane streaming output is searched a few times a second, not on
+    /// every frame. `None` with nothing to search.
+    fn due(&self) -> Option<Instant> {
+        self.stale
+            .then(|| self.searched.map_or(Instant::now(), |t| t + FIND_EVERY))
+    }
+}
+
+/// Quick select: a label on each URL, path and commit hash in view in the
+/// focused pane. Typing a label copies what it marks; with Shift it opens
+/// it.
+struct Quick {
+    pane: PaneId,
+    /// The line epoch the matches are numbered in.
+    epoch: u32,
+    /// The matches from the bottom of the view up, labelled `a` to `z`:
+    /// their cells, their text, and what opening them does. A hash opens
+    /// nothing.
+    items: Vec<QuickItem>,
+    /// Their cells in order, as each frame highlights them.
+    found: Vec<Found>,
+}
+
+type QuickItem = (Found, String, Option<Target>);
+
+/// The URLs, paths and commit hashes in the `rows` high view of `term`, at
+/// most one for each letter, from the bottom up: as [`Quick::items`]; and
+/// the line epoch they were read at. A path counts when `resolve` finds
+/// the file, which looks at the disk, so only once `term` is unlocked:
+/// the pane's output never waits on a slow drive.
+fn quick_items(
+    term: &Mutex<vt::Terminal>,
+    pal: &Palette,
+    rows: u16,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> (Vec<QuickItem>, u32) {
+    let t = lock(term);
+    let top = t.view_top();
+    let shown = top..top + usize::from(rows);
+    let mut lines = Vec::new();
+    let mut n = top;
+    while shown.contains(&n) {
+        let l = Logical::new(&t, pal, n);
+        n = l.cells.last().map_or(n, |c| c.1.0.max(n)) + 1;
+        lines.push(l);
+    }
+    let epoch = t.line_epoch();
+    drop(t);
+    let mut out = Vec::new();
+    for l in lines {
+        let mut found: Vec<(Range<usize>, Option<Target>)> = Vec::new();
+        for (range, link) in crate::links::scan(&l.text) {
+            let target = match link {
+                Link::Url(u) => Target::Uri(u),
+                Link::Path(p, at) => match resolve(&p) {
+                    Some(full) => Target::Path(full, at),
+                    None => continue,
+                },
+            };
+            found.push((range, Some(target)));
+        }
+        for range in hashes(&l.text) {
+            if !found
+                .iter()
+                .any(|(r, _)| r.start < range.end && range.start < r.end)
+            {
+                found.push((range, None));
+            }
+        }
+        found.sort_by_key(|f| f.0.start);
+        for (range, target) in found {
+            let (start, end) = l.span(range.clone());
+            if shown.contains(&start.0) {
+                out.push((Found { start, end }, l.text[range].to_owned(), target));
+            }
+        }
+    }
+    out.reverse();
+    out.truncate(26);
+    (out, epoch)
+}
+
+/// The label a key types for quick select, `a` as 0, and whether Shift
+/// asks to open rather than copy. By the key, not its text, so Caps Lock
+/// does not turn a copy into an open, and a label types on any layout.
+fn quick_label(k: &KeyInput) -> Option<(usize, bool)> {
+    let m = &k.mods;
+    let letter = (0x41..=0x5a).contains(&k.vk);
+    let other = m.lctrl || m.rctrl || m.lalt || m.ralt || m.lsuper || m.rsuper;
+    (letter && !other).then(|| (usize::from(k.vk - 0x41), m.lshift || m.rshift))
+}
+
+/// Where `text` holds a commit hash: 7 to 40 hex digits with a letter and
+/// a digit among them, a word of its own. Not a piece of a path, a GUID
+/// or a name such as cargo's `blitz-3f2a1b9c8d7e6f50`.
+fn hashes(text: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let len = b[i..].iter().take_while(|c| c.is_ascii_hexdigit()).count();
+        let word = &b[i..i + len];
+        let alone =
+            |j: Option<&u8>| j.is_none_or(|c| !c.is_ascii_alphanumeric() && !b"_-/\\".contains(c));
+        if (7..=40).contains(&len)
+            && word.iter().any(u8::is_ascii_digit)
+            && word.iter().any(u8::is_ascii_alphabetic)
+            && alone(i.checked_sub(1).and_then(|j| b.get(j)))
+            && alone(b.get(i + len))
+        {
+            out.push(i..i + len);
+        }
+        i += len.max(1);
+    }
+    out
 }
 
 /// Sends [`UserEvent::Settings`] whenever a file in `%APPDATA%\blitz`, or
@@ -1157,10 +1529,13 @@ impl App {
             game: None,
             game_ended: None,
             motion: animations_on(),
+            vanish: mouse_vanish(),
             commands: None,
             commands_hits: None,
             font_zoom: 0.0,
             find: None,
+            find_last: String::new(),
+            quick: None,
             scale: 1.0,
             win: layout::Window::default(),
             views: Vec::new(),
@@ -1168,18 +1543,21 @@ impl App {
             next_id: 1,
             next_num: 1,
             focused: false,
+            orphan: None,
             away: false,
-            selection: None,
             hover: None,
             resolved: RefCell::new(None),
             mouse: Mouse::default(),
             preedit: String::new(),
+            dropped: Vec::new(),
+            jumped: None,
             update: None,
             updating: None,
             closed: None,
             banner_note: None,
             banner: None,
             below: Vec::new(),
+            find_bar: None,
             eaten: Eaten::default(),
             ime_at: None,
             title: "blitz".into(),
@@ -1542,6 +1920,7 @@ impl App {
         lock(&pane.term).set_cell_px(cw as u16, ch as u16);
         pane.name = program_name(&launch.cmdline);
         self.views.push(View {
+            tracker: Default::default(),
             pane,
             snap: Snapshot::default(),
             grid,
@@ -1560,6 +1939,7 @@ impl App {
             progress: None,
             claude_working: None,
             hooks_seen: false,
+            selection: None,
         });
         if let Some(text) = fell_back {
             // It covers the pane's last row, so it stays only until the
@@ -1628,22 +2008,23 @@ impl App {
     }
 
     /// Catches up after the focused pane may have changed: focus reports,
-    /// attention, the selection, the find bar and the window title.
+    /// attention, a drag, the find bar and the window title.
     fn focus_moved(&mut self, before: Option<PaneId>) {
         self.request_redraw();
         let now = self.focus_id();
         if now == before {
             return;
         }
-        self.selection = None;
+        self.orphan = None;
         self.find = None;
+        self.quick = None;
         if let Some(left) = before {
             focus_left(
                 self.views.iter_mut().map(|v| (v.pane.id, &mut v.notice)),
                 left,
             );
         }
-        self.mouse.drag = None;
+        self.set_drag(None);
         // A drag belongs to the tab it started in.
         self.mouse.divider = None;
         self.set_hover(None);
@@ -1694,6 +2075,10 @@ impl App {
 
     fn current(&self) -> Option<&View> {
         self.focus_id().and_then(|id| self.view(id))
+    }
+
+    fn current_mut(&mut self) -> Option<&mut View> {
+        self.focus_id().and_then(|id| self.view_mut(id))
     }
 
     /// Runs the `--selftest` script on its own thread; the app exits with
@@ -1773,11 +2158,18 @@ impl App {
             commands: self.commands.as_ref().map(|cm| chrome::Commands {
                 filter: &cm.filter,
                 items: (cm.matches().into_iter())
-                    .map(|(a, label)| {
-                        let keys = keymap::keys_for(a, &self.config.keys);
-                        (label, keys.unwrap_or_default())
+                    .map(|(pick, label)| {
+                        let side = match pick {
+                            Pick::Run(a) => keymap::keys_for(a, &self.config.keys),
+                            Pick::Show(id) => (cm.sessions.iter().flatten())
+                                .find(|s| s.0 == id)
+                                .map(|s| s.2.clone()),
+                            Pick::Settings => None,
+                        };
+                        (label, side.unwrap_or_default())
                     })
                     .collect(),
+                sessions: cm.sessions.is_some(),
                 sel: cm.sel,
                 rename: cm.rename.map(|r| match r {
                     Rename::Session(_) => "Rename session",
@@ -1787,6 +2179,8 @@ impl App {
             find: self.find.as_ref().map(|f| chrome::FindBar {
                 query: &f.query,
                 count: f.cur.map(|i| (i + 1, f.found.len())),
+                fresh: f.fresh,
+                screen_only: self.view(f.pane).is_some_and(|v| v.snap.alt_screen),
             }),
             spark: self.config.mascot.then(|| self.anim_time()),
             game: self.game.as_ref().map(|g| &g.0),
@@ -1968,10 +2362,6 @@ impl App {
         let Some(p) = &mut self.settings else {
             return;
         };
-        let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
         match k.vk {
             VK_ESCAPE if !p.filter.is_empty() => {
                 p.filter.clear();
@@ -1988,12 +2378,7 @@ impl App {
                     self.set_setting(s.key, None);
                 }
             }
-            VK_BACK if p.filter.pop().is_some() => p.sel = 0,
-            VK_BACK => return,
-            _ if !chord && !k.text.is_empty() => {
-                p.filter.push_str(k.text);
-                p.sel = 0;
-            }
+            _ if edit_field(&mut p.filter, k) => p.sel = 0,
             _ => return,
         }
         self.request_redraw();
@@ -2004,7 +2389,7 @@ impl App {
     /// highlights it, and one outside the panel closes it.
     fn settings_click(&mut self) {
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let Some(h) = &self.settings_hits else {
             return;
         };
@@ -2108,6 +2493,21 @@ impl App {
         self.request_redraw();
     }
 
+    /// Makes the font a point bigger or smaller, within the range the
+    /// font_size setting allows, or with 0 puts the setting's size back.
+    fn font_size(&mut self, by: i8) {
+        let set = self.config.font_size;
+        let now = set + self.font_zoom;
+        let pt = match by {
+            0 => set,
+            _ => (now + f32::from(by)).clamp(4.0, 72.0),
+        };
+        if pt != now {
+            self.font_zoom = pt - set;
+            self.reload_font();
+        }
+    }
+
     /// A key while the command palette is open: up and down choose an
     /// action, typing narrows the list, Enter runs the action and Esc
     /// closes the palette.
@@ -2115,33 +2515,25 @@ impl App {
         let Some(cm) = &mut self.commands else {
             return;
         };
-        let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
         let page = chrome::PICKER_ROWS as isize;
         match k.vk {
             VK_ESCAPE => self.commands = None,
             VK_RETURN => {
-                let picked = cm.matches().get(cm.sel).map(|a| a.0);
+                let picked = cm.matches().get(cm.sel).map(|r| r.0);
+                let typed = cm.filter.trim().to_string();
                 let rename = cm.rename.map(|r| (r, crate::hook::one_line(&cm.filter)));
                 self.commands = None;
                 if let Some((r, name)) = rename {
                     self.rename(r, name);
-                } else if let Some(a) = picked {
-                    self.act(el, a);
+                } else if let Some(p) = picked {
+                    self.pick(el, p, typed);
                 }
             }
             VK_UP => cm.move_by(-1),
             VK_DOWN => cm.move_by(1),
             VK_PRIOR => cm.move_by(-page),
             VK_NEXT => cm.move_by(page),
-            VK_BACK if cm.filter.pop().is_some() => cm.sel = 0,
-            VK_BACK => return,
-            _ if !chord && !k.text.is_empty() => {
-                cm.filter.push_str(k.text);
-                cm.sel = 0;
-            }
+            _ if edit_field(&mut cm.filter, k) => cm.sel = 0,
             _ => return,
         }
         self.request_redraw();
@@ -2169,7 +2561,7 @@ impl App {
     /// runs it, and one outside the palette closes it.
     fn commands_click(&mut self, el: &ActiveEventLoop) {
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let Some((panel, rows)) = &self.commands_hits else {
             return;
         };
@@ -2181,41 +2573,128 @@ impl App {
         let Some(&(i, _)) = rows.iter().find(|r| inside(&r.1)) else {
             return;
         };
-        let picked = (self.commands.as_ref()).and_then(|cm| cm.matches().get(i).map(|a| a.0));
-        self.commands = None;
+        let Some(cm) = self.commands.take() else {
+            return;
+        };
         self.request_redraw();
-        if let Some(a) = picked {
-            self.act(el, a);
+        if let Some(&(p, _)) = cm.matches().get(i) {
+            self.pick(el, p, cm.filter.trim().to_string());
         }
+    }
+
+    /// Does what a row picked in the command palette does, where `typed`
+    /// is what was typed there. An action with nothing to do says so.
+    fn pick(&mut self, el: &ActiveEventLoop, p: Pick, typed: String) {
+        match p {
+            Pick::Run(a) => {
+                if !self.act(el, a)
+                    && let Some(id) = self.focus_id()
+                {
+                    let text = format!("Nothing to do: {}", keymap::label(a));
+                    self.set_notice(id, text, Some(Instant::now() + NOTHING), true);
+                }
+            }
+            Pick::Show(id) => self.show(id),
+            Pick::Settings => {
+                self.open_settings();
+                if let Some(p) = &mut self.settings {
+                    p.filter = typed;
+                }
+            }
+        }
+    }
+
+    /// A key while quick select's labels show: a label copies what it
+    /// marks, and with Shift opens it; any other key puts them away.
+    fn quick_key(&mut self, k: &KeyInput) {
+        if matches!(
+            k.key,
+            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
+        ) {
+            return;
+        }
+        let Some(q) = self.quick.take() else {
+            return;
+        };
+        self.request_redraw();
+        let Some((i, open)) = quick_label(k) else {
+            return;
+        };
+        let Some((_, text, target)) = q.items.get(i) else {
+            return;
+        };
+        if open && let Some(t) = target {
+            self.open_link(t);
+            return;
+        }
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        let said = if crate::clipboard::set_text(Some(hwnd), text) {
+            format!("Copied {text}")
+        } else {
+            "Could not copy to the clipboard".into()
+        };
+        self.set_notice(q.pane, said, Some(Instant::now() + NOTICE), true);
     }
 
     /// A key while the find bar is open: typing searches as it goes, Enter
     /// or F3 goes to the next match up, with Shift the next one down, and
-    /// Esc closes the bar, leaving the view where it is.
+    /// Esc closes the bar, leaving the view where it is and the current
+    /// match selected, ready to copy.
     fn find_key(&mut self, k: &KeyInput) {
         let Some(f) = &mut self.find else {
             return;
         };
         let m = &k.mods;
-        // Ctrl and Alt together are AltGr when the layout gives a character.
-        let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
-        let chord = ctrl != alt || (ctrl && k.uc == 0);
         // Matches are oldest first, so up is back through the list.
         let by = if m.lshift || m.rshift { 1 } else { -1 };
         match k.vk {
             VK_ESCAPE => {
-                self.find = None;
+                let pal = self.theme.pal;
+                if let Some(mut f) = self.find.take()
+                    && let Some(v) = self.views.iter_mut().find(|v| v.pane.id == f.pane)
+                {
+                    let mut term = lock(&v.pane.term);
+                    let found = f.close(&mut term, v.grid.1);
+                    let sel = found.map(|m| selection_of(&term, &pal, m.start, m.end));
+                    drop(term);
+                    v.selection = sel.or(v.selection.take());
+                }
                 self.request_redraw();
             }
             VK_RETURN | VK_F3 => self.find_go(false, by),
-            VK_BACK if f.query.pop().is_some() => self.find_go(true, 0),
-            VK_BACK => {}
-            _ if !chord && !k.text.is_empty() => {
-                f.query.push_str(k.text);
-                self.find_go(true, 0);
-            }
+            _ if f.edit(k) => self.find_go(true, 0),
             _ => {}
         }
+    }
+
+    /// Opens the find bar on pane `id` with the first line of its
+    /// selection as the query, or else the last one, drawn selected so
+    /// typing replaces it. The current match is the selected text.
+    fn open_find(&mut self, id: PaneId) {
+        let mut f = Find::new(id);
+        let mut at = None;
+        if let Some(v) = self.view(id) {
+            let term = lock(&v.pane.term);
+            if let Some(s) = v.selection.as_ref().filter(|s| s.kept(&term)) {
+                let text = selection_text(&term, &self.theme.pal, s, 0);
+                f.query = text.lines().next().unwrap_or_default().trim().into();
+                at = Some(s.start);
+            }
+        }
+        if f.query.is_empty() {
+            f.query = self.find_last.clone();
+        }
+        f.fresh = !f.query.is_empty();
+        self.find = Some(f);
+        let v = self.views.iter().find(|v| v.pane.id == id);
+        if let (Some(f), Some(v)) = (&mut self.find, v) {
+            let term = lock(&v.pane.term);
+            f.back = Some((term.view_top(), term.viewport() == 0));
+            f.search(&term, v.grid.1);
+            let picked = f.found.iter().position(|m| Some(m.start) == at);
+            f.cur = picked.or(f.cur);
+        }
+        self.find_go(false, 0);
     }
 
     /// Searches the find bar's pane again when `search` is set or output
@@ -2231,8 +2710,14 @@ impl App {
             return;
         };
         let mut term = lock(&v.pane.term);
+        if search || by != 0 {
+            f.back = None;
+        }
         if search || f.stale {
             f.search(&term, v.grid.1);
+        }
+        if search {
+            self.find_last.clone_from(&f.query);
         }
         f.step(by);
         let shown = f.cur.map(|i| f.found[i]);
@@ -2243,8 +2728,9 @@ impl App {
         self.request_redraw();
     }
 
-    /// Typed text for the filter of the command palette, the theme picker
-    /// or the settings panel, or for the find bar. False when none is open.
+    /// Typed or pasted text for the filter of the command palette, the
+    /// theme picker or the settings panel, or for the find bar. False when
+    /// none is open.
     fn filter_text(&mut self, t: &str) -> bool {
         if self.game.is_some() {
             // The game takes keys, not text.
@@ -2261,8 +2747,10 @@ impl App {
             p.sel = 0;
             self.request_redraw();
         } else if let Some(f) = &mut self.find {
-            f.query.push_str(t);
+            f.type_text(t);
             self.find_go(true, 0);
+        } else if self.quick.take().is_some() {
+            self.request_redraw();
         } else {
             return false;
         }
@@ -2368,6 +2856,31 @@ impl App {
         }
     }
 
+    /// Starts or ends the drag that makes a selection in the focused pane,
+    /// whose view holds still meanwhile, so output does not slide the text
+    /// out from under the pointer.
+    fn set_drag(&mut self, drag: Option<Drag>) {
+        let (now, was) = (drag.is_some(), self.mouse.drag.is_some());
+        self.mouse.drag = drag;
+        let focus = self.focus_id();
+        if now && !was {
+            let v = focus.and_then(|id| self.view(id));
+            self.mouse.drag_in = v.map(|v| (v.pane.id, lock(&v.pane.term).viewport() == 0));
+        }
+        let ended = if was && !now {
+            self.mouse.drag_in.take()
+        } else {
+            None
+        };
+        let held = focus.filter(|_| now);
+        for v in &self.views {
+            let mut term = lock(&v.pane.term);
+            if drag_holds(&mut term, v.pane.id, held, ended, v.selection.is_some()) {
+                self.request_redraw();
+            }
+        }
+    }
+
     /// Scrolls the main screen; positive is up into the scrollback.
     fn scroll(&mut self, lines: isize) {
         if let Some(v) = self.current() {
@@ -2383,7 +2896,8 @@ impl App {
     fn offer_update(&mut self, v: String, log: Option<PathBuf>) {
         let installed = crate::update::installed();
         let shown = self.update.as_ref();
-        if let Some(text) = crate::update::banner(shown, &v, log.as_deref(), installed) {
+        let keys = keymap::press_for(Action::Update, &self.config.keys);
+        if let Some(text) = crate::update::banner(shown, &v, log.as_deref(), installed, &keys) {
             self.update = Some((v, text));
             self.request_redraw();
         }
@@ -2403,8 +2917,8 @@ impl App {
     }
 
     /// Says `text` dimly in pane `id`, which nobody asked for, until
-    /// `until`, unless a question, an error or a plain notice waits there.
-    /// Whether it did.
+    /// `until`, unless a question, an error, a plain notice or a notice
+    /// that stays up waits there. Whether it did.
     fn hint(&mut self, id: PaneId, text: impl Into<String>, until: Instant) -> bool {
         let shown =
             (self.view_mut(id)).is_some_and(|v| hint_into(&mut v.notice, text.into(), until));
@@ -2412,8 +2926,10 @@ impl App {
         shown
     }
 
-    /// Shows `text` in pane `id` in place of any notice there, as what a
-    /// user's action led to does; a hint nobody asked for goes through
+    /// Shows `text` in pane `id` until `until`, or else until something
+    /// replaces it, in place of any notice there, as what a user's action
+    /// led to does, unless it would hide one that stays up
+    /// ([`hides_lasting`]); a hint nobody asked for goes through
     /// [`App::hint`].
     fn set_notice(
         &mut self,
@@ -2422,7 +2938,9 @@ impl App {
         until: Option<Instant>,
         dim: bool,
     ) {
-        if let Some(v) = self.view_mut(id) {
+        if let Some(v) = self.view_mut(id)
+            && !hides_lasting(v.notice.as_ref(), until, dim)
+        {
             v.notice = Some(Notice {
                 text: text.into(),
                 until,
@@ -2489,6 +3007,7 @@ impl App {
                     if !self.filter_text(&t) {
                         // As any other key, it takes questions away.
                         self.dismiss(None);
+                        self.hide_pointer(true);
                         self.typed(t.into_bytes());
                     }
                 }
@@ -2504,6 +3023,8 @@ impl App {
     fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput, held: bool) {
         if matches!(k.key, vt::Key::Control | vt::Key::Shift) {
             self.update_hover();
+            // Shift takes the mouse back from a program.
+            self.update_pointer();
         }
         if !k.down && self.eaten.release(k.vk) {
             return;
@@ -2518,6 +3039,19 @@ impl App {
             || self.game.is_some();
         let taken = self.eaten.0.contains(&k.vk);
         if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
+            return;
+        }
+        // A paste key pastes into the open panel's text field; blitz run
+        // has none, and a shortcut closes it.
+        if panel
+            && self.game.is_none()
+            && k.down
+            && keymap::action(k, &self.config.keys) == Some(Action::Paste)
+        {
+            self.eaten.press(k.vk);
+            if let Some(text) = crate::clipboard::get_text() {
+                self.filter_text(&first_line(&text));
+            }
             return;
         }
         // Every key pressed while blitz run is open is the game's, and so is
@@ -2541,11 +3075,12 @@ impl App {
         // The same for the command palette.
         if self.commands.is_some() && k.down {
             self.eaten.press(k.vk);
-            if keymap::action(k, &self.config.keys) == Some(Action::Palette) {
-                self.commands = None;
-                self.request_redraw();
-            } else {
-                self.commands_key(el, k);
+            match keymap::action(k, &self.config.keys) {
+                Some(Action::Palette | Action::GoToSession) => {
+                    self.commands = None;
+                    self.request_redraw();
+                }
+                _ => self.commands_key(el, k),
             }
             return;
         }
@@ -2576,14 +3111,33 @@ impl App {
             }
             return;
         }
-        // And for the find bar.
-        if self.find.is_some() && k.down {
+        // And for quick select.
+        if self.quick.is_some() && k.down {
             self.eaten.press(k.vk);
-            if keymap::action(k, &self.config.keys) == Some(Action::Find) {
-                self.find = None;
+            if keymap::action(k, &self.config.keys) == Some(Action::QuickSelect) {
+                self.quick = None;
                 self.request_redraw();
             } else {
-                self.find_key(k);
+                self.quick_key(k);
+            }
+            return;
+        }
+        // And for the find bar, but another shortcut runs, and closes it
+        // unless it scrolls.
+        if self.find.is_some() && k.down {
+            self.eaten.press(k.vk);
+            match keymap::action(k, &self.config.keys).filter(|&a| find_runs(a)) {
+                Some(Action::Find) => {
+                    self.find = None;
+                    self.request_redraw();
+                }
+                Some(a) => {
+                    if self.act(el, a) && !find_keeps(a) {
+                        self.find = None;
+                        self.request_redraw();
+                    }
+                }
+                None => self.find_key(k),
             }
             return;
         }
@@ -2591,13 +3145,22 @@ impl App {
             k.key,
             vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
         );
-        let a = keymap::action(k, &self.config.keys);
+        let action = keymap::action(k, &self.config.keys);
+        // A copy key with no selection in view goes to the program.
+        let shown = self.selection_shown();
+        let hidden =
+            action == Some(Action::Copy) && !copy_key_copies(k, shown, self.orphan.is_some());
+        let action = action.filter(|_| !hidden);
         if k.down && !modifier && !lock_key(k.vk) {
-            self.dismiss(a);
+            self.dismiss(action);
         }
-        if let Some(a) = a
-            && self.act(el, a)
+        if let Some(a) = action
+            && (self.act(el, a) || !keymap::passes_on(a))
         {
+            self.eaten.press(k.vk);
+            return;
+        }
+        if action == Some(Action::Copy) && eats_copy_key(k, &self.modes()) {
             self.eaten.press(k.vk);
             return;
         }
@@ -2632,6 +3195,7 @@ impl App {
         let mut out = Vec::new();
         vt::encode_key(k, &self.modes(), &mut out);
         if k.down && !modifier && !out.is_empty() {
+            self.hide_pointer(true);
             self.typed(out);
         } else {
             self.send(out);
@@ -2641,15 +3205,18 @@ impl App {
     /// Sends input the user typed: the view follows the cursor again, and
     /// it answers what the session asked.
     fn typed(&mut self, bytes: Vec<u8>) {
-        if self.selection.take().is_some() {
+        let Some(v) = self.current_mut() else {
+            return;
+        };
+        let selected = v.selection.take().is_some();
+        lock(&v.pane.term).scroll_viewport(isize::MIN);
+        v.pane.send(bytes);
+        let id = v.pane.id;
+        if selected {
             self.request_redraw();
         }
-        if let Some(v) = self.current() {
-            lock(&v.pane.term).scroll_viewport(isize::MIN);
-            v.pane.send(bytes);
-            let id = v.pane.id;
-            self.answered(id);
-        }
+        self.orphan = None;
+        self.answered(id);
     }
 
     /// The user typed, pasted or clicked into session `id`. A question it
@@ -2666,52 +3233,211 @@ impl App {
         }
     }
 
+    /// Pastes `text` into pane `id`, the focused one, or asks first as
+    /// [`vt::keys::needs_paste_confirm`] says, or for file `names` that
+    /// [`quote_paths`] would ask about, as `ask` makes the question;
+    /// `confirmed` when this is the answer. A single line goes without its
+    /// line break, so it is not run.
+    fn paste(
+        &mut self,
+        id: PaneId,
+        text: &str,
+        confirmed: bool,
+        names: bool,
+        ask: fn(String) -> Ask,
+    ) {
+        let text = trim_paste(text);
+        let Some(v) = self.view(id).filter(|_| !text.is_empty()) else {
+            return;
+        };
+        let label = format!("{} {}", v.pane.name, v.num);
+        if let Some(refused) = paste_refused(&label, v.pane.exit_code) {
+            self.set_notice(id, refused, None, false);
+            return;
+        }
+        let mut term = lock(&v.pane.term);
+        let bracketed = term.input_modes().bracketed;
+        let trusted = term.paste_trusted();
+        if confirmed {
+            term.confirm_paste();
+        }
+        drop(term);
+        if !confirmed && asks_first(text, names, bracketed, trusted) {
+            self.ask_paste(id, text, names, ask);
+            return;
+        }
+        let mut out = Vec::new();
+        vt::encode_paste(text, bracketed, &mut out);
+        self.typed(out);
+    }
+
+    /// Asks before pasting `text` into pane `id`; the paste key confirms.
+    fn ask_paste(&mut self, id: PaneId, text: &str, names: bool, ask: fn(String) -> Ask) {
+        let key = keymap::keys_for(Action::Paste, &self.config.keys);
+        let asked = paste_question(text, names, key.as_deref());
+        self.ask(id, asked, ask(text.to_owned()));
+    }
+
+    /// The kind of shell pane `id` started, which pasted paths are quoted
+    /// for.
+    fn shell_of(&self, id: PaneId) -> crate::shell::Kind {
+        let name = self.view(id).map_or("", |v| v.pane.name.as_str());
+        crate::shell::kind(Path::new(name))
+    }
+
+    /// A paste with only an image on the clipboard, such as a screenshot.
+    /// Claude Code pastes one on Alt+V, so its pane gets that. False for
+    /// any other pane, where the key goes on to the program.
+    fn paste_image(&mut self, id: PaneId) -> bool {
+        let claude = |v: &&View| v.pane.claude.is_some() && v.pane.exit_code.is_none();
+        let Some(v) = self.view(id).filter(claude) else {
+            return false;
+        };
+        if !crate::clipboard::has_image() {
+            return false;
+        }
+        let keys = alt_v(&lock(&v.pane.term).input_modes());
+        self.typed(keys);
+        true
+    }
+
+    /// Whether the selection shows in the focused pane's view, when there
+    /// is one.
+    fn selection_shown(&self) -> Option<bool> {
+        let v = self.current()?;
+        let s = v.selection.as_ref()?;
+        let top = lock(&v.pane.term).view_top();
+        Some(in_view(s.start, s.end, s.drag.block, top, v.grid).is_some())
+    }
+
+    /// Copies the selection in the focused pane, or else the text of one
+    /// that output just rewrote. False when there is neither, so the key
+    /// goes on to the program. When another program holds the clipboard
+    /// the selection stays, to copy again. With `unindent`, the text goes
+    /// as [`without_indent`] leaves it.
+    fn copy(&mut self, unindent: bool) -> bool {
+        let Some(v) = self.current() else {
+            return false;
+        };
+        let id = v.pane.id;
+        let term = lock(&v.pane.term);
+        let (text, rewritten) = match v.selection.as_ref().filter(|s| s.kept(&term)) {
+            Some(sel) => (selection_text(&term, &self.theme.pal, sel, 0), false),
+            None => match &self.orphan {
+                Some(t) => (t.clone(), true),
+                None => return false,
+            },
+        };
+        drop(term);
+        let text = if unindent {
+            without_indent(&text)
+        } else {
+            text
+        };
+        let owner = Some(HWND(self.hwnd as *mut c_void));
+        let copied = crate::clipboard::set_text(owner, &text);
+        if copied {
+            if let Some(v) = self.current_mut() {
+                v.selection = None;
+            }
+            self.orphan = None;
+        }
+        self.notice_copy(id, copy_notice(&text, copied, rewritten), copied);
+        true
+    }
+
+    /// Says in pane `id` what a copy did: briefly and dimly when it
+    /// worked, a while longer when it did not.
+    fn notice_copy(&mut self, id: PaneId, text: String, worked: bool) {
+        let shown = if worked { BRIEF } else { NOTICE };
+        self.set_notice(id, text, Some(Instant::now() + shown), worked);
+    }
+
     /// Runs a shortcut. Returns false when it does not apply right now, in
-    /// which case the key goes to the program.
+    /// which case the key goes to the program if [`keymap::passes_on`].
     fn act(&mut self, el: &ActiveEventLoop, a: Action) -> bool {
         let before = self.focus_id();
         match a {
-            Action::Copy => {
+            Action::Copy => return self.copy(false),
+            Action::CopyUnindented => return self.copy(true),
+            Action::Paste => {
+                let Some(id) = before else {
+                    return false;
+                };
+                // Files copied in Explorer paste as their paths.
+                let text = (crate::clipboard::get_text().filter(|t| !t.is_empty()))
+                    .map(|t| (t, false))
+                    .or_else(|| {
+                        let shell = self.shell_of(id);
+                        crate::clipboard::get_files().map(|f| quote_paths(&f, shell))
+                    });
+                // The answer to a question pastes what it asked about; a
+                // clipboard that changed since asks again.
+                let asked = (self.view_mut(id)).and_then(|v| {
+                    v.notice
+                        .take_if(|n| matches!(n.ask, Ask::Paste(_) | Ask::Drop(_)))
+                });
+                if asked.is_some() {
+                    self.request_redraw();
+                }
+                let now = text.as_ref().map(|t| t.0.as_str());
+                if let Some(answer) = asked.and_then(|n| answers(n.ask, now)) {
+                    self.paste(id, &answer, true, false, Ask::Paste);
+                    return true;
+                }
+                match text {
+                    Some((text, names)) => self.paste(id, &text, false, names, Ask::Paste),
+                    None => return self.paste_image(id),
+                }
+            }
+            Action::QuickSelect => {
                 let Some(v) = self.current() else {
                     return false;
                 };
-                let term = lock(&v.pane.term);
-                let Some(sel) = self.selection.as_ref().filter(|s| s.kept(&term)) else {
-                    return false;
-                };
-                let text = selection_text(&term, &self.theme.pal, sel, 0);
-                drop(term);
-                if !crate::clipboard::set_text(Some(HWND(self.hwnd as *mut c_void)), &text) {
-                    eprintln!("blitz: could not copy to the clipboard");
+                let cwd = &v.pane.cwd;
+                let resolve = |p: &str| crate::links::resolve(p, cwd);
+                let (items, epoch) = quick_items(&v.pane.term, &self.theme.pal, v.grid.1, resolve);
+                let id = v.pane.id;
+                if items.is_empty() {
+                    let until = Some(Instant::now() + NOTICE);
+                    self.set_notice(id, "No links, paths or hashes in view", until, true);
+                    return true;
                 }
-                self.selection = None;
+                self.find = None;
+                let mut found: Vec<Found> = items.iter().map(|i| i.0).collect();
+                found.sort();
+                self.quick = Some(Quick {
+                    pane: id,
+                    epoch,
+                    items,
+                    found,
+                });
                 self.request_redraw();
             }
-            Action::Paste => {
-                let Some(text) = crate::clipboard::get_text().filter(|t| !t.is_empty()) else {
+            Action::SelectAll | Action::SelectOutput => {
+                let pal = self.theme.pal;
+                let Some(v) = self.current_mut() else {
                     return false;
                 };
-                let bracketed = self.modes().bracketed;
-                let trusted = self
-                    .current()
-                    .is_some_and(|v| lock(&v.pane.term).paste_trusted());
-                if vt::keys::needs_paste_confirm(&text, trusted) {
-                    let Some(id) = before else {
-                        return false;
+                let mut term = lock(&v.pane.term);
+                let found = match a {
+                    Action::SelectAll => all_text(&term, &pal),
+                    _ => last_output(&term, &pal),
+                };
+                let Some((first, last)) = found else {
+                    return false;
+                };
+                let sel = selection_of(&term, &pal, (first, 0), (last, u16::MAX));
+                if a == Action::SelectOutput {
+                    let m = Found {
+                        start: (first, 0),
+                        end: (last, 0),
                     };
-                    if !self.confirmed(id, &Ask::Paste(text.clone())) {
-                        let lines = text.lines().count();
-                        let asked = format!("Paste {lines} lines? Press Ctrl+V again");
-                        self.ask(id, asked, Ask::Paste(text));
-                        return true;
-                    }
-                    if let Some(v) = self.view(id) {
-                        lock(&v.pane.term).confirm_paste();
-                    }
+                    reveal(&mut term, m, v.grid.1, 0);
                 }
-                let mut out = Vec::new();
-                vt::encode_paste(&text, bracketed, &mut out);
-                self.typed(out);
+                drop(term);
+                v.selection = Some(sel);
+                self.request_redraw();
             }
             Action::ScrollPage(dir) => {
                 if self.modes().alt_screen {
@@ -2720,6 +3446,37 @@ impl App {
                 let rows = self.current().map_or(1, |v| v.grid.1);
                 let page = rows.saturating_sub(1).max(1) as isize;
                 self.scroll(page * isize::from(dir));
+            }
+            Action::ScrollEnd(dir) => {
+                if self.modes().alt_screen {
+                    return false;
+                }
+                self.scroll(if dir > 0 { isize::MAX } else { isize::MIN });
+            }
+            Action::Reset => {
+                let Some(v) = self.current() else {
+                    return false;
+                };
+                lock(&v.pane.term).reset_modes();
+                self.request_redraw();
+            }
+            // A full-screen program's screen would be cleared under it.
+            Action::ClearScrollback => {
+                let Some(v) = self.current().filter(|_| !self.modes().alt_screen) else {
+                    return false;
+                };
+                lock(&v.pane.term).clear_scrollback();
+                // The console host draws the screen again after this.
+                let screen = v.pane.pty.clear();
+                let id = v.pane.id;
+                if let Some(f) = self.find.as_mut() {
+                    f.stale = true;
+                }
+                if !screen {
+                    let text = "Cleared the scrollback; this console host cannot clear the screen";
+                    self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                }
+                self.request_redraw();
             }
             Action::NewTab => self.add(None, new_tab),
             Action::ClosePane => {
@@ -2762,9 +3519,32 @@ impl App {
                     self.focus_moved(before);
                 }
             }
-            Action::GoToTab(i) => {
-                if usize::from(i) < self.win.tabs.len() {
-                    self.win.active = usize::from(i);
+            Action::MoveTab(by) => {
+                if !self.win.move_tab(by.into()) {
+                    return false;
+                }
+                self.request_redraw();
+            }
+            Action::PaneToNewTab => {
+                let Some(id) = before else {
+                    return false;
+                };
+                // Unnamed, the new tab goes by the pane's folder.
+                if !self.win.pane_to_new_tab(id, String::new()) {
+                    return false;
+                }
+                // A divider being dragged is known by its place in the old
+                // layout.
+                self.mouse.divider = None;
+                self.request_redraw();
+            }
+            Action::GoToTab(_) | Action::LastTab => {
+                let i = match a {
+                    Action::GoToTab(i) => usize::from(i),
+                    _ => self.win.tabs.len().saturating_sub(1),
+                };
+                if i < self.win.tabs.len() {
+                    self.win.active = i;
                     self.focus_moved(before);
                 }
             }
@@ -2792,11 +3572,38 @@ impl App {
                     self.closed = Some((cwd, claude));
                 }
             }
+            // Typed at the shell's first prompt, as a restored session is.
+            Action::NewClaude => {
+                let id = PaneId(self.next_id);
+                self.act(el, Action::SplitRight);
+                if let Some(v) = self.view_mut(id) {
+                    v.resume = Some(("claude\r".into(), Instant::now() + RESUME_AFTER));
+                }
+            }
             Action::ToggleSidebar => return self.toggle_sidebar(),
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
+            Action::GoToSession => {
+                let now = Instant::now();
+                let list = (self.sessions().iter())
+                    .map(|s| (s.id, session_row(s), chrome::state_word(s, now)))
+                    .collect();
+                self.commands = Some(Commands {
+                    sessions: Some(list),
+                    ..Commands::default()
+                });
+                self.request_redraw();
+            }
             Action::Palette => {
-                self.commands = Some(Commands::default());
+                // Update without a release would only look for one.
+                let hidden = match self.update {
+                    None => vec![Action::Update],
+                    Some(_) => Vec::new(),
+                };
+                self.commands = Some(Commands {
+                    hidden,
+                    ..Commands::default()
+                });
                 self.request_redraw();
             }
             Action::Focus(dir) => {
@@ -2830,8 +3637,15 @@ impl App {
                 let waiting = (self.views.iter())
                     .filter(|v| Some(v.pane.id) != before)
                     .map(|v| (v.pane.id, v.pane.attn));
-                if let Some(id) = crate::attention::jump_target(waiting) {
-                    self.show(id);
+                let target = crate::attention::jump_target(waiting);
+                match jump(before, target, &mut self.jumped).filter(|&id| self.view(id).is_some()) {
+                    Some(id) => self.show(id),
+                    None => {
+                        if let Some(id) = before {
+                            let until = Some(Instant::now() + NOTHING);
+                            self.set_notice(id, "Nothing needs you", until, true);
+                        }
+                    }
                 }
             }
             Action::Update => {
@@ -2910,19 +3724,7 @@ impl App {
                 }
                 self.request_redraw();
             }
-            // Within the range the font_size setting allows.
-            Action::FontSize(by) => {
-                let set = self.config.font_size;
-                let now = set + self.font_zoom;
-                let pt = match by {
-                    0 => set,
-                    _ => (now + f32::from(by)).clamp(4.0, 72.0),
-                };
-                if pt != now {
-                    self.font_zoom = pt - set;
-                    self.reload_font();
-                }
-            }
+            Action::FontSize(by) => self.font_size(by),
             // Borderless on the window's monitor. winit puts the window back
             // where it was; the session keeps that place, not the monitor's.
             Action::Fullscreen => {
@@ -2970,8 +3772,7 @@ impl App {
                 let Some(id) = before else {
                     return false;
                 };
-                self.find = Some(Find::new(id));
-                self.request_redraw();
+                self.open_find(id);
             }
             // The palette's line takes the name, starting from the one the
             // user gave before.
@@ -2991,8 +3792,8 @@ impl App {
                 };
                 self.commands = Some(Commands {
                     filter: name,
-                    sel: 0,
                     rename: Some(rename),
+                    ..Commands::default()
                 });
                 self.request_redraw();
             }
@@ -3010,6 +3811,12 @@ impl App {
                 let hwnd = HWND(self.hwnd as *mut c_void);
                 // SAFETY: our own window, and a message that carries no pointers.
                 let _ = unsafe { PostMessageW(Some(hwnd), WM_SYSCOMMAND, menu, space) };
+            }
+            Action::SendText(i) => {
+                let Some(text) = self.config.texts.get(usize::from(i)) else {
+                    return false;
+                };
+                self.typed(text.clone());
             }
         }
         true
@@ -3142,6 +3949,7 @@ impl App {
                     v.hooks_seen = true;
                     v.pane.cmd.hooked = true;
                     note_hook(&mut v.pane.msg, &mut v.pane.claude, ev, session, body);
+                    hook_confirms_paste(&mut lock(&v.pane.term), ev);
                     v.pane.hooked = ev != Ev::Idle;
                     if crate::attention::notify_protocol(&title).1 < crate::hook::PROTOCOL {
                         self.hooks_hint(id, true);
@@ -3168,6 +3976,15 @@ impl App {
             // pane; looking is all it asks for.
             Event::Bell if rings(bell, v.pane.hooked) => {
                 self.attention(id, Ev::Bell);
+            }
+            // OSC 52. The pane says so, as any program can write there.
+            // Only the pane the user is in, with blitz in front, copies:
+            // output in another cannot swap the clipboard under them.
+            Event::Clipboard(text) => {
+                let here = Some(id) == self.focus_id() && self.focused;
+                let owner = Some(HWND(self.hwnd as *mut c_void));
+                let copied = here && crate::clipboard::set_text(owner, &text);
+                self.notice_copy(id, program_copy_notice(&text, here, copied), copied);
             }
             _ => {}
         }
@@ -3288,6 +4105,12 @@ impl App {
         self.focus_id().map_or((0, 0), |id| self.cell_in(id, pos))
     }
 
+    /// The cell of pane `id` under `pos`; `None` off its grid.
+    fn grid_cell(&self, id: PaneId, pos: PhysicalPosition<f64>) -> Option<(u16, u16)> {
+        let v = self.view(id)?;
+        grid_cell(v.rect?, v.grid, self.cell(), (pos.x, pos.y))
+    }
+
     /// The cell of pane `id` under `pos`, clamped to its grid.
     fn cell_in(&self, id: PaneId, pos: PhysicalPosition<f64>) -> (u16, u16) {
         let Some(v) = self.view(id) else {
@@ -3327,7 +4150,7 @@ impl App {
     /// or a row of the sidebar. The second value is true for the sidebar.
     fn hit(&self, pos: PhysicalPosition<f64>) -> (Option<PaneId>, bool) {
         let (x, y) = (pos.x as i32, pos.y as i32);
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         let area = self.tab_area();
         let (rects, side) = match self.win.tabs.get(self.win.active) {
             Some(_) if x < area.x => (self.side.rows.clone(), true),
@@ -3336,6 +4159,53 @@ impl App {
         };
         let id = rects.into_iter().find(|(_, r)| inside(r)).map(|(id, _)| id);
         (id, side)
+    }
+
+    /// Where the pointer is now, in client pixels. A drag from another
+    /// program moves it without telling the window, so `mouse.pos` is old.
+    fn pointer(&self) -> Option<PhysicalPosition<f64>> {
+        let mut pt = POINT::default();
+        // SAFETY: plain queries that write one POINT; a stale window only
+        // fails the second.
+        unsafe {
+            GetCursorPos(&mut pt).ok()?;
+            ScreenToClient(HWND(self.hwnd as *mut c_void), &mut pt)
+                .ok()
+                .ok()?;
+        }
+        Some(PhysicalPosition::new(f64::from(pt.x), f64::from(pt.y)))
+    }
+
+    /// Handles the files dropped since the last turn of the event loop,
+    /// where the pointer let go of them. blitz run covers the panes, so
+    /// nothing is dropped on them while it is open.
+    fn on_drop(&mut self) {
+        let paths = std::mem::take(&mut self.dropped);
+        if paths.is_empty() || self.game.is_some() {
+            return;
+        }
+        let Some(pos) = self.pointer() else {
+            return;
+        };
+        match dropped(paths, self.hit(pos)) {
+            Some(Dropped::Paste(id, paths)) => {
+                self.show(id);
+                let (text, names) = quote_paths(&paths, self.shell_of(id));
+                self.paste(id, &text, false, names, Ask::Drop);
+            }
+            Some(Dropped::Open(dirs)) if dirs.is_empty() => {
+                if let Some(id) = self.focus_id() {
+                    let text = "Only folders open from the sidebar; drop files on a pane";
+                    self.set_notice(id, text, Some(Instant::now() + NOTICE), true);
+                }
+            }
+            Some(Dropped::Open(dirs)) => {
+                for dir in dirs {
+                    self.add(Some(dir), new_tab);
+                }
+            }
+            None => {}
+        }
     }
 
     /// The divider of the active tab under a point, if the settings panel
@@ -3410,7 +4280,7 @@ impl App {
     /// own mouse mode.
     fn mouse_report(&mut self, id: PaneId, kind: MouseKind, button: u8, mods: Mods) {
         let (col, row) = self.cell_in(id, self.mouse.pos);
-        let Some(v) = self.views.iter().find(|v| v.pane.id == id) else {
+        let Some(v) = self.views.iter_mut().find(|v| v.pane.id == id) else {
             return;
         };
         let m = lock(&v.pane.term).input_modes();
@@ -3422,7 +4292,7 @@ impl App {
             mods,
         };
         let mut out = Vec::new();
-        if self.mouse.tracker.encode(ev, &m, &mut out) {
+        if v.tracker.encode(ev, &m, &mut out) {
             v.pane.send(out);
         }
     }
@@ -3449,6 +4319,9 @@ impl App {
             return;
         }
         let mods = mods_now();
+        if pressed && self.quick.take().is_some() {
+            self.request_redraw();
+        }
         // Presses go to the command palette or the settings panel; a
         // release still goes wherever its press went.
         if pressed && self.commands.is_some() {
@@ -3468,14 +4341,12 @@ impl App {
             return;
         }
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let on_banner = (self.banner)
-            .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        let on_banner = (self.banner).is_some_and(|r| r.contains(x, y));
         if pressed && b == 0 && on_banner {
             self.act(el, Action::Update);
             return;
         }
-        let chip = (self.below.iter())
-            .find(|(_, r)| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+        let chip = (self.below.iter()).find(|(_, r)| r.contains(x, y));
         if pressed
             && b == 0
             && let Some(&(id, _)) = chip
@@ -3484,6 +4355,11 @@ impl App {
                 lock(&v.pane.term).scroll_viewport(isize::MIN);
             }
             self.request_redraw();
+            return;
+        }
+        // A click on the find bar keeps it, where one below it closes it.
+        let on_find = (self.find_bar).is_some_and(|r| r.contains(x, y));
+        if pressed && on_find && self.find.is_some() {
             return;
         }
         if b == 0 && !pressed && self.mouse.divider.take().is_some() {
@@ -3520,20 +4396,48 @@ impl App {
             }
             return;
         }
-        // A click on another pane only moves focus.
+        // A click on another pane only moves focus. One in the focused
+        // pane closes its find bar and goes on, unless it is on the pane's
+        // header or outside the panes, where it does nothing.
+        if pressed {
+            let id = self.hit(self.mouse.pos).0;
+            if let Some(id) = id.filter(|&id| Some(id) != self.focus_id()) {
+                self.show(id);
+                return;
+            }
+            if id.is_some() && self.find.take().is_some() {
+                self.request_redraw();
+            }
+            let on_grid = (self.current())
+                .and_then(|v| v.rect)
+                .is_some_and(|r| r.contains(x, y));
+            if !on_grid {
+                return;
+            }
+        }
         if pressed
-            && let Some(id) = (self.hit(self.mouse.pos).0).filter(|&id| Some(id) != self.focus_id())
+            && b == 0
+            && let Some((target, _)) = self.ctrl_link(&mods)
         {
-            self.show(id);
+            self.open_link(&target);
             return;
         }
+        // The program hears of presses on its cells only, not on the padding
+        // past them.
         let program = self.mouse_to_program(&mods).and(self.focus_id());
+        if pressed && program.is_some_and(|id| self.grid_cell(id, self.mouse.pos).is_none()) {
+            return;
+        }
         if let Some(id) = route_button(&mut self.mouse.reported, b, pressed, program) {
             let kind = if pressed {
                 MouseKind::Press
             } else {
                 MouseKind::Release
             };
+            if b == 0 && pressed {
+                let plain = mods == Mods::default();
+                self.mouse.program_press = Some((self.cell_in(id, self.mouse.pos), plain));
+            }
             self.mouse_report(id, kind, b as u8, mods);
             // A click can pick an answer in the program's menu.
             if pressed {
@@ -3541,25 +4445,26 @@ impl App {
             }
             return;
         }
+        if b == 2 && pressed {
+            let selected = (self.current()).is_some_and(|v| {
+                let term = lock(&v.pane.term);
+                v.selection.as_ref().is_some_and(|s| s.kept(&term))
+            });
+            if let Some(a) = right_click_does(self.config.right_click_paste, selected) {
+                self.act(el, a);
+            }
+        }
         if b != 0 {
             return;
         }
         if pressed {
-            // Ctrl+click opens a link; with mouse reporting on, the click
-            // got here because Shift was held too.
-            if (mods.lctrl || mods.rctrl)
-                && let Some((target, _)) = self.link_under(self.mouse.pos)
-            {
-                self.open_link(&target);
-                return;
-            }
             // With mouse reporting on, Shift is what brought the click
             // here, so it does not extend.
             let shift = mods.lshift || mods.rshift;
             let extend = shift && self.modes().mouse == MouseMode::Off;
             self.press(&mods, extend);
         } else {
-            self.mouse.drag = None;
+            self.set_drag(None);
             self.mouse.scroll_at = None;
         }
     }
@@ -3581,9 +4486,10 @@ impl App {
         let Some((epoch, here)) = self.line_cell(self.mouse.pos) else {
             return;
         };
-        let held = self.selection.as_ref().map(|s| s.drag);
+        self.orphan = None;
+        let held = (self.current()).and_then(|v| Some(v.selection.as_ref()?.drag));
         if let Some(drag) = held.filter(|d| extend && d.epoch == epoch) {
-            self.mouse.drag = Some(drag);
+            self.set_drag(Some(drag));
             self.extend_drag();
             return;
         }
@@ -3598,8 +4504,12 @@ impl App {
             return;
         };
         let drag = Drag::new(&lock(&v.pane.term), &self.theme.pal, here, unit, block);
-        self.mouse.drag = Some(drag);
-        if self.selection.take().is_some() {
+        self.set_drag(Some(drag));
+        if self
+            .current_mut()
+            .and_then(|v| v.selection.take())
+            .is_some()
+        {
             self.request_redraw();
         }
         // A double or triple click selects at once.
@@ -3619,17 +4529,20 @@ impl App {
         let term = lock(&v.pane.term);
         if term.line_epoch() != drag.epoch {
             drop(term);
-            self.mouse.drag = None;
+            self.set_drag(None);
             return;
         }
         let head = (term.view_top() + usize::from(row), col);
-        if self.selection.is_none() && drag.unit == 1 && head == drag.anchor.0 {
+        if v.selection.is_none() && drag.unit == 1 && head == drag.anchor.0 {
             return;
         }
         let s = Selection::new(&term, &self.theme.pal, drag, head);
         drop(term);
-        if self.selection.as_ref().map(|o| (o.start, o.end)) != Some((s.start, s.end)) {
-            self.selection = Some(s);
+        let Some(v) = self.current_mut() else {
+            return;
+        };
+        if v.selection.as_ref().map(|o| (o.start, o.end)) != Some((s.start, s.end)) {
+            v.selection = Some(s);
             self.request_redraw();
         }
     }
@@ -3681,7 +4594,7 @@ impl App {
             (crate::links::scan(&l.text).into_iter()).find(|(r, _)| r.contains(&here))?;
         let target = match found {
             Link::Url(u) => Target::Uri(u),
-            Link::Path(p) => Target::Path(self.resolve(&p, &v.pane.cwd)?),
+            Link::Path(p, at) => Target::Path(self.resolve(&p, &v.pane.cwd)?, at),
         };
         Some((target, l.span(range)))
     }
@@ -3695,22 +4608,31 @@ impl App {
         resolve_again(last, word, cwd, crate::links::resolve)
     }
 
-    /// Underlines the link under the pointer, and shows the hand, while
-    /// Ctrl is held; with mouse reporting on, Ctrl and Shift.
+    /// The link under the pointer that a click with `mods` held opens,
+    /// with the cells it covers: Ctrl must be held, and a program that
+    /// takes the mouse gets the click unless [`opens_link`] says otherwise.
+    fn ctrl_link(&self, mods: &Mods) -> Option<(Target, (Pos, Pos))> {
+        if !(mods.lctrl || mods.rctrl) || self.mouse.drag.is_some() {
+            return None;
+        }
+        let found = self.link_under(self.mouse.pos)?;
+        let program = self.mouse_to_program(mods).is_some();
+        let claude = self.current().is_some_and(|v| v.pane.claude.is_some());
+        opens_link(&found.0, program, claude, &self.config.editor_uri).then_some(found)
+    }
+
+    /// Underlines the link under the pointer, and shows the hand, while a
+    /// click would open it; see [`Self::ctrl_link`].
     fn update_hover(&mut self) {
         let mods = mods_now();
-        let ctrl = (mods.lctrl || mods.rctrl) && self.mouse_to_program(&mods).is_none();
         // A file made since Ctrl was last held counts.
-        if !ctrl {
+        if !(mods.lctrl || mods.rctrl) {
             *self.resolved.get_mut() = None;
         }
-        let hover = (ctrl && self.mouse.drag.is_none())
-            .then(|| self.link_under(self.mouse.pos))
-            .flatten()
-            .and_then(|(_, (a, b))| {
-                let epoch = lock(&self.current()?.pane.term).line_epoch();
-                Some((epoch, a, b))
-            });
+        let hover = (self.ctrl_link(&mods)).and_then(|(_, (a, b))| {
+            let epoch = lock(&self.current()?.pane.term).line_epoch();
+            Some((epoch, a, b))
+        });
         self.set_hover(hover);
     }
 
@@ -3719,16 +4641,8 @@ impl App {
             return;
         }
         self.hover = hover;
-        self.show_cursor();
+        self.update_pointer();
         self.request_redraw();
-    }
-
-    /// Shows the pointer for what is under it.
-    fn show_cursor(&self) {
-        if let Some(w) = &self.window {
-            let hand = self.hover.is_some() || self.mouse.over_side.is_some();
-            w.set_cursor(cursor_icon(self.mouse.over_divider, hand));
-        }
     }
 
     /// Notes what in the sidebar the pointer is over: the hand says a
@@ -3738,13 +4652,53 @@ impl App {
             return;
         }
         self.mouse.over_side = over;
-        self.show_cursor();
+        self.update_pointer();
         self.request_redraw();
+    }
+
+    /// Shows the pointer for what is under it; see [`pointer`].
+    fn update_pointer(&mut self) {
+        let pos = self.mouse.pos;
+        let (x, y) = (pos.x as i32, pos.y as i32);
+        let inside = |r: &Rect| r.contains(x, y);
+        let panel = self.commands.is_some()
+            || self.settings.is_some()
+            || self.picker.is_some()
+            || self.game.is_some();
+        let divider = self.divider_at(pos).map(|d| d.1).filter(|_| !panel);
+        let hand = self.hover.is_some()
+            || self.banner.as_ref().is_some_and(inside)
+            || self.mouse.over_side.is_some();
+        let mods = mods_now();
+        let grid = (!panel).then(|| self.hit(pos)).and_then(|(id, side)| {
+            let v = self.view(id.filter(|_| !side)?)?;
+            v.rect.filter(inside)?;
+            let mouse = lock(&v.pane.term).input_modes().mouse;
+            Some(mouse != MouseMode::Off && !(mods.lshift || mods.rshift))
+        });
+        let icon = pointer(divider, hand && !panel, grid);
+        if icon != self.mouse.icon {
+            self.mouse.icon = icon;
+            if let Some(w) = &self.window {
+                w.set_cursor(icon);
+            }
+        }
+    }
+
+    /// Hides the pointer while typing, or shows it again, as Windows'
+    /// "hide pointer while typing" asks.
+    fn hide_pointer(&mut self, hide: bool) {
+        if hide != self.mouse.hidden && (self.vanish || !hide) {
+            self.mouse.hidden = hide;
+            if let Some(w) = &self.window {
+                w.set_cursor_visible(!hide);
+            }
+        }
     }
 
     /// Opens a link, or says in the pane why not.
     fn open_link(&mut self, target: &Target) {
-        if let Err(e) = crate::links::open(target)
+        if let Err(e) = crate::links::open(target, &self.config.editor_uri)
             && let Some(id) = self.focus_id()
         {
             self.error(id, e);
@@ -3752,6 +4706,10 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, pos: PhysicalPosition<f64>) {
+        // Windows may send a move that is none, as when a window opens.
+        if pos != self.mouse.pos {
+            self.hide_pointer(false);
+        }
         self.mouse.pos = pos;
         if let Some((i, min)) = self.mouse.divider {
             let (area, active) = (self.tab_area(), self.win.active);
@@ -3769,11 +4727,7 @@ impl App {
             }
             return;
         }
-        let over = self.divider_at(pos).map(|d| d.1);
-        if over != self.mouse.over_divider {
-            self.mouse.over_divider = over;
-            self.show_cursor();
-        }
+        self.update_pointer();
         // blitz run covers the panes, so programs see no motion under it.
         if self.game.is_some() {
             return;
@@ -3788,9 +4742,23 @@ impl App {
         let held = (0..3).find_map(|b| Some((b, self.mouse.reported[b]?)));
         if let Some((b, id)) = held {
             self.mouse_report(id, MouseKind::Move, b as u8, mods);
+            // The first time a plain drag goes to a program, say how to
+            // select instead.
+            let here = self.cell_in(id, pos);
+            let press = &mut self.mouse.program_press;
+            if b == 0 && press.take_if(|p| p.1 && p.0 != here).is_some() {
+                let hints = crate::session::dir().map(|d| d.join("hints"));
+                if first_time(hints.as_deref(), "shift-drag") {
+                    let text = "Shift+drag selects while the program uses the mouse";
+                    self.hint(id, text, Instant::now() + NOTICE);
+                }
+            }
         } else if self.mouse_to_program(&mods).is_some()
             && let Some(id) = self.focus_id()
+            && self.grid_cell(id, pos).is_some()
         {
+            // Only over the program's own cells: not while the pointer
+            // crosses the sidebar, a header or another pane.
             self.mouse_report(id, MouseKind::Move, 3, mods);
         }
     }
@@ -3819,42 +4787,45 @@ impl App {
         if self.game.is_some() {
             return;
         }
-        // Over another pane, the wheel scrolls that pane's history without
-        // moving focus.
-        // Programs in unfocused panes never get wheel reports;
-        // route them by pane if a full-screen app needs them.
+        // The pane under the pointer takes the wheel without taking focus:
+        // its history scrolls, or a full-screen program there gets the
+        // reports at its own cell. Outside the panes it is the focused one's.
+        let mods = mods_now();
         let (under, side) = self.hit(self.mouse.pos);
-        if side {
+        let Some(v) = wheel_pane(under, side, self.focus_id()).and_then(|id| self.view(id)) else {
             return;
-        }
-        if let Some(v) = under
-            .filter(|&id| Some(id) != self.focus_id())
-            .and_then(|id| self.view(id))
-        {
-            let mut t = lock(&v.pane.term);
-            if !t.input_modes().alt_screen {
-                t.scroll_viewport(steps as isize * WHEEL_LINES);
+        };
+        let id = v.pane.id;
+        let focused = Some(id) == self.focus_id();
+        let m = lock(&v.pane.term).input_modes();
+        let lines = steps as isize * wheel_lines(scroll_lines(), v.grid.1);
+        let cells = self.grid_cell(id, self.mouse.pos).is_some();
+        match wheel_does(&m, &mods, v.pane.claude.is_some(), focused, cells) {
+            Wheel::Font => {
+                let now = Instant::now();
+                if let Some(by) = wheel_font(steps, self.mouse.font_at, now) {
+                    self.mouse.font_at = Some(now);
+                    self.font_size(by);
+                }
+            }
+            _ if side => {}
+            Wheel::Report => {
+                let kind = if steps > 0.0 {
+                    MouseKind::WheelUp
+                } else {
+                    MouseKind::WheelDown
+                };
+                for _ in 0..steps.abs() as u32 {
+                    self.mouse_report(id, kind, 0, mods);
+                }
+            }
+            Wheel::Arrows => self.send(wheel_keys(lines, &m)),
+            Wheel::Scroll if focused => self.scroll(lines),
+            Wheel::Scroll => {
+                lock(&v.pane.term).scroll_viewport(lines);
                 self.request_redraw();
             }
-            return;
-        }
-        let mods = mods_now();
-        if let Some(id) = self.mouse_to_program(&mods).and(self.focus_id()) {
-            let kind = if steps > 0.0 {
-                MouseKind::WheelUp
-            } else {
-                MouseKind::WheelDown
-            };
-            for _ in 0..steps.abs() as u32 {
-                self.mouse_report(id, kind, 0, mods);
-            }
-        } else if self.modes().alt_screen {
-            // As in xterm's alternateScroll: pagers such as less and man
-            // have no scrollback to show, but scroll by the arrow keys.
-            let keys = wheel_keys(steps as isize * WHEEL_LINES, &self.modes());
-            self.send(keys);
-        } else {
-            self.scroll(steps as isize * WHEEL_LINES);
+            Wheel::Nothing => {}
         }
     }
 
@@ -3872,6 +4843,9 @@ impl App {
         if self.win.fit_width(size.width as f32 / self.scale as f32) {
             self.fit_min_size();
         }
+        // What is under a still pointer can change too, as when a program
+        // takes the mouse or a panel opens from the keyboard.
+        self.update_pointer();
         self.ensure_gfx();
         let Some(g) = &self.gfx else {
             return;
@@ -3896,15 +4870,25 @@ impl App {
         }
         let (cw, ch) = self.cell();
         let focus = self.focus_id();
-        let cursor = self.current().map(|v| lock(&v.pane.term).cursor());
+        // Where the cursor is drawn, as of the last frame, else where it
+        // is: a program may hide it, or the view may be scrolled.
+        let cursor = self.current().map(|v| match v.snap.cursor {
+            Some((col, row, _)) => (col, row),
+            None => {
+                let (col, row, _) = lock(&v.pane.term).cursor();
+                (col, row)
+            }
+        });
         let sessions = self.sessions();
         let preedit = cursor
             .filter(|_| !self.preedit.is_empty())
-            .map(|(c, r, _)| (c, r, self.preedit.as_str()));
+            .map(|(c, r)| (c, r, self.preedit.as_str()));
         let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
         self.side = std::mem::take(&mut chrome.side);
         self.banner = chrome.banner;
         self.below = std::mem::take(&mut chrome.below);
+        self.find_bar = chrome.find;
+
         self.settings_hits = chrome.settings.take();
         self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
@@ -3929,42 +4913,90 @@ impl App {
                 if v.resize_at.is_none() {
                     v.grid = grid;
                     v.resized = Some(started);
-                    v.pane.resize(grid.0, grid.1);
+                    // A selection stays on its text as a new width wraps it.
+                    let mut marks = v.selection.as_ref().map_or_else(Vec::new, Selection::marks);
+                    let kept = v.pane.resize(grid.0, grid.1, &mut marks);
+                    let term = lock(&v.pane.term);
+                    if let Some(s) = v.selection.as_mut().filter(|_| kept) {
+                        s.reflowed(&term, &self.theme.pal, &marks);
+                    }
+                    drop(term);
                     lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
-                    // A new width rewraps the lines that matched.
+                    // A new width rewraps the lines that matched, which a
+                    // search must find again before they are drawn.
                     if let Some(f) = &mut find {
-                        f.stale = true;
+                        (f.stale, f.searched) = (true, None);
                     }
                 }
             }
             v.rect = Some(rect);
-            let sel = self.selection.as_mut().filter(|_| Some(id) == focus);
             let mut term = lock(&v.pane.term);
             v.sync_until = term.sync_deadline();
-            if !refresh(&mut term, &mut v.snap, &self.theme.pal, sel) {
-                self.selection = None;
+            if !refresh(
+                &mut term,
+                &mut v.snap,
+                &self.theme.pal,
+                v.selection.as_mut(),
+            ) {
+                let lost = v.selection.take();
+                if Some(id) == focus {
+                    self.orphan = lost.and_then(|s| s.last_text(&term, &self.theme.pal));
+                }
             }
             v.snap.highlights.clear();
             if let Some(f) = find {
-                // ponytail: searches all of the scrollback again on each
-                // frame with new output, ~50 ms for 100,000 full rows; keep
-                // the matches in scrollback rows if that ever shows.
-                if f.stale {
+                // ponytail: searches all of the scrollback again, ~50 ms for
+                // 100,000 full rows, at most every FIND_EVERY; keep the
+                // matches in scrollback rows if that ever shows.
+                if f.due().is_some_and(|t| t <= Instant::now()) {
                     f.search(&term, v.grid.1);
                 }
                 v.snap.highlight(&f.found, f.cur);
             }
-            if Some(id) == focus {
-                let (top, size) = (term.view_top(), (v.snap.cols, v.snap.rows));
-                let sel = self.selection.as_ref();
-                v.snap.selection =
-                    sel.and_then(|s| in_view(s.start, s.end, s.drag.block, top, size));
-                v.snap.block = sel.is_some_and(|s| s.drag.block);
-                let hover = self.hover.filter(|h| h.0 == term.line_epoch());
-                v.snap.hover = hover.and_then(|(_, a, b)| in_view(a, b, false, top, size));
-            } else if chrome::dims(split, v.pane.attn.state) {
+            if let Some(q) = self.quick.as_ref().filter(|q| q.pane == id) {
+                v.snap.highlight(&q.found, None);
+            }
+            // Only the focused pane has a link under the pointer.
+            let hover = (self.hover)
+                .filter(|h| Some(id) == focus && h.0 == term.line_epoch())
+                .map(|(_, a, b)| (a, b));
+            mark(&mut v.snap, term.view_top(), v.selection.as_ref(), hover);
+            if Some(id) != focus && chrome::dims(split, v.pane.attn.state) {
                 dimmed.push(id);
             }
+        }
+
+        // Output that numbered the lines anew leaves the labels on nothing.
+        let shown = (self.quick.as_ref()).and_then(|q| {
+            let v = self.view(q.pane)?;
+            let term = lock(&v.pane.term);
+            let view = term.view_top()..term.view_top() + usize::from(v.grid.1);
+            (term.line_epoch() == q.epoch).then_some((q, v.rect, view))
+        });
+        match shown {
+            Some((q, Some(r), view)) => {
+                let ui = &self.theme.ui;
+                for (i, (m, _, _)) in q.items.iter().enumerate() {
+                    let ((line, col), (cw, ch)) = (m.start, (cw as i32, ch as i32));
+                    if !view.contains(&line) {
+                        continue;
+                    }
+                    let x = r.x + i32::from(col) * cw;
+                    let y = r.y + (line - view.start) as i32 * ch;
+                    let cell = Rect { x, y, w: cw, h: ch };
+                    chrome.prims.push(chrome::Prim::Rect(cell, ui.name));
+                    chrome.prims.push(chrome::Prim::Text {
+                        x,
+                        y,
+                        text: char::from(b'a' + i as u8).to_string(),
+                        color: ui.side_bg,
+                        bold: true,
+                        term: true,
+                    });
+                }
+            }
+            Some(_) => {}
+            None => self.quick = None,
         }
 
         let pal = self.theme.pal;
@@ -4061,18 +5093,15 @@ impl App {
             }
         }
 
-        let at = self.current().and_then(|v| v.rect).zip(cursor);
-        if let Some((r, (col, row, _))) = at {
-            let at = (
-                r.x + i32::from(col) * cw as i32,
-                r.y + i32::from(row) * ch as i32,
-            );
-            if self.ime_at != Some(at)
-                && let Some(w) = &self.window
-            {
-                self.ime_at = Some(at);
-                w.set_ime_cursor_area(PhysicalPosition::new(at.0, at.1), PhysicalSize::new(cw, ch));
-            }
+        let pane = self.current().and_then(|v| v.rect);
+        let cell = (cw as i32, ch as i32);
+        if let Some(at) = ime_area(chrome.field.map(|f| f.0), pane, cursor, cell)
+            && self.ime_at != Some(at)
+            && let Some(w) = &self.window
+        {
+            self.ime_at = Some(at);
+            let size = PhysicalSize::new(at.w.max(1) as u32, at.h.max(1) as u32);
+            w.set_ime_cursor_area(PhysicalPosition::new(at.x, at.y), size);
         }
     }
 
@@ -4210,6 +5239,10 @@ impl App {
         let shown = (self.window.as_ref())
             .is_some_and(|w| w.inner_size().width > 0 && w.inner_size().height > 0);
         let gfx = self.gfx_retry.filter(|_| self.gfx.is_none() && shown);
+        // Only a frame searches.
+        let find = (self.find.as_ref())
+            .filter(|_| shown && self.gfx.is_some())
+            .and_then(Find::due);
         // Only a window in use animates.
         let still =
             !self.motion || (self.config.scenery == "off" && !(self.config.mascot && sidebar));
@@ -4224,6 +5257,7 @@ impl App {
             timer,
             resume,
             resize,
+            find,
             self.save_after,
             gfx,
             anim,
@@ -4282,18 +5316,6 @@ fn route_button(
     }
 }
 
-/// The pointer over a divider along `divider`, or with `hand` over a
-/// link or something in the sidebar a click acts on. Kept in one place,
-/// so leaving one of them cannot take the hand away from another.
-fn cursor_icon(divider: Option<Axis>, hand: bool) -> CursorIcon {
-    match divider {
-        Some(Axis::Row) => CursorIcon::ColResize,
-        Some(Axis::Column) => CursorIcon::RowResize,
-        None if hand => CursorIcon::Pointer,
-        None => CursorIcon::Default,
-    }
-}
-
 /// The one of `hidden`, sessions the sidebar has no room for, that a
 /// click on their count goes to: the one waiting longest for the user,
 /// else the one after `focus`, so clicks go round them all.
@@ -4309,6 +5331,89 @@ fn hidden_target(
         let h = hidden.get(next).or(hidden.first())?;
         (Some(h.0) != focus).then_some(h.0)
     })
+}
+
+/// The cell under the point `(x, y)` of a grid of `grid` cells, each
+/// `cell` pixels, at `r`; `None` off it, as over the header above it or
+/// the padding past its last cell.
+fn grid_cell(
+    r: Rect,
+    grid: (u16, u16),
+    cell: (u32, u32),
+    (x, y): (f64, f64),
+) -> Option<(u16, u16)> {
+    let (dx, dy) = (x - f64::from(r.x), y - f64::from(r.y));
+    if dx < 0.0 || dy < 0.0 {
+        return None;
+    }
+    let (col, row) = (dx as u32 / cell.0.max(1), dy as u32 / cell.1.max(1));
+    let inside = col < u32::from(grid.0) && row < u32::from(grid.1);
+    inside.then_some((col as u16, row as u16))
+}
+
+/// Whether Ctrl+click on `target` is blitz's to open rather than the
+/// `program`'s, when that takes the mouse. Claude Code (`claude`) does in
+/// fullscreen, so with an `editor` set blitz opens its file paths there.
+fn opens_link(target: &Target, program: bool, claude: bool, editor: &str) -> bool {
+    !program || claude && !editor.is_empty() && matches!(target, Target::Path(..))
+}
+
+/// What a right click that is not the program's does, with
+/// `right_click_paste` `on`: copies the selection when there is one
+/// (`selected`), else pastes, asking first as Ctrl+V does.
+fn right_click_does(on: bool, selected: bool) -> Option<Action> {
+    on.then_some(if selected {
+        Action::Copy
+    } else {
+        Action::Paste
+    })
+}
+
+/// Whether the hint `name` shows: only the first time ever, as remembered
+/// by a file of that name in `dir`. With nowhere to remember it, never, so
+/// it cannot show at every start.
+fn first_time(dir: Option<&Path>, name: &str) -> bool {
+    let Some(dir) = dir else {
+        return false;
+    };
+    let file = dir.join(name);
+    !file.exists()
+        && std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(file, ""))
+            .is_ok()
+}
+
+/// The pointer's shape: a resize arrow on a `divider` between panes, the
+/// hand on a link, a session row or the banner (`hand`), the I-beam over a
+/// pane's text that blitz selects, and the arrow over a pane whose program
+/// takes the mouse (`grid` says which) and anywhere else.
+fn pointer(divider: Option<Axis>, hand: bool, grid: Option<bool>) -> CursorIcon {
+    match (divider, hand, grid) {
+        (Some(Axis::Row), ..) => CursorIcon::ColResize,
+        (Some(Axis::Column), ..) => CursorIcon::RowResize,
+        (None, true, _) => CursorIcon::Pointer,
+        (None, false, Some(false)) => CursorIcon::Text,
+        _ => CursorIcon::Default,
+    }
+}
+
+/// Whether Windows hides the pointer while typing: Mouse settings,
+/// Pointer Options. Read once at start.
+fn mouse_vanish() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETMOUSEVANISH, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut on = windows::core::BOOL(0);
+    // SAFETY: SPI_GETMOUSEVANISH writes one BOOL.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSEVANISH,
+            0,
+            Some((&raw mut on).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    read.is_ok() && on.as_bool()
 }
 
 /// Whether Windows shows animations; off under Accessibility, Visual
@@ -4328,6 +5433,75 @@ fn animations_on() -> bool {
         )
     };
     read.is_err() || on.as_bool()
+}
+
+/// Where a jump to the session that needs you goes from `at`: to
+/// `waiting`, or with nothing waiting back to where the last jump came
+/// from, unless that is `at`. `jumped` is the last jump, from and to. A
+/// jump from where the last one landed keeps where that one came from, so
+/// going round every waiting session still comes back to the start.
+fn jump(
+    at: Option<PaneId>,
+    waiting: Option<PaneId>,
+    jumped: &mut Option<(PaneId, PaneId)>,
+) -> Option<PaneId> {
+    let Some(to) = waiting else {
+        return jumped.take().map(|j| j.0).filter(|&from| Some(from) != at);
+    };
+    let from = match *jumped {
+        Some((from, to)) if Some(to) == at => Some(from),
+        _ => at,
+    };
+    *jumped = from.map(|from| (from, to));
+    Some(to)
+}
+
+/// Time a font size change from the wheel holds off the next, so a fast
+/// spin, each step of which sizes every session again, makes one step.
+const FONT_WHEEL: Duration = Duration::from_millis(100);
+
+/// The font size step for `steps` of the wheel with Ctrl held: one point
+/// up or down, unless the last step, `last`, was too recent.
+fn wheel_font(steps: f64, last: Option<Instant>, now: Instant) -> Option<i8> {
+    let ready = last.is_none_or(|t| now.saturating_duration_since(t) >= FONT_WHEEL);
+    (ready && steps != 0.0).then_some(if steps > 0.0 { 1 } else { -1 })
+}
+
+/// Where the IME composes, which its candidates stay clear of: the field
+/// of the panel or bar that takes typing, else the cell of the cursor in
+/// the focused pane at `pane`, kept inside the pane.
+fn ime_area(
+    field: Option<Rect>,
+    pane: Option<Rect>,
+    cursor: Option<(u16, u16)>,
+    (cw, ch): (i32, i32),
+) -> Option<Rect> {
+    if field.is_some() {
+        return field;
+    }
+    let (r, (col, row)) = pane.zip(cursor)?;
+    let x = (r.x + i32::from(col) * cw).min(r.right() - cw).max(r.x);
+    Some(Rect {
+        x,
+        y: r.y + i32::from(row) * ch,
+        w: cw,
+        h: ch,
+    })
+}
+
+/// Whether a shortcut pressed while the find bar is open runs, which
+/// closes the bar. Paste is left to the bar.
+fn find_runs(a: Action) -> bool {
+    a != Action::Paste
+}
+
+/// Whether the find bar stays open after shortcut `a` ran: scrolling
+/// through what was found keeps it, as the wheel does.
+fn find_keeps(a: Action) -> bool {
+    matches!(
+        a,
+        Action::ScrollPage(_) | Action::ScrollEnd(_) | Action::JumpToPrompt(_)
+    )
 }
 
 /// How long after a session needing the user closes blitz run a jump key
@@ -4606,6 +5780,80 @@ fn reveal(term: &mut vt::Terminal, m: Found, rows: u16, covered: u16) -> bool {
     term.view_top() != top
 }
 
+/// What the wheel does over a pane whose program is in modes `m`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wheel {
+    /// The font size, with Ctrl.
+    Font,
+    /// Wheel reports to the program, which takes the mouse.
+    Report,
+    /// Arrow keys, as in xterm's alternateScroll (mode 1007): pagers have
+    /// no scrollback to show, but scroll by the arrow keys.
+    Arrows,
+    /// Scroll the main screen's view.
+    Scroll,
+    Nothing,
+}
+
+/// What the wheel does over a pane in modes `m`, with modifiers `mods`.
+/// Ctrl changes the font size, unless the program takes the mouse; Shift
+/// keeps it from such a program, which hears of it only over its own
+/// `cells`. Arrows go only to a full-screen program that did not turn
+/// them off, in the `focused` pane, where the user types, and never to
+/// Claude Code (`claude`), where they walk its prompt history and replace
+/// what was typed.
+fn wheel_does(m: &InputModes, mods: &Mods, claude: bool, focused: bool, cells: bool) -> Wheel {
+    let program = m.mouse != MouseMode::Off;
+    if (mods.lctrl || mods.rctrl) && !program {
+        Wheel::Font
+    } else if program && !(mods.lshift || mods.rshift) {
+        if cells { Wheel::Report } else { Wheel::Nothing }
+    } else if !m.alt_screen {
+        Wheel::Scroll
+    } else if m.alt_scroll && !claude && focused {
+        Wheel::Arrows
+    } else {
+        Wheel::Nothing
+    }
+}
+
+/// The pane the wheel goes by over `under`, the pane [`App::hit`] found,
+/// which is a session's row in the sidebar when `side`: that pane, or the
+/// focused one elsewhere. Ctrl+wheel over a row sizes the font as the
+/// focused pane says, not as a row the user cannot tell apart says.
+fn wheel_pane(under: Option<PaneId>, side: bool, focus: Option<PaneId>) -> Option<PaneId> {
+    under.filter(|_| !side).or(focus)
+}
+
+/// Lines a wheel notch scrolls with Windows' "lines to scroll" set to
+/// `setting`: that many, or a page of a `rows` high pane for "one screen
+/// at a time".
+fn wheel_lines(setting: u32, rows: u16) -> isize {
+    const WHEEL_PAGESCROLL: u32 = u32::MAX;
+    match setting {
+        WHEEL_PAGESCROLL => rows.saturating_sub(1).max(1) as isize,
+        n => n.min(100) as isize,
+    }
+}
+
+/// Windows' "lines to scroll" for each wheel notch; 3 if it cannot be read.
+fn scroll_lines() -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut n = 3u32;
+    // SAFETY: SPI_GETWHEELSCROLLLINES writes one UINT.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&raw mut n).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if read.is_ok() { n } else { 3 }
+}
+
 /// `n` presses of Up, or of Down for a negative `n`, each with its
 /// release, as the program asked keys to be sent.
 fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
@@ -4635,12 +5883,23 @@ fn wheel_keys(n: isize, m: &InputModes) -> Vec<u8> {
     out
 }
 
+/// The rows a notice takes in a pane of `grid` cells: broken at spaces
+/// onto as many as it needs, so its end, which often names the key to
+/// press, is not cut off in a narrow pane.
+fn notice_rows(text: &str, (cols, rows): (u16, u16)) -> Vec<String> {
+    let lines = chrome::wrap(text, i32::from(cols) - 1, 1, usize::from(rows.max(1)));
+    lines.into_iter().map(|l| format!(" {l}")).collect()
+}
+
 /// Puts a hint nobody asked for in a pane's notice `slot`, dim until
 /// `until`, unless a question or an error waits there, which it would
-/// take the place of. Whether it did. Only another dim hint gives way:
-/// a plain notice may be the one word that a session was lost.
+/// take the place of, or a notice that stays up ([`hides_lasting`]).
+/// Whether it did. Only another dim hint gives way: a plain notice may
+/// be the one word that a session was lost.
 fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
-    let fits = slot.as_ref().is_none_or(|n| n.ask == Ask::Nothing && n.dim);
+    let old = slot.as_ref();
+    let fits = old.is_none_or(|n| n.ask == Ask::Nothing && n.dim)
+        && !hides_lasting(old, Some(until), true);
     if fits {
         *slot = Some(Notice {
             text,
@@ -4652,7 +5911,7 @@ fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
     fits
 }
 
-/// The bottom row of a pane, and whether it is dim: its notice, else for
+/// The notice of a pane, and whether it is dim: its own, else for
 /// a program that exited, how and what Enter and Esc do, which comes
 /// back when a notice over it goes.
 fn notice_line(n: Option<&Notice>, exit: Option<u32>) -> Option<(Cow<'_, str>, bool)> {
@@ -4666,10 +5925,12 @@ fn notice_line(n: Option<&Notice>, exit: Option<u32>) -> Option<(Cow<'_, str>, b
     }
 }
 
-/// Draws a notice over the bottom row of the pane whose grid is at `at`.
+/// Draws a notice over the bottom rows of the pane whose grid is at `at`.
 fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text: &str, dim: bool) {
     let (_, ch) = r.cell();
-    let mut s = text_snapshot(&format!(" {text}"), grid.0, 1, pal);
+    let lines = notice_rows(text, grid);
+    let rows = (lines.len() as u16).clamp(1, grid.1.max(1));
+    let mut s = text_snapshot(&lines.join("\n"), grid.0, rows, pal);
     let bg = if dim { pal.bg } else { pal.selection_bg };
     for c in &mut s.cells {
         c.bg = bg;
@@ -4678,7 +5939,7 @@ fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text
         }
     }
     let banner = Palette { bg, ..*pal };
-    let y = at.y + i32::from(grid.1.saturating_sub(1)) * ch as i32;
+    let y = at.y + i32::from(grid.1.saturating_sub(rows)) * ch as i32;
     r.snapshot(&s, &banner, at.x, y);
 }
 
@@ -5042,6 +6303,311 @@ fn label(
     (name.to_owned(), msg.to_owned())
 }
 
+/// `text` without Claude Code's gutter: the mark that starts a reply (⏺,
+/// or ● outside macOS) and the ⎿ before a tool's output become spaces,
+/// then the indent every line shares goes. Lines are never joined.
+fn without_indent(text: &str) -> String {
+    let lines: Vec<String> = (text.lines())
+        .map(|l| {
+            let body = l.trim_start_matches(' ');
+            match body.chars().next() {
+                Some(c @ ('\u{23FA}' | '\u{25CF}' | '\u{23BF}')) => {
+                    format!("{} {}", &l[..l.len() - body.len()], &body[c.len_utf8()..])
+                }
+                _ => l.to_owned(),
+            }
+        })
+        .collect();
+    let common = (lines.iter())
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start_matches(' ').len())
+        .min()
+        .unwrap_or(0);
+    let lines: Vec<&str> = (lines.iter())
+        .map(|l| l.get(common..).unwrap_or_default().trim_end())
+        .collect();
+    lines.join("\r\n")
+}
+
+/// What a pane says when its program copied `text` with OSC 52, `here`
+/// when the pane had the user's focus.
+fn program_copy_notice(text: &str, here: bool, copied: bool) -> String {
+    if !here {
+        return "A program here tried to copy while you were elsewhere; nothing was copied".into();
+    }
+    if !copied {
+        return copy_notice(text, false, false);
+    }
+    let n = text.chars().count();
+    let s = if n == 1 { "" } else { "s" };
+    format!("Program copied {n} character{s}")
+}
+
+/// What a copy of `text` says: how many lines went to the clipboard, and
+/// whether they were the selection output then rewrote, or that another
+/// program held the clipboard.
+fn copy_notice(text: &str, copied: bool, rewritten: bool) -> String {
+    if !copied {
+        return "Clipboard busy; nothing was copied".into();
+    }
+    let lines = text.split('\n').count();
+    let s = if lines == 1 { "" } else { "s" };
+    let old = if rewritten {
+        ", as selected before the output changed"
+    } else {
+        ""
+    };
+    format!("Copied {lines} line{s}{old}")
+}
+
+/// A key for a one-line text field, such as the find bar or a list's
+/// filter: a key that types adds its text, Backspace takes off a character
+/// and Ctrl+Backspace a word. Returns whether the field changed.
+fn edit_field(field: &mut String, k: &KeyInput) -> bool {
+    let m = &k.mods;
+    // Ctrl and Alt together are AltGr when the layout gives a character.
+    let (ctrl, alt) = (m.lctrl || m.rctrl, m.lalt || m.ralt);
+    let chord = ctrl != alt || (ctrl && k.uc == 0);
+    match k.vk {
+        VK_BACK if ctrl && !alt => {
+            let word = (field.trim_end())
+                .trim_end_matches(|c: char| !c.is_whitespace())
+                .len();
+            let cut = word < field.len();
+            field.truncate(word);
+            cut
+        }
+        VK_BACK => field.pop().is_some(),
+        _ if !chord && !k.text.is_empty() => {
+            field.push_str(k.text);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// What a paste adds to a one-line text field: the first line of `text`,
+/// past any line breaks it starts with, without control characters.
+fn first_line(text: &str) -> String {
+    let line = text.trim_start_matches(['\r', '\n']).lines().next();
+    line.unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+/// Whether copy key `k` copies a selection that `shown` says is in view or
+/// not, when there is one, or else the text of one output rewrote
+/// (`orphan`), which shows nowhere. Plain Ctrl+C is the interrupt too, so
+/// it copies only what the user can see; the other copy keys always copy.
+fn copy_key_copies(k: &KeyInput, shown: Option<bool>, orphan: bool) -> bool {
+    shown.or(orphan.then_some(false)) != Some(false) || !vt::keys::is_interrupt(k)
+}
+
+/// Whether a copy key that found nothing to copy is kept from the program.
+/// Ctrl+Shift+C would reach it as Ctrl+C and interrupt it, unless kitty
+/// flags make it a key of its own; plain Ctrl+C is meant to interrupt.
+fn eats_copy_key(k: &KeyInput, m: &InputModes) -> bool {
+    !vt::keys::is_interrupt(k) && vt::keys::interrupts(k, m)
+}
+
+/// What a hook notification `ev` from Claude Code does to pastes into
+/// `term`: Claude Code reads every paste under bracketed paste as text, so
+/// one confirms bracketed paste as the user would, or, before Claude Code
+/// turned it on, the next time it does. Like theirs, it lasts until
+/// bracketed paste is turned on anew, as by a shell left behind when
+/// Claude Code dies without saying so. The session's end forgets it.
+fn hook_confirms_paste(term: &mut vt::Terminal, ev: Ev) {
+    term.vouch_paste(ev != Ev::Idle);
+}
+
+/// Paths as a paste types them into a pane that started `shell`, joined
+/// by spaces, and whether to ask before pasting them. A name with anything
+/// but letters, digits and `_.-:\/` is quoted for that shell: cmd gets
+/// double quotes, PowerShell single ones with each single quote mark
+/// doubled, and any other shell is taken for bash, where `\` needs quoting
+/// too and `'\''` puts a `'` in single quotes. The line may be read by a
+/// shell started inside the pane, by other rules, so a name with anything
+/// but letters, digits, spaces and `._-\/:~()[]+,@=`, none of which a shell
+/// reads as syntax inside either kind of quotes, asks first, whatever the
+/// pane runs.
+fn quote_paths(paths: &[PathBuf], shell: crate::shell::Kind) -> (String, bool) {
+    use crate::shell::Kind::{Cmd, Other, PowerShell};
+    let plain =
+        |c: char| c.is_alphanumeric() || "_.-:/".contains(c) || (c == '\\' && shell != Other);
+    let safe = |c: char| c.is_alphanumeric() || r" ._-\/:~()[]+,@=".contains(c);
+    let mut asks = false;
+    let quoted: Vec<String> = (paths.iter())
+        .map(|p| {
+            let s = p.to_string_lossy();
+            asks |= !s.chars().all(safe);
+            if s.chars().all(plain) {
+                return s.into_owned();
+            }
+            if shell == Cmd {
+                return format!("\"{s}\"");
+            }
+            let mut q = String::from('\'');
+            for c in s.chars() {
+                match c {
+                    '\'' if shell == Other => q.push_str(r"'\''"),
+                    '\'' | '\u{2018}'..='\u{201b}' if shell == PowerShell => q.extend([c, c]),
+                    _ => q.push(c),
+                }
+            }
+            q + "'"
+        })
+        .collect();
+    (quoted.join(" "), asks)
+}
+
+/// What files dropped on the window do.
+#[derive(Debug, PartialEq)]
+enum Dropped {
+    /// Pasted into this pane as their paths, the way [`quote_paths`] types
+    /// them.
+    Paste(PaneId, Vec<PathBuf>),
+    /// The folders among them, dropped on the sidebar, each opened in a
+    /// new tab.
+    Open(Vec<PathBuf>),
+}
+
+/// What `paths` dropped where [`App::hit`] found `hit` do.
+fn dropped(paths: Vec<PathBuf>, hit: (Option<PaneId>, bool)) -> Option<Dropped> {
+    match hit {
+        (_, true) => Some(Dropped::Open(
+            paths.into_iter().filter(|p| p.is_dir()).collect(),
+        )),
+        (Some(id), false) => Some(Dropped::Paste(id, paths)),
+        (None, false) => None,
+    }
+}
+
+/// Alt+V pressed and released, as the program asked keys to be sent:
+/// the key Claude Code pastes an image on.
+fn alt_v(m: &InputModes) -> Vec<u8> {
+    let mut out = Vec::new();
+    for down in [true, false] {
+        let k = KeyInput {
+            vk: 0x56,
+            scan: 0x2f,
+            extended: false,
+            down,
+            repeat: 1,
+            mods: Mods {
+                lalt: true,
+                ..Mods::default()
+            },
+            locks: vt::Locks::default(),
+            text: "v",
+            uc: u16::from(b'v'),
+            cs: 0,
+            key: vt::Key::Char('v'),
+            us_base: Some('v'),
+        };
+        vt::encode_key(&k, m, &mut out);
+    }
+    out
+}
+
+/// Why nothing is pasted into the pane `label` names, when its program
+/// exited with `code`. The notice it replaces said how to restart or
+/// close the pane, so this one does too.
+fn paste_refused(label: &str, code: Option<u32>) -> Option<String> {
+    Some(format!(
+        "{label}: {}, so nothing was pasted \u{b7} Enter restart \u{b7} Esc close",
+        exit_text(code?)
+    ))
+}
+
+/// Whether a dim notice that goes away at `until` would hide `old`, one
+/// that stays up and asks nothing, such as why nothing was pasted into a
+/// pane that exited. News never does; what an action from the palette
+/// says still shows over a question.
+fn hides_lasting(old: Option<&Notice>, until: Option<Instant>, dim: bool) -> bool {
+    dim && until.is_some() && old.is_some_and(|n| n.until.is_none() && n.ask == Ask::Nothing)
+}
+
+/// What pasting answers paste question `ask` with, the clipboard holding
+/// `now`: the text it asked about, while the clipboard still holds it.
+/// Dropped files are answered whatever the clipboard holds.
+fn answers(ask: Ask, now: Option<&str>) -> Option<String> {
+    match ask {
+        Ask::Drop(text) => Some(text),
+        Ask::Paste(text) if now.map(trim_paste) == Some(text.as_str()) => Some(text),
+        _ => None,
+    }
+}
+
+/// `text` without the line break at its end when that is its only one: a
+/// command copied with its line break is pasted, not run.
+fn trim_paste(text: &str) -> &str {
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.contains(['\r', '\n']) {
+        text
+    } else {
+        line
+    }
+}
+
+/// Whether a paste of `text` asks first: as
+/// [`vt::keys::needs_paste_confirm`] says, or for file `names` that
+/// [`quote_paths`] would ask about, even in a program trusted with pastes:
+/// Claude Code runs a line in its bash mode.
+fn asks_first(text: &str, names: bool, bracketed: bool, trusted: bool) -> bool {
+    names || vt::keys::needs_paste_confirm(text, bracketed, trusted)
+}
+
+/// What a paste that needs confirming asks: how many lines, how they
+/// start, or why file `names` ask, and the paste `key`, when one is bound.
+fn paste_question(text: &str, names: bool, key: Option<&str>) -> String {
+    // A lone CR is Enter too, and the preview leaves out what would hide
+    // or reorder the text.
+    let first = (text.trim_start().split(['\r', '\n']).next()).unwrap_or_default();
+    let mut start = vt::osc::clean(first, 41);
+    if start.chars().count() > 40 {
+        start.pop();
+        start.push('\u{2026}');
+    }
+    let lines = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .count();
+    let s = if lines == 1 { "" } else { "s" };
+    let again = match key {
+        Some(k) => format!("Press {k} again"),
+        None => "Paste again".into(),
+    };
+    if names && lines == 1 {
+        // All of it, as the name that asks may be anywhere in a long line,
+        // with what the preview leaves out shown as left out. Quoted
+        // already, as only a quoted name asks.
+        let shown = |c: char| !vt::osc::clean(c.encode_utf8(&mut [0; 4]), 1).is_empty();
+        let all: String = text
+            .chars()
+            .map(|c| if shown(c) { c } else { '\u{fffd}' })
+            .collect();
+        return format!("Paste {all}? A shell may run part of a file name. {again}");
+    }
+    format!("Paste {lines} line{s} starting \"{start}\"? {again}")
+}
+
+/// A session as the palette lists it: its name, folder and branch.
+fn session_row(s: &chrome::Session) -> String {
+    let mut row = s.name.clone();
+    let folder = (!s.cwd.is_empty()).then(|| chrome::folder_name(&s.cwd));
+    for part in [folder.as_deref(), s.branch.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        row.push_str(" \u{b7} ");
+        row.push_str(part);
+    }
+    row
+}
+
 /// Takes a fresh snapshot of `term` into `snap`. Returns false when that
 /// found output rewrote the text under `sel`; see [`Selection::still`].
 fn refresh(
@@ -5253,7 +6819,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.eaten = Eaten::default();
                     self.mouse.divider = None;
                     crate::handoff::forget_activating_click();
-                    self.mouse.drag = None;
+                    self.set_drag(None);
                     self.mouse.scroll_at = None;
                     let mods = mods_now();
                     for b in 0..3 {
@@ -5264,6 +6830,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Ctrl may be let go while another window has the keys.
                 self.set_hover(None);
+                self.hide_pointer(false);
                 // The cursor is hollow while the window is in the background.
                 self.request_redraw();
                 if let Some(v) = self.current() {
@@ -5280,6 +6847,7 @@ impl ApplicationHandler<UserEvent> for App {
                 text.retain(|c| !c.is_control());
                 if !self.filter_text(&text) {
                     self.dismiss(None);
+                    self.hide_pointer(true);
                     self.typed(text.into_bytes());
                 }
             }
@@ -5297,6 +6865,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.on_mouse_button(el, state, button);
             }
             WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
+            WindowEvent::DroppedFile(path) => self.dropped.push(path),
             // Windows switched between light and dark mode.
             WindowEvent::ThemeChanged(_) => {
                 // winit has just set the frame to the system's mode.
@@ -5367,6 +6936,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.drain_keys(el);
+        self.on_drop();
         // Back at the screen, with a key or the mouse: the focused pane
         // is in view again.
         let game = self.game.is_some();
@@ -5765,7 +7335,8 @@ mod tests {
         let mut win = layout::Window::default();
         win.tabs.push(Tab::new("a".into(), PaneId(1)));
         win.tabs.push(Tab::new("b".into(), PaneId(2)));
-        let offer = crate::update::banner(None, "0.2.0", None, true).expect("an offer");
+        let offer = crate::update::banner(None, "0.2.0", None, true, "Ctrl+Alt+Shift+F12");
+        let offer = offer.expect("an offer");
         let update = ("0.2.0".to_string(), offer);
         let note = "Sessions are busy, and updating restarts blitz. Press Ctrl+Alt+Shift+F12 again";
         let area = |note| chrome::area(&win, (1440, 900), 1.0, banner_text(Some(&update), note), 7);
@@ -5907,6 +7478,59 @@ mod tests {
     }
 
     #[test]
+    fn app_selection_follows_its_text_to_a_new_width() {
+        let pal = crate::theme::dark();
+        let mut t = fed(6, 3, "one two three\r\nfour");
+        let mut s = Snapshot::default();
+        // "two three", across the wrap.
+        let mut sel = select(&t, (0, 4), (2, 0));
+        assert_eq!(selection_text(&t, &pal, &sel, 0), "two three");
+        for cols in [20, 4, 9] {
+            let mut marks = sel.marks();
+            assert!(t.resize_keeping(cols, 3, &mut marks), "{cols}");
+            sel.reflowed(&t, &pal, &marks);
+            assert!(refresh(&mut t, &mut s, &pal, Some(&mut sel)), "{cols}");
+            assert_eq!(selection_text(&t, &pal, &sel, 0), "two three", "{cols}");
+        }
+        // A block's columns mean nothing at another width.
+        let block = drag(&t, (0, 0), (1, 1), 1, true);
+        assert!(block.marks().is_empty());
+    }
+
+    #[test]
+    fn app_selection_outlives_blitz_prompt() {
+        let pal = crate::theme::dark();
+        let mut t = fed(10, 3, "ls\r\na b\r\n");
+        let mut s = Snapshot::default();
+        let mut sel = select(&t, (1, 0), (1, 2));
+        // What blitz's shell integration prints before each prompt.
+        t.feed(b"\x1b[?1049h\x1b[?1049l\x1b[!pPS> ");
+        assert!(refresh(&mut t, &mut s, &pal, Some(&mut sel)));
+        assert_eq!(selection_text(&t, &pal, &sel, 0), "a b");
+    }
+
+    #[test]
+    fn app_every_pane_shows_its_own_selection() {
+        let pal = crate::theme::dark();
+        let (a, b) = (fed(10, 2, "one\r\ntwo"), fed(10, 2, "three"));
+        let (sa, sb) = (select(&a, (0, 0), (0, 2)), select(&b, (0, 1), (0, 3)));
+        let (mut snap_a, mut snap_b) = (Snapshot::default(), Snapshot::default());
+        let (mut a, mut b) = (a, b);
+        a.snapshot(&mut snap_a, &pal);
+        b.snapshot(&mut snap_b, &pal);
+        // Pane a has focus and the pointer on a link; pane b keeps its
+        // selection all the same.
+        mark(&mut snap_a, 0, Some(&sa), Some(((1, 0), (1, 2))));
+        mark(&mut snap_b, 0, Some(&sb), None);
+        assert_eq!(snap_a.selection, Some(((0, 0), (2, 0))));
+        assert_eq!(snap_a.hover, Some(((0, 1), (2, 1))));
+        assert_eq!(snap_b.selection, Some(((1, 0), (3, 0))));
+        assert_eq!(snap_b.hover, None);
+        mark(&mut snap_b, 0, None, None);
+        assert_eq!(snap_b.selection, None);
+    }
+
+    #[test]
     fn app_selection_shows_the_part_in_view() {
         let size = (10, 3);
         let view = |a, b| in_view(a, b, false, 5, size);
@@ -5936,6 +7560,20 @@ mod tests {
         let t = fed(10, 1, "\u{4e2d}\u{6587} x");
         let word = |at| Drag::new(&t, &pal, at, 2, false).anchor;
         assert_eq!(word((0, 1)), ((0, 0), (0, 3)), "wide characters");
+    }
+
+    #[test]
+    fn app_double_click_takes_a_whole_url_or_path_without_the_full_stop() {
+        let t = fed(40, 3, "at https://x.com/a_(b), see a.rs(3,4). Done.");
+        let pal = crate::theme::dark();
+        let words = |at| {
+            let s = drag(&t, at, at, 2, false);
+            selection_text(&t, &pal, &s, 0)
+        };
+        assert_eq!(words((0, 10)), "https://x.com/a_(b)");
+        assert_eq!(words((0, 29)), "a.rs(3,4)");
+        assert_eq!(words((1, 1)), "Done");
+        assert_eq!(words((1, 3)), "Done.", "a click on the full stop keeps it");
     }
 
     #[test]
@@ -5989,6 +7627,182 @@ mod tests {
     }
 
     #[test]
+    fn app_quick_select_labels_urls_paths_and_hashes_from_the_bottom() {
+        let pal = crate::theme::dark();
+        let t = Mutex::new(fed(
+            30,
+            4,
+            "see https://x.com/a\r\nat src/a.rs:3 and b/none.rs\r\ncommit 1a2b3c4d done\r\n",
+        ));
+        // The disk is looked at only with the pane's output free to come.
+        let found = |p: &str| {
+            assert!(t.try_lock().is_ok(), "{p} looked up under the lock");
+            (p == "src/a.rs").then(|| PathBuf::from(r"C:\x\src\a.rs"))
+        };
+        let (items, epoch) = quick_items(&t, &pal, 4, found);
+        assert_eq!(epoch, lock(&t).line_epoch());
+        let texts: Vec<&str> = items.iter().map(|i| i.1.as_str()).collect();
+        assert_eq!(texts, ["1a2b3c4d", "src/a.rs:3", "https://x.com/a"]);
+        assert_eq!(
+            items[0].0,
+            Found {
+                start: (2, 7),
+                end: (2, 14)
+            }
+        );
+        assert_eq!(items[0].2, None, "a hash opens nothing");
+        let path = Target::Path(PathBuf::from(r"C:\x\src\a.rs"), Some((3, 1)));
+        assert_eq!(items[1].2, Some(path));
+        assert_eq!(items[2].2, Some(Target::Uri("https://x.com/a".into())));
+        // Only what is in view.
+        assert_eq!(quick_items(&t, &pal, 1, found).0.len(), 1);
+    }
+
+    #[test]
+    fn app_quick_select_labels_go_by_the_key() {
+        let key = |vk: u16, text, mods, caps| KeyInput {
+            vk,
+            scan: 0,
+            extended: false,
+            down: true,
+            repeat: 1,
+            mods,
+            locks: vt::Locks {
+                caps,
+                ..vt::Locks::default()
+            },
+            text,
+            uc: 0,
+            cs: 0,
+            key: vt::Key::Char('x'),
+            us_base: None,
+        };
+        let shift = Mods {
+            lshift: true,
+            ..Mods::default()
+        };
+        let ctrl = Mods {
+            rctrl: true,
+            ..Mods::default()
+        };
+        let label = |vk, text, mods, caps| quick_label(&key(vk, text, mods, caps));
+        assert_eq!(label(0x43, "c", Mods::default(), false), Some((2, false)));
+        assert_eq!(label(0x43, "C", shift, false), Some((2, true)));
+        assert_eq!(
+            label(0x43, "C", Mods::default(), true),
+            Some((2, false)),
+            "Caps Lock"
+        );
+        assert_eq!(
+            label(0x41, "\u{444}", Mods::default(), false),
+            Some((0, false)),
+            "Cyrillic"
+        );
+        assert_eq!(label(0x5a, "z", Mods::default(), false), Some((25, false)));
+        assert_eq!(label(0x43, "c", ctrl, false), None);
+        assert_eq!(label(0x31, "1", Mods::default(), false), None);
+    }
+
+    #[test]
+    fn app_hashes_are_hex_words_with_letters_and_digits() {
+        let text = "abc1234 deadbeefcafe 1234567 abcdefa x1a2b3c4 1a2b3c4_ 9f8e7d6c5b.";
+        let found: Vec<&str> = hashes(text).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(found, ["abc1234", "9f8e7d6c5b"]);
+        let text = "abc1234..def5678 build/a1b2c3d/x blitz-3f2a1b9c8d7e6f50                     550e8400-e29b-41d4-a716-446655440000 (fe12ab3)";
+        let found: Vec<&str> = hashes(text).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(found, ["abc1234", "def5678", "fe12ab3"]);
+    }
+
+    #[test]
+    fn app_hints_show_once_ever() {
+        let dir = std::env::temp_dir().join(format!("blitz-hints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let seen = [
+            first_time(Some(&dir), "shift-drag"),
+            first_time(Some(&dir), "shift-drag"),
+            first_time(Some(&dir), "other"),
+        ];
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(seen, [true, false, true]);
+        assert!(!first_time(None, "shift-drag"), "nowhere to remember it");
+    }
+
+    #[test]
+    fn app_pointer_shows_what_a_click_does() {
+        assert_eq!(
+            pointer(None, false, Some(false)),
+            CursorIcon::Text,
+            "selectable text"
+        );
+        assert_eq!(
+            pointer(None, false, Some(true)),
+            CursorIcon::Default,
+            "the program's"
+        );
+        assert_eq!(
+            pointer(None, true, Some(false)),
+            CursorIcon::Pointer,
+            "a link"
+        );
+        assert_eq!(
+            pointer(None, true, None),
+            CursorIcon::Pointer,
+            "a row or the banner"
+        );
+        assert_eq!(pointer(None, false, None), CursorIcon::Default);
+        assert_eq!(pointer(Some(Axis::Row), true, None), CursorIcon::ColResize);
+        assert_eq!(
+            pointer(Some(Axis::Column), false, Some(false)),
+            CursorIcon::RowResize
+        );
+    }
+
+    #[test]
+    fn app_mouse_reports_come_only_from_the_grid() {
+        let r = Rect {
+            x: 100,
+            y: 50,
+            w: 85,
+            h: 64,
+        };
+        let cell = |x, y| grid_cell(r, (10, 4), (8, 16), (x, y));
+        assert_eq!(cell(100.0, 50.0), Some((0, 0)));
+        assert_eq!(cell(179.9, 113.9), Some((9, 3)));
+        assert_eq!(cell(181.0, 60.0), None, "padding past the last column");
+        assert_eq!(cell(120.0, 40.0), None, "the header above");
+        assert_eq!(cell(99.0, 60.0), None, "left of the grid");
+        assert_eq!(cell(120.0, 114.0), None, "below it");
+    }
+
+    #[test]
+    fn app_right_click_copies_a_selection_or_pastes() {
+        assert_eq!(right_click_does(true, true), Some(Action::Copy));
+        assert_eq!(right_click_does(true, false), Some(Action::Paste));
+        assert_eq!(right_click_does(false, true), None, "turned off");
+    }
+
+    #[test]
+    fn app_ctrl_click_in_claude_fullscreen_opens_paths_in_the_editor() {
+        let file = Target::Path(PathBuf::from(r"C:\x\a.rs"), Some((3, 1)));
+        let web = Target::Uri("https://example.com".into());
+        let code = "vscode://file/{path}:{line}:{col}";
+        for t in [&file, &web] {
+            assert!(
+                opens_link(t, false, false, ""),
+                "no program takes the mouse"
+            );
+            assert!(opens_link(t, false, true, code));
+        }
+        assert!(opens_link(&file, true, true, code));
+        assert!(
+            !opens_link(&web, true, true, code),
+            "Claude Code opens its own URLs"
+        );
+        assert!(!opens_link(&file, true, true, ""), "no editor");
+        assert!(!opens_link(&file, true, false, code), "not Claude Code");
+    }
+
+    #[test]
     fn app_wheel_on_the_alternate_screen_sends_arrow_keys() {
         let legacy = InputModes::default();
         assert_eq!(wheel_keys(3, &legacy), b"\x1b[A\x1b[A\x1b[A");
@@ -6001,6 +7815,105 @@ mod tests {
         // Kitty flags 1 and 2: releases are reported too.
         let kitty = InputModes { kitty: 3, ..legacy };
         assert_eq!(wheel_keys(1, &kitty), b"\x1b[A\x1b[1;1:3A");
+    }
+
+    #[test]
+    fn app_wheel_follows_the_windows_lines_to_scroll() {
+        assert_eq!(wheel_lines(3, 40), 3);
+        assert_eq!(wheel_lines(1, 40), 1);
+        assert_eq!(wheel_lines(0, 40), 0, "no scrolling");
+        assert_eq!(wheel_lines(u32::MAX, 40), 39, "a page");
+        assert_eq!(wheel_lines(u32::MAX, 1), 1);
+        assert_eq!(wheel_lines(5000, 40), 100);
+    }
+
+    #[test]
+    fn app_wheel_sends_arrows_unless_turned_off_and_never_to_claude() {
+        let alt = InputModes {
+            alt_screen: true,
+            ..InputModes::default()
+        };
+        let asked = InputModes {
+            alt_scroll: true,
+            ..alt
+        };
+        let mouse = InputModes {
+            mouse: MouseMode::Click,
+            ..asked
+        };
+        let does = |m: &InputModes, shift, claude| wheel_does(m, &held(shift), claude, true, true);
+        assert_eq!(does(&InputModes::default(), false, false), Wheel::Scroll);
+        assert_eq!(does(&alt, false, false), Wheel::Nothing, "turned off");
+        assert_eq!(does(&asked, false, false), Wheel::Arrows);
+        // Pagers such as less never ask.
+        let pager = fed(10, 2, "\x1b[?1049h").input_modes();
+        assert_eq!(does(&pager, false, false), Wheel::Arrows, "less");
+        assert_eq!(does(&asked, false, true), Wheel::Nothing, "Claude Code");
+        assert_eq!(does(&mouse, false, true), Wheel::Report);
+        assert_eq!(
+            does(&mouse, true, true),
+            Wheel::Nothing,
+            "Shift over Claude"
+        );
+        assert_eq!(does(&mouse, true, false), Wheel::Arrows, "Shift");
+        let main = InputModes {
+            mouse: MouseMode::Any,
+            ..InputModes::default()
+        };
+        assert_eq!(does(&main, true, true), Wheel::Scroll);
+    }
+
+    #[test]
+    fn app_wheel_over_another_pane_reports_or_scrolls_but_sends_no_keys() {
+        let asked = InputModes {
+            alt_screen: true,
+            alt_scroll: true,
+            ..InputModes::default()
+        };
+        let mouse = InputModes {
+            mouse: MouseMode::Drag,
+            ..asked
+        };
+        let does = |m: &InputModes, shift, claude| wheel_does(m, &held(shift), claude, false, true);
+        assert_eq!(does(&mouse, false, true), Wheel::Report);
+        assert_eq!(does(&asked, false, false), Wheel::Nothing);
+        assert_eq!(does(&mouse, true, false), Wheel::Nothing);
+        let main = InputModes::default();
+        assert_eq!(does(&main, false, false), Wheel::Scroll);
+        // Not over its header or padding.
+        let none = Mods::default();
+        assert_eq!(
+            wheel_does(&mouse, &none, false, false, false),
+            Wheel::Nothing
+        );
+    }
+
+    /// Shift held, or nothing.
+    fn held(shift: bool) -> Mods {
+        Mods {
+            lshift: shift,
+            ..Mods::default()
+        }
+    }
+
+    #[test]
+    fn app_ctrl_and_the_wheel_size_the_font_unless_the_pane_under_it_takes_the_mouse() {
+        let ctrl = Mods {
+            lctrl: true,
+            ..Mods::default()
+        };
+        let mouse = InputModes {
+            mouse: MouseMode::Click,
+            ..InputModes::default()
+        };
+        let does = |m: &InputModes| wheel_does(m, &ctrl, false, false, true);
+        assert_eq!(does(&InputModes::default()), Wheel::Font);
+        assert_eq!(does(&mouse), Wheel::Report);
+        // Over a session's row in the sidebar, the focused pane decides.
+        let (row, focus) = (Some(PaneId(2)), Some(PaneId(1)));
+        assert_eq!(wheel_pane(row, true, focus), focus);
+        assert_eq!(wheel_pane(row, false, focus), row);
+        assert_eq!(wheel_pane(None, false, focus), focus);
     }
 
     #[test]
@@ -6251,6 +8164,29 @@ mod tests {
     }
 
     #[test]
+    fn app_text_fields_delete_words_and_take_the_first_line_of_a_paste() {
+        let mut field = String::from("git log  --oneline ");
+        let mut back = input(VK_BACK, true, vt::Key::Backspace, "");
+        assert!(edit_field(&mut field, &back));
+        assert_eq!(field, "git log  --oneline");
+        back.mods.lctrl = true;
+        assert!(edit_field(&mut field, &back));
+        assert_eq!(field, "git log  ");
+        assert!(edit_field(&mut field, &back));
+        assert_eq!(field, "git ");
+        assert!(edit_field(&mut field, &back));
+        assert_eq!(field, "");
+        assert!(!edit_field(&mut field, &back), "nothing left");
+        assert!(edit_field(
+            &mut field,
+            &input(0x41, true, vt::Key::Char('a'), "a")
+        ));
+        assert_eq!(field, "a");
+        assert_eq!(first_line("\r\ngit\tstatus\r\nrm -rf x"), "gitstatus");
+        assert_eq!(first_line(""), "");
+    }
+
+    #[test]
     fn app_keys_kept_for_a_shortcut_keep_their_release() {
         let mut e = Eaten::default();
         // Shift and A typed into the theme picker, released in any order.
@@ -6262,6 +8198,31 @@ mod tests {
         assert!(!e.release(0x41), "once");
         // Ctrl was down before the picker opened: its release goes on.
         assert!(!e.release(0x11));
+    }
+
+    #[test]
+    fn app_find_closed_before_doing_anything_selects_nothing_and_goes_back() {
+        let mut t = vt::Terminal::new(vt::Options {
+            cols: 20,
+            rows: 3,
+            scrollback_lines: 100,
+            ..vt::Options::default()
+        });
+        t.feed(b"error\r\n");
+        for i in 0..10 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let bottom = t.view_top();
+        let mut f = Find::new(PaneId(1));
+        f.query = "error".into();
+        f.back = Some((bottom, true));
+        f.search(&t, 3);
+        assert!(reveal(&mut t, f.found[0], 3, 0));
+        assert_eq!(f.close(&mut t, 3), None, "the last query, untouched");
+        assert_eq!(t.view_top(), bottom);
+        // Once it moves or searches, Esc leaves the match selected.
+        f.back = None;
+        assert_eq!(f.close(&mut t, 3), Some(f.found[0]));
     }
 
     #[test]
@@ -6316,6 +8277,193 @@ mod tests {
         f.search(&t, 3);
         f.step(1);
         assert_eq!((f.found.len(), f.cur), (0, None));
+    }
+
+    #[test]
+    fn app_jumps_come_back_when_nothing_waits() {
+        let (a, b, c, d) = (PaneId(1), PaneId(2), PaneId(3), PaneId(4));
+        let mut j = None;
+        assert_eq!(jump(Some(a), None, &mut j), None, "nothing waits");
+        // Round the waiting sessions, then back to the start.
+        assert_eq!(jump(Some(a), Some(b), &mut j), Some(b));
+        assert_eq!(jump(Some(b), Some(c), &mut j), Some(c));
+        assert_eq!(jump(Some(c), None, &mut j), Some(a));
+        assert_eq!(jump(Some(a), None, &mut j), None, "once");
+        // Moving away by hand starts over from there.
+        assert_eq!(jump(Some(a), Some(b), &mut j), Some(b));
+        assert_eq!(jump(Some(d), Some(c), &mut j), Some(c));
+        assert_eq!(jump(Some(c), None, &mut j), Some(d));
+        // Already back where it came from.
+        assert_eq!(jump(Some(a), Some(b), &mut j), Some(b));
+        assert_eq!(jump(Some(a), None, &mut j), None);
+        assert_eq!(j, None);
+    }
+
+    #[test]
+    fn app_ctrl_wheel_steps_the_font_a_point_at_a_time() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        assert_eq!(wheel_font(1.0, None, t0), Some(1));
+        assert_eq!(wheel_font(-3.0, None, t0), Some(-1), "one point a step");
+        assert_eq!(wheel_font(1.0, Some(t0), ms(99)), None, "a fast spin");
+        assert_eq!(wheel_font(1.0, Some(t0), ms(100)), Some(1));
+        assert_eq!(wheel_font(0.0, None, t0), None);
+    }
+
+    #[test]
+    fn app_ime_composes_in_the_field_or_at_the_cursor() {
+        let pane = Rect {
+            x: 100,
+            y: 50,
+            w: 90,
+            h: 200,
+        };
+        let cell = (9, 20);
+        let at = |x, y| Rect { x, y, w: 9, h: 20 };
+        assert_eq!(
+            ime_area(None, Some(pane), Some((2, 1)), cell),
+            Some(at(118, 70))
+        );
+        // A cursor past the last whole cell stays in the pane.
+        assert_eq!(
+            ime_area(None, Some(pane), Some((10, 0)), cell),
+            Some(at(181, 50))
+        );
+        let field = Rect {
+            x: 400,
+            y: 60,
+            w: 200,
+            h: 15,
+        };
+        assert_eq!(
+            ime_area(Some(field), Some(pane), Some((2, 1)), cell),
+            Some(field)
+        );
+        assert_eq!(ime_area(None, None, Some((2, 1)), cell), None);
+    }
+
+    #[test]
+    fn app_shortcuts_close_the_find_bar_and_run() {
+        for a in [
+            Action::Copy,
+            Action::Palette,
+            Action::SplitRight,
+            Action::Find,
+        ] {
+            assert!(find_runs(a), "{a:?}");
+        }
+        assert!(!find_runs(Action::Paste), "for the bar");
+        // Scrolling looks through the matches; the rest leave the bar.
+        for a in [
+            Action::ScrollPage(1),
+            Action::ScrollEnd(-1),
+            Action::JumpToPrompt(1),
+        ] {
+            assert!(find_runs(a) && find_keeps(a), "{a:?}");
+        }
+        for a in [Action::Copy, Action::SplitRight, Action::FontSize(1)] {
+            assert!(!find_keeps(a), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn app_find_searches_streaming_output_a_few_times_a_second() {
+        let t = fed(10, 2, "abc");
+        let mut f = Find::new(PaneId(1));
+        f.query = "b".into();
+        assert_eq!(f.due(), None, "nothing new");
+        f.stale = true;
+        assert!(f.due().is_some_and(|t| t <= Instant::now()), "at once");
+        f.search(&t, 2);
+        assert_eq!(f.due(), None);
+        f.stale = true;
+        let at = f.due().expect("a search to come");
+        assert!(at > Instant::now() && at <= Instant::now() + FIND_EVERY);
+    }
+
+    #[test]
+    fn app_typing_replaces_a_query_find_opened_with() {
+        let back = input(VK_BACK, true, vt::Key::Backspace, "");
+        let n = input(0x4e, true, vt::Key::Char('n'), "n");
+        let e = input(0x45, true, vt::Key::Char('e'), "e");
+        let mut f = Find::new(PaneId(1));
+        f.query = "old".into();
+        f.fresh = true;
+        assert!(!f.edit(&input(0x70, true, vt::Key::F(1), "")), "F1");
+        assert!(f.fresh);
+        assert!(f.edit(&n) && f.edit(&e));
+        assert_eq!((f.query.as_str(), f.fresh), ("ne", false));
+        assert!(f.edit(&back));
+        assert_eq!(f.query, "n");
+        f.fresh = true;
+        assert!(f.edit(&back), "Backspace takes all of a fresh query");
+        assert!(f.query.is_empty() && !f.edit(&back));
+        f.query = "old".into();
+        f.fresh = true;
+        f.type_text("pasted");
+        assert_eq!(f.query, "pasted");
+    }
+
+    #[test]
+    fn app_selects_all_text_or_the_last_command_output() {
+        let pal = crate::theme::dark();
+        const PROMPT: &str = "\x1b]133;A;blitz=1\x07$ ";
+        let text_of = |t: &vt::Terminal, (a, b): (usize, usize)| {
+            let s = selection_of(t, &pal, (a, 0), (b, u16::MAX));
+            selection_text(t, &pal, &s, 0)
+        };
+        let text = format!(
+            "{PROMPT}ls\r\none\r\n{PROMPT}cargo build --release\r\n\
+             Compiling x\r\nFinished\r\n\r\n{PROMPT}"
+        );
+        let t = fed(12, 4, &text);
+        let text = |(a, b): (usize, usize)| {
+            let s = selection_of(&t, &pal, (a, 0), (b, u16::MAX));
+            selection_text(&t, &pal, &s, 0)
+        };
+        let out = last_output(&t, &pal).expect("output");
+        assert_eq!(
+            text(out),
+            "Compiling x\r\nFinished",
+            "past the wrapped command"
+        );
+        let all = all_text(&t, &pal).expect("text");
+        assert!(text(all).starts_with("$ ls\r\none\r\n$ cargo build"));
+        assert!(text(all).ends_with("Finished\r\n\r\n$"));
+        // A prompt of two lines, and a command of two, where the shell
+        // marks the output's start.
+        let text = format!(
+            "{PROMPT}~/repo\r\n$ git commit\r\n>> -m x\r\n\x1b]133;C\x07\
+             [main 1a2b3c4] x\r\n{PROMPT}"
+        );
+        let t = fed(20, 4, &text);
+        let out = last_output(&t, &pal).expect("output");
+        assert_eq!(text_of(&t, out), "[main 1a2b3c4] x");
+        // A command with no output.
+        let t = fed(20, 4, &format!("{PROMPT}cd x\r\n\x1b]133;C\x07{PROMPT}"));
+        assert_eq!(last_output(&t, &pal), None);
+        // One prompt has no command before it.
+        let t = fed(12, 4, &format!("hello\r\n{PROMPT}"));
+        assert_eq!(last_output(&t, &pal), None);
+        let t = fed(12, 4, "");
+        assert_eq!(all_text(&t, &pal), None, "nothing to select");
+    }
+
+    #[test]
+    fn app_closing_find_leaves_the_match_selected() {
+        let pal = crate::theme::dark();
+        let mut t = fed(6, 3, "one Needle, \u{4e2d}x");
+        let mut f = Find::new(PaneId(1));
+        f.query = "needle, \u{4e2d}".into();
+        f.search(&t, 3);
+        let m = f.found[f.cur.expect("a match")];
+        let mut sel = selection_of(&t, &pal, m.start, m.end);
+        assert_eq!(selection_text(&t, &pal, &sel, 0), "Needle, \u{4e2d}");
+        let mut s = Snapshot::default();
+        assert!(
+            refresh(&mut t, &mut s, &pal, Some(&mut sel)),
+            "a selection like any"
+        );
     }
 
     #[test]
@@ -6975,7 +9123,13 @@ mod tests {
     #[test]
     fn notices_go_at_the_next_key_that_does_not_answer_them() {
         let close = Some(Action::ClosePane);
-        for ask in [Ask::ClosePane, Ask::CloseTab, Ask::Paste("a\nb".into())] {
+        let asks = [
+            Ask::ClosePane,
+            Ask::CloseTab,
+            Ask::Paste("a\nb".into()),
+            Ask::Drop("C:\\a.txt".into()),
+        ];
+        for ask in asks {
             assert!(ask.of_pane());
             for a in [close, Some(Action::CloseTab), Some(Action::Paste)] {
                 assert!(ask.gone(a, false), "{ask:?} at {a:?} elsewhere");
@@ -7022,7 +9176,14 @@ mod tests {
             ask,
         };
         let until = Instant::now();
-        for mut slot in [None, Some(notice(Ask::Nothing, true))] {
+        let passing = Notice {
+            until: Some(until),
+            ..notice(Ask::Nothing, true)
+        };
+        let mut lasting = Some(notice(Ask::Nothing, true));
+        assert!(!hint_into(&mut lasting, "hint".into(), until));
+        assert!(lasting.is_some_and(|n| n.text == "n"), "one that stays up");
+        for mut slot in [None, Some(passing)] {
             assert!(hint_into(&mut slot, "hint".into(), until));
             let n = slot.expect("the hint");
             assert_eq!(
@@ -7151,17 +9312,101 @@ mod tests {
     #[test]
     fn palette_matches_every_word_of_the_label_or_name() {
         let mut c = Commands::default();
-        assert_eq!(c.matches().len(), keymap::ACTIONS.len() - 1, "not itself");
+        let run = |a| (Pick::Run(a), keymap::label(a).to_string());
+        assert_eq!(c.matches().len(), keymap::ACTIONS.len() - 10, "not itself");
+        c.filter = "tab".into();
+        assert!(c.matches().iter().all(|m| m.1 != "Go to the last tab"));
         c.filter = "Split R".into();
-        assert_eq!(c.matches(), [(Action::SplitRight, "Split right")]);
+        assert_eq!(c.matches(), [run(Action::SplitRight)]);
         c.filter = "font_size_up".into();
-        assert_eq!(c.matches(), [(Action::FontSize(1), "Bigger font")]);
+        assert_eq!(c.matches(), [run(Action::FontSize(1))]);
         c.filter = "claude".into();
-        assert_eq!(c.matches(), [(Action::ClaudeSetup, "Claude Code setup")]);
+        assert_eq!(
+            c.matches(),
+            [run(Action::NewClaude), run(Action::ClaudeSetup)]
+        );
+        // Actions with no keys are here too.
+        c.filter = "claude setup".into();
+        assert_eq!(c.matches(), [run(Action::ClaudeSetup)]);
+        c.filter = "reset term".into();
+        assert_eq!(c.matches(), [run(Action::Reset)]);
+        c.filter = "clear".into();
+        assert_eq!(c.matches(), [run(Action::ClearScrollback)]);
         c.move_by(5);
         assert_eq!(c.sel, 0, "one match");
+        // What has nothing to do is left out.
+        c.filter = "update".into();
+        assert_eq!(c.matches(), [run(Action::Update)]);
+        c.hidden = vec![Action::Update];
+        let search = (Pick::Settings, "Search settings for \"update\"".into());
+        assert_eq!(c.matches(), [search]);
+    }
+
+    #[test]
+    fn palette_lists_sessions_to_go_to() {
+        let t0 = Instant::now();
+        let s = |id, name: &str, cwd: &str, branch: Option<&str>| chrome::Session {
+            id: PaneId(id),
+            name: name.into(),
+            cwd: cwd.into(),
+            branch: branch.map(Into::into),
+            state: Attn::Idle,
+            since: t0,
+            msg: String::new(),
+            num: None,
+            turn: None,
+            took: None,
+            seen: false,
+            progress: None,
+            exit_code: None,
+            below: 0,
+        };
+        let a = s(1, "claude 1", r"C:\dev\shop", Some("main"));
+        assert_eq!(session_row(&a), "claude 1 \u{b7} shop \u{b7} main");
+        assert_eq!(
+            session_row(&s(2, "pwsh 2", r"C:\", None)),
+            "pwsh 2 \u{b7} C:\\"
+        );
+        assert_eq!(session_row(&s(3, "cmd 3", "", None)), "cmd 3");
+        let mut c = Commands {
+            sessions: Some(vec![
+                (PaneId(1), session_row(&a), "needs you".into()),
+                (
+                    PaneId(2),
+                    "pwsh 2 \u{b7} api".into(),
+                    "working \u{b7} 5s".into(),
+                ),
+            ]),
+            ..Commands::default()
+        };
+        let picks = |c: &Commands| c.matches().into_iter().map(|m| m.0).collect::<Vec<_>>();
+        assert_eq!(picks(&c), [Pick::Show(PaneId(1)), Pick::Show(PaneId(2))]);
+        // By name, folder, branch or state; never the settings.
+        for (typed, want) in [("shop", 1), ("MAIN", 1), ("needs", 1), ("work", 2)] {
+            c.filter = typed.into();
+            assert_eq!(picks(&c), [Pick::Show(PaneId(want))], "{typed}");
+        }
         c.filter = "zzz".into();
         assert!(c.matches().is_empty());
+    }
+
+    #[test]
+    fn palette_searches_the_settings_when_no_action_matches() {
+        let mut c = Commands {
+            filter: " scroll lines ".into(),
+            ..Commands::default()
+        };
+        let search = (
+            Pick::Settings,
+            "Search settings for \"scroll lines\"".into(),
+        );
+        assert_eq!(c.matches(), [search]);
+        c.filter = "  ".into();
+        assert_eq!(
+            c.matches().len(),
+            keymap::ACTIONS.len() - 10,
+            "nothing typed"
+        );
     }
 
     #[test]
@@ -7203,6 +9448,445 @@ mod tests {
     }
 
     #[test]
+    fn app_copy_without_indent_drops_claude_codes_gutter() {
+        let reply = "\u{23FA} Here is the fix:\r\n  fn main() {\r\n      run();\r\n  }";
+        assert_eq!(
+            without_indent(reply),
+            "Here is the fix:\r\nfn main() {\r\n    run();\r\n}"
+        );
+        let tool = "  \u{23BF}  src/a.rs\r\n     src/b.rs";
+        assert_eq!(without_indent(tool), "src/a.rs\r\nsrc/b.rs");
+        // Claude Code marks replies with ● outside macOS.
+        let both = "\u{25CF} Bash(ls)\r\n  \u{23BF}  a.rs\r\n     b.rs";
+        assert_eq!(without_indent(both), "Bash(ls)\r\n   a.rs\r\n   b.rs");
+        // Blank lines stay, and lines are never joined.
+        assert_eq!(without_indent("    a\r\n\r\n      b"), "a\r\n\r\n  b");
+        assert_eq!(without_indent("x \u{23BF} y"), "x \u{23BF} y");
+    }
+
+    #[test]
+    fn app_a_program_copy_says_so() {
+        let notice = |t| program_copy_notice(t, true, true);
+        assert_eq!(notice("é"), "Program copied 1 character");
+        assert_eq!(notice("ls -la"), "Program copied 6 characters");
+        assert_eq!(
+            program_copy_notice("ls", true, false),
+            "Clipboard busy; nothing was copied"
+        );
+        assert_eq!(
+            program_copy_notice("ls", false, false),
+            "A program here tried to copy while you were elsewhere; nothing was copied"
+        );
+    }
+
+    #[test]
+    fn app_a_copy_says_what_it_did() {
+        assert_eq!(copy_notice("ls", true, false), "Copied 1 line");
+        assert_eq!(
+            copy_notice("", true, false),
+            "Copied 1 line",
+            "a blank line"
+        );
+        assert_eq!(copy_notice("a\r\nb\r\n", true, false), "Copied 3 lines");
+        assert_eq!(
+            copy_notice("a\r\nb", true, true),
+            "Copied 2 lines, as selected before the output changed"
+        );
+        assert_eq!(
+            copy_notice("a\r\nb", false, true),
+            "Clipboard busy; nothing was copied"
+        );
+    }
+
+    #[test]
+    fn app_copy_takes_the_selected_text_that_output_rewrote() {
+        let pal = crate::theme::dark();
+        let mut s = Snapshot::default();
+        // "one" is in scrollback, line 0; the screen holds lines 1 and 2.
+        let mut t = fed(10, 2, "one\r\ntwo\r\nthree");
+        assert!(refresh(&mut t, &mut s, &pal, None));
+        let mut sel = select(&t, (0, 0), (2, 9));
+        t.feed(b"\x1b[2;1HTHREE");
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)));
+        assert_eq!(
+            sel.last_text(&t, &pal).as_deref(),
+            Some("one\r\ntwo\r\nthree")
+        );
+        // On the screen only: kept even once the lines are gone.
+        let mut sel = select(&t, (1, 0), (1, 9));
+        t.feed(b"\x1b[?1049h");
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)));
+        assert_eq!(sel.last_text(&t, &pal).as_deref(), Some("two"));
+        t.feed(b"\x1b[?1049l");
+        // Partly in scrollback that is gone: nothing to take.
+        let mut sel = select(&t, (0, 0), (2, 9));
+        t.resize(8, 2);
+        assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)));
+        assert_eq!(sel.last_text(&t, &pal), None);
+    }
+
+    #[test]
+    fn app_ctrl_shift_c_with_nothing_to_copy_never_interrupts() {
+        let chord = |vk, key, shift| {
+            let mut k = input(vk, true, key, "c");
+            (k.mods.lctrl, k.mods.lshift) = (true, shift);
+            k
+        };
+        let ctrl_c = chord(0x43, vt::Key::Char('c'), false);
+        let ctrl_shift_c = chord(0x43, vt::Key::Char('c'), true);
+        let ctrl_insert = chord(0x2d, vt::Key::Insert, false);
+        let legacy = InputModes::default();
+        let w32im = InputModes {
+            w32im: true,
+            ..legacy
+        };
+        let kitty = InputModes { kitty: 1, ..legacy };
+        for m in [legacy, w32im] {
+            assert!(eats_copy_key(&ctrl_shift_c, &m), "{m:?}");
+        }
+        // A key of its own under kitty flags, which Claude Code ignores.
+        assert!(!eats_copy_key(&ctrl_shift_c, &kitty));
+        for m in [legacy, w32im, kitty] {
+            assert!(!eats_copy_key(&ctrl_c, &m), "the interrupt");
+            assert!(!eats_copy_key(&ctrl_insert, &m));
+        }
+        // Ctrl+C copies only a selection in view; scrolled out of view it
+        // interrupts, and the other copy keys still copy it.
+        assert!(copy_key_copies(&ctrl_c, Some(true), false));
+        assert!(!copy_key_copies(&ctrl_c, Some(false), false));
+        assert!(copy_key_copies(&ctrl_c, None, false), "nothing selected");
+        // Nor what output rewrote, which shows nowhere.
+        assert!(!copy_key_copies(&ctrl_c, None, true));
+        for k in [ctrl_shift_c, ctrl_insert] {
+            assert!(copy_key_copies(&k, Some(false), false));
+            assert!(copy_key_copies(&k, None, true));
+        }
+    }
+
+    #[test]
+    fn app_claude_code_takes_bracketed_pastes_without_asking() {
+        let mut t = fed(10, 2, "");
+        // Claude Code's start-up hook reports before it turns bracketed
+        // paste on.
+        hook_confirms_paste(&mut t, Ev::Ready);
+        assert!(!t.paste_trusted(), "no bracketed paste");
+        t.feed(b"\x1b[?2004h");
+        assert!(t.paste_trusted(), "Claude Code turned it on");
+        // A shell turns it on with no hook since: it asks once first.
+        t.feed(b"\x1b[?2004l\x1b[?2004h");
+        assert!(!t.paste_trusted(), "a shell asks once first");
+        hook_confirms_paste(&mut t, Ev::Busy);
+        assert!(t.paste_trusted());
+        // Claude Code died; a file printed turns bracketed paste on again.
+        t.feed(b"\x1b[?2004l\x1b[?2004h");
+        assert!(!t.paste_trusted(), "asks again");
+        hook_confirms_paste(&mut t, Ev::Idle);
+        assert!(!t.paste_trusted(), "Claude Code quit");
+        // A session that ends before it turns bracketed paste on leaves
+        // nothing for the next program that does.
+        t.feed(b"\x1b[?2004l");
+        hook_confirms_paste(&mut t, Ev::Ready);
+        hook_confirms_paste(&mut t, Ev::Idle);
+        t.feed(b"\x1b[?2004h");
+        assert!(!t.paste_trusted(), "ended first");
+    }
+
+    #[test]
+    fn app_news_never_hides_a_notice_that_stays_up() {
+        let notice = |until| Notice {
+            text: "exit 1 \u{b7} Enter restart \u{b7} Esc close".into(),
+            until,
+            dim: false,
+            ask: Ask::Nothing,
+        };
+        let (now, brief) = (Instant::now(), Some(Instant::now() + BRIEF));
+        assert!(hides_lasting(Some(&notice(None)), brief, true));
+        assert!(
+            !hides_lasting(Some(&notice(None)), brief, false),
+            "an error"
+        );
+        assert!(!hides_lasting(Some(&notice(None)), None, true));
+        assert!(!hides_lasting(Some(&notice(Some(now))), brief, true));
+        assert!(!hides_lasting(None, brief, true));
+        let question = Notice {
+            ask: Ask::ClosePane,
+            ..notice(None)
+        };
+        assert!(
+            !hides_lasting(Some(&question), brief, true),
+            "what an action says shows over a question"
+        );
+    }
+
+    #[test]
+    fn app_a_click_while_output_streams_leaves_the_view_following_it() {
+        let held = |bottom, selected| {
+            let mut t = fed(10, 2, "a\r\nb");
+            t.hold(true);
+            t.feed(b"\r\nc\r\nd");
+            let_go(&mut t, bottom, selected);
+            t.feed(b"\r\ne");
+            t.view_top() == t.screen_top()
+        };
+        assert!(held(true, false), "a click");
+        assert!(!held(true, true), "a selection keeps its text in view");
+        assert!(!held(false, false), "scrolled back before the click");
+        // Focus moved to another pane before the button came up: the pane
+        // the drag began in lets go, the other keeps its place.
+        let (a, b) = (PaneId(1), PaneId(2));
+        let mut began = fed(10, 2, "a\r\nb");
+        began.hold(true);
+        began.feed(b"\r\nc\r\nd");
+        let mut other = fed(10, 2, "a\r\nb\r\nc\r\nd");
+        other.scroll_viewport(1);
+        let top = other.view_top();
+        assert!(drag_holds(&mut began, a, None, Some((a, true)), false));
+        assert!(!drag_holds(&mut other, b, None, Some((a, true)), false));
+        assert_eq!(began.view_top(), began.screen_top());
+        assert_eq!(other.view_top(), top, "scrolled back");
+    }
+
+    #[test]
+    fn app_a_paste_question_is_answered_only_while_the_clipboard_holds_its_text() {
+        let asked = || Ask::Paste("a\nb".into());
+        assert_eq!(answers(asked(), Some("a\nb")), Some("a\nb".into()));
+        assert_eq!(answers(asked(), Some("x\ny")), None, "copied since");
+        assert_eq!(answers(asked(), None), None, "an image since");
+        let dropped = Ask::Drop("C:\\a.txt".into());
+        assert_eq!(answers(dropped, Some("x")), Some("C:\\a.txt".into()));
+        assert_eq!(answers(Ask::ClosePane, Some("a\nb")), None);
+    }
+
+    #[test]
+    fn app_one_line_pastes_without_its_line_break() {
+        for (text, pasted) in [
+            ("ls -la\r\n", "ls -la"),
+            ("ls -la\n", "ls -la"),
+            ("ls -la\r", "ls -la"),
+            ("ls -la", "ls -la"),
+            ("\r\n", ""),
+            // More than one line break: the text stays as copied.
+            ("a\r\nb\r\n", "a\r\nb\r\n"),
+            ("a\n\n", "a\n\n"),
+            ("a\nb", "a\nb"),
+        ] {
+            assert_eq!(trim_paste(text), pasted, "{text:?}");
+        }
+        assert!(!vt::keys::needs_paste_confirm(
+            trim_paste("git status\r\n"),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn app_files_paste_as_paths_quoted_for_the_panes_shell() {
+        use crate::shell::Kind::{Cmd, Other, PowerShell};
+        let paths = [r"C:\some dir\shot.png", r"D:\b.txt"].map(PathBuf::from);
+        let cmd = r#""C:\some dir\shot.png" D:\b.txt"#;
+        assert_eq!(quote_paths(&paths, Cmd), (cmd.into(), false));
+        let ps = r"'C:\some dir\shot.png' D:\b.txt";
+        assert_eq!(quote_paths(&paths, PowerShell), (ps.into(), false));
+        let bash = r"'C:\some dir\shot.png' 'D:\b.txt'";
+        assert_eq!(
+            quote_paths(&paths, Other),
+            (bash.into(), false),
+            "bash reads `\\`"
+        );
+        let one = |p: &str, shell| quote_paths(&[PathBuf::from(p)], shell).0;
+        for shell in [Cmd, PowerShell] {
+            assert_eq!(one(r"C:\café_1-2.txt", shell), r"C:\café_1-2.txt");
+        }
+        assert_eq!(one("C:/café_1-2.txt", Other), "C:/café_1-2.txt");
+        // A name that asks is still quoted for the pane's own shell: cmd's
+        // double quotes, and single ones that only a single quote mark
+        // ends, doubled in PowerShell and as `'\''` in bash.
+        assert_eq!(one(r"C:\x&calc&.txt", Cmd), r#""C:\x&calc&.txt""#);
+        let quote = r#"C:\x"&calc&".txt"#;
+        assert_eq!(one(quote, PowerShell), format!("'{quote}'"));
+        assert_eq!(
+            one(r"C:\x$’;calc;’.txt", PowerShell),
+            r"'C:\x$’’;calc;’’.txt'"
+        );
+        assert_eq!(one("C:\\a`b‚‛.txt", PowerShell), "'C:\\a`b‚‚‛‛.txt'");
+        assert_eq!(one(r"C:\it's $x.txt", Other), r"'C:\it'\''s $x.txt'");
+    }
+
+    #[test]
+    fn app_file_names_ask_first_with_anything_a_shell_might_read() {
+        use crate::shell::Kind::{Cmd, Other, PowerShell};
+        let asks = |p: &str, shell| quote_paths(&[PathBuf::from(p)], shell).1;
+        for shell in [Cmd, PowerShell, Other] {
+            // Nothing in these is syntax inside quotes, in any shell.
+            for name in [
+                r"C:\Users\me\OneDrive - Contoso\Screenshot 2026-10-07 (1).png",
+                r"C:\a [x]+b,c@d=e~f.txt",
+                r"C:\café\ünï.txt",
+                r"\\srv\share\a.txt",
+            ] {
+                assert!(!asks(name, shell), "{name} in {shell:?}");
+            }
+            // A shell started inside the pane may read these by its own
+            // rules: pwsh or cmd in Git Bash, bash in Claude Code.
+            for name in [
+                r"C:\x’;Write-Host PWNED;’.txt",
+                r"C:\it's;Write-Host PWNED;#",
+                r"C:\x&calc&.txt",
+                r#"C:\x"&calc&".txt"#,
+                r"C:\a|b.txt",
+                r"C:\dl\a`calc`.txt",
+                r"C:\dl\a$(calc).txt",
+                r"C:\Report “final” v2.docx",
+                r"C:\%PATH%.txt",
+                r"C:\x!y.txt",
+                r"C:\d\a`",
+                "C:\\a\u{7}b.txt",
+                "C:\\a\nb.txt",
+            ] {
+                assert!(asks(name, shell), "{name:?} in {shell:?}");
+            }
+        }
+        // One such name among them is enough.
+        let paths = [r"C:\a.txt", r"C:\x&calc&.txt"].map(PathBuf::from);
+        assert!(quote_paths(&paths, Cmd).1);
+    }
+
+    #[test]
+    fn app_drops_paste_into_a_pane_or_open_folders_from_the_sidebar() {
+        let dir = std::env::temp_dir().join(format!("blitz drop {}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("shot.png");
+        std::fs::write(&file, "").expect("file");
+        let paths = vec![file.clone(), dir.clone()];
+        let pane = dropped(paths.clone(), (Some(PaneId(2)), false));
+        let side = dropped(paths.clone(), (Some(PaneId(1)), true));
+        let nowhere = dropped(paths, (None, false));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            pane,
+            Some(Dropped::Paste(PaneId(2), vec![file, dir.clone()]))
+        );
+        assert_eq!(side, Some(Dropped::Open(vec![dir])), "folders only");
+        assert_eq!(nowhere, None);
+    }
+
+    #[test]
+    fn app_an_image_reaches_claude_code_as_alt_v() {
+        let legacy = InputModes::default();
+        assert_eq!(alt_v(&legacy), b"\x1bv");
+        let kitty = InputModes { kitty: 1, ..legacy };
+        assert_eq!(alt_v(&kitty), b"\x1b[118;3u");
+        let w32im = InputModes {
+            w32im: true,
+            ..legacy
+        };
+        assert_eq!(alt_v(&w32im), b"\x1b[86;47;118;1;2;1_\x1b[86;47;118;0;2;1_");
+    }
+
+    #[test]
+    fn app_nothing_is_pasted_into_an_exited_pane() {
+        assert_eq!(paste_refused("pwsh 3", None), None);
+        assert_eq!(
+            paste_refused("pwsh 3", Some(1)).as_deref(),
+            Some("pwsh 3: exit 1, so nothing was pasted \u{b7} Enter restart \u{b7} Esc close")
+        );
+        assert!(
+            paste_refused("cmd 1", Some(0xC000_013A))
+                .is_some_and(|t| t.starts_with("cmd 1: Ctrl+C,"))
+        );
+    }
+
+    #[test]
+    fn app_paste_question_says_what_and_which_key() {
+        assert_eq!(
+            paste_question("\r\ngit status\r\ngit diff\r\n", false, Some("Ctrl+V")),
+            "Paste 3 lines starting \"git status\"? Press Ctrl+V again"
+        );
+        // The first 40 characters, without tabs or other controls.
+        let long = format!("{}\tyz", "x".repeat(39));
+        assert_eq!(
+            paste_question(&long, false, Some("Shift+Insert")),
+            format!(
+                "Paste 1 line starting \"{}y\u{2026}\"? Press Shift+Insert again",
+                "x".repeat(39)
+            )
+        );
+        assert_eq!(
+            paste_question("a\nb", false, None),
+            "Paste 2 lines starting \"a\"? Paste again"
+        );
+        // A lone CR runs a line too.
+        assert_eq!(
+            paste_question("echo hi\rcalc\r", false, None),
+            "Paste 2 lines starting \"echo hi\"? Paste again"
+        );
+        // Nothing invisible or reordering in the preview.
+        assert_eq!(
+            paste_question("\u{202e}\u{200b}ab\nc", false, None),
+            "Paste 2 lines starting \"ab\"? Paste again"
+        );
+        // File names say why they ask.
+        assert_eq!(
+            paste_question(r#""C:\a”;calc;”.txt""#, true, Some("Ctrl+V")),
+            "Paste \"C:\\a”;calc;”.txt\"? A shell may run part of a file name. \
+             Press Ctrl+V again"
+        );
+        // All of a long name, and of every name dropped with it, with
+        // what is left out of a preview shown as left out.
+        let long = r#""C:\Users\me\OneDrive - Contoso\Documents\Report “final” v2.docx""#;
+        assert_eq!(
+            paste_question(long, true, None),
+            format!("Paste {long}? A shell may run part of a file name. Paste again")
+        );
+        let many = "C:\\a.txt \"C:\\me\\b c.txt\" \"C:\\x\u{202e}”;calc;”\u{7}.txt\"";
+        assert_eq!(
+            paste_question(many, true, None),
+            "Paste C:\\a.txt \"C:\\me\\b c.txt\" \"C:\\x\u{fffd}”;calc;”\u{fffd}.txt\"? \
+             A shell may run part of a file name. Paste again"
+        );
+        // A pane too narrow for it goes on over more rows, the end of the
+        // name too.
+        let ask = paste_question(r#""C:\Downloads\a-long-folder\x&calc&.txt""#, true, None);
+        let rows = notice_rows(&ask, (16, 24));
+        let all: String = rows.iter().map(|r| r.trim_start()).collect();
+        assert!(all.contains(r"a-long-folder\x&calc&.txt"), "{rows:?}");
+        assert!(rows.iter().all(|r| r.chars().count() <= 16), "{rows:?}");
+    }
+
+    #[test]
+    fn app_file_names_ask_even_when_the_program_is_trusted_with_pastes() {
+        let ask = |t: &vt::Terminal, text, names| {
+            let trusted = t.paste_trusted();
+            asks_first(text, names, t.input_modes().bracketed, trusted)
+        };
+        let mut t = fed(20, 2, "\x1b[?2004h");
+        assert!(ask(&t, "'C:\\x$&calc&.txt'", true));
+        assert!(!ask(&t, "'C:\\x$.txt'", false));
+        assert!(ask(&t, "a\nb", false));
+        // Claude Code's hooks reported. It reads a paste as text, but its
+        // bash mode runs the line.
+        t.vouch_paste(true);
+        assert!(ask(&t, "'C:\\x$&calc&.txt'", true));
+        assert!(!ask(&t, "a\nb", false));
+    }
+
+    #[test]
+    fn app_a_notice_too_long_for_its_pane_goes_on_to_more_rows() {
+        let ask = "Paste 2 lines starting \"echo a\"? Press Ctrl+V again";
+        assert_eq!(notice_rows(ask, (80, 24)), [format!(" {ask}")]);
+        assert_eq!(
+            notice_rows(ask, (34, 24)),
+            [" Paste 2 lines starting \"echo a\"?", " Press Ctrl+V again"]
+        );
+        let rows = notice_rows(ask, (12, 24));
+        assert_eq!(rows.last().map(String::as_str), Some(" again"), "{rows:?}");
+        // No more rows than the pane has, the last cut with an ellipsis.
+        let rows = notice_rows(ask, (12, 2));
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].ends_with('\u{2026}'), "{rows:?}");
+    }
+
+    #[test]
     fn saved_output_keeps_the_last_lines() {
         assert_eq!(last_lines("\n\na\nb\nc\n\n\n", 2), "b\nc");
         assert_eq!(last_lines("a\n\nb", 10), "a\n\nb");
@@ -7235,11 +9919,11 @@ mod tests {
 
     #[test]
     fn the_pointer_shows_what_is_under_it() {
-        assert_eq!(cursor_icon(None, false), CursorIcon::Default);
-        assert_eq!(cursor_icon(None, true), CursorIcon::Pointer);
-        assert_eq!(cursor_icon(Some(Axis::Row), true), CursorIcon::ColResize);
+        assert_eq!(pointer(None, false, None), CursorIcon::Default);
+        assert_eq!(pointer(None, true, None), CursorIcon::Pointer);
+        assert_eq!(pointer(Some(Axis::Row), true, None), CursorIcon::ColResize);
         assert_eq!(
-            cursor_icon(Some(Axis::Column), false),
+            pointer(Some(Axis::Column), false, None),
             CursorIcon::RowResize
         );
     }

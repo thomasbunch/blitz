@@ -254,6 +254,33 @@ fn pty_close_ends_an_interactive_shell() {
     assert_eq!(code, 0xC000_013A);
 }
 
+/// Clearing the console host's buffer draws its screen again without the
+/// cleared text, so the pane's screen follows.
+#[test]
+fn pty_clear_draws_the_screen_without_the_old_text() {
+    let (pty, _, rx) = spawn("cmd /d", &[]);
+    let mut out = Vec::new();
+    assert!(wait_for(&rx, &mut out, b">"), "no prompt");
+    pty.writer().send(&b"echo marker-%OS%\r"[..]);
+    assert!(wait_for(&rx, &mut out, b"marker-Windows_NT"), "no echo");
+    if !pty.clear() {
+        let bundled = std::env::var_os("BLITZ_CONPTY_DIR").is_some();
+        assert!(!bundled, "the bundled ConPTY can clear");
+        eprintln!("SKIPPED: the system's ConPTY cannot clear its buffer");
+        return;
+    }
+    let mut t = vt::Terminal::new(vt::Options::default());
+    t.feed(&out);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while t.screen_text().contains("marker-Windows_NT") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Ok((_, chunk))) => t.feed(&chunk),
+            _ => panic!("still on screen:\n{}", t.screen_text()),
+        }
+    }
+}
+
 /// A flood of output neither stalls the pane nor loses its end, and a pane
 /// whose child has gone takes input, resizes and closes without fuss.
 #[test]

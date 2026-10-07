@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 use vt::{Key, KeyInput, Locks, Mods, MouseEv, MouseKind, Terminal};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
 
+use crate::keymap::unesc;
 use crate::pty::{Pty, PtyEvent, SpawnOpts, Writer};
 
 const USAGE: &str = "usage: blitz debug run --script FILE [--cmd CMD] [--cwd DIR] \
@@ -864,38 +865,6 @@ fn esc(b: &[u8]) -> String {
         }
     }
     s
-}
-
-fn unesc(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let (c, next) = (b[i], b.get(i + 1).copied());
-        i += 1;
-        if c != b'\\' || next.is_none() {
-            out.push(c);
-            continue;
-        }
-        i += 1;
-        match next.unwrap_or_default() {
-            b'e' => out.push(0x1b),
-            b'r' => out.push(b'\r'),
-            b'n' => out.push(b'\n'),
-            b't' => out.push(b'\t'),
-            b's' => out.push(b' '),
-            b'\\' => out.push(b'\\'),
-            b'x' => match s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                Some(v) => {
-                    out.push(v);
-                    i += 2;
-                }
-                None => out.extend_from_slice(b"\\x"),
-            },
-            other => out.extend_from_slice(&[b'\\', other]),
-        }
-    }
-    out
 }
 
 /// The first of `wanted` (each as [`squash`] leaves it) that shows up in

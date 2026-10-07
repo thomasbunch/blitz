@@ -10,19 +10,26 @@ fn term(s: &str) -> Terminal {
     t
 }
 
+/// All but wheel arrows, which pagers such as less never ask for.
 #[test]
 fn modes_start_off() {
-    assert_eq!(term("").input_modes(), InputModes::default());
+    let wheel = InputModes {
+        alt_scroll: true,
+        ..InputModes::default()
+    };
+    assert_eq!(term("").input_modes(), wheel);
+    assert_eq!(term("\x1b[?1007l").input_modes(), InputModes::default());
 }
 
 #[test]
 fn dec_modes_reach_input_modes() {
-    let mut t = term("\x1b[?1h\x1b=\x1b[?2004h\x1b[?1004h\x1b[?9001h\x1b[?1002;1006h");
+    let mut t = term("\x1b[?1h\x1b=\x1b[?2004h\x1b[?1004h\x1b[?9001h\x1b[?1002;1006;1007h");
     let m = t.input_modes();
     assert!(m.decckm && m.deckpam && m.bracketed && m.focus && m.w32im && m.mouse_sgr);
+    assert!(m.alt_scroll);
     assert_eq!(m.mouse, MouseMode::Drag);
 
-    t.feed(b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\x1b[?9001l\x1b[?1002l\x1b[?1006l");
+    t.feed(b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\x1b[?9001l\x1b[?1002l\x1b[?1006;1007l");
     assert_eq!(t.input_modes(), InputModes::default());
 
     t.feed(b"\x1b[?66h");
@@ -209,6 +216,30 @@ fn blitz_prompt_resets_input_modes() {
     let mut t = leftovers();
     t.feed(b"\x1b]133;A;aid=1;blitz=1\x1b\\");
     assert_clean(&t);
+}
+
+#[test]
+fn the_host_resets_what_a_program_left() {
+    let mut t = leftovers();
+    t.feed(b"xyz\x1b[?25l\x1b[4h\x1b[31m");
+    t.reset_modes();
+    let m = t.input_modes();
+    assert_eq!(
+        (t.kitty_stack(false), t.kitty_stack(true)),
+        (&[][..], &[][..])
+    );
+    assert_eq!(
+        (m.mouse, m.mouse_sgr, m.bracketed, m.decckm),
+        (MouseMode::Off, false, false, false)
+    );
+    assert!(m.w32im && m.focus, "ConPTY's own modes stay");
+    assert!(t.cursor().2, "the cursor shows");
+    // Insert mode is off and the colour is gone; the text stays.
+    t.feed(b"\x1b[Ha");
+    assert_eq!(t.screen_text().lines().next(), Some("ayz"));
+    let mut s = vt::Snapshot::default();
+    t.snapshot(&mut s, &PAL);
+    assert_eq!(s.cells[0].fg, PAL.fg);
 }
 
 /// Display state a program can leave behind that would garble or hide

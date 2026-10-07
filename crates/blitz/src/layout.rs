@@ -63,6 +63,12 @@ impl Rect {
         self.y + self.h
     }
 
+    /// Whether the point (`x`, `y`) is inside: the right and bottom edges
+    /// are the next rect's.
+    pub fn contains(self, x: i32, y: i32) -> bool {
+        (self.x..self.right()).contains(&x) && (self.y..self.bottom()).contains(&y)
+    }
+
     /// Splits off a divider along `axis`. `a` gets `ratio` of what is left
     /// after the divider, rounded, and `b` gets the rest.
     /// Returns `(a, divider, b)`.
@@ -624,6 +630,35 @@ impl Window {
         }
         true
     }
+    /// Moves the active tab `by` places, stopping at either end. Returns
+    /// false when it is already there.
+    pub fn move_tab(&mut self, by: isize) -> bool {
+        let last = self.tabs.len().saturating_sub(1);
+        let to = self.active.saturating_add_signed(by).min(last);
+        if to == self.active {
+            return false;
+        }
+        let t = self.tabs.remove(self.active);
+        self.tabs.insert(to, t);
+        self.active = to;
+        true
+    }
+
+    /// Takes pane `p` out of its tab into a new tab named `name` after the
+    /// others, and shows that. Returns false when `p` is its tab's only
+    /// pane, or in no tab.
+    pub fn pane_to_new_tab(&mut self, p: PaneId, name: String) -> bool {
+        if !self
+            .tabs
+            .iter_mut()
+            .any(|t| t.root.contains(p) && t.close(p))
+        {
+            return false;
+        }
+        self.tabs.push(Tab::new(name, p));
+        self.active = self.tabs.len() - 1;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -655,6 +690,13 @@ mod tests {
 
     fn ids(v: &[u32]) -> Vec<PaneId> {
         v.iter().map(|&n| PaneId(n)).collect()
+    }
+
+    #[test]
+    fn rects_hold_points_up_to_their_right_and_bottom_edges() {
+        let a = r(10, 20, 5, 4);
+        assert!(a.contains(10, 20) && a.contains(14, 23));
+        assert!(!a.contains(15, 20) && !a.contains(10, 24) && !a.contains(9, 21));
     }
 
     #[test]
@@ -1132,5 +1174,47 @@ mod tests {
         w.fit_width(1000.0);
         w.fit_width(799.0);
         assert!(!w.sidebar_expanded);
+    }
+
+    #[test]
+    fn tabs_move_and_panes_get_tabs_of_their_own() {
+        let mut w = Window::default();
+        for n in 1..=3 {
+            w.tabs.push(Tab::new(format!("t{n}"), PaneId(n)));
+        }
+        let names = |w: &Window| w.tabs.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert!(w.move_tab(1));
+        assert_eq!(
+            (names(&w), w.active),
+            (vec!["t2".into(), "t1".into(), "t3".into()], 1)
+        );
+        assert!(w.move_tab(5), "as far as the end");
+        assert_eq!(
+            (names(&w), w.active),
+            (vec!["t2".into(), "t3".into(), "t1".into()], 2)
+        );
+        assert!(!w.move_tab(1), "already last");
+        assert!(w.move_tab(-9));
+        assert_eq!(w.active, 0);
+        assert!(!w.move_tab(-1), "already first");
+
+        // A pane leaves its tab for a new one at the end, which shows.
+        let mut w = Window::default();
+        w.tabs.push(four());
+        w.tabs.push(Tab::new("t5".into(), PaneId(5)));
+        let before = w.clone();
+        assert!(
+            !w.pane_to_new_tab(PaneId(5), "x".into()),
+            "alone in its tab"
+        );
+        assert!(!w.pane_to_new_tab(PaneId(9), "x".into()));
+        assert_eq!(w, before);
+        assert!(w.pane_to_new_tab(PaneId(3), "x".into()));
+        assert_eq!(w.tabs[0].panes(), ids(&[1, 2, 4]));
+        assert_eq!((w.tabs.len(), w.active), (3, 2));
+        assert_eq!(
+            (w.tabs[2].name.as_str(), w.tabs[2].panes()),
+            ("x", ids(&[3]))
+        );
     }
 }

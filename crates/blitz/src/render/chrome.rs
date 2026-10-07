@@ -81,7 +81,9 @@ pub struct ChromeModel<'a> {
     /// One line of text in a strip under the panes, such as an available
     /// update.
     pub banner: Option<&'a str>,
-    /// IME composition in the focused pane: column, row and text.
+    /// IME composition at the cursor of the focused pane: column, row and
+    /// text. With a panel or bar open that takes typing, it goes in that
+    /// one's field instead.
     pub preedit: Option<(u16, u16, &'a str)>,
     pub picker: Option<Picker<'a>>,
     pub settings: Option<Settings<'a>>,
@@ -101,6 +103,10 @@ pub struct FindBar<'a> {
     /// The current match, counting from 1, and how many there are; `None`
     /// when nothing matches.
     pub count: Option<(usize, usize)>,
+    /// The query was put there and is drawn selected: typing replaces it.
+    pub fresh: bool,
+    /// A full-screen program's pane: only its screen is searched.
+    pub screen_only: bool,
 }
 
 /// The theme picker, drawn over everything.
@@ -117,8 +123,10 @@ pub struct Picker<'a> {
 pub struct Commands<'a> {
     /// What was typed to narrow the list.
     pub filter: &'a str,
-    /// The actions that match it, each with the keys that run it, if any.
-    pub items: Vec<(&'a str, String)>,
+    /// The actions that match it, each with the keys that run it, if any;
+    /// or with `sessions` the sessions, each with its state.
+    pub items: Vec<(String, String)>,
+    pub sessions: bool,
     /// The highlighted item.
     pub sel: usize,
     /// What the typed line renames, such as `Rename session`, instead of
@@ -171,6 +179,8 @@ pub struct SettingsHits {
     pub rows: Vec<(usize, Rect, Rect)>,
     /// The first list line shown.
     pub top: usize,
+    /// Where typed text goes next, and where the field starts.
+    pub field: (Rect, i32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -211,9 +221,14 @@ pub struct Chrome {
     /// The chip on each pane scrolled back, which a click takes to the
     /// bottom.
     pub below: Vec<(PaneId, Rect)>,
+    /// The find bar, for clicks.
+    pub find: Option<Rect>,
     pub settings: Option<SettingsHits>,
     /// The command palette and each row it shows, by index, for clicks.
     pub commands: Option<(Rect, Vec<(usize, Rect)>)>,
+    /// Where text typed into the open panel or bar goes next, for the IME,
+    /// and where its field starts.
+    pub field: Option<(Rect, i32)>,
 }
 
 /// Where the sidebar or rail put what a click there acts on.
@@ -244,7 +259,7 @@ pub enum Side {
 impl SideHits {
     /// What is at (`x`, `y`).
     pub fn at(&self, x: i32, y: i32) -> Option<Side> {
-        let inside = |r: &Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+        let inside = |r: &Rect| r.contains(x, y);
         if let Some(&(id, _)) = self.rows.iter().find(|r| inside(&r.1)) {
             return Some(Side::Session(id));
         }
@@ -934,58 +949,114 @@ pub fn build(m: &ChromeModel) -> Chrome {
             term: false,
         });
     }
-    if let (Some((col, row, t)), Some(r)) = (m.preedit, pane(tab.focus)) {
+    let typing =
+        m.find.is_some() || m.settings.is_some() || m.picker.is_some() || m.commands.is_some();
+    if let (Some((col, row, t)), Some(r), false) = (m.preedit, pane(tab.focus), typing) {
         let (x, y) = (r.x + i32::from(col) * cw, r.y + i32::from(row) * ch);
         // Cut at the pane's edge, so a long composition cannot draw over
         // the next pane or the sidebar.
-        let t = fit(t, r.right() - x, cw);
-        let pw = text_w(&t, cw);
-        extra.push(Prim::Rect(Rect { x, y, w: pw, h: ch }, c.term_bg));
-        extra.push(Prim::Text {
-            x,
-            y,
-            text: t,
-            color: c.term_fg,
-            bold: false,
-            term: true,
-        });
-        let u = s(1.0).max(1);
-        let line = Rect {
-            x,
-            y: y + ch - 2 * u,
-            w: pw,
-            h: u,
-        };
-        extra.push(Prim::Rect(line, c.term_fg));
+        let colors = (c.term_bg, c.term_fg);
+        composition(
+            &mut extra,
+            t,
+            Rect {
+                x,
+                y,
+                w: r.right() - x,
+                h: ch,
+            },
+            cw,
+            true,
+            colors,
+            s(1.0),
+        );
     }
-    // Typing goes to the topmost of these, which alone shows a caret.
+    // Typing goes to the topmost of these, which alone shows a caret and
+    // takes the IME.
     let to_commands = m.game.is_none();
     let to_picker = to_commands && m.commands.is_none();
     let to_settings = to_picker && m.picker.is_none();
     let to_find = to_settings && m.settings.is_none();
     if let (Some(f), Some(r)) = (&m.find, pane(tab.focus)) {
-        find_bar(&mut extra, f, c, r, s, (tw, th), to_find);
+        let (bar, at) = find_bar(&mut extra, f, c, r, s, (tw, th), to_find);
+        out.find = Some(bar);
+        out.field = out.field.or(to_find.then_some(at));
     }
     if let Some(st) = &m.settings {
         let hits = settings(&mut extra, st, c, area, s, (tw, th), to_settings);
+        out.field = out.field.or(to_settings.then_some(hits.field));
         out.settings = Some(hits);
     }
     if let Some(pk) = &m.picker {
-        picker(&mut extra, pk, c, area, s, (tw, th), to_picker);
+        let at = picker(&mut extra, pk, c, area, s, (tw, th), to_picker);
+        out.field = out.field.or(to_picker.then_some(at));
     }
     if let Some(g) = m.game {
         g.draw(&mut extra, area, m.scale, c, (tw, th));
     }
     if let Some(cm) = &m.commands {
-        let hits = commands(&mut extra, cm, c, area, s, (tw, th), to_commands);
-        out.commands = Some(hits);
+        let (panel, rows, at) = commands(&mut extra, cm, c, area, s, (tw, th), to_commands);
+        out.commands = Some((panel, rows));
+        out.field = out.field.or(to_commands.then_some(at));
+    }
+    if let (Some((_, _, t)), Some((f, left))) = (m.preedit, out.field) {
+        let f = ime_rect(f, left, text_w(t, tw));
+        // Over the hint an empty field shows.
+        extra.push(Prim::Rect(f, c.side_bg));
+        composition(&mut extra, t, f, tw, false, (c.side_bg, c.msg), s(1.0));
     }
     out.prims.extend(extra);
     out
 }
 
+/// Where a composition `w` wide goes in a field from `left` whose typed
+/// text goes next at `f`: there, or over the right end of the typed text
+/// when that leaves too little room, never left of the field.
+fn ime_rect(f: Rect, left: i32, w: i32) -> Rect {
+    let x = f.x.min(f.right() - w).max(left);
+    Rect {
+        x,
+        w: f.right() - x,
+        ..f
+    }
+}
+
+/// IME composition `t`, underlined, from the top left of `r` and cut at
+/// its right edge, in the terminal font (`term`) or the sidebar font,
+/// whose cells are `cw` wide.
+fn composition(
+    p: &mut Vec<Prim>,
+    t: &str,
+    r: Rect,
+    cw: i32,
+    term: bool,
+    (bg, fg): (u32, u32),
+    px: i32,
+) {
+    let t = fit(t, r.w, cw);
+    let w = text_w(&t, cw);
+    p.push(Prim::Rect(Rect { w, ..r }, bg));
+    p.push(Prim::Text {
+        x: r.x,
+        y: r.y,
+        text: t,
+        color: fg,
+        bold: false,
+        term,
+    });
+    let u = px.max(1);
+    let line = Rect {
+        x: r.x,
+        y: r.y + r.h - 2 * u,
+        w,
+        h: u,
+    };
+    p.push(Prim::Rect(line, fg));
+}
+
 /// The find bar: one line at the top right of pane `r` with the query and
-/// which match is current, or that nothing matches.
+/// which match is current, or that nothing matches. Returns the bar and
+/// where typed text goes.
 fn find_bar(
     p: &mut Vec<Prim>,
     f: &FindBar,
@@ -994,7 +1065,7 @@ fn find_bar(
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
     caret: bool,
-) {
+) -> (Rect, (Rect, i32)) {
     let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
         p.push(Prim::Text {
             x,
@@ -1028,14 +1099,32 @@ fn find_bar(
         None if f.query.is_empty() => (String::new(), c.dim),
         None => ("no matches".into(), c.error),
     };
+    let mut right = right;
+    if f.screen_only {
+        let note = "screen only";
+        right -= text_w(note, tw);
+        text(p, right, ty, note.into(), c.dim, false);
+        right -= s(8.0);
+    }
     let cx = right - text_w(&count, tw);
     let qx = left + 6 * tw;
-    let caret = caret.then_some(one);
-    let at = (qx, ty, cx - s(8.0));
-    field(p, c, at, (f.query, "type to find"), caret, (tw, th));
+    let (caret, at) = (caret.then_some(one), (qx, ty, cx - s(8.0)));
+    if f.fresh && !f.query.is_empty() {
+        // Drawn selected: typing replaces it.
+        let w = text_w(&fit_left(f.query, at.2 - qx, tw), tw);
+        let r = Rect {
+            x: qx,
+            y: ty,
+            w,
+            h: th,
+        };
+        p.push(Prim::Rect(r, c.track));
+    }
+    let field = field(p, c, at, (f.query, "type to find"), caret, (tw, th));
     if !count.is_empty() {
         text(p, cx, ty, count, color, false);
     }
+    (panel, field)
 }
 
 /// What the theme picker and the command palette have in common.
@@ -1060,8 +1149,8 @@ struct List<'a> {
 /// A list panel near the top of the panes' area `a`, clear of the sidebar:
 /// the title and the filter, a window of rows that follows the highlight,
 /// and a key hint. `side(p, i, row, right)` draws the right end of row `i`
-/// up to `right` and returns where the name must end. Returns the panel
-/// and each row shown, by index.
+/// up to `right` and returns where the name must end. Returns the panel,
+/// each row shown, by index, and where typed text goes.
 fn list(
     p: &mut Vec<Prim>,
     l: &List,
@@ -1070,7 +1159,7 @@ fn list(
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
     mut side: impl FnMut(&mut Vec<Prim>, usize, Rect, i32) -> i32,
-) -> (Rect, Vec<(usize, Rect)>) {
+) -> (Rect, Vec<(usize, Rect)>, (Rect, i32)) {
     let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
         p.push(Prim::Text {
             x,
@@ -1102,7 +1191,7 @@ fn list(
     let fx = left + text_w(l.title, tw) + 2 * tw;
     let caret = l.caret.then_some(one);
     let at = (fx, ty(y), right);
-    field(p, c, at, (l.filter, l.prompt), caret, (tw, th));
+    let field = field(p, c, at, (l.filter, l.prompt), caret, (tw, th));
     y += row_h;
     let rule = Rect {
         x: inner.x,
@@ -1146,10 +1235,11 @@ fn list(
 
     let hy = panel.bottom() - row_h - s(2.0);
     text(p, left, ty(hy), fit(l.hint, right - left, tw), c.dim, false);
-    (panel, rows)
+    (panel, rows, field)
 }
 
 /// The theme picker: the matching themes, each with a strip of its colours.
+/// Returns where typed text goes.
 fn picker(
     p: &mut Vec<Prim>,
     pk: &Picker,
@@ -1158,7 +1248,7 @@ fn picker(
     s: impl Fn(f32) -> i32,
     cells: (i32, i32),
     caret: bool,
-) {
+) -> (Rect, i32) {
     let l = List {
         title: "Theme",
         filter: pk.filter,
@@ -1174,7 +1264,7 @@ fn picker(
     // background.
     let (sq, gap, one) = (s(8.0), s(4.0), s(1.0).max(1));
     let strip_w = 7 * sq + 8 * gap;
-    list(p, &l, c, a, &s, cells, |p, i, row, right| {
+    let (_, _, field) = list(p, &l, c, a, &s, cells, |p, i, row, right| {
         let t = pk.items[i];
         let strip = Rect {
             x: right - strip_w,
@@ -1201,6 +1291,7 @@ fn picker(
         }
         strip.x
     });
+    field
 }
 
 /// The command palette: the matching actions, each with its keys.
@@ -1212,7 +1303,8 @@ fn commands(
     s: impl Fn(f32) -> i32,
     (tw, th): (i32, i32),
     caret: bool,
-) -> (Rect, Vec<(usize, Rect)>) {
+) -> (Rect, Vec<(usize, Rect)>, (Rect, i32)) {
+    let hint;
     let l = match cm.rename {
         Some(title) => List {
             title,
@@ -1229,17 +1321,24 @@ fn commands(
             width: 460.0,
             caret,
         },
-        None => List {
-            title: "Commands",
-            filter: cm.filter,
-            names: cm.items.iter().map(|i| i.0).collect(),
-            sel: cm.sel,
-            empty: "no command matches",
-            hint: "\u{2191}\u{2193} choose  \u{b7}  Enter run  \u{b7}  Esc close",
-            prompt: "type to filter",
-            width: 460.0,
-            caret,
-        },
+        None => {
+            let (title, empty, enter) = match cm.sessions {
+                true => ("Sessions", "no session matches", "go"),
+                false => ("Commands", "no command matches", "run"),
+            };
+            hint = format!("\u{2191}\u{2193} choose  \u{b7}  Enter {enter}  \u{b7}  Esc close");
+            List {
+                title,
+                filter: cm.filter,
+                names: cm.items.iter().map(|i| i.0.as_str()).collect(),
+                sel: cm.sel,
+                empty,
+                hint: &hint,
+                prompt: "type to filter",
+                width: 460.0,
+                caret,
+            }
+        }
     };
     list(p, &l, c, a, s, (tw, th), |p, i, row, right| {
         let keys = &cm.items[i].1;
@@ -1258,7 +1357,8 @@ fn commands(
 
 /// A one-line text field from (`x`, `y`) to `right`: what was typed, the
 /// end of it when it is long, or the `hint` while it is empty, and with a
-/// `caret` of that width the caret where typing goes.
+/// `caret` of that width the caret where typing goes. Returns where typed
+/// text goes next: after the text, or over the hint at its start; and `x`.
 fn field(
     p: &mut Vec<Prim>,
     c: &Ui,
@@ -1266,7 +1366,7 @@ fn field(
     (typed, hint): (&str, &str),
     caret: Option<i32>,
     (tw, th): (i32, i32),
-) {
+) -> (Rect, i32) {
     let (shown, color, end) = if typed.is_empty() {
         (fit(hint, right - x, tw), c.dim, x)
     } else {
@@ -1293,6 +1393,14 @@ fn field(
             c.name,
         ));
     }
+    let end = end.min(right);
+    let at = Rect {
+        x: end,
+        y,
+        w: right - end,
+        h: th,
+    };
+    (at, x)
 }
 
 /// `r` shrunk by `by` on every side.
@@ -1381,6 +1489,7 @@ fn settings(
         panel,
         rows: Vec::new(),
         top: first,
+        field: Default::default(),
     };
     p.push(Prim::Rect(panel, c.border));
     let inner = Rect {
@@ -1407,7 +1516,7 @@ fn settings(
     let fx = left + 10 * tw;
     let caret = caret.then_some(one);
     let at = (fx, mid(y, head_h), right);
-    field(p, c, at, (st.filter, "type to search"), caret, (tw, th));
+    hits.field = field(p, c, at, (st.filter, "type to search"), caret, (tw, th));
     y += head_h;
     rule(p, y);
     y += one + gap;
@@ -1541,9 +1650,10 @@ fn foot_lines(msg: &str, side: i32, scale: f32, tw: i32) -> Option<Vec<String>> 
     (words(&lines.join(" ")) == words(msg)).then_some(lines)
 }
 
-/// `t` broken at spaces into at most `n` lines of `max` pixels; the last
-/// ends in an ellipsis when the text goes on.
-fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
+/// `t` broken at spaces into at most `n` lines of `max` pixels, a word
+/// wider than a line going on over the next; the last ends in an ellipsis
+/// when the text goes on.
+pub fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for word in t.split_whitespace() {
         match lines.last_mut() {
@@ -1551,7 +1661,19 @@ fn wrap(t: &str, max: i32, cw: i32, n: usize) -> Vec<String> {
                 l.push(' ');
                 l.push_str(word);
             }
-            _ => lines.push(word.to_string()),
+            _ => {
+                let (mut line, mut w) = (String::new(), 0);
+                for c in word.chars() {
+                    let cells = char_cells(c) * cw;
+                    if w + cells > max && !line.is_empty() {
+                        lines.push(std::mem::take(&mut line));
+                        w = 0;
+                    }
+                    line.push(c);
+                    w += cells;
+                }
+                lines.push(line);
+            }
         }
     }
     if lines.len() > n {
@@ -1599,7 +1721,7 @@ fn ring(x: Option<&Session>) -> f32 {
 /// The state shown on the right of a sidebar row, with how long the turn
 /// has run, how long the last one took, or after a minute how long a
 /// question has waited.
-fn state_word(x: &Session, now: Instant) -> String {
+pub fn state_word(x: &Session, now: Instant) -> String {
     let waited = now.saturating_duration_since(x.since);
     match (x.state, x.exit_code) {
         (Attn::NeedsYou, _) if waited.as_secs() >= 60 => {
@@ -2450,9 +2572,10 @@ mod tests {
         });
         m.commands = Some(Commands {
             filter: "",
-            items: vec![("Split right", String::new())],
+            items: vec![("Split right".into(), String::new())],
             sel: 0,
             rename: None,
+            sessions: false,
         });
         let c = build(&m);
         let amber = |p: &Prim| p_color(p) == m.ui.accent;
@@ -2562,12 +2685,63 @@ mod tests {
     }
 
     #[test]
+    fn preedit_goes_in_the_field_of_what_takes_typing() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.preedit = Some((2, 1, "\u{4e2d}"));
+        m.find = Some(FindBar {
+            query: "ab",
+            count: None,
+            fresh: false,
+            screen_only: false,
+        });
+        let c = build(&m);
+        let (find, _) = c.field.expect("the find bar's field");
+        let composed = |c: &Chrome| {
+            (c.prims.iter()).find_map(|p| match p {
+                Prim::Text {
+                    text, x, y, term, ..
+                } if text == "\u{4e2d}" => Some((*x, *y, *term)),
+                _ => None,
+            })
+        };
+        // After the query, in the bar's font, and only there.
+        assert_eq!(composed(&c), Some((find.x, find.y, false)));
+        assert_eq!(texts(&c).iter().filter(|t| **t == "\u{4e2d}").count(), 1);
+        let ab = (c.prims.iter()).find_map(|p| match p {
+            Prim::Text { text, x, .. } if text == "ab" => Some(*x),
+            _ => None,
+        });
+        assert_eq!(ab.map(|x| x + 2 * 7), Some(find.x));
+        // The palette on top takes it, at the start of its empty filter.
+        m.commands = Some(Commands {
+            filter: "",
+            items: Vec::new(),
+            sel: 0,
+            rename: None,
+            sessions: false,
+        });
+        let c = build(&m);
+        let (field, _) = c.field.expect("the palette's field");
+        assert!(field.y < find.y || field.x != find.x);
+        assert_eq!(composed(&c), Some((field.x, field.y, false)));
+        let hint = Prim::Rect(field, crate::theme::blitz(false).ui.side_bg);
+        assert!(c.prims.contains(&hint), "covers \"type to filter\"");
+        // With nothing open there is no field.
+        let mut m = model(&win, &sessions, now);
+        m.preedit = Some((2, 1, "\u{4e2d}"));
+        assert_eq!(build(&m).field, None);
+    }
+
+    #[test]
     fn find_bar_sits_at_the_top_right_of_the_focused_pane() {
         let (win, sessions, now) = fleet(true);
         let mut m = model(&win, &sessions, now);
         m.find = Some(FindBar {
             query: "needle",
             count: Some((3, 17)),
+            fresh: false,
+            screen_only: false,
         });
         let c = build(&m);
         let t = texts(&c);
@@ -2580,10 +2754,16 @@ mod tests {
                 if *c == border && r.right() == focus.right() && r.y == focus.y && r.w < focus.w)
         };
         assert!(c.prims.iter().any(corner));
+        // The bar is reported for clicks, and only while it is open.
+        let bar = c.find.expect("the bar");
+        assert!(corner(&Prim::Rect(bar, border)));
+        assert_eq!(build(&model(&win, &sessions, now)).find, None);
 
         m.find = Some(FindBar {
             query: "zzz",
             count: None,
+            fresh: false,
+            screen_only: false,
         });
         let c = build(&m);
         let error = m.ui.error;
@@ -2640,6 +2820,33 @@ mod tests {
     }
 
     #[test]
+    fn a_composition_shows_in_a_full_field() {
+        let room = Rect {
+            x: 100,
+            y: 5,
+            w: 40,
+            h: 16,
+        };
+        assert_eq!(ime_rect(room, 60, 24), room, "after the typed text");
+        let full = Rect {
+            x: 139,
+            w: 1,
+            ..room
+        };
+        assert_eq!(
+            ime_rect(full, 60, 24),
+            Rect {
+                x: 116,
+                w: 24,
+                ..room
+            }
+        );
+        // Wider than the whole field: from its start, cut at its end.
+        let wide = ime_rect(full, 60, 500);
+        assert_eq!((wide.x, wide.right()), (60, room.right()));
+    }
+
+    #[test]
     fn a_caret_shows_where_typing_goes() {
         let (win, sessions, now) = fleet(true);
         let mut m = model(&win, &sessions, now);
@@ -2663,6 +2870,8 @@ mod tests {
         m.find = Some(FindBar {
             query: "needle",
             count: Some((3, 17)),
+            fresh: false,
+            screen_only: false,
         });
         let c = build(&m);
         let (x, y) = at(&c, "needle").expect("query");
@@ -2671,12 +2880,46 @@ mod tests {
         // caret comes before the hint.
         m.commands = Some(Commands {
             filter: "",
-            items: vec![("Split right", String::new())],
+            items: vec![("Split right".into(), String::new())],
             sel: 0,
             rename: None,
+            sessions: false,
         });
         let c = build(&m);
         assert_eq!(carets(&c), [at(&c, "type to filter").expect("hint")]);
+    }
+
+    #[test]
+    fn find_bar_shows_a_query_it_was_given_selected_and_says_screen_only() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let track = m.ui.track;
+        // A highlight under the query.
+        let selected = |c: &Chrome| {
+            let at = c.prims.iter().find_map(|p| match p {
+                Prim::Text { text, x, y, .. } if text == "needle" => Some((*x, *y)),
+                _ => None,
+            });
+            (c.prims.iter())
+                .any(|p| matches!(p, Prim::Rect(r, c) if *c == track && Some((r.x, r.y)) == at))
+        };
+        let note = |c: &Chrome| texts(c).contains(&"screen only");
+        m.find = Some(FindBar {
+            query: "needle",
+            count: Some((1, 2)),
+            fresh: true,
+            screen_only: true,
+        });
+        let c = build(&m);
+        assert!(selected(&c) && note(&c));
+        m.find = Some(FindBar {
+            query: "needle",
+            count: Some((1, 2)),
+            fresh: false,
+            screen_only: false,
+        });
+        let c = build(&m);
+        assert!(!selected(&c) && !note(&c));
     }
 
     fn setting_rows() -> Vec<SettingRow> {
@@ -2750,9 +2993,10 @@ mod tests {
         });
         m.commands = Some(Commands {
             filter: "",
-            items: vec![("Split right", String::new())],
+            items: vec![("Split right".into(), String::new())],
             sel: 0,
             rename: None,
+            sessions: false,
         });
         let c = build(&m);
         let a = area(&win, m.size, 1.0, None, 7);
@@ -2802,13 +3046,14 @@ mod tests {
         let (win, sessions, now) = fleet(true);
         let mut m = model(&win, &sessions, now);
         let items = (0..20)
-            .map(|i| ("Split right", format!("Ctrl+{i}")))
+            .map(|i| ("Split right".to_string(), format!("Ctrl+{i}")))
             .collect();
         m.commands = Some(Commands {
             filter: "",
             items,
             sel: 15,
             rename: None,
+            sessions: false,
         });
         let c = build(&m);
         let (panel, rows) = c.commands.clone().expect("palette hits");
@@ -2819,6 +3064,17 @@ mod tests {
         let t = texts(&c);
         assert!(t.contains(&"Commands") && t.contains(&"Ctrl+15"));
         assert!(!t.contains(&"Ctrl+3"), "scrolled out");
+        // The list of sessions says what it is.
+        m.commands = Some(Commands {
+            filter: "zzz",
+            items: Vec::new(),
+            sel: 0,
+            rename: None,
+            sessions: true,
+        });
+        let c = build(&m);
+        let t = texts(&c);
+        assert!(t.contains(&"Sessions") && t.contains(&"no session matches"));
     }
 
     /// Renaming takes the palette's line for the name.
@@ -2831,6 +3087,7 @@ mod tests {
             items: Vec::new(),
             sel: 0,
             rename: Some("Rename tab"),
+            sessions: false,
         });
         let t: Vec<String> = texts(&build(&m)).iter().map(|t| t.to_string()).collect();
         assert!(t.contains(&"Rename tab".into()) && t.contains(&"type a name".into()));
@@ -2841,6 +3098,7 @@ mod tests {
             items: Vec::new(),
             sel: 0,
             rename: Some("Rename tab"),
+            sessions: false,
         });
         let c = build(&m);
         assert!(texts(&c).contains(&"shop api"));
@@ -2853,6 +3111,10 @@ mod tests {
         assert_eq!(wrap("aa bb cc", 35, 7, 2), ["aa bb", "cc"]);
         assert_eq!(wrap("aa bb cc dd ee", 35, 7, 2), ["aa bb", "cc d\u{2026}"]);
         assert!(wrap("", 35, 7, 2).is_empty());
+        // A word wider than a line, such as a long path, goes on over
+        // the next rather than losing its end.
+        assert_eq!(wrap("a bcdefghijk", 35, 7, 3), ["a", "bcdef", "ghijk"]);
+        assert_eq!(wrap("abcdefghijk", 35, 7, 2), ["abcde", "fghi\u{2026}"]);
     }
 
     #[test]

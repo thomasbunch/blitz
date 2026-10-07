@@ -8,12 +8,29 @@ use crate::layout::Dir;
 /// What a shortcut does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Copy the selection. Without one the key goes to the program.
+    /// Copy the selection, or one that output just rewrote. Without one
+    /// the key goes to the program.
     Copy,
+    /// Copy the selection without Claude Code's gutter and the indent its
+    /// lines share.
+    CopyUnindented,
     /// Paste clipboard text. Without text the key goes to the program.
     Paste,
+    /// Select all of the focused pane's text, its scrollback too.
+    SelectAll,
+    /// Select the last command's output: the lines between blitz's last
+    /// two prompts.
+    SelectOutput,
     /// Scroll the main screen by a page; positive is up.
     ScrollPage(i8),
+    /// Scroll the main screen to the top of the scrollback (1) or to the
+    /// bottom (-1).
+    ScrollEnd(i8),
+    /// Drop the scrollback, and what the console host keeps of it.
+    ClearScrollback,
+    /// Undo the modes a crashed program left on, such as mouse reports or
+    /// a hidden cursor.
+    Reset,
     NewTab,
     ClosePane,
     /// Close every pane of the active tab.
@@ -23,26 +40,34 @@ pub enum Action {
     ReopenClosed,
     /// Next (1) or previous (-1) tab.
     CycleTab(i8),
-    /// Tab 1 to 9, 0-based.
+    /// Move the tab right (1) or left (-1).
+    MoveTab(i8),
+    /// Take the focused pane out of its tab into a new one.
+    PaneToNewTab,
+    /// Tab 1 to 8, 0-based. With no such tab the key does nothing.
     GoToTab(u8),
+    /// The last tab, whatever its number.
+    LastTab,
     SplitRight,
     SplitDown,
+    /// Split right and start Claude Code in the new pane's shell.
+    NewClaude,
     Focus(Dir),
     /// Move the nearest divider of the focused pane toward `Dir`.
     Resize(Dir),
     /// Trade places with the pane in `Dir`.
     Swap(Dir),
     JumpToAttention,
+    /// Open the command palette on the list of sessions, or close it.
+    GoToSession,
     ToggleSidebar,
-    /// Install the newer release, or without one look for it now. Without
-    /// a focused pane the key goes to the program.
+    /// Install the newer release, or without one look for it now.
     Update,
     /// Open the theme picker, or close it unchanged.
     ThemePicker,
     /// Open or close the settings panel.
     Settings,
     /// Show only the focused pane, filling the tab, or every pane again.
-    /// In a tab of one pane the key goes to the program.
     Zoom,
     /// Give the tab's panes equal space.
     Equalize,
@@ -68,6 +93,13 @@ pub enum Action {
     ClaudeSetup,
     /// Open the window menu, as Alt+Space does in other windows.
     SystemMenu,
+    /// Type what a `text:` binding holds, from [`Config::texts`] by index.
+    ///
+    /// [`Config::texts`]: crate::config::Config::texts
+    SendText(u16),
+    /// Label the URLs, paths and commit hashes in view, to copy or open
+    /// one by its label.
+    QuickSelect,
 }
 
 /// Every action a key can be bound to, with its name in `config.toml` and
@@ -75,9 +107,16 @@ pub enum Action {
 #[rustfmt::skip]
 pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Copy, "copy", "Copy"),
+    (Action::CopyUnindented, "copy_without_indent", "Copy without indent"),
     (Action::Paste, "paste", "Paste"),
+    (Action::SelectAll, "select_all", "Select all"),
+    (Action::SelectOutput, "select_last_output", "Select the last command's output"),
     (Action::ScrollPage(1), "scroll_page_up", "Scroll up a page"),
     (Action::ScrollPage(-1), "scroll_page_down", "Scroll down a page"),
+    (Action::ScrollEnd(1), "scroll_to_top", "Scroll to the top"),
+    (Action::ScrollEnd(-1), "scroll_to_bottom", "Scroll to the bottom"),
+    (Action::ClearScrollback, "clear_scrollback", "Clear the scrollback and screen"),
+    (Action::Reset, "reset_terminal", "Reset the terminal"),
     (Action::NewTab, "new_tab", "New tab"),
     (Action::ClosePane, "close_pane", "Close pane"),
     (Action::CloseTab, "close_tab", "Close tab"),
@@ -86,13 +125,18 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::ReopenClosed, "reopen_closed", "Reopen the last closed pane"),
     (Action::CycleTab(1), "next_tab", "Next tab"),
     (Action::CycleTab(-1), "previous_tab", "Previous tab"),
+    (Action::MoveTab(-1), "move_tab_left", "Move the tab left"),
+    (Action::MoveTab(1), "move_tab_right", "Move the tab right"),
+    (Action::PaneToNewTab, "move_pane_to_new_tab", "Move the pane to a new tab"),
     (Action::SplitRight, "split_right", "Split right"),
     (Action::SplitDown, "split_down", "Split down"),
+    (Action::NewClaude, "new_claude", "New Claude Code session"),
     (Action::Focus(Dir::Left), "focus_left", "Focus the pane on the left"),
     (Action::Focus(Dir::Right), "focus_right", "Focus the pane on the right"),
     (Action::Focus(Dir::Up), "focus_up", "Focus the pane above"),
     (Action::Focus(Dir::Down), "focus_down", "Focus the pane below"),
     (Action::JumpToAttention, "jump_to_attention", "Jump to the next session that needs you"),
+    (Action::GoToSession, "go_to_session", "Go to a session"),
     (Action::ToggleSidebar, "toggle_sidebar", "Expand or collapse the sidebar"),
     (Action::Update, "update", "Update blitz"),
     (Action::ThemePicker, "theme_picker", "Pick a theme"),
@@ -117,6 +161,16 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Find, "find", "Find in the scrollback"),
     (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
     (Action::SystemMenu, "system_menu", "Window menu"),
+    (Action::QuickSelect, "quick_select", "Quick select a link, path or hash"),
+    (Action::GoToTab(0), "go_to_tab_1", "Go to tab 1"),
+    (Action::GoToTab(1), "go_to_tab_2", "Go to tab 2"),
+    (Action::GoToTab(2), "go_to_tab_3", "Go to tab 3"),
+    (Action::GoToTab(3), "go_to_tab_4", "Go to tab 4"),
+    (Action::GoToTab(4), "go_to_tab_5", "Go to tab 5"),
+    (Action::GoToTab(5), "go_to_tab_6", "Go to tab 6"),
+    (Action::GoToTab(6), "go_to_tab_7", "Go to tab 7"),
+    (Action::GoToTab(7), "go_to_tab_8", "Go to tab 8"),
+    (Action::LastTab, "last_tab", "Go to the last tab"),
 ];
 
 /// A key binding: modifiers, virtual key, and the action, or `None` where
@@ -140,10 +194,15 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (SHIFT, 0x2d, Action::Paste),
     (SHIFT, 0x21, Action::ScrollPage(1)),
     (SHIFT, 0x22, Action::ScrollPage(-1)),
+    // Not Shift+Home and Shift+End: PSReadLine selects with them.
+    (CTRL | SHIFT, 0x24, Action::ScrollEnd(1)),
+    (CTRL | SHIFT, 0x23, Action::ScrollEnd(-1)),
     (CTRL | SHIFT, b'T' as u16, Action::NewTab),
     (CTRL | SHIFT, b'W' as u16, Action::ClosePane),
     (CTRL, 0x09, Action::CycleTab(1)),
     (CTRL | SHIFT, 0x09, Action::CycleTab(-1)),
+    (CTRL | SHIFT, 0x21, Action::MoveTab(-1)),
+    (CTRL | SHIFT, 0x22, Action::MoveTab(1)),
     (CTRL | SHIFT, b'R' as u16, Action::SplitRight),
     (CTRL | SHIFT, b'D' as u16, Action::SplitDown),
     (CTRL | ALT, 0x25, Action::Focus(Dir::Left)),
@@ -159,17 +218,23 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | ALT | SHIFT, 0x27, Action::Swap(Dir::Right)),
     (CTRL | ALT | SHIFT, 0x28, Action::Swap(Dir::Down)),
     (CTRL | SHIFT, b'J' as u16, Action::JumpToAttention),
+    (CTRL | SHIFT, b'O' as u16, Action::GoToSession),
     (CTRL | SHIFT, b'B' as u16, Action::ToggleSidebar),
     (CTRL | SHIFT, b'U' as u16, Action::Update),
     (CTRL | SHIFT, b'K' as u16, Action::ThemePicker),
     // VK_OEM_COMMA: the comma key on every layout.
     (CTRL, 0xbc, Action::Settings),
     (CTRL | SHIFT, b'Z' as u16, Action::Zoom),
-    // VK_OEM_PLUS and VK_OEM_MINUS. Ctrl+Shift+- still goes to the
-    // program: it is Claude Code's undo.
+    // VK_OEM_PLUS and VK_OEM_MINUS, with Shift too where + needs it, and
+    // the keypad's. Ctrl+Shift+- still goes to the program: it is Claude
+    // Code's undo.
     (CTRL, 0xbb, Action::FontSize(1)),
+    (CTRL | SHIFT, 0xbb, Action::FontSize(1)),
     (CTRL, 0xbd, Action::FontSize(-1)),
     (CTRL, b'0' as u16, Action::FontSize(0)),
+    (CTRL, 0x6b, Action::FontSize(1)),
+    (CTRL, 0x6d, Action::FontSize(-1)),
+    (CTRL, 0x60, Action::FontSize(0)),
     // F11.
     (0, 0x7a, Action::Fullscreen),
     (CTRL | SHIFT, b'P' as u16, Action::Palette),
@@ -177,11 +242,12 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, 0x28, Action::JumpToPrompt(-1)),
     (CTRL | SHIFT, b'F' as u16, Action::Find),
     (ALT, 0x20, Action::SystemMenu),
+    (CTRL | SHIFT, 0x20, Action::QuickSelect),
 ];
 
 /// Key names for chords, matched ignoring case. The first name of each
-/// key is the one the command palette shows. Letters, digits and F1 to F24
-/// need no entry.
+/// key is the one the command palette shows. Letters, digits, F1 to F24
+/// and Numpad0 to Numpad9 need no entry.
 const KEY_NAMES: &[(&str, u16)] = &[
     ("Backspace", 0x08),
     ("Tab", 0x09),
@@ -229,6 +295,12 @@ const KEY_NAMES: &[(&str, u16)] = &[
     ("BracketRight", 0xdd),
     ("'", 0xde),
     ("Quote", 0xde),
+    // The keypad's other keys with Num Lock on.
+    ("NumpadMultiply", 0x6a),
+    ("NumpadAdd", 0x6b),
+    ("NumpadSubtract", 0x6d),
+    ("NumpadDecimal", 0x6e),
+    ("NumpadDivide", 0x6f),
 ];
 
 /// A binding as `config.toml` writes it: a chord, `=`, and an action's
@@ -237,6 +309,62 @@ const KEY_NAMES: &[(&str, u16)] = &[
 /// joined by `+`. Case and spaces around the parts do not matter.
 pub fn binding(s: &str) -> Option<Binding> {
     let (chord, name) = s.rsplit_once('=')?;
+    let action = match name.trim() {
+        n if n.eq_ignore_ascii_case("none") => None,
+        n => Some(ACTIONS.iter().find(|a| a.1.eq_ignore_ascii_case(n))?.0),
+    };
+    let (mods, vk) = parse_chord(chord)?;
+    Some((mods, vk, action))
+}
+
+/// A binding that types text, as in `ctrl+shift+e=text:git status\r`: the
+/// chord, and the text with the escapes of [`unesc`]. Read before
+/// [`binding`] would split at an `=` in the text.
+pub fn text_binding(s: &str) -> Option<(u8, u16, Vec<u8>)> {
+    let (chord, text) = s.split_once("=text:")?;
+    let (mods, vk) = parse_chord(chord)?;
+    Some((mods, vk, unesc(text))).filter(|b| !b.2.is_empty())
+}
+
+/// Text with the escapes `\e \r \n \t \s \\ \xNN`, as bytes. Any other
+/// backslash stays.
+pub fn unesc(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let (c, next) = (b[i], b.get(i + 1).copied());
+        i += 1;
+        if c != b'\\' || next.is_none() {
+            out.push(c);
+            continue;
+        }
+        i += 1;
+        match next.unwrap_or_default() {
+            b'e' => out.push(0x1b),
+            b'r' => out.push(b'\r'),
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b's' => out.push(b' '),
+            b'\\' => out.push(b'\\'),
+            b'x' => match (s.get(i..i + 2))
+                .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                Some(v) => {
+                    out.push(v);
+                    i += 2;
+                }
+                None => out.extend_from_slice(b"\\x"),
+            },
+            other => out.extend_from_slice(&[b'\\', other]),
+        }
+    }
+    out
+}
+
+/// A chord's modifiers and virtual key.
+fn parse_chord(chord: &str) -> Option<(u8, u16)> {
     let chord = chord.trim();
     // A + key ends the chord, after the + that joins it on, if any.
     let (mods, key) = match chord.strip_suffix('+').map(str::trim_end) {
@@ -257,11 +385,7 @@ pub fn binding(s: &str) -> Option<Binding> {
         }
         bits |= bit;
     }
-    let action = match name.trim() {
-        n if n.eq_ignore_ascii_case("none") => None,
-        n => Some(ACTIONS.iter().find(|a| a.1.eq_ignore_ascii_case(n))?.0),
-    };
-    Some((bits, key_code(key.trim())?, action))
+    Some((bits, key_code(key.trim())?))
 }
 
 /// The virtual key a key name stands for.
@@ -272,7 +396,10 @@ fn key_code(name: &str) -> Option<u16> {
     let f = (name.strip_prefix(['f', 'F']))
         .filter(|n| !n.starts_with('0'))
         .and_then(|n| n.parse::<u16>().ok());
+    let pad = (name.get(..6).filter(|p| p.eq_ignore_ascii_case("numpad")))
+        .and_then(|_| name[6..].parse::<u16>().ok());
     match (f, name.as_bytes()) {
+        _ if pad.is_some_and(|n| n <= 9) => pad.map(|n| 0x60 + n),
         (Some(n @ 1..=24), _) => Some(0x6f + n),
         (_, &[c]) if c.is_ascii_alphanumeric() => Some(c.to_ascii_uppercase().into()),
         _ => None,
@@ -289,6 +416,7 @@ fn chord_label(mods: u8, vk: u16) -> String {
     }
     match vk {
         0x30..=0x39 | 0x41..=0x5a => s.push(char::from(vk as u8)),
+        0x60..=0x69 => s.push_str(&format!("Numpad{}", vk - 0x60)),
         0x70..=0x87 => s.push_str(&format!("F{}", vk - 0x6f)),
         _ => s.push_str(KEY_NAMES.iter().find(|k| k.1 == vk).map_or("?", |k| k.0)),
     }
@@ -311,6 +439,17 @@ pub fn keys_for(a: Action, user: &[Binding]) -> Option<String> {
         .map(|(m, vk, _)| chord_label(m, vk))
 }
 
+/// How the command palette shows `a`.
+pub fn label(a: Action) -> &'static str {
+    ACTIONS.iter().find(|x| x.0 == a).map_or("", |x| x.2)
+}
+
+/// What a notice tells the user to press for `a`: its first chord, or
+/// with none its name in the command palette.
+pub fn press_for(a: Action, user: &[Binding]) -> String {
+    keys_for(a, user).unwrap_or_else(|| format!("\"{}\"", label(a)))
+}
+
 /// The shortcut a key press triggers, if any, with the `user` bindings
 /// from `config.toml` over the defaults. Modifiers must match exactly, so
 /// AltGr (Ctrl+Alt) and Win never trigger Ctrl shortcuts.
@@ -328,11 +467,30 @@ pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
         (m.lalt || m.ralt, ALT),
     ];
     let mods = held.iter().filter(|h| h.0).fold(0, |a, h| a | h.1);
+    // Windows reports AltGr as Ctrl+Alt: a key it types a character with,
+    // or a dead key that starts one, is typing, not a Ctrl+Alt chord.
+    let typed = char::from_u32(k.uc.into()).is_some_and(|c| !c.is_control()) || k.key == Key::Other;
+    if mods & (CTRL | ALT) == CTRL | ALT && typed {
+        return None;
+    }
     if let Some(b) = bindings(user).find(|b| (b.0, b.1) == (mods, k.vk)) {
         return b.2;
     }
-    let tab = mods == CTRL && (0x31..=0x39).contains(&k.vk);
-    tab.then(|| Action::GoToTab((k.vk - 0x31) as u8))
+    // Ctrl and a digit go to a tab, 9 to the last, where the key types
+    // that digit. On AZERTY the same keys type & é " ' ( - è _ ç, and
+    // Ctrl+- and Ctrl+_ are for the program.
+    let digit = (0x31..=0x39).contains(&k.vk) && k.key == Key::Char(char::from(k.vk as u8));
+    (mods == CTRL && digit).then(|| match k.vk {
+        0x39 => Action::LastTab,
+        vk => Action::GoToTab((vk - 0x31) as u8),
+    })
+}
+
+/// Whether the key of a shortcut with nothing to do right now goes on to
+/// the program. Update and Zoom keep theirs: under the default chords the
+/// program would get ^U, which erases the line, and ^Z, which suspends.
+pub fn passes_on(a: Action) -> bool {
+    !matches!(a, Action::Update | Action::Zoom)
 }
 
 /// Whether a key message is an auto-repeat: lParam bit 30 says the key was
@@ -353,6 +511,7 @@ pub fn repeats(k: &KeyInput, user: &[Binding], panel: bool) -> bool {
             a,
             Action::ScrollPage(_)
                 | Action::CycleTab(_)
+                | Action::MoveTab(_)
                 | Action::Focus(_)
                 | Action::Resize(_)
                 | Action::Swap(_)
@@ -580,6 +739,16 @@ mod msg_to_key_tests {
     const US: &[(u16, &str, &str, &str)] = &[
         (0x0d, "\r", "\r", ""),
         (0x20, " ", " ", ""),
+        (0x30, "0", ")", ""),
+        (0x31, "1", "!", ""),
+        (0x32, "2", "@", ""),
+        (0x33, "3", "#", ""),
+        (0x34, "4", "$", ""),
+        (0x35, "5", "%", ""),
+        (0x36, "6", "^", ""),
+        (0x37, "7", "&", ""),
+        (0x38, "8", "*", ""),
+        (0x39, "9", "(", ""),
         (0x41, "a", "A", ""),
         (0x4a, "j", "J", ""),
         (0x51, "q", "Q", ""),
@@ -592,6 +761,14 @@ mod msg_to_key_tests {
         (0x51, "q", "Q", "@"),
         (0x5a, "z", "Z", ""),
         (0x6e, ",", ",", ""),
+    ];
+
+    /// French AZERTY: the digit keys type symbols, and digits with Shift.
+    const FR: &[(u16, &str, &str, &str)] = &[
+        (0x31, "&", "1", ""),
+        (0x36, "-", "6", "|"),
+        (0x38, "_", "8", "\\"),
+        (0x39, "\u{e7}", "9", "^"),
     ];
 
     /// Polish (214): AltGr+Q is a backslash.
@@ -963,10 +1140,16 @@ mod msg_to_key_tests {
         assert_eq!(press(0x56, &[LCTRL, LSHIFT]), Some(Action::Paste));
         assert_eq!(press(0x2d, &[0xa1]), Some(Action::Paste));
         assert_eq!(press(0x21, &[LSHIFT]), Some(Action::ScrollPage(1)));
+        assert_eq!(press(0x24, &[LCTRL, LSHIFT]), Some(Action::ScrollEnd(1)));
+        assert_eq!(press(0x23, &[LCTRL, LSHIFT]), Some(Action::ScrollEnd(-1)));
+        assert_eq!(press(0x23, &[LSHIFT]), None, "PSReadLine selects");
         assert_eq!(press(0x52, &[LCTRL, LSHIFT]), Some(Action::SplitRight));
         assert_eq!(press(0x44, &[0xa3, LSHIFT]), Some(Action::SplitDown));
         assert_eq!(press(0x42, &[LCTRL, LSHIFT]), Some(Action::ToggleSidebar));
+        assert_eq!(press(0x4f, &[LCTRL, LSHIFT]), Some(Action::GoToSession));
         assert_eq!(press(0x09, &[LCTRL, LSHIFT]), Some(Action::CycleTab(-1)));
+        assert_eq!(press(0x21, &[LCTRL, LSHIFT]), Some(Action::MoveTab(-1)));
+        assert_eq!(press(0x22, &[LCTRL, LSHIFT]), Some(Action::MoveTab(1)));
         assert_eq!(press(0x33, &[LCTRL]), Some(Action::GoToTab(2)));
         assert_eq!(press(0x25, &[LCTRL, LALT]), Some(Action::Focus(Dir::Left)));
         assert_eq!(press(0x26, &[LALT, LSHIFT]), Some(Action::Resize(Dir::Up)));
@@ -979,6 +1162,11 @@ mod msg_to_key_tests {
         assert_eq!(press(0x25, &[LCTRL, LSHIFT]), None, "selects a word");
         assert_eq!(press(0xbd, &[LCTRL]), Some(Action::FontSize(-1)));
         assert_eq!(press(0xbd, &[LCTRL, LSHIFT]), None, "Claude Code's undo");
+        // Ctrl and + with Shift, as on a US layout, and on the keypad.
+        assert_eq!(press(0xbb, &[LCTRL, LSHIFT]), Some(Action::FontSize(1)));
+        assert_eq!(press(0x6b, &[LCTRL]), Some(Action::FontSize(1)));
+        assert_eq!(press(0x6d, &[LCTRL]), Some(Action::FontSize(-1)));
+        assert_eq!(press(0x60, &[LCTRL]), Some(Action::FontSize(0)));
         assert_eq!(press(0x30, &[LCTRL]), Some(Action::FontSize(0)));
         assert_eq!(press(0x52, &[LCTRL]), None);
         assert_eq!(press(0x43, &[LCTRL, LALT]), None, "AltGr is not Ctrl");
@@ -1057,9 +1245,44 @@ mod msg_to_key_tests {
         ] {
             assert_eq!(binding(bad), None, "{bad}");
         }
+        // The keypad by name.
+        assert_eq!(
+            binding("ctrl+numpad0=copy"),
+            Some((CTRL, 0x60, Some(Action::Copy)))
+        );
+        assert_eq!(
+            binding("ctrl+Numpad9=copy"),
+            Some((CTRL, 0x69, Some(Action::Copy)))
+        );
+        assert_eq!(
+            binding("ctrl+numpadadd=copy"),
+            Some((CTRL, 0x6b, Some(Action::Copy)))
+        );
+        assert_eq!(binding("ctrl+numpad10=copy"), None);
+        assert_eq!(chord_label(CTRL, 0x60), "Ctrl+Numpad0");
+        assert_eq!(chord_label(CTRL, 0x6d), "Ctrl+NumpadSubtract");
         assert_eq!(chord_label(CTRL | ALT | SHIFT, 0x25), "Ctrl+Alt+Shift+Left");
         assert_eq!(chord_label(CTRL, 0xbc), "Ctrl+,");
         assert_eq!(chord_label(0, 0x7a), "F11");
+    }
+
+    #[test]
+    fn keymap_reads_text_bindings() {
+        assert_eq!(
+            text_binding(r"ctrl+shift+e=text:git status\r"),
+            Some((CTRL | SHIFT, 0x45, b"git status\r".to_vec()))
+        );
+        // An = in the text, or as the key, is kept apart from the chord.
+        assert_eq!(
+            text_binding(r"alt+==text:a=b\e[A\x41\s"),
+            Some((ALT, 0xbb, b"a=b\x1b[AA ".to_vec()))
+        );
+        // Only two hex digits make a byte.
+        assert_eq!(unesc(r"\x+f\x4"), br"\x+f\x4");
+        assert_eq!(text_binding("ctrl+e=text:"), None, "nothing to type");
+        assert_eq!(text_binding("ctrl+bogus+e=text:x"), None);
+        assert_eq!(text_binding("ctrl+e=split_right"), None);
+        assert_eq!(binding(r"ctrl+e=text:x"), None, "not an action");
     }
 
     #[test]
@@ -1088,6 +1311,72 @@ mod msg_to_key_tests {
         assert_eq!(keys(Action::SplitRight), None);
         assert_eq!(keys(Action::ClosePane), None);
         assert_eq!(keys_for(Action::Copy, &[]).as_deref(), Some("Ctrl+C"));
+        // A notice names the user's keys, or the palette's name.
+        assert_eq!(press_for(Action::NewTab, &user), "Ctrl+Shift+R");
+        assert_eq!(press_for(Action::ClosePane, &user), "\"Close pane\"");
+        assert_eq!(press_for(Action::Paste, &[]), "Ctrl+V");
+    }
+
+    #[test]
+    fn keymap_ctrl_digits_go_to_tabs_where_the_key_types_the_digit() {
+        let press_on = |vk, rows, user: &[Binding]| {
+            let mut t = String::new();
+            let lp = lp(0x09, false, true, 1);
+            let k = msg_to_key(vk, lp, &state(&[0xa2], &[]), layout(rows), &mut t);
+            action(&k, user)
+        };
+        assert_eq!(press_on(0x31, US, &[]), Some(Action::GoToTab(0)));
+        assert_eq!(press_on(0x38, US, &[]), Some(Action::GoToTab(7)));
+        assert_eq!(press_on(0x39, US, &[]), Some(Action::LastTab));
+        // AZERTY: Ctrl+_ and Ctrl+- go to the program, and so do the rest.
+        for vk in [0x31, 0x36, 0x38, 0x39] {
+            assert_eq!(press_on(vk, FR, &[]), None, "{vk:#x}");
+        }
+        // Bound by name, a digit key goes to its tab on any layout.
+        let user: Vec<Binding> = ["ctrl+1=go_to_tab_1", "ctrl+9=last_tab"]
+            .into_iter()
+            .filter_map(binding)
+            .collect();
+        assert_eq!(press_on(0x31, FR, &user), Some(Action::GoToTab(0)));
+        assert_eq!(press_on(0x39, FR, &user), Some(Action::LastTab));
+        assert_eq!(
+            binding("alt+3=go_to_tab_3"),
+            Some((ALT, 0x33, Some(Action::GoToTab(2))))
+        );
+        assert_eq!(binding("ctrl+0=go_to_tab_9"), None, "Ctrl+9 is the last");
+    }
+
+    #[test]
+    fn keymap_altgr_types_rather_than_running_a_ctrl_alt_binding() {
+        let user: Vec<Binding> = [
+            "ctrl+alt+q=new_tab",
+            "ctrl+alt+1=new_tab",
+            "ctrl+alt+left=split_right",
+        ]
+        .into_iter()
+        .filter_map(binding)
+        .collect();
+        let press = |vk, rows, held: &[usize]| {
+            let mut t = String::new();
+            let lp = lp(0x10, false, true, 1);
+            let k = msg_to_key(vk, lp, &state(held, &[]), layout(rows), &mut t);
+            action(&k, &user)
+        };
+        let altgr = [0xa2, 0xa5];
+        assert_eq!(press(0x51, DE, &altgr), None, "AltGr+Q types @");
+        assert_eq!(press(0x51, PL, &altgr), None, "AltGr+Q types \\");
+        assert_eq!(press(0x31, CZ, &altgr), None, "AltGr+1 is a dead ~");
+        // Without a character for AltGr it is the chord.
+        assert_eq!(press(0x51, US, &altgr), Some(Action::NewTab));
+        assert_eq!(press(0x25, DE, &altgr), Some(Action::SplitRight), "arrows");
+        // The default Ctrl+Alt+Arrows still move focus on AltGr layouts.
+        let k = |vk| {
+            let mut t = String::new();
+            let lp = lp(0x4b, true, true, 1);
+            let k = msg_to_key(vk, lp, &state(&altgr, &[]), layout(DE), &mut t);
+            action(&k, &[])
+        };
+        assert_eq!(k(0x25), Some(Action::Focus(Dir::Left)));
     }
 
     /// The left-hand keys for a set of shortcut modifiers.
@@ -1118,9 +1407,10 @@ mod msg_to_key_tests {
                 }
             }
         }
-        for i in 0..9 {
+        for i in 0..8 {
             assert_eq!(press(0x31 + i, &[0xa2]), Some(Action::GoToTab(i as u8)));
         }
+        assert_eq!(press(0x39, &[0xa2]), Some(Action::LastTab), "Ctrl+9");
         assert_eq!(press(0x30, &[0xa2]), Some(Action::FontSize(0)), "Ctrl+0");
         assert_eq!(press(0x31, &[0xa2, 0xa0]), None, "Ctrl+Shift+1");
         assert_eq!(press(0x31, &[0xa2, 0xa4]), None, "AltGr+1");
@@ -1135,15 +1425,6 @@ mod msg_to_key_tests {
             }
             let tab = a.0 == CTRL && (0x31..=0x39).contains(&a.1);
             assert!(!tab, "{a:?} is a Go to tab key");
-        }
-    }
-
-    #[test]
-    fn readme_names_every_action() {
-        let readme = include_str!("../../../README.md");
-        for &(_, name, _) in ACTIONS {
-            let named = readme.contains(&format!("`{name}`"));
-            assert!(named, "README.md does not name {name}");
         }
     }
 
@@ -1165,6 +1446,17 @@ mod msg_to_key_tests {
             let arrows = format!("{}Arrows", mods.trim_end_matches('A'));
             let arrow = (0x25..=0x28).contains(&vk) && listed(&arrows);
             assert!(listed(&chord) || arrow, "README.md does not list {chord}");
+        }
+    }
+
+    #[test]
+    fn readme_names_every_action() {
+        let readme = include_str!("../../../README.md");
+        for &(a, name, _) in ACTIONS {
+            // Listed as `go_to_tab_1` to `go_to_tab_8`.
+            let between = matches!(a, Action::GoToTab(1..=6));
+            let named = readme.contains(&format!("`{name}`"));
+            assert!(named || between, "README.md does not name {name}");
         }
     }
 
@@ -1202,6 +1494,7 @@ mod msg_to_key_tests {
         for (vk, held) in [
             (0x21, &[0xa0][..]),         // ScrollPage
             (0x09, &[0xa2]),             // CycleTab
+            (0x22, &[0xa2, 0xa0]),       // MoveTab
             (0x25, &[0xa2, 0xa4]),       // Focus
             (0x26, &[0xa4, 0xa0]),       // Resize
             (0x27, &[0xa2, 0xa4, 0xa0]), // Swap
@@ -1312,5 +1605,17 @@ mod msg_to_key_tests {
             &mut t,
         );
         assert_eq!(action(&k, &user), None);
+    }
+    #[test]
+    fn keymap_update_and_zoom_keys_never_reach_the_program() {
+        // Ctrl+Shift+U and Ctrl+Shift+Z would arrive as ^U and ^Z.
+        for a in [Action::Update, Action::Zoom] {
+            assert!(!passes_on(a), "{a:?}");
+        }
+        // Copy with nothing selected is Ctrl+C for the program, and a
+        // divider that cannot move gives Alt+Shift+Arrows back.
+        for a in [Action::Copy, Action::Paste, Action::Resize(Dir::Left)] {
+            assert!(passes_on(a), "{a:?}");
+        }
     }
 }

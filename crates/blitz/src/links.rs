@@ -4,17 +4,20 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_FRIENDLYAPPNAME, AssocQueryStringW, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 /// What Ctrl+click on a link opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     /// An OSC 8 hyperlink's URI, or a URL in the text.
     Uri(String),
-    /// A file or folder named in the text.
-    Path(PathBuf),
+    /// A file or folder named in the text, and the line and column after
+    /// it.
+    Path(PathBuf, Option<(u32, u32)>),
 }
 
 /// A link in the text.
@@ -22,9 +25,11 @@ pub enum Target {
 pub enum Link {
     /// An `http` or `https` URL.
     Url(String),
-    /// A word that looks like a file path, without the `:line:col` after
-    /// it. It is a link only if the file exists; see [`resolve`].
-    Path(String),
+    /// A word that looks like a file path, and the line and column after
+    /// it, as in `src/app.rs:12:5` or tsc's `src/app.ts(12,5)`; a line alone
+    /// is at column 1. It is a link only if the file exists; see
+    /// [`resolve`].
+    Path(String, Option<(u32, u32)>),
 }
 
 /// How blitz opens a link.
@@ -54,8 +59,9 @@ const OPENS: &[&str] = &[
 /// This runs on every Ctrl-hover, so it is linear by construction: one
 /// pass that looks at each char once, knowing only the char before it and
 /// the one its character builds on, and a URL or path word is measured
-/// only from past the end of the last one of its kind, found or not. No
-/// char is walked by more than one measure of each kind, whatever the text.
+/// only from past the end of the last one of its kind, found or not, but
+/// for a few paths inside a word. No char is walked by more than a few
+/// measures of each kind, whatever the text.
 pub fn scan(text: &str) -> Vec<(Range<usize>, Link)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -64,10 +70,18 @@ pub fn scan(text: &str) -> Vec<(Range<usize>, Link)> {
     let (mut prev, mut before) = (None, None);
     // Where the last URL and path word measured end. Nothing is lost by
     // starting no other before them: every char a path word holds is a
-    // path char or builds on one, so no path starts inside it, and past
-    // the URL taken from it, or past its scheme when none was, a URL word
-    // holds only the punctuation and joiners trimmed off, never a scheme.
+    // path char or builds on one, so no path starts inside it but after
+    // a bracket, `=` or quote, and past the URL taken from it, or past its
+    // scheme when none was, a URL word holds only the punctuation and
+    // joiners trimmed off, never a scheme.
     let (mut url_end, mut path_end) = (0, 0);
+    // Claude Code's tool headers, as in `Update(src/app.rs)`, Markdown
+    // links and `--flag=path` put a path right after a word, so one may
+    // start after a bracket, `=` or quote inside a path word too. Each such
+    // start reads the rest of the word, so only the first few in a word
+    // are tried, and a word of `a(a(a(` is read a few times, not once per
+    // bracket.
+    let mut tries = 0;
     while let Some(c) = text[i..].chars().next() {
         let rest = &text[i..];
         let mut found = None;
@@ -78,10 +92,15 @@ pub fn scan(text: &str) -> Vec<(Range<usize>, Link)> {
                 url_end = i + seen;
                 found = n.map(|n| (0, n, Link::Url(rest[..n].to_owned())));
             }
-            if found.is_none() && i >= path_end && before.is_none_or(|b| !path_char(b)) {
+            let after = matches!(before, Some('(' | '[' | '=' | '\''));
+            let new = i >= path_end && (after || before.is_none_or(|b| !path_char(b)));
+            if found.is_none() && (new || after && tries < 8) {
+                tries = if new { 0 } else { tries + 1 };
                 let (seen, at) = path_at(rest);
-                path_end = i + seen;
-                found = at.map(|(path, end)| (path.start, end, Link::Path(rest[path].to_owned())));
+                path_end = path_end.max(i + seen);
+                found = at.map(|(path, end, at)| {
+                    (path.start, end, Link::Path(rest[path].to_owned(), at))
+                });
             }
             before = Some(c);
         }
@@ -153,43 +172,84 @@ fn path_char(c: char) -> bool {
         || c.is_ascii_graphic() && !matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | ':' | '`')
 }
 
+/// Where a path is in a word, where the word ends, and the line and
+/// column after the path.
+type PathWord = (Range<usize>, usize, Option<(u32, u32)>);
+
 /// How far `s` was read for a path word at its start, and, if it is one,
-/// where the path is in it and where the word ends after any `:line` or
-/// `:line:col`. A path starts with a drive, or holds a `/` or `\` and ends
-/// in a name with an extension.
-fn path_at(s: &str) -> (usize, Option<(Range<usize>, usize)>) {
+/// where the path is in it, where the word ends after any `:line`,
+/// `:line:col` or `(line,col)`, and that line and column. A path starts
+/// with a drive or `~`, holds a `/` or `\` and ends in a name with an
+/// extension, or is a bare `name.ext`.
+fn path_at(s: &str) -> (usize, Option<PathWord>) {
     // A bracket or quote before a path is not part of it.
     let lead = s.len() - s.trim_start_matches(['(', '[', '\'']).len();
     let p = &s[lead..];
     let b = p.as_bytes();
     let drive =
         b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    let home = p.starts_with("~/") || p.starts_with("~\\");
     let from = if drive { 2 } else { 0 };
     let word = from + word_len(&p[from..], path_char);
     let seen = lead + word;
-    let path = &p[..trim_end(&p[..word])];
+    // A Markdown link's text ends where its target starts.
+    let word = p[..word].find("](").unwrap_or(word);
+    let mut path = &p[..trim_end(&p[..word])];
+    // tsc and MSBuild put the place in brackets: `a.ts(12,5)`.
+    let mut at = None;
+    let mut end = lead + path.len();
+    if let Some(i) = path.rfind('(')
+        && let Some(place) = path[i + 1..].strip_suffix(')').and_then(bracketed)
+    {
+        (path, at) = (&path[..i], Some(place));
+    }
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    let named = name.rsplit_once('.').is_some_and(|(stem, ext)| {
-        !stem.is_empty() && !ext.is_empty() && ext.chars().all(char::is_alphanumeric)
+    let ext = name.rsplit_once('.').and_then(|(stem, ext)| {
+        let ok = !stem.is_empty() && !ext.is_empty() && ext.chars().all(char::is_alphanumeric);
+        ok.then_some(ext)
     });
+    let sep = path.contains(['/', '\\']);
     // A path from a separator would be read from the root of the drive, or
     // from another machine for two.
-    let relative = path.contains(['/', '\\']) && !path.starts_with(['/', '\\']) && named;
-    if !drive && !relative {
+    let relative = sep && !path.starts_with(['/', '\\']) && ext.is_some();
+    // A bare name is looked for in the pane's folder; `v1.2` is no file.
+    let bare = !sep && ext.is_some_and(|e| e.chars().any(|c| c.is_ascii_alphabetic()));
+    // In `--flag=path` the path starts after the `=`.
+    let flag = path
+        .split(['/', '\\'])
+        .next()
+        .is_some_and(|s| s.contains('='));
+    if !drive && !home && !relative && !bare || flag {
         return (seen, None);
     }
-    // ponytail: editor:line integration later
-    let mut end = lead + path.len();
-    for _ in 0..2 {
-        let digits = s[end..].strip_prefix(':').map_or(0, |r| {
-            r.len() - r.trim_start_matches(|c: char| c.is_ascii_digit()).len()
-        });
-        if digits == 0 {
-            break;
+    if at.is_none() {
+        let mut place = Vec::new();
+        while place.len() < 2
+            && let Some(r) = s[end..].strip_prefix(':')
+            && let digits = r.len() - r.trim_start_matches(|c: char| c.is_ascii_digit()).len()
+            && let Ok(n) = r[..digits].parse()
+        {
+            place.push(n);
+            end += 1 + digits;
         }
-        end += 1 + digits;
+        at = place
+            .first()
+            .map(|&line| (line, place.get(1).copied().unwrap_or(1)));
     }
-    (seen, Some((lead..lead + path.len(), end)))
+    (seen, Some((lead..lead + path.len(), end, at)))
+}
+
+/// The line and column in `12,5` or `12`, a line alone at column 1.
+fn bracketed(s: &str) -> Option<(u32, u32)> {
+    let num = |n: &str| {
+        n.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| n.parse().ok())?
+    };
+    match s.split_once(',') {
+        Some((line, col)) => Some((num(line)?, num(col)?)),
+        None => Some((num(s)?, 1)),
+    }
 }
 
 /// The length of `s` without the punctuation of a sentence around it, or
@@ -226,18 +286,34 @@ fn trim_end(s: &str) -> usize {
 }
 
 /// Where a path word from the text is: as it is when it starts with a
-/// drive, else in the pane's folder `cwd`. Only a path that exists counts,
-/// and one that would reach another machine is never looked at, nor is
-/// one through a link; see [`plain`].
+/// drive, in the user's folder for `~`, else in the pane's folder `cwd`.
+/// Only a path that exists counts, and one that would reach another
+/// machine is never looked at, nor is one through a link; see [`plain`].
 pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
-    let (full, from) = if vt::osc::local_dir(word) {
-        (PathBuf::from(word), 3)
-    } else if vt::osc::local_dir(cwd) {
-        (Path::new(cwd).join(word), cwd.len())
-    } else {
-        return None;
-    };
+    let home = std::env::var("USERPROFILE").ok();
+    let (full, from) = full_path(word, cwd, home.as_deref())?;
     plain(&full, from).then_some(full)
+}
+
+/// [`resolve`] without looking at the disk, `~` standing for `home`, and
+/// the length of the folder it starts from, which is trusted.
+fn full_path(word: &str, cwd: &str, home: Option<&str>) -> Option<(PathBuf, usize)> {
+    let (base, rest) = match word.strip_prefix('~') {
+        Some(r) if r.starts_with(['/', '\\']) => (home?, &r[1..]),
+        _ if vt::osc::local_dir(word) => return Some((PathBuf::from(word), 3)),
+        _ => (cwd, word),
+    };
+    // A rest that is itself absolute, such as `\\host\share`, replaces
+    // the base when joined, so the result is checked too, and then none
+    // of it is trusted.
+    let full = Path::new(base).join(rest);
+    let from = if full.starts_with(base) {
+        base.len()
+    } else {
+        3
+    };
+    (vt::osc::local_dir(base) && vt::osc::local_dir(&full.to_string_lossy()))
+        .then_some((full, from))
 }
 
 /// Whether each folder and file `path` names after its first `from`
@@ -305,7 +381,7 @@ pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
 pub fn plan(t: &Target, pathext: &str) -> Option<Open> {
     let p = match t {
         Target::Uri(u) => plan_uri(u, pathext)?,
-        Target::Path(p) => plan_path(p, pathext)?,
+        Target::Path(p, _) => plan_path(p, pathext)?,
     };
     match p {
         Open::Uri(_) => Some(p),
@@ -324,13 +400,91 @@ pub fn plan(t: &Target, pathext: &str) -> Option<Open> {
     }
 }
 
-/// Opens `t` as [`plan`] allows.
-pub fn open(t: &Target) -> Result<(), &'static str> {
+/// What opening a file that [`plan`] allows does with `editor`, the
+/// `editor_uri` setting: with one, a file opens there at `place`, else at
+/// line 1, whatever its type, as an editor never runs it. Without one, a
+/// file no program opens (`has_program` says) is shown in Explorer, so
+/// Windows does not ask what to open it with. Folders open as they are.
+pub fn with_editor(
+    how: Open,
+    editor: &str,
+    place: Option<(u32, u32)>,
+    has_program: impl Fn(&Path) -> bool,
+) -> Result<Open, &'static str> {
+    Ok(match how {
+        Open::File(p) | Open::Reveal(p) if !editor.is_empty() && !p.is_dir() => {
+            let uri = editor_uri(editor, &p, place.unwrap_or((1, 1)));
+            Open::Uri(uri.ok_or("editor_uri must be a URI such as vscode://file/{path}")?)
+        }
+        Open::File(p) if !p.is_dir() && !has_program(&p) => Open::Reveal(p),
+        how => how,
+    })
+}
+
+/// `template`, the `editor_uri` setting, with `{path}`, `{line}` and
+/// `{col}` filled in. `None` unless it is a URI that is not a `file:` one,
+/// so the setting never names a program or a file to run.
+pub fn editor_uri(template: &str, path: &Path, (line, col): (u32, u32)) -> Option<String> {
+    let (scheme, _) = template.split_once(':')?;
+    let named = scheme.len() > 1
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+    let odd = |c: char| c.is_control() || c.is_whitespace() || c == '"';
+    if !named || scheme.eq_ignore_ascii_case("file") || template.chars().any(odd) {
+        return None;
+    }
+    let mut p = String::new();
+    for b in path.to_str()?.replace('\\', "/").bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                p.push(char::from(b));
+            }
+            _ => p.push_str(&format!("%{b:02X}")),
+        }
+    }
+    Some(
+        (template.replace("{path}", &p))
+            .replace("{line}", &line.to_string())
+            .replace("{col}", &col.to_string()),
+    )
+}
+
+/// Whether Windows has a program to open files of `path`'s type.
+fn has_program(path: &Path) -> bool {
+    let Some(ext) = path.extension() else {
+        return false;
+    };
+    let ext = HSTRING::from(format!(".{}", ext.to_string_lossy()));
+    let mut len = 0;
+    // SAFETY: a NUL-terminated type that outlives the call; with no buffer
+    // it only writes the length.
+    let found = unsafe {
+        AssocQueryStringW(
+            ASSOCF_INIT_IGNOREUNKNOWN,
+            ASSOCSTR_FRIENDLYAPPNAME,
+            &ext,
+            PCWSTR::null(),
+            None,
+            &mut len,
+        )
+    };
+    found.is_ok()
+}
+
+/// Opens `t` as [`plan`] and [`with_editor`] allow.
+pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
     let pathext = std::env::var("PATHEXT").unwrap_or_default();
-    let (file, args) = match plan(t, &pathext) {
-        Some(Open::Uri(u)) => (u, String::new()),
-        Some(Open::File(p)) => (p.display().to_string(), String::new()),
-        Some(Open::Reveal(p)) => {
+    let how = plan(t, &pathext).ok_or("blitz opens only web links and files on this computer")?;
+    let place = match t {
+        Target::Path(_, place) => *place,
+        Target::Uri(_) => None,
+    };
+    let (file, args) = match with_editor(how, editor, place, has_program)? {
+        Open::Uri(u) => (u, String::new()),
+        Open::File(p) => (p.display().to_string(), String::new()),
+        Open::Reveal(p) => {
             // A relative SystemRoot would run a planted explorer.exe.
             let root = crate::shell::system_root(|k| std::env::var_os(k));
             let explorer = root.join("explorer.exe");
@@ -339,7 +493,6 @@ pub fn open(t: &Target) -> Result<(), &'static str> {
                 format!("/select,\"{}\"", p.display()),
             )
         }
-        None => return Err("blitz opens only web links and files on this computer"),
     };
     // SAFETY: NUL-terminated strings that outlive the call, and no window.
     let done = unsafe {
@@ -373,7 +526,11 @@ mod tests {
     }
 
     fn path(s: &str) -> Link {
-        Link::Path(s.into())
+        Link::Path(s.into(), None)
+    }
+
+    fn path_at(s: &str, line: u32, col: u32) -> Link {
+        Link::Path(s.into(), Some((line, col)))
     }
 
     #[test]
@@ -450,6 +607,11 @@ mod tests {
             let text = format!("{word}{}", ")]".repeat(50_000));
             assert_eq!(quick(&text, word), 1);
         }
+        // A path may start after each of these inside a word.
+        for open in ["(", "[", "=", "'"] {
+            let text = format!("a{open}").repeat(50_000);
+            assert_eq!(quick(&text, open), 0);
+        }
         // Every letter carries a mark or joiner, so none starts a word, and
         // a run of marks on a space or quote starts none either.
         let mut marks = vec!["a\u{300}".repeat(100_000), "a\u{200D}".repeat(100_000)];
@@ -460,7 +622,7 @@ mod tests {
         // Lines of everything that has ever made a walk start over: each
         // its own mix, so some hold long words and some long runs of marks.
         let parts: Vec<_> =
-            "a|Z|/|.|:|(|)|[|]|\u{300}|\u{941}|\u{200D}|\u{200C}|\u{D4E}|\u{111C2}|漢| |https://"
+            "a|Z|/|.|:|(|)|[|]|=|'|\u{300}|\u{941}|\u{200D}|\u{200C}|\u{D4E}|\u{111C2}|漢| |https://"
                 .split('|')
                 .collect();
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -490,7 +652,7 @@ mod tests {
     fn links_scan_paths() {
         assert_eq!(
             found("error in src/foo.rs:42 here"),
-            [("src/foo.rs:42", path("src/foo.rs"))]
+            [("src/foo.rs:42", path_at("src/foo.rs", 42, 1))]
         );
         assert_eq!(
             found(r"wrote C:\Users\x\file.txt."),
@@ -500,7 +662,7 @@ mod tests {
             found("C:/dev/blitz/src/app.rs:2066:9: error"),
             [(
                 "C:/dev/blitz/src/app.rs:2066:9",
-                path("C:/dev/blitz/src/app.rs")
+                path_at("C:/dev/blitz/src/app.rs", 2066, 9)
             )]
         );
         assert_eq!(
@@ -516,18 +678,101 @@ mod tests {
         );
         let accent = "docs/cafe\u{301}.md";
         assert_eq!(found(accent), [(accent, path(accent))]);
+        // A Prepend letter joins no space or quote: only the bare name
+        // after it.
+        let prepend = "docs/a\u{D4E} b.txt rest";
+        assert_eq!(found(prepend), [("b.txt", path("b.txt"))]);
+        let prepend = "docs\\x\u{111C2}\"y.txt";
+        assert_eq!(found(prepend), [("y.txt", path("y.txt"))]);
         for none in [
-            "file.txt",
             "a/b",
             "1/2 done, v1.2/3",
             r"\\server\share\x.txt",
             "//host/x.txt",
             r"\Windows\notepad.exe",
             "a/.env",
-            "docs/a\u{D4E} b.txt rest",
-            "docs\\x\u{111C2}\"y.txt",
+            "v1.2 and 3.14",
+            ".env",
+            "~ and ~x",
+            "a.b(x)",
         ] {
             assert_eq!(found(none), [], "{none}");
+        }
+    }
+
+    #[test]
+    fn links_scan_tool_headers_markdown_places_and_names() {
+        // Claude Code's tool headers.
+        assert_eq!(
+            found("Update(src/app.rs)"),
+            [("src/app.rs", path("src/app.rs"))]
+        );
+        assert_eq!(found("Read(README.md)"), [("README.md", path("README.md"))]);
+        // A Markdown link's target.
+        assert_eq!(
+            found("[x](docs/x.md) and [a/y.md](y/z.md:3)."),
+            [
+                ("docs/x.md", path("docs/x.md")),
+                ("a/y.md", path("a/y.md")),
+                ("y/z.md:3", path_at("y/z.md", 3, 1))
+            ]
+        );
+        assert_eq!(
+            found("--manifest-path=crates/vt/Cargo.toml"),
+            [("crates/vt/Cargo.toml", path("crates/vt/Cargo.toml"))]
+        );
+        // tsc and MSBuild.
+        assert_eq!(
+            found("src/app.ts(12,5): error TS2322"),
+            [("src/app.ts(12,5)", path_at("src/app.ts", 12, 5))]
+        );
+        assert_eq!(
+            found("Program.cs(7): warning"),
+            [("Program.cs(7)", path_at("Program.cs", 7, 1))]
+        );
+        assert_eq!(
+            found("Update(src/app.ts(1,2))"),
+            [("src/app.ts(1,2)", path_at("src/app.ts", 1, 2))]
+        );
+        // The user's folder, and a bare name, if the file is there.
+        assert_eq!(
+            found(r"~/.claude/settings.json and ~\notes"),
+            [
+                ("~/.claude/settings.json", path("~/.claude/settings.json")),
+                (r"~\notes", path(r"~\notes"))
+            ]
+        );
+        assert_eq!(
+            found("edit file.txt:3:9, then go"),
+            [("file.txt:3:9", path_at("file.txt", 3, 9))]
+        );
+    }
+
+    #[test]
+    fn links_find_home_and_relative_paths() {
+        let home = Some(r"C:\Users\me");
+        let full = |w| full_path(w, r"D:\work", home).map(|f| f.0);
+        let me = Path::new(r"C:\Users\me");
+        assert_eq!(full("~/x/y.rs"), Some(me.join("x/y.rs")));
+        assert_eq!(full(r"~\y.rs"), Some(me.join("y.rs")));
+        assert_eq!(full("a.rs"), Some(Path::new(r"D:\work").join("a.rs")));
+        assert_eq!(full(r"E:\b.rs"), Some(PathBuf::from(r"E:\b.rs")));
+        assert_eq!(full_path("~/x", r"D:\work", None), None, "no home");
+        assert_eq!(full_path("~/x", r"D:\work", Some(r"\\server\me")), None);
+        assert_eq!(full_path("a.rs", r"\\server\share", home), None);
+        // Only what the word names is checked for links, not the folder it
+        // starts from, unless a drive in the word took that folder's place.
+        let from = |w| full_path(w, r"D:\work", home).map(|f| f.1);
+        assert_eq!(from("a.rs"), Some(r"D:\work".len()));
+        assert_eq!(from("~/x/y.rs"), Some(r"C:\Users\me".len()));
+        assert_eq!(from(r"E:\b.rs"), Some(3));
+        assert_eq!(from(r"~/E:\b.rs"), Some(3));
+        for unc in [
+            r"~/\\host\share\x.txt",
+            r"~\\\host\share\x.txt",
+            r"\\host\share\x.txt",
+        ] {
+            assert_eq!(full(unc), None, "{unc}");
         }
     }
 
@@ -640,7 +885,7 @@ mod tests {
         let tool = resolve("tool.cmd", &cwd);
         let gone = resolve("sub/gone.txt", &cwd);
         let far = resolve("sub/notes.txt", r"\\server\share");
-        let plan = |p: &Option<PathBuf>| plan(&Target::Path(p.clone().expect("found")), "");
+        let plan = |p: &Option<PathBuf>| plan(&Target::Path(p.clone().expect("found"), None), "");
         let notes_plan = plan(&notes);
         let tool_plan = plan(&tool);
         let _ = std::fs::remove_dir_all(&dir);
@@ -652,6 +897,78 @@ mod tests {
         let missing = ('A'..='Z').rev().map(root).find(|r| !Path::new(r).exists());
         assert_eq!(resolve(&missing.expect("a free drive letter"), ""), None);
         assert!(resolve(&root('C'), "").is_some());
+    }
+
+    const VSCODE: &str = "vscode://file/{path}:{line}:{col}";
+
+    #[test]
+    fn links_fill_in_the_editor_uri() {
+        let uri = |t, p: &str| editor_uri(t, Path::new(p), (12, 5));
+        assert_eq!(
+            uri(VSCODE, r"C:\my code\a.rs").as_deref(),
+            Some("vscode://file/C:/my%20code/a.rs:12:5")
+        );
+        assert_eq!(
+            uri("idea://open?file={path}&line={line}", r"C:\x\%#&é.rs").as_deref(),
+            Some("idea://open?file=C:/x/%25%23%26%C3%A9.rs&line=12")
+        );
+        // Only a URI: never a program, a file, or text for a command line.
+        for bad in [
+            r"C:\tools\code.exe {path}",
+            "code {path}",
+            "c:{path}",
+            "file:///{path}",
+            "FILE:{path}",
+            "vscode://file/{path} --x",
+            "vscode://\"{path}\"",
+            "1x:{path}",
+            "",
+        ] {
+            assert_eq!(uri(bad, r"C:\a.rs"), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn links_open_files_in_the_editor_or_show_them() {
+        let dir = std::env::temp_dir().join(format!("blitz-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "x").expect("write");
+        let (yes, no) = (|_: &Path| true, |_: &Path| false);
+        let go = |how, editor, program: &dyn Fn(&Path) -> bool| {
+            with_editor(how, editor, Some((3, 4)), program)
+        };
+        let at = editor_uri(VSCODE, &file, (3, 4)).map(Open::Uri).ok_or("");
+        let seen = [
+            go(Open::File(file.clone()), VSCODE, &no),
+            go(Open::Reveal(file.clone()), VSCODE, &no),
+            go(Open::File(dir.clone()), VSCODE, &no),
+            go(Open::File(file.clone()), "", &no),
+            go(Open::File(file.clone()), "", &yes),
+            go(Open::Reveal(file.clone()), "", &yes),
+            go(Open::File(dir.clone()), "", &no),
+            go(Open::File(file.clone()), "notepad {path}", &yes),
+        ];
+        let line_one = with_editor(Open::File(file.clone()), VSCODE, None, no);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(seen[0], at, "at its line");
+        assert_eq!(seen[1], at, "an editor never runs a script");
+        assert_eq!(seen[2], Ok(Open::File(dir.clone())), "a folder");
+        assert_eq!(seen[3], Ok(Open::Reveal(file.clone())), "no program");
+        assert_eq!(seen[4], Ok(Open::File(file.clone())));
+        assert_eq!(seen[5], Ok(Open::Reveal(file.clone())));
+        assert_eq!(seen[6], Ok(Open::File(dir.clone())));
+        assert!(seen[7].is_err(), "not a URI");
+        let one = editor_uri(VSCODE, &file, (1, 1)).map(Open::Uri).ok_or("");
+        assert_eq!(line_one, one);
+    }
+
+    #[test]
+    fn links_know_which_types_have_a_program() {
+        // Which known types have one depends on the machine: Windows
+        // Server can leave even .txt without a program's name.
+        assert!(!has_program(Path::new(r"C:\x\a.blitz-no-such-type")));
+        assert!(!has_program(Path::new(r"C:\x\Makefile")));
     }
 
     #[test]
