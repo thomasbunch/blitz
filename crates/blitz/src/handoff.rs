@@ -42,7 +42,8 @@ pub fn encode(dir: &Path) -> Vec<u16> {
     dir.as_os_str().encode_wide().collect()
 }
 
-/// The folder in a payload, or `None` when it is not one blitz sent.
+/// The folder in a payload, or `None` when it is not one blitz sent: blitz
+/// only sends absolute paths.
 pub fn decode(data: usize, bytes: &[u8]) -> Option<PathBuf> {
     if data != MAGIC
         || bytes.is_empty()
@@ -55,7 +56,7 @@ pub fn decode(data: usize, bytes: &[u8]) -> Option<PathBuf> {
         .map(|&b| u16::from_le_bytes(b))
         .collect();
     let text = String::from_utf16(&units).ok()?;
-    (!text.contains('\0')).then(|| PathBuf::from(text))
+    (!text.contains('\0') && Path::new(&text).is_absolute()).then(|| PathBuf::from(text))
 }
 
 /// Sends `dir` to the running blitz. True only when it took it; on false
@@ -168,15 +169,45 @@ mod tests {
         assert_eq!(decode(MAGIC + 1, &ok), None, "another magic");
         assert_eq!(decode(MAGIC, &[]), None, "empty");
         assert_eq!(decode(MAGIC, &ok[..ok.len() - 1]), None, "odd byte count");
+        let drive: Vec<u16> = r"C:\".encode_utf16().collect();
         assert_eq!(
-            decode(MAGIC, &bytes(&[0x43, 0xd800])),
+            decode(MAGIC, &bytes(&[&drive[..], &[0xd800]].concat())),
             None,
             "lone surrogate"
         );
-        assert_eq!(decode(MAGIC, &bytes(&[0x43, 0, 0x44])), None, "a NUL");
+        assert_eq!(
+            decode(MAGIC, &bytes(&[&drive[..], &[0x43, 0, 0x44]].concat())),
+            None,
+            "a NUL"
+        );
         let long = bytes(&vec![u16::from(b'a'); MAX_BYTES / 2 + 1]);
         assert_eq!(decode(MAGIC, &long), None, "too long");
-        let most = bytes(&vec![u16::from(b'a'); MAX_BYTES / 2]);
-        assert!(decode(MAGIC, &most).is_some(), "the longest allowed");
+        let most: Vec<u16> = "C:\\"
+            .encode_utf16()
+            .chain(std::iter::repeat(u16::from(b'a')))
+            .take(MAX_BYTES / 2)
+            .collect();
+        assert!(
+            decode(MAGIC, &bytes(&most)).is_some(),
+            "the longest allowed"
+        );
+    }
+
+    /// blitz sends absolute paths. A relative one would be read against
+    /// the receiver's directory, which is not the sender's.
+    #[test]
+    fn handoff_takes_only_absolute_folders() {
+        let take = |p: &str| decode(MAGIC, &bytes(&encode(Path::new(p)))).is_some();
+        for ok in [
+            r"C:\x",
+            r"\\server\share\x",
+            r"\\?\C:\x",
+            r"\\?\UNC\server\share",
+        ] {
+            assert!(take(ok), "{ok}");
+        }
+        for bad in [r"x", r"x\y", r"..\x", r"C:x", r"\x"] {
+            assert!(!take(bad), "{bad}");
+        }
     }
 }
