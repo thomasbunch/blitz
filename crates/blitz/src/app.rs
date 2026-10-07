@@ -1037,8 +1037,9 @@ struct App {
     /// Said in the banner in place of the offer for now: the question that
     /// running Update again answers, or that the update is downloading.
     banner_note: Option<(String, Ask)>,
-    /// The banner strip in the last frame, for clicks.
-    banner: Option<Rect>,
+    /// The banner strip and the x that closes it in the last frame, for
+    /// clicks.
+    banner: Option<(Rect, Rect)>,
     /// The chips on panes scrolled back in the last frame, for clicks.
     below: Vec<(PaneId, Rect)>,
     /// The find bar in the last frame, for clicks.
@@ -2374,6 +2375,10 @@ impl App {
             self.font_zoom = 0.0;
         }
         let jump = c.global_jump != self.config.global_jump;
+        // The banner goes with the checks; looks stop at the next start.
+        if self.config.check_updates && !c.check_updates {
+            self.update = None;
+        }
         self.config = c;
         if jump {
             self.global_jump();
@@ -2785,6 +2790,30 @@ impl App {
             // The pointer is over other text now.
             self.extend_drag();
             self.request_redraw();
+        }
+    }
+
+    /// Hides the banner until a newer release, in this run and the next.
+    fn dismiss_update(&mut self) {
+        if let Some((v, _)) = self.update.take() {
+            if let Some(dir) = session::dir() {
+                crate::update::dismiss_in(&dir, Some(&v));
+            }
+            self.request_redraw();
+        }
+    }
+
+    /// Opens the notes of the release the banner shows.
+    fn open_notes(&mut self) {
+        let Some((v, _)) = &self.update else {
+            return;
+        };
+        let url = crate::update::notes(v);
+        if !crate::update::open(&url)
+            && let Some(id) = self.focus_id()
+        {
+            let text = format!("Could not open a browser; see {url}");
+            self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
         }
     }
 
@@ -3500,7 +3529,7 @@ impl App {
                     return true;
                 };
                 if !crate::update::installed() {
-                    if !crate::update::open_page() {
+                    if !crate::update::open(crate::update::PAGE) {
                         let text = format!(
                             "Could not open a browser; get it at {}",
                             crate::update::PAGE
@@ -3523,6 +3552,10 @@ impl App {
                     self.banner_note = Some((text, Ask::Update));
                     self.request_redraw();
                     return true;
+                }
+                // Asked for by hand: shown again if it fails.
+                if let Some(dir) = session::dir() {
+                    crate::update::dismiss_in(&dir, None);
                 }
                 self.updating = Some(id);
                 let text = format!("Downloading blitz {v}\u{2026}");
@@ -4327,10 +4360,11 @@ impl App {
             return;
         }
         let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
-        let on_banner = (self.banner)
-            .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
-        if pressed && b == 0 && on_banner {
-            self.act(el, Action::Update);
+        if let Some(click) = banner_click(self.banner, x, y).filter(|_| pressed && b == 0) {
+            match click {
+                BannerClick::Close => self.dismiss_update(),
+                BannerClick::Notes => self.open_notes(),
+            }
             return;
         }
         let chip = (self.below.iter())
@@ -4641,7 +4675,7 @@ impl App {
             || self.game.is_some();
         let divider = self.divider_at(pos).map(|d| d.1).filter(|_| !panel);
         let hand = self.hover.is_some()
-            || self.banner.as_ref().is_some_and(inside)
+            || self.banner.as_ref().is_some_and(|b| inside(&b.0))
             || self.mouse.over_side.is_some();
         let mods = mods_now();
         let grid = (!panel).then(|| self.hit(pos)).and_then(|(id, side)| {
@@ -4859,10 +4893,9 @@ impl App {
             .map(|(c, r)| (c, r, self.preedit.as_str()));
         let mut chrome = chrome::build(&self.model(&self.win, &sessions, preedit));
         self.side = std::mem::take(&mut chrome.side);
-        self.banner = chrome.banner;
+        self.banner = chrome.banner.zip(chrome.banner_close);
         self.below = std::mem::take(&mut chrome.below);
         self.find_bar = chrome.find;
-
         self.settings_hits = chrome.settings.take();
         self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
@@ -6095,6 +6128,26 @@ fn start_failed(e: &str, config: Option<&Path>) -> String {
     format!("blitz could not start: {e}{file}")
 }
 
+/// What a click on the banner does.
+#[derive(Debug, PartialEq)]
+enum BannerClick {
+    Close,
+    Notes,
+}
+
+/// What a click at (`x`, `y`) does to the banner, given its strip and its
+/// x: the x closes it and anywhere else opens the release notes. Updating
+/// restarts blitz, so only the key does that.
+fn banner_click(banner: Option<(Rect, Rect)>, x: i32, y: i32) -> Option<BannerClick> {
+    let inside = |r: Rect| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y);
+    let (_, close) = banner.filter(|b| inside(b.0))?;
+    Some(if inside(close) {
+        BannerClick::Close
+    } else {
+        BannerClick::Notes
+    })
+}
+
 /// The last `n` lines of `text`, without blank lines at either end.
 fn last_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.trim_matches('\n').lines().collect();
@@ -6727,7 +6780,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 el.exit();
             }
-            UserEvent::Update(v, log) => self.offer_update(v, log),
+            // Unasked for: not after checks were turned off, and not one
+            // whose banner was closed.
+            UserEvent::Update(v, log) => {
+                let closed = session::dir().and_then(|d| crate::update::dismissed_in(&d));
+                let checks = self.config.check_updates;
+                if crate::update::show_unasked(&v, log.is_some(), checks, closed.as_deref()) {
+                    self.offer_update(v, log);
+                }
+            }
             UserEvent::Checked(found) => {
                 let (text, failed) = (crate::update::found(&found), found.is_err());
                 if let Ok(Some(v)) = found {
@@ -8895,6 +8956,30 @@ mod tests {
         assert!(a.handed_off(Some(true)), "taken");
         assert!(!a.handed_off(Some(false)), "hung or refused");
         assert!(a.new_window, "a window of its own");
+    }
+
+    #[test]
+    fn a_click_on_the_banner_never_updates() {
+        let strip = Rect {
+            x: 240,
+            y: 578,
+            w: 740,
+            h: 22,
+        };
+        let close = Rect {
+            x: 958,
+            w: 22,
+            ..strip
+        };
+        let banner = Some((strip, close));
+        assert_eq!(banner_click(banner, 300, 590), Some(BannerClick::Notes));
+        assert_eq!(banner_click(banner, 957, 578), Some(BannerClick::Notes));
+        assert_eq!(banner_click(banner, 958, 578), Some(BannerClick::Close));
+        assert_eq!(banner_click(banner, 979, 599), Some(BannerClick::Close));
+        for (x, y) in [(239, 590), (300, 577), (980, 590), (300, 600)] {
+            assert_eq!(banner_click(banner, x, y), None, "{x},{y}");
+        }
+        assert_eq!(banner_click(None, 300, 590), None);
     }
 
     #[test]

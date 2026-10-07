@@ -109,14 +109,19 @@ pub fn installed() -> bool {
         .unwrap_or(false)
 }
 
-/// Opens the latest release's page in the browser; false if it could not.
-pub fn open_page() -> bool {
+/// The page of release `v` (from `newer`), with its notes.
+pub fn notes(v: &str) -> String {
+    format!("https://github.com/{REPO}/releases/tag/v{v}")
+}
+
+/// Opens a web page in the browser; false if it could not.
+pub fn open(url: &str) -> bool {
     // SAFETY: valid strings and no window.
     let h = unsafe {
         ShellExecuteW(
             None,
             w!("open"),
-            &HSTRING::from(PAGE),
+            &HSTRING::from(url),
             None,
             None,
             SW_SHOWNORMAL,
@@ -124,6 +129,37 @@ pub fn open_page() -> bool {
     };
     // Above 32 is success.
     h.0 as isize > 32
+}
+
+/// Where the release whose banner was closed is kept.
+const DISMISSED: &str = "update-dismissed";
+
+/// The release whose banner was closed, as kept in `dir`.
+pub fn dismissed_in(dir: &Path) -> Option<String> {
+    let v = std::fs::read_to_string(dir.join(DISMISSED)).ok()?;
+    version(v.trim())?;
+    Some(v.trim().into())
+}
+
+/// Keeps `v` as the release whose banner was closed, or with `None`
+/// forgets it. A failed save only shows the banner again.
+pub fn dismiss_in(dir: &Path, v: Option<&str>) {
+    let file = dir.join(DISMISSED);
+    match v {
+        Some(v) => {
+            let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(file, v));
+        }
+        None => {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
+/// Whether the banner shows release `v` that a look found unasked, or
+/// whose update `failed`: never one whose banner was `closed` until a
+/// newer release comes, and no offer once `checks` are off.
+pub fn show_unasked(v: &str, failed: bool, checks: bool, closed: Option<&str>) -> bool {
+    (failed || checks) && closed.is_none_or(|d| newer(d, v).is_some())
 }
 
 /// The newest update that `install` started and that did not happen, with
@@ -406,6 +442,40 @@ mod tests {
         assert!(
             rebound.ends_with("Alt+F12 to update and restart"),
             "{rebound}"
+        );
+    }
+
+    #[test]
+    fn a_closed_banner_stays_closed_until_a_newer_release() {
+        let dir = std::env::temp_dir().join(format!("blitz-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(dismissed_in(&dir), None);
+        assert!(show_unasked("0.0.5", false, true, None));
+        dismiss_in(&dir, Some("0.0.5"));
+        let closed = dismissed_in(&dir);
+        assert_eq!(closed.as_deref(), Some("0.0.5"));
+        for failed in [false, true] {
+            assert!(!show_unasked("0.0.5", failed, true, closed.as_deref()));
+            assert!(!show_unasked("0.0.4", failed, true, closed.as_deref()));
+            assert!(show_unasked("0.0.6", failed, true, closed.as_deref()));
+        }
+        // With checks off only a failed update shows.
+        assert!(!show_unasked("0.0.6", false, false, closed.as_deref()));
+        assert!(show_unasked("0.0.6", true, false, None));
+        // Anything else in the file closes nothing.
+        std::fs::write(dir.join(DISMISSED), "0.0.5/../x").unwrap();
+        assert_eq!(dismissed_in(&dir), None);
+        dismiss_in(&dir, Some("0.0.5"));
+        dismiss_in(&dir, None);
+        assert_eq!(dismissed_in(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_notes_are_on_the_release_page() {
+        assert_eq!(
+            notes("0.0.5"),
+            "https://github.com/thomasbunch/blitz/releases/tag/v0.0.5"
         );
     }
 

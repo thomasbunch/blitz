@@ -216,8 +216,9 @@ pub struct Chrome {
     pub panes: Vec<(PaneId, Rect)>,
     /// What a click in the sidebar or rail acts on.
     pub side: SideHits,
-    /// The banner strip, for clicks.
+    /// The banner strip, for clicks, and the x at its end that closes it.
     pub banner: Option<Rect>,
+    pub banner_close: Option<Rect>,
     /// The chip on each pane scrolled back, which a click takes to the
     /// bottom.
     pub below: Vec<(PaneId, Rect)>,
@@ -933,16 +934,25 @@ pub fn build(m: &ChromeModel) -> Chrome {
         out.banner = Some(strip);
         extra.push(Prim::Rect(strip, c.hdr_bg));
         extra.push(Prim::Rect(Rect { h: 1, ..strip }, c.hdr_line));
-        let x = strip.x + s(14.0);
-        let msg = fit(msg, strip.right() - s(14.0) - x, tw);
-        extra.push(Prim::Text {
-            x,
-            y: strip.y + (bh + 1 - th) / 2,
-            text: msg,
-            color: c.dim,
-            bold: false,
-            term: false,
-        });
+        let (x, ty) = (strip.x + s(14.0), strip.y + (bh + 1 - th) / 2);
+        // A square at the end, wider than the x drawn in it.
+        let close = Rect {
+            x: strip.right() - bh,
+            w: bh,
+            ..strip
+        };
+        out.banner_close = Some(close);
+        let msg = fit(msg, close.x - s(4.0) - x, tw);
+        for (x, text) in [(x, msg), (close.x + (bh - tw) / 2, "\u{d7}".into())] {
+            extra.push(Prim::Text {
+                x,
+                y: ty,
+                text,
+                color: c.dim,
+                bold: false,
+                term: false,
+            });
+        }
     }
     let typing =
         m.find.is_some() || m.settings.is_some() || m.picker.is_some() || m.commands.is_some();
@@ -2567,6 +2577,18 @@ mod tests {
         assert_eq!(c.banner, Some(strip), "even without a sidebar");
         assert_eq!(c.panes[0].1.bottom(), strip.y, "panes end above it");
         assert!(texts(&c).contains(&"blitz 0.0.2 is available"));
+        // An x at the end closes it, and the text stops short of it.
+        let close = c.banner_close.expect("a close box");
+        assert_eq!((close.right(), close.y, close.h), (AREA.w, strip.y, 22));
+        assert!(texts(&c).contains(&"\u{d7}"));
+        let long = "blitz 0.0.2 is available ".repeat(40);
+        m.banner = Some(&long);
+        let c = build(&m);
+        let cut = c.prims.iter().find_map(|p| match p {
+            Prim::Text { x, text, .. } if text.starts_with("blitz") => Some(x + text_w(text, 7)),
+            _ => None,
+        });
+        assert!(cut.is_some_and(|end| end <= close.x), "{cut:?}");
 
         // Beside the rail, the strip is under the panes.
         let (win, sessions, now) = fleet(false);
