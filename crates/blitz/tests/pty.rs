@@ -9,22 +9,21 @@ use std::time::{Duration, Instant};
 
 use blitz::pty::{Pty, PtyEvent, SpawnOpts};
 
-/// What the console host writes before any output of the child.
-const PRELUDE: [&[u8]; 4] = [b"\x1b[1t", b"\x1b[c", b"\x1b[?1004h", b"\x1b[?9001h"];
+/// As long as a real pane's token, so sequences that carry one are too.
+const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// True if `chunk` holds anything besides the console host's prelude.
-fn past_prelude(chunk: &[u8]) -> bool {
-    let mut rest = chunk.to_vec();
-    for p in PRELUDE {
-        while let Some(i) = find(&rest, p) {
-            rest.drain(i..i + p.len());
-        }
-    }
-    !rest.is_empty()
+/// What `out` leaves on an 80x24 screen, scrollback first.
+fn text(out: &[u8]) -> String {
+    let mut t = vt::Terminal::new(vt::Options {
+        scrollback_lines: 100_000,
+        ..Default::default()
+    });
+    t.feed(out);
+    format!("{}\n{}", t.scrollback_text(), t.screen_text())
 }
 
 struct Run {
@@ -48,12 +47,17 @@ type Events = mpsc::Receiver<Result<(Instant, Vec<u8>), u32>>;
 /// bundled ConPTY's startup DA1 query, which otherwise holds output back
 /// for about 3 s.
 fn spawn(cmdline: &str, env: &[(String, String)]) -> (Pty, Instant, Events) {
+    spawn_in(cmdline, env, None)
+}
+
+fn spawn_in(cmdline: &str, env: &[(String, String)], cwd: Option<&Path>) -> (Pty, Instant, Events) {
     // A failing test must not leave console hosts running.
     static JOB: Once = Once::new();
     JOB.call_once(|| blitz::pty::kill_children_on_exit().expect("job object"));
     let (tx, rx) = mpsc::channel();
     let opts = SpawnOpts {
         cmdline,
+        cwd,
         env,
         cols: 80,
         rows: 24,
@@ -63,8 +67,8 @@ fn spawn(cmdline: &str, env: &[(String, String)]) -> (Pty, Instant, Events) {
     let started = Instant::now();
     let pty = Pty::spawn(&opts, move |ev, w| match ev {
         PtyEvent::Data(d) => {
-            if find(d, b"[c").is_some() {
-                w.send(&b"[?62;22c"[..]);
+            if find(d, b"\x1b[c").is_some() {
+                w.send(&b"\x1b[?62;22c"[..]);
             }
             let _ = tx.send(Ok((Instant::now(), d.to_vec())));
         }
@@ -95,6 +99,20 @@ fn run(cmdline: &str) -> Run {
             }
         }
     }
+}
+
+/// Reads output into `out` until it holds `what`; false if the child
+/// exited or 30 s passed first.
+fn wait_for(rx: &Events, out: &mut Vec<u8>, what: &[u8]) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while find(out, what).is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Ok((_, chunk))) => out.extend(chunk),
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// A program that cannot start is an error, and promptly: the window must
@@ -142,37 +160,53 @@ fn pty_spawn_failures_are_errors() {
 
 #[test]
 fn pty_echo_reaches_the_reader() {
-    let r = run("cmd /c echo hi");
-    let out = r.output();
-    assert!(
-        find(&out, b"hi").is_some(),
-        "{}",
-        String::from_utf8_lossy(&out)
-    );
+    let r = run("cmd /d /c echo hi");
+    let screen = text(&r.output());
+    assert!(screen.lines().any(|l| l.trim_end() == "hi"), "{screen:?}");
     assert_eq!(r.code, 0);
 }
 
 #[test]
+fn pty_exit_codes_come_through() {
+    assert_eq!(run("cmd /d /c exit 3").code, 3);
+    // What a console program ended by Ctrl+C or a closed console returns.
+    assert_eq!(run("cmd /d /c exit -1073741510").code, 0xC000_013A);
+}
+
+/// The bundled ConPTY holds output back for about 3 s until its startup
+/// query is answered. The best of three runs keeps a busy machine from
+/// failing this.
+#[test]
 fn pty_first_output_is_quick() {
     // The first run pays for loading the console host from disk.
-    run("cmd /c echo hi");
-    let r = run("cmd /c echo hi");
-    let (t, _) = r
-        .chunks
-        .iter()
-        .find(|(_, c)| past_prelude(c))
-        .expect("output past the prelude");
-    let ms = t.duration_since(r.started).as_secs_f64() * 1000.0;
-    eprintln!("first post-prelude byte after {ms:.1} ms");
-    assert!(ms < 2000.0, "first post-prelude byte after {ms:.1} ms");
+    run("cmd /d /c echo hi");
+    let best = (0..3)
+        .map(|_| {
+            let r = run("cmd /d /c echo hi");
+            let (t, _) = (r.chunks.iter())
+                .find(|(_, c)| find(c, b"hi").is_some())
+                .expect("the child's output");
+            t.duration_since(r.started)
+        })
+        .min()
+        .expect("three runs");
+    eprintln!("the child's output after {best:?}");
+    assert!(
+        best < Duration::from_secs(2),
+        "the child's output after {best:?}"
+    );
 }
 
 #[test]
 fn pty_uses_bundled_conpty_when_configured() {
-    if std::env::var_os("BLITZ_CONPTY_DIR").is_none() {
+    let Some(dir) = std::env::var_os("BLITZ_CONPTY_DIR").map(PathBuf::from) else {
+        eprintln!("SKIPPED: BLITZ_CONPTY_DIR is not set, so the bundled ConPTY is untested");
         return;
+    };
+    for f in ["conpty.dll", "OpenConsole.exe"] {
+        assert!(dir.join(f).is_file(), "no {f} in {}", dir.display());
     }
-    let r = run("cmd /c echo hi");
+    let r = run("cmd /d /c echo hi");
     let (_, first) = &r.chunks[0];
     assert!(
         first.starts_with(b"\x1b[1t"),
@@ -184,48 +218,170 @@ fn pty_uses_bundled_conpty_when_configured() {
 
 #[test]
 fn pty_close_ends_an_interactive_shell() {
-    let (pty, _, rx) = spawn("cmd", &[]);
-    rx.recv_timeout(Duration::from_secs(30))
-        .expect("output")
-        .expect("cmd exited by itself");
+    let (pty, _, rx) = spawn("cmd /d", &[]);
+    let mut out = Vec::new();
+    assert!(wait_for(&rx, &mut out, b">"), "no prompt");
     pty.resize(100, 30);
+    pty.writer().send(&b"mode con\r"[..]);
+    assert!(
+        wait_for(&rx, &mut out, b"Columns:"),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    let screen = text(&out);
+    let size = |what: &str| {
+        let line = screen.lines().find(|l| l.trim_start().starts_with(what));
+        line.and_then(|l| l.split_whitespace().last()?.parse::<u32>().ok())
+    };
+    assert_eq!(
+        (size("Columns:"), size("Lines:")),
+        (Some(100), Some(30)),
+        "{screen}"
+    );
     drop(pty);
     let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let code = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx
             .recv_timeout(left)
             .expect("no exit within 10 s of closing")
         {
             Ok(_) => continue,
-            Err(_) => break,
+            Err(code) => break code,
         }
+    };
+    // Closing the console ends cmd as Ctrl+C would.
+    assert_eq!(code, 0xC000_013A);
+}
+
+/// A flood of output neither stalls the pane nor loses its end, and a pane
+/// whose child has gone takes input, resizes and closes without fuss.
+#[test]
+fn pty_takes_a_burst_and_calls_after_exit() {
+    let r = run(r#"cmd /d /c "for /L %i in (1,1,20000) do @echo line %i""#);
+    assert_eq!(r.code, 0);
+    let screen = text(&r.output());
+    assert!(
+        screen.contains("line 20000"),
+        "{}",
+        &screen[screen.len().saturating_sub(300)..]
+    );
+
+    let (pty, _, rx) = spawn("cmd /d /c exit 0", &[]);
+    while let Ok(Ok(_)) = rx.recv_timeout(Duration::from_secs(30)) {}
+    pty.writer().send(&b"late\r"[..]);
+    pty.resize(0, 0);
+    pty.resize(0, 30);
+    pty.resize(u16::MAX, u16::MAX);
+    pty.close();
+    pty.close();
+    drop(pty);
+}
+
+/// Claude Code prints what blitz-hook returns, an OSC 777 notification as
+/// long as a real pane token and session id make it, and the console host
+/// must pass it on untouched.
+#[test]
+fn pty_hook_sequences_reach_the_reader() {
+    let seq = format!(
+        "\x1b]777;notify;blitz:{TOKEN}:needs-you:3f2a0c1e-0000-4000-8000-00000000abcd;Claude needs you\x07"
+    );
+    let ps = seq
+        .replace('\x1b', "'+[char]27+'")
+        .replace('\x07', "'+[char]7+'");
+    let r = run(&format!(
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Write('{ps}')\""
+    ));
+    let out = r.output();
+    assert!(
+        find(&out, seq.as_bytes()).is_some(),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(r.code, 0);
+}
+
+/// Each shell blitz integrates with that is on this machine, without the
+/// user's profile, which could replace the prompt.
+fn shells() -> Vec<String> {
+    let root = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+    let mut v = vec![
+        root.join("System32").join("cmd.exe"),
+        root.join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe"),
+    ];
+    let pwsh = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("pwsh.exe"))
+        .find(|p| p.is_absolute() && p.is_file());
+    match pwsh {
+        Some(p) => v.push(p),
+        None => eprintln!("SKIPPED: pwsh.exe is not on PATH, so PowerShell 7 is untested"),
     }
+    v.into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn launch(program: &str) -> blitz::shell::Launch {
+    let mut l = blitz::shell::launch(program, &[], true, TOKEN);
+    l.cmdline = l.cmdline.replacen(" -NoLogo", " -NoProfile -NoLogo", 1);
+    l.env.push(("BLITZ_PANE_TOKEN".into(), TOKEN.into()));
+    l
 }
 
 #[test]
 fn pty_shells_print_prompt_marks() {
-    // "" is the detected default shell, PowerShell on a stock install.
-    for program in ["cmd.exe", ""] {
-        if program == "cmd.exe" && std::env::var_os("PROMPT").is_some() {
-            continue; // a user's own PROMPT is left alone
+    let mark = format!("\x1b]133;A;blitz={TOKEN}");
+    for program in shells() {
+        let launch = launch(&program);
+        if program.ends_with("cmd.exe") && launch.env.len() < 2 {
+            eprintln!("SKIPPED: cmd with the user's own PROMPT, which blitz leaves alone");
+            continue;
         }
-        let launch = blitz::shell::launch(program, &[], true, "5eed");
-        let mut env = launch.env.clone();
-        env.push(("BLITZ_PANE_TOKEN".into(), "5eed".into()));
-        let (_pty, _, rx) = spawn(&launch.cmdline, &env);
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let (_pty, _, rx) = spawn(&launch.cmdline, &launch.env);
         let mut out = Vec::new();
-        while find(&out, b"]133;A;blitz=5eed").is_none() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left) {
-                Ok(Ok((_, chunk))) => out.extend(chunk),
-                _ => panic!(
-                    "{:?}: no prompt mark in {:?}",
-                    launch.cmdline.get(..40),
-                    String::from_utf8_lossy(&out)
-                ),
-            }
+        assert!(
+            wait_for(&rx, &mut out, mark.as_bytes()),
+            "{program}: no prompt mark in {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        if !program.ends_with("cmd.exe") {
+            assert!(
+                wait_for(&rx, &mut out, b"\x1b]7;file:///"),
+                "{program}: no folder in {:?}",
+                String::from_utf8_lossy(&out)
+            );
         }
     }
+}
+
+/// A shell started in a `\\?\` folder still marks its prompt and reports
+/// the folder.
+#[test]
+fn pty_powershell_reports_a_verbatim_folder() {
+    let dir = std::env::temp_dir().join(format!("blitz-verbatim-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let verbatim = PathBuf::from(format!(r"\\?\{}", dir.display()));
+    let l = launch(&shells()[1]);
+    let (pty, _, rx) = spawn_in(&l.cmdline, &l.env, Some(&verbatim));
+    let mut out = Vec::new();
+    let mark = format!("\x1b]133;A;blitz={TOKEN}");
+    let marked = wait_for(&rx, &mut out, mark.as_bytes());
+    let reported = wait_for(&rx, &mut out, b"\x1b]7;file:///");
+    drop(pty);
+    let _ = std::fs::remove_dir_all(&dir);
+    let shown = String::from_utf8_lossy(&out);
+    assert!(marked && reported, "{shown:?}");
+    let url = shown
+        .split("\x1b]7;")
+        .nth(1)
+        .and_then(|s| s.split('\x07').next());
+    let name = dir
+        .file_name()
+        .expect("name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(url.is_some_and(|u| u.ends_with(&name)), "{url:?}");
 }
