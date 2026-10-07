@@ -662,6 +662,26 @@ impl Selection {
         let now = selection_text(term, pal, self, *top);
         Some(all.strip_suffix(now.as_str())?.to_owned() + shown)
     }
+
+    /// The cells that move with the text when a new width wraps the lines
+    /// again: its ends and its anchor. None for a block, whose columns
+    /// mean nothing at another width.
+    fn marks(&self) -> Vec<Pos> {
+        match self.drag.block {
+            true => Vec::new(),
+            false => vec![self.start, self.end, self.drag.anchor.0, self.drag.anchor.1],
+        }
+    }
+
+    /// Takes the cells [`Self::marks`] gave, moved to where `term` wrapped
+    /// their text again.
+    fn reflowed(&mut self, term: &vt::Terminal, pal: &Palette, marks: &[Pos]) {
+        if let &[start, end, a, b] = marks {
+            (self.start, self.end, self.drag.anchor) = (start, end, (a, b));
+            self.drag.epoch = term.line_epoch();
+            self.look(term, pal);
+        }
+    }
 }
 
 /// The cells from `start` to `end`, or the block they are the corners
@@ -4216,7 +4236,14 @@ impl App {
                 if v.resize_at.is_none() {
                     v.grid = grid;
                     v.resized = Some(started);
-                    v.pane.resize(grid.0, grid.1);
+                    // A selection stays on its text as a new width wraps it.
+                    let mut marks = v.selection.as_ref().map_or_else(Vec::new, Selection::marks);
+                    let kept = v.pane.resize(grid.0, grid.1, &mut marks);
+                    let term = lock(&v.pane.term);
+                    if let Some(s) = v.selection.as_mut().filter(|_| kept) {
+                        s.reflowed(&term, &self.theme.pal, &marks);
+                    }
+                    drop(term);
                     lock(&v.pane.term).set_cell_px(cw as u16, ch as u16);
                     // A new width rewraps the lines that matched.
                     if let Some(f) = &mut find {
@@ -6367,6 +6394,26 @@ mod tests {
         let mut sel = select(&t, (3, 0), (3, 0));
         t.resize(8, 2);
         assert!(!refresh(&mut t, &mut s, &pal, Some(&mut sel)), "rewrapped");
+    }
+
+    #[test]
+    fn app_selection_follows_its_text_to_a_new_width() {
+        let pal = crate::theme::dark();
+        let mut t = fed(6, 3, "one two three\r\nfour");
+        let mut s = Snapshot::default();
+        // "two three", across the wrap.
+        let mut sel = select(&t, (0, 4), (2, 0));
+        assert_eq!(selection_text(&t, &pal, &sel, 0), "two three");
+        for cols in [20, 4, 9] {
+            let mut marks = sel.marks();
+            assert!(t.resize_keeping(cols, 3, &mut marks), "{cols}");
+            sel.reflowed(&t, &pal, &marks);
+            assert!(refresh(&mut t, &mut s, &pal, Some(&mut sel)), "{cols}");
+            assert_eq!(selection_text(&t, &pal, &sel, 0), "two three", "{cols}");
+        }
+        // A block's columns mean nothing at another width.
+        let block = drag(&t, (0, 0), (1, 1), 1, true);
+        assert!(block.marks().is_empty());
     }
 
     #[test]

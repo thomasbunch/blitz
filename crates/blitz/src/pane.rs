@@ -192,12 +192,14 @@ impl Pane {
 
     /// Resizes the screen, then the pseudoconsole, so a cursor report the
     /// program asks for right after the resize already uses the new size.
-    pub fn resize(&self, cols: u16, rows: u16) {
+    /// `marks` move with their text; see [`vt::Terminal::resize_keeping`].
+    pub fn resize(&self, cols: u16, rows: u16, marks: &mut [vt::terminal::LineCol]) -> bool {
         if cols == 0 || rows == 0 {
-            return;
+            return false;
         }
-        lock(&self.term).resize(cols, rows);
+        let kept = lock(&self.term).resize_keeping(cols, rows, marks);
         self.pty.resize(cols, rows);
+        kept
     }
 
     pub fn send(&self, bytes: impl Into<Vec<u8>>) {
