@@ -388,38 +388,59 @@ fn entry(line: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// Where the string that starts `s` with quote `q` ends. In a `"` string
-/// `\"` is a quote, unless that leaves the string open: then the first
-/// `"` ends it, so a path ending in `\` reads as it always did.
+/// `\"` is a quote and `\\` a backslash, unless that leaves the string
+/// open: then the first `"` ends it, so a path ending in `\` reads as it
+/// always did.
 fn closing(s: &str, q: char) -> Option<usize> {
     let first = s[1..].find(q)? + 1;
     if q == '\'' {
         return Some(first);
     }
     let b = s.as_bytes();
-    let escaped = (first..b.len()).find(|&i| b[i] == b'"' && b[i - 1] != b'\\');
-    Some(escaped.unwrap_or(first))
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    Some(first)
 }
 
-/// The text of a quoted value; `None` when it is not quoted.
+/// The text of a quoted value; `None` when it is not quoted. In a `"`
+/// string only `\"` and `\\` are escapes: any other backslash stays, as
+/// Windows paths are written by hand.
 fn unquote(value: &str) -> Option<String> {
     let q = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
     let inner = value.strip_prefix(q)?.strip_suffix(q)?;
-    Some(match q {
-        '"' => inner.replace("\\\"", "\""),
-        _ => inner.to_string(),
-    })
+    if q == '\'' {
+        return Some(inner.to_string());
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('\\', Some(&e @ ('"' | '\\'))) => {
+                out.push(e);
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 /// `s` as a TOML string. One holding `"` or `\` is a literal string, as a
 /// basic one would read those as escapes; one that also holds `'` is a
-/// basic string with its `"` escaped.
+/// basic string with its `"` and `\` escaped.
 pub fn quote(s: &str) -> String {
     if !s.contains(['"', '\\']) {
         format!("\"{s}\"")
     } else if !s.contains('\'') {
         format!("'{s}'")
     } else {
-        format!("\"{}\"", s.replace('"', "\\\""))
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
 }
 
@@ -439,6 +460,14 @@ pub fn save(key: &str, value: Option<&str>) -> std::io::Result<()> {
 }
 
 fn save_in(dir: &Path, key: &str, value: Option<&str>) -> std::io::Result<()> {
+    // A control character, such as a newline in a font's name, would end
+    // the line and start a setting of its own.
+    if value.is_some_and(|v| v.chars().any(char::is_control)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a setting cannot hold a control character",
+        ));
+    }
     std::fs::create_dir_all(dir)?;
     let mut path = dir.join(FILE);
     // A config.toml linked from elsewhere, as from a dotfiles folder, is
@@ -809,6 +838,9 @@ scenery = stars
             r#"O'Neil "x""#,
             r"C:\it's\sh.exe",
             r#"'"'"#,
+            r#"'"\"#,
+            r#"it's "C:\x\""#,
+            r#"\\'\""#,
             "plain",
             "",
             "No #1",
@@ -820,8 +852,27 @@ scenery = stars
                 "{line}"
             );
         }
-        // A hand-written path ending in a backslash reads as before.
+        // Hand-written paths read as before: a backslash that escapes
+        // nothing stays, and one at the end does not hold the string open.
         assert_eq!(Config::parse(r#"shell = "C:\tools\""#).shell, r"C:\tools\");
+        assert_eq!(
+            Config::parse(r#"shell = "C:\x\sh.exe""#).shell,
+            r"C:\x\sh.exe"
+        );
+    }
+
+    #[test]
+    fn a_value_with_a_control_character_is_not_saved() {
+        let dir = std::env::temp_dir().join(format!("blitz-control-{}", std::process::id()));
+        // A hostile font could name itself so, to add a shell of its own.
+        let name = quote("Evil\nshell = 'C:\\x\\evil.exe'");
+        let saved = save_in(&dir, "font_family", Some(&name)).map_err(|e| e.kind());
+        let wrote = dir.join(FILE).exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            (saved, wrote),
+            (Err(std::io::ErrorKind::InvalidInput), false)
+        );
     }
 
     #[test]
