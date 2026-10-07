@@ -4,6 +4,7 @@
 use std::fmt::Write;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::hook::{Json, escape_json};
 use crate::layout::{self, Axis, Node, PaneId, Rect, Split, Tab};
@@ -235,6 +236,22 @@ pub fn load() -> Option<State> {
 pub fn save(s: &State) -> io::Result<()> {
     let dir = dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
     std::fs::create_dir_all(&dir)?;
+    // A crash between the write and the swap leaves a temporary file named
+    // for a process that is gone; one this old is no live window's. Once a
+    // run is enough: a held resize key saves every half second.
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let old = (e.metadata().and_then(|m| m.modified()).ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(60));
+            if old && name.starts_with("session.json.") && name.ends_with(".tmp") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    });
     let tmp = dir.join(format!("session.json.{}.tmp", std::process::id()));
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
         f.write_all(to_json(s).as_bytes())?;
@@ -292,6 +309,13 @@ pub fn is_key(k: &str) -> bool {
 pub fn load_output(key: &str) -> Option<String> {
     let dir = output_dir().filter(|_| is_key(key))?;
     std::fs::read_to_string(dir.join(format!("{key}.txt"))).ok()
+}
+
+/// Output saved before panes had keys, filed by tab and leaf index in the
+/// same session. Read on the first start after an update; the next save of
+/// output files it by key.
+pub fn load_legacy_output(tab: usize, leaf: usize) -> Option<String> {
+    std::fs::read_to_string(output_dir()?.join(format!("{tab}-{leaf}.txt"))).ok()
 }
 
 /// Replaces every pane's saved output with `panes`, as (key, text). None

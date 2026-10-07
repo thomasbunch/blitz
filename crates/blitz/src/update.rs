@@ -7,6 +7,7 @@
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
 
 use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
 use windows::Win32::Networking::WinHttp::{
@@ -233,12 +234,21 @@ pub fn show_unasked(v: &str, failed: bool, checks: bool, closed: Option<&str>) -
 
 /// The newest update that `install` started and that did not happen, with
 /// the installer's log: its folder is for a version newer than this build.
-/// The folders of updates to this version or older are removed.
+/// The folders of updates to this version or older are removed, and so are
+/// those of updates whose installer never started.
 pub fn failed() -> Option<(String, PathBuf)> {
-    failed_in(&std::env::temp_dir(), env!("CARGO_PKG_VERSION"))
+    failed_in(
+        &std::env::temp_dir(),
+        env!("CARGO_PKG_VERSION"),
+        SystemTime::now(),
+    )
 }
 
-fn failed_in(temp: &Path, current: &str) -> Option<(String, PathBuf)> {
+/// How long an update's folder may wait for its installer to start, as
+/// another blitz may be about to start it.
+const UNSTARTED: Duration = Duration::from_secs(10 * 60);
+
+fn failed_in(temp: &Path, current: &str, now: SystemTime) -> Option<(String, PathBuf)> {
     let mut out: Option<((u64, u64, u64), String, PathBuf)> = None;
     for e in std::fs::read_dir(temp).ok()?.flatten() {
         let name = e.file_name();
@@ -254,12 +264,21 @@ fn failed_in(temp: &Path, current: &str) -> Option<(String, PathBuf)> {
             continue;
         };
         // No log: the installer has not run, or another blitz is about to
-        // start it. A log that says it worked comes from an install this
-        // older copy of blitz did not do.
+        // start it; once that is long past, it never will. A log that says
+        // it worked comes from an install this older copy of blitz did not
+        // do.
         let log = e.path().join("setup.log");
+        if !log.is_file() {
+            let age = (e.metadata().and_then(|m| m.modified()).ok())
+                .and_then(|t| now.duration_since(t).ok());
+            if age.is_some_and(|a| a > UNSTARTED) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+            continue;
+        }
         let worked = std::fs::read(&log)
             .is_ok_and(|b| String::from_utf8_lossy(&b).contains("Installation process succeeded"));
-        let Some(n) = version(&v).filter(|_| log.is_file() && !worked) else {
+        let Some(n) = version(&v).filter(|_| !worked) else {
             continue;
         };
         if out.as_ref().is_none_or(|o| n > o.0) {
@@ -286,7 +305,10 @@ pub fn fetch(v: &str) -> Result<PathBuf, String> {
     let sums = curl(&[&format!("{base}/SHA256SUMS.txt")])?;
     let sums = String::from_utf8_lossy(&sums);
     let want = sum_for(&sums, &name).ok_or("the release has no checksum for its installer")?;
-    let exe = curl(&["--max-filesize", "64M", &format!("{base}/{name}")])?;
+    // A line that trickles just above the stall floor still ends: 64 MB in
+    // half an hour is 36 KB/s.
+    let url = format!("{base}/{name}");
+    let exe = curl(&["--max-time", "1800", "--max-filesize", "64M", &url])?;
     if !sha256_hex(&exe).is_some_and(|got| got.eq_ignore_ascii_case(want)) {
         return Err("the download does not match its checksum".into());
     }
@@ -295,10 +317,14 @@ pub fn fetch(v: &str) -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join(format!("blitz-update-{v}"));
     let path = dir.join(&name);
     // The error names no path: it can end up in an issue report.
-    std::fs::create_dir_all(&dir)
+    let saved = std::fs::create_dir_all(&dir)
         .and_then(|()| std::fs::write(&path, &exe))
-        .map_err(|e| format!("could not save the installer: {e}"))?;
-    Ok(path)
+        .map_err(|e| format!("could not save the installer: {e}"));
+    // An installer that never ran leaves nothing to report.
+    if saved.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    saved.map(|()| path)
 }
 
 /// Starts the `installer` that `fetch` saved. It closes what is left of
@@ -307,14 +333,23 @@ pub fn run(installer: &Path, relaunch: bool) -> Result<(), String> {
     // blitz is gone by the time the installer could fail, so the log is
     // what `failed` finds on the next start.
     let log = installer.with_file_name("setup.log");
-    Command::new(installer)
+    let started = Command::new(installer)
         .args(installer_args(&log, relaunch))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("could not start the installer: {e}"))?;
-    Ok(())
+        .map(drop)
+        .map_err(|e| format!("could not start the installer: {e}"));
+    // An installer that never ran leaves nothing to report, nor a folder
+    // that holds only it.
+    if started.is_err() {
+        let _ = std::fs::remove_file(installer);
+        if let Some(dir) = installer.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+    started
 }
 
 /// A silent install writing `log`; `.github/blitz.iss` starts blitz again
@@ -346,15 +381,19 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
     Some(out.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Runs curl.exe over HTTPS only, redirects included, and returns what it
-/// downloaded. A bare name finds System32's copy: Rust searches blitz's
-/// own folder, then System32, before PATH, and never the current directory.
+/// Runs System32's curl.exe over HTTPS only, redirects included, and
+/// returns what it downloaded. Named by its full path: a bare name is
+/// looked for in blitz's own folder first, where a planted curl.exe would
+/// run instead.
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let ua = concat!("blitz/", env!("CARGO_PKG_VERSION"));
+    let exe = crate::shell::system_root(|k| std::env::var_os(k))
+        .join("System32")
+        .join("curl.exe");
     // curl does not read Windows' proxy setting itself.
     let proxy = system_proxy();
     // A slow line still finishes the download; one that stalls gives up.
-    let out = Command::new("curl.exe")
+    let out = Command::new(exe)
         .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https"])
         .args(["--connect-timeout", "20", "--speed-limit", "1000"])
         .args(["--speed-time", "30", "-A", ua])
@@ -828,7 +867,7 @@ mod tests {
         }
         // Not a folder: left alone.
         std::fs::write(temp.join("blitz-update-0.0.99"), "").unwrap();
-        let got = failed_in(&temp, current);
+        let got = failed_in(&temp, current, SystemTime::now());
         let mut left: Vec<_> = (std::fs::read_dir(&temp).unwrap().flatten())
             .map(|e| e.file_name().into_string().unwrap())
             .collect();
@@ -893,7 +932,24 @@ mod tests {
         let (got, _, _) = failed_with("nothing", &[], "0.0.2");
         assert_eq!(got, None);
         let missing = std::env::temp_dir().join(format!("blitz-no-temp-{}", std::process::id()));
-        assert_eq!(failed_in(&missing, "0.0.2"), None);
+        assert_eq!(failed_in(&missing, "0.0.2", SystemTime::now()), None);
+    }
+
+    #[test]
+    fn an_update_never_started_goes_in_the_end() {
+        let temp = std::env::temp_dir().join(format!("blitz-unstarted-{}", std::process::id()));
+        let dir = temp.join("blitz-update-0.0.5");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&dir).unwrap();
+        let after = |s| SystemTime::now() + Duration::from_secs(s);
+        // Another blitz may be about to start it.
+        let soon = failed_in(&temp, "0.0.2", after(60));
+        let kept = dir.exists();
+        // One that has not started in ten minutes never will.
+        let later = failed_in(&temp, "0.0.2", after(11 * 60));
+        let gone = !dir.exists();
+        let _ = std::fs::remove_dir_all(&temp);
+        assert_eq!((soon, kept, later, gone), (None, true, None, true));
     }
 
     #[test]

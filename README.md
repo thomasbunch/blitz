@@ -527,6 +527,12 @@ keybind = ctrl+shift+g=text:git status\r
 keybind = 'alt+c=text:claude --continue # last session\r'
 ```
 
+A key with nothing to do goes to the program in the pane: Ctrl+C with no
+text selected, or a resize or swap with no split or neighbour that way.
+Held down, the keys that move focus, switch or move tabs, scroll, resize
+and swap repeat; the others act once, so a held key never answers its own
+"press again".
+
 ## Accessibility
 
 - The cursor does not blink, and nothing is animated unless you turn on

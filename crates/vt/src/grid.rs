@@ -100,18 +100,19 @@ impl Row {
             .map(|g| g.1.as_str())
     }
 
-    /// Appends `c` to the cluster in cell `col`.
-    pub fn push_grapheme(&mut self, col: u16, c: char) {
+    /// Appends `c` to the cluster in cell `col`; false when it does not fit.
+    pub fn push_grapheme(&mut self, col: u16, c: char) -> bool {
         let Some(cell) = self.cells.get_mut(col as usize) else {
-            return;
+            return false;
         };
         cell.flags |= cf::GRAPHEME;
         let ex = self.extra.get_or_insert_with(Default::default);
         match ex.graphemes.iter_mut().find(|g| g.0 == col) {
             Some(g) if g.1.len() + c.len_utf8() <= MAX_GRAPHEME_TAIL => g.1.push(c),
-            Some(_) => {}
+            Some(_) => return false,
             None => ex.graphemes.push((col, c.to_string())),
         }
+        true
     }
 
     fn drop_graphemes(&mut self, cols: Range<usize>) {
@@ -612,6 +613,12 @@ impl Grid {
                     graphemes.push((line.len(), g));
                 }
                 line.push(*c);
+            }
+            // A cursor past the end of its row, as one saved before the
+            // row narrowed, keeps to the row's last cell, or the rewrap
+            // would lose its place and every row below the first screen.
+            if i == cy && cursor.is_none() {
+                cursor = Some(line.len().saturating_sub(1));
             }
             // Past the row's last cell, as a whole line's selection ends.
             for (r, k) in rows.iter_mut().zip(&mut at_k) {
