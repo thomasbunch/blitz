@@ -4460,8 +4460,11 @@ fn min_window(
     scale: f32,
 ) -> PhysicalSize<u32> {
     let (w, h) = pane_min(cell, th as i32, scale, win.sidebar_expanded);
-    let side = chrome::area(win, (0, 0), scale, false, tw as i32).x;
-    PhysicalSize::new((w + side) as u32, h as u32)
+    // The sidebar takes at most 2/5 of the window, so the pane's room
+    // grows by one pixel or none for each the window does.
+    let room = |x: i32| chrome::area(win, (x, h), scale, None, tw as i32).w;
+    let width = (w..).find(|&x| room(x) >= w).unwrap_or(w);
+    PhysicalSize::new(width as u32, h as u32)
 }
 
 /// The size in cells of `cw` by `ch` pixels of each pane in every tab of
@@ -6167,7 +6170,7 @@ mod tests {
                 let th = cell.1 as i32;
                 let min = min_window(&win, cell, (cell.0 / 2, cell.1), scale);
                 let size = (min.width as i32, min.height as i32);
-                let area = chrome::area(&win, size, scale, false, cell.0 as i32 / 2);
+                let area = chrome::area(&win, size, scale, None, cell.0 as i32 / 2);
                 assert!(area.x > 0, "the side is shown");
                 let at = format!("{scale} {expanded}");
                 assert_eq!(
