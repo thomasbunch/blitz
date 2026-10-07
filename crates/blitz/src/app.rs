@@ -3719,6 +3719,12 @@ impl App {
         self.focus_id().map_or((0, 0), |id| self.cell_in(id, pos))
     }
 
+    /// The cell of pane `id` under `pos`; `None` off its grid.
+    fn grid_cell(&self, id: PaneId, pos: PhysicalPosition<f64>) -> Option<(u16, u16)> {
+        let v = self.view(id)?;
+        grid_cell(v.rect?, v.grid, self.cell(), (pos.x, pos.y))
+    }
+
     /// The cell of pane `id` under `pos`, clamped to its grid.
     fn cell_in(&self, id: PaneId, pos: PhysicalPosition<f64>) -> (u16, u16) {
         let Some(v) = self.view(id) else {
@@ -3985,7 +3991,8 @@ impl App {
             return;
         }
         // A click on another pane only moves focus. One in the focused
-        // pane closes its find bar and goes on.
+        // pane closes its find bar and goes on, unless it is on the pane's
+        // header or outside the panes, where it does nothing.
         if pressed {
             let id = self.hit(self.mouse.pos).0;
             if let Some(id) = id.filter(|&id| Some(id) != self.focus_id()) {
@@ -3995,6 +4002,12 @@ impl App {
             if id.is_some() && self.find.take().is_some() {
                 self.request_redraw();
             }
+            let on_grid = (self.current())
+                .and_then(|v| v.rect)
+                .is_some_and(|r| (r.x..r.right()).contains(&x) && (r.y..r.bottom()).contains(&y));
+            if !on_grid {
+                return;
+            }
         }
         if pressed
             && b == 0
@@ -4003,7 +4016,12 @@ impl App {
             self.open_link(&target);
             return;
         }
+        // The program hears of presses on its cells only, not on the padding
+        // past them.
         let program = self.mouse_to_program(&mods).and(self.focus_id());
+        if pressed && program.is_some_and(|id| self.grid_cell(id, self.mouse.pos).is_none()) {
+            return;
+        }
         if let Some(id) = route_button(&mut self.mouse.reported, b, pressed, program) {
             let kind = if pressed {
                 MouseKind::Press
@@ -4268,7 +4286,10 @@ impl App {
             self.mouse_report(id, MouseKind::Move, b as u8, mods);
         } else if self.mouse_to_program(&mods).is_some()
             && let Some(id) = self.focus_id()
+            && self.grid_cell(id, pos).is_some()
         {
+            // Only over the program's own cells: not while the pointer
+            // crosses the sidebar, a header or another pane.
             self.mouse_report(id, MouseKind::Move, 3, mods);
         }
     }
@@ -4811,6 +4832,24 @@ fn hidden_target(
         let h = hidden.get(next).or(hidden.first())?;
         (Some(h.0) != focus).then_some(h.0)
     })
+}
+
+/// The cell under the point `(x, y)` of a grid of `grid` cells, each
+/// `cell` pixels, at `r`; `None` off it, as over the header above it or
+/// the padding past its last cell.
+fn grid_cell(
+    r: Rect,
+    grid: (u16, u16),
+    cell: (u32, u32),
+    (x, y): (f64, f64),
+) -> Option<(u16, u16)> {
+    let (dx, dy) = (x - f64::from(r.x), y - f64::from(r.y));
+    if dx < 0.0 || dy < 0.0 {
+        return None;
+    }
+    let (col, row) = (dx as u32 / cell.0.max(1), dy as u32 / cell.1.max(1));
+    let inside = col < u32::from(grid.0) && row < u32::from(grid.1);
+    inside.then_some((col as u16, row as u16))
 }
 
 /// Whether Ctrl+click on `target` is blitz's to open rather than the
@@ -6769,6 +6808,23 @@ mod tests {
         let (range, found) = crate::links::scan(&l.text).remove(0);
         assert_eq!(found, Link::Url("https://e.com/abc".into()));
         assert_eq!(l.span(range), ((0, 3), (1, 9)), "across the wrap");
+    }
+
+    #[test]
+    fn app_mouse_reports_come_only_from_the_grid() {
+        let r = Rect {
+            x: 100,
+            y: 50,
+            w: 85,
+            h: 64,
+        };
+        let cell = |x, y| grid_cell(r, (10, 4), (8, 16), (x, y));
+        assert_eq!(cell(100.0, 50.0), Some((0, 0)));
+        assert_eq!(cell(179.9, 113.9), Some((9, 3)));
+        assert_eq!(cell(181.0, 60.0), None, "padding past the last column");
+        assert_eq!(cell(120.0, 40.0), None, "the header above");
+        assert_eq!(cell(99.0, 60.0), None, "left of the grid");
+        assert_eq!(cell(120.0, 114.0), None, "below it");
     }
 
     #[test]
