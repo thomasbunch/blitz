@@ -1492,6 +1492,7 @@ impl App {
         self.win = win;
         // A divider being dragged is known by its place in the old layout.
         self.mouse.divider = None;
+        self.fit_min_size();
         self.focus_moved(before);
     }
 
@@ -2649,6 +2650,7 @@ impl App {
             }
             Action::ToggleSidebar => {
                 self.win.sidebar_expanded = !self.win.sidebar_expanded;
+                self.fit_min_size();
                 self.request_redraw();
             }
             Action::ThemePicker => self.open_picker(),
@@ -3211,10 +3213,10 @@ impl App {
     }
 
     /// Keeps the window from getting smaller than [`min_window`] for the
-    /// font and scale in use.
+    /// layout, font and scale in use.
     fn fit_min_size(&self) {
         if let Some(w) = &self.window {
-            let min = min_window(self.cell(), self.scale as f32, self.win.sidebar_expanded);
+            let min = min_window(&self.win, self.cell(), self.scale as f32);
             w.set_min_inner_size(Some(min));
         }
     }
@@ -4339,13 +4341,14 @@ fn pane_min((cw, ch): (u32, u32), scale: f32, expanded: bool) -> (i32, i32) {
     )
 }
 
-/// The smallest the window may get: the rail and one smallest pane. Any
-/// smaller and a pane shrinks to a column or two, and a program such as
-/// Claude Code redraws everything at that width.
-fn min_window(cell: (u32, u32), scale: f32, expanded: bool) -> PhysicalSize<u32> {
-    let (w, h) = pane_min(cell, scale, expanded);
-    let rail = (chrome::RAIL_W * scale).round() as i32;
-    PhysicalSize::new((w + rail) as u32, h as u32)
+/// The smallest the window may get: the sidebar or the rail as `win`
+/// shows them, and one smallest pane. Any smaller and a pane shrinks to a
+/// column or two, and a program such as Claude Code redraws everything at
+/// that width.
+fn min_window(win: &layout::Window, cell: (u32, u32), scale: f32) -> PhysicalSize<u32> {
+    let (w, h) = pane_min(cell, scale, win.sidebar_expanded);
+    let side = chrome::area(win, (0, 0), scale, false).x;
+    PhysicalSize::new((w + side) as u32, h as u32)
 }
 
 /// The size in cells of `cw` by `ch` pixels of each pane in every tab of
@@ -6017,26 +6020,35 @@ mod tests {
         assert_eq!(back, moved, "restored");
     }
 
-    /// The smallest window still has room for the rail and one pane of
-    /// the smallest size, at any scale.
+    /// The smallest window still has room for the rail or the sidebar and
+    /// one pane of the smallest size, at any scale.
     #[test]
     fn app_the_window_never_gets_smaller_than_one_pane() {
-        let mut win = layout::Window {
-            sidebar_expanded: false,
+        for expanded in [false, true] {
+            let mut win = layout::Window {
+                sidebar_expanded: expanded,
+                ..Default::default()
+            };
+            win.tabs.push(Tab::new("a".into(), PaneId(1)));
+            win.tabs.push(Tab::new("b".into(), PaneId(2)));
+            for (cell, scale) in [((8, 16), 1.0), ((12, 24), 1.5), ((16, 32), 2.0)] {
+                let min = min_window(&win, cell, scale);
+                let size = (min.width as i32, min.height as i32);
+                let area = chrome::area(&win, size, scale, false);
+                assert!(area.x > 0, "the side is shown");
+                let at = format!("{scale} {expanded}");
+                assert_eq!((area.w, area.h), pane_min(cell, scale, expanded), "{at}");
+                let frame = chrome::pane_frame(scale, expanded, true).0;
+                assert_eq!((area.w - frame) / cell.0 as i32, layout::MIN_COLS, "{at}");
+            }
+        }
+        let one = layout::Window {
+            tabs: vec![Tab::new("a".into(), PaneId(1))],
             ..Default::default()
         };
-        win.tabs.push(Tab::new("a".into(), PaneId(1)));
-        win.tabs.push(Tab::new("b".into(), PaneId(2)));
-        for (cell, scale) in [((8, 16), 1.0), ((12, 24), 1.5), ((16, 32), 2.0)] {
-            let min = min_window(cell, scale, false);
-            let size = (min.width as i32, min.height as i32);
-            let area = chrome::area(&win, size, scale, false);
-            assert!(area.x > 0, "the rail is shown");
-            assert_eq!((area.w, area.h), pane_min(cell, scale, false), "{scale}");
-            let cols = (area.w - chrome::pane_frame(scale, false, true).0) / cell.0 as i32;
-            assert_eq!(cols, layout::MIN_COLS, "{scale}");
-        }
-        assert_eq!(min_window((8, 16), 1.0, true), PhysicalSize::new(123, 78));
+        let (w, h) = pane_min((8, 16), 1.0, true);
+        let min = min_window(&one, (8, 16), 1.0);
+        assert_eq!(min, PhysicalSize::new(w as u32, h as u32), "no rail");
     }
 
     #[test]
