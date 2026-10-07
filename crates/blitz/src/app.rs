@@ -1049,7 +1049,7 @@ struct App {
     update_error: Option<String>,
     /// The release that installs when blitz closes, with its installer
     /// once downloaded.
-    at_close: Option<(String, Option<PathBuf>)>,
+    at_close: Option<AtClose>,
     /// The banner strip and the x that closes it in the last frame, for
     /// clicks.
     banner: Option<(Rect, Rect)>,
@@ -2402,7 +2402,7 @@ impl App {
         // the checks; looks stop at the next start.
         if self.config.check_updates && !c.check_updates {
             self.update = None;
-            self.at_close = None;
+            self.at_close = kept_at_close(self.at_close.take(), self.updating.is_some());
         }
         self.config = c;
         if jump {
@@ -2821,7 +2821,7 @@ impl App {
     /// Hides the banner until a newer release, in this run and the next,
     /// and drops an update left for when blitz closes.
     fn dismiss_update(&mut self) {
-        self.at_close = None;
+        self.at_close = kept_at_close(self.at_close.take(), self.updating.is_some());
         if let Some((v, _)) = self.update.take() {
             if let Some(dir) = session::dir() {
                 crate::update::dismiss_in(&dir, Some(&v));
@@ -3629,7 +3629,7 @@ impl App {
                 if let Some((text, later)) = ask.filter(|_| asked.is_none()) {
                     self.banner_note = Some((text, Ask::Update));
                     self.request_redraw();
-                    if later && self.at_close.is_none() {
+                    if later && arms(self.at_close.as_ref(), &v) {
                         self.at_close = Some((v.clone(), None));
                         let keys = keymap::press_for(Action::Update, &self.config.keys);
                         self.update = Some((v.clone(), crate::update::at_close(&v, &keys)));
@@ -6271,6 +6271,25 @@ fn first_hint(user: &[keymap::Binding]) -> String {
         .filter_map(|&(a, what)| Some(format!("{} {what}", keymap::keys_for(a, user)?)))
         .collect();
     parts.join(" \u{b7} ")
+}
+
+/// An update left for when blitz closes: its release, and its installer
+/// once downloaded.
+type AtClose = (String, Option<PathBuf>);
+
+/// Whether Ctrl+Shift+U, leaving release `v` for when blitz closes, starts
+/// its download: not when `at_close` already holds it, but when it holds an
+/// older release, which a later look replaced on the banner.
+fn arms(at_close: Option<&AtClose>, v: &str) -> bool {
+    at_close.is_none_or(|a| a.0 != v)
+}
+
+/// What is left of an update for when blitz closes once the banner goes,
+/// by its x or with checks turned off: nothing, unless Ctrl+Shift+U asked
+/// to restart now (`updating`) while it downloads. That goes ahead, or its
+/// "Downloading" notice would stay, and the key do nothing, until a restart.
+fn kept_at_close(at_close: Option<AtClose>, updating: bool) -> Option<AtClose> {
+    at_close.filter(|_| updating)
 }
 
 /// What a click on the banner does.
@@ -9138,6 +9157,26 @@ mod tests {
             first_hint(&user),
             "Alt+P every action \u{b7} Ctrl+, settings"
         );
+    }
+
+    #[test]
+    fn an_update_left_for_close_follows_the_banner() {
+        let left = |v: &str, got: bool| (v.to_string(), got.then(|| PathBuf::from("setup.exe")));
+        // Pressed again for the same release, nothing downloads twice; for
+        // a newer one that took the banner, it does.
+        assert!(arms(None, "0.0.5"));
+        assert!(!arms(Some(&left("0.0.5", false)), "0.0.5"));
+        assert!(!arms(Some(&left("0.0.5", true)), "0.0.5"));
+        assert!(arms(Some(&left("0.0.5", true)), "0.0.6"));
+        // Hiding the banner drops it, but not a restart asked for while it
+        // downloads.
+        assert_eq!(kept_at_close(Some(left("0.0.5", true)), false), None);
+        assert_eq!(kept_at_close(Some(left("0.0.5", false)), false), None);
+        assert_eq!(
+            kept_at_close(Some(left("0.0.5", false)), true),
+            Some(left("0.0.5", false))
+        );
+        assert_eq!(kept_at_close(None, true), None);
     }
 
     #[test]
