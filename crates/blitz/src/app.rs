@@ -124,6 +124,11 @@ const SAVED_LINES: usize = 1000;
 /// key writes the file at most once this often rather than every step. A
 /// divider drag writes it once, after the drag.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// Failed writes of the session in a row after which the user is told,
+/// once: a release build has no console, so the window is otherwise not
+/// saved without a word.
+const SAVE_WARN: u32 = 3;
 /// How long to wait before building the renderer again after it failed.
 const GFX_RETRY: Duration = Duration::from_secs(1);
 /// Time between the steps a drag scrolls while the pointer is held above
@@ -1121,6 +1126,8 @@ struct App {
     save_after: Option<Instant>,
     /// Writes of the session in a row that failed.
     save_fails: u32,
+    /// A notification failed, and the user was told.
+    toasts_failed: bool,
     /// No renderer could be built; the next try is not before this.
     gfx_retry: Option<Instant>,
     /// Where the window last was while not minimized, maximized or full
@@ -1586,6 +1593,7 @@ impl App {
             saved: None,
             save_after: None,
             save_fails: 0,
+            toasts_failed: false,
             gfx_retry: None,
             placed: Geometry::default(),
             watched: None,
@@ -4442,8 +4450,12 @@ impl App {
                 true
             }
             Ok(None) => false,
+            // Said once, where it is seen: a release build has no console.
             Err(e) => {
                 eprintln!("blitz: notification: {e}");
+                if !std::mem::replace(&mut self.toasts_failed, true) {
+                    self.error(id, format!("Windows notifications are not working: {e}"));
+                }
                 false
             }
         }
@@ -5565,20 +5577,24 @@ impl App {
         self.save_after = None;
         // Output, which changes all the time, is saved only at exit, and
         // only once the layout holding the keys it is filed by was written.
-        let written = match session::save(&s) {
-            Ok(()) => {
-                if force {
-                    self.save_output();
-                }
-                true
-            }
-            Err(e) => {
-                eprintln!("blitz: saving the session: {e}");
-                false
-            }
-        };
+        let written = session::save(&s);
+        if written.is_ok() && force {
+            self.save_output();
+        }
         let now = Instant::now();
-        self.save_after = saved(written, s, now, &mut self.saved, &mut self.save_fails);
+        let ok = written.is_ok();
+        self.save_after = saved(ok, s, now, &mut self.saved, &mut self.save_fails);
+        if let Err(e) = written {
+            eprintln!("blitz: saving the session: {e}");
+            if self.save_fails == SAVE_WARN
+                && let Some(id) = self.focus_id()
+            {
+                self.error(
+                    id,
+                    format!("blitz cannot save this window ({e}); it keeps trying"),
+                );
+            }
+        }
     }
 
     /// Saves each pane's recent output when `restore_scrollback` is on, and
