@@ -1513,8 +1513,11 @@ impl App {
         }
         self.selection = None;
         self.find = None;
-        if let Some(v) = before.and_then(|id| self.view_mut(id)) {
-            v.notice.take_if(|n| n.ask.of_pane());
+        if let Some(left) = before {
+            focus_left(
+                self.views.iter_mut().map(|v| (v.pane.id, &mut v.notice)),
+                left,
+            );
         }
         self.mouse.drag = None;
         // A drag belongs to the tab it started in.
@@ -4104,6 +4107,23 @@ fn tell_focus(v: &View, focused: bool) {
     drop(term);
 }
 
+/// Whether the user, `away` when a pane changed, is back to see the
+/// focused pane: blitz run does not cover it, and they are `here`, which
+/// is asked only then. Clears `away` if so.
+fn back_at_screen(away: &mut bool, game_open: bool, here: impl FnOnce() -> bool) -> bool {
+    let back = *away && !game_open && here();
+    *away &= !back;
+    back
+}
+
+/// Takes a question about pane `left`, which focus just left, off it, so
+/// a press in another pane never answers it. Other notices stay.
+fn focus_left<'a>(notices: impl Iterator<Item = (PaneId, &'a mut Option<Notice>)>, left: PaneId) {
+    for (_, n) in notices.filter(|(id, _)| *id == left) {
+        n.take_if(|n| n.ask.of_pane());
+    }
+}
+
 /// Whether the user is at the window: it is in front, and they touched a
 /// key or the mouse in the last `AWAY_AFTER`, `idle` being how long ago.
 /// Walking away from blitz must not let a question pass as seen.
@@ -4746,11 +4766,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.drain_keys(el);
         // Back at the screen, with a key or the mouse: the focused pane
         // is in view again.
-        if self.away && self.game.is_none() && present(self.focused, idle_for()) {
-            self.away = false;
-            if let Some(id) = self.focus_id() {
-                self.attention(id, Ev::Attended);
-            }
+        let game = self.game.is_some();
+        if back_at_screen(&mut self.away, game, || present(self.focused, idle_for()))
+            && let Some(id) = self.focus_id()
+        {
+            self.attention(id, Ev::Attended);
         }
         self.save_session(false);
         let flow = match self.next_deadline() {
@@ -6071,6 +6091,46 @@ mod tests {
             Some(("n".into(), false))
         );
         assert_eq!(notice_line(None, None), None);
+    }
+
+    /// Focus leaving a pane takes its close or paste question with it, and
+    /// leaves every other notice, there and in other panes.
+    #[test]
+    fn focus_leaving_a_pane_takes_its_question() {
+        let notice = |ask| {
+            Some(Notice {
+                text: "n".into(),
+                until: None,
+                dim: false,
+                ask,
+            })
+        };
+        for ask in [Ask::ClosePane, Ask::CloseTab, Ask::Paste(String::new())] {
+            let mut notices = [(PaneId(1), notice(ask.clone())), (PaneId(2), notice(ask))];
+            focus_left(notices.iter_mut().map(|(id, n)| (*id, n)), PaneId(1));
+            assert!(notices[0].1.is_none());
+            assert!(notices[1].1.is_some(), "only the pane focus left");
+        }
+        for ask in [Ask::Key, Ask::Update, Ask::Quit, Ask::Nothing] {
+            let mut notices = [(PaneId(1), notice(ask))];
+            focus_left(notices.iter_mut().map(|(id, n)| (*id, n)), PaneId(1));
+            assert!(notices[0].1.is_some());
+        }
+    }
+
+    /// Coming back to the screen after a change while away sees the
+    /// focused pane, once, unless blitz run covers it.
+    #[test]
+    fn back_at_the_screen_sees_the_focused_pane() {
+        let mut away = false;
+        assert!(!back_at_screen(&mut away, false, || unreachable!()));
+        away = true;
+        assert!(!back_at_screen(&mut away, true, || true));
+        assert!(!back_at_screen(&mut away, false, || false));
+        assert!(away, "still away");
+        assert!(back_at_screen(&mut away, false, || true));
+        assert!(!away);
+        assert!(!back_at_screen(&mut away, false, || true), "once");
     }
 
     #[test]
