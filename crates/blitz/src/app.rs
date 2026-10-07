@@ -1289,11 +1289,7 @@ impl App {
         cwd: Option<PathBuf>,
     ) -> Result<(), String> {
         let grids = self.grids(&win);
-        let split = self.focus_id();
-        let small = |&(p, (c, r)): &(PaneId, (i32, i32))| {
-            (p == id || Some(p) == split) && (c < layout::MIN_COLS || r < layout::MIN_ROWS)
-        };
-        if !self.views.is_empty() && grids.iter().any(small) {
+        if !self.views.is_empty() && no_room(&win, &grids, id, self.focus_id()) {
             return Err("no room for another pane".into());
         }
         self.spawn(id, &grids, cmd, cwd, None)?;
@@ -1377,8 +1373,8 @@ impl App {
     }
 
     /// Starts a session for pane `id`, sized as `grids` lays it out (or
-    /// 80x24 while hidden), running `cmd` or else the shell, below `old`,
-    /// output saved by [`session::save_output`].
+    /// 80x24 when it has no place there), running `cmd` or else the shell,
+    /// below `old`, output saved by [`session::save_output`].
     fn spawn(
         &mut self,
         id: PaneId,
@@ -4372,6 +4368,24 @@ fn tab_grids(
         .collect()
 }
 
+/// Whether `grids` leave pane `id`, new in `win`, or `split`, the pane it
+/// split, below the minimum size. Only the tab shown counts: a new tab
+/// splits nothing, and the pane focused before it may be one the window
+/// already made small.
+fn no_room(
+    win: &layout::Window,
+    grids: &[(PaneId, (i32, i32))],
+    id: PaneId,
+    split: Option<PaneId>,
+) -> bool {
+    let shown = win.tabs.get(win.active).map(Tab::panes).unwrap_or_default();
+    grids.iter().any(|&(p, (c, r))| {
+        (p == id || Some(p) == split)
+            && shown.contains(&p)
+            && (c < layout::MIN_COLS || r < layout::MIN_ROWS)
+    })
+}
+
 /// When a pane whose size changed gives its terminal the new size: now
 /// (`None`), unless the terminal `last` took one within [`RESIZE_GAP`],
 /// then that long after it. The first change goes at once and the last
@@ -5873,6 +5887,33 @@ mod tests {
             "another divider"
         );
         assert!(!evens(&mut last, 2, t0 + ms(1100), within), "too late");
+    }
+
+    /// A new tab has room even when the pane focused before it, now in a
+    /// tab not shown, is below the minimum; a split checks the pane it
+    /// splits.
+    #[test]
+    fn app_a_small_pane_in_another_tab_leaves_room_for_a_new_tab() {
+        let any = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 400,
+        };
+        let mut a = Tab::new("a".into(), PaneId(1));
+        assert!(a.split(Dir::Right, PaneId(3), any, (0, 0)));
+        let mut win = layout::Window::default();
+        win.tabs.push(a);
+        win.tabs.push(Tab::new("b".into(), PaneId(2)));
+        win.active = 1;
+        let grids = [
+            (PaneId(1), (4, 2)),
+            (PaneId(3), (4, 2)),
+            (PaneId(2), (80, 24)),
+        ];
+        assert!(!no_room(&win, &grids, PaneId(2), Some(PaneId(1))), "a tab");
+        win.active = 0;
+        assert!(no_room(&win, &grids, PaneId(3), Some(PaneId(1))), "a split");
     }
 
     /// Restored panes in tabs not shown start at their real size, so Claude
