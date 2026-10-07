@@ -318,24 +318,61 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
     ch(16) | ch(8) | ch(0)
 }
 
+/// Each sRGB channel value in linear light, looked up rather than worked
+/// out, as the renderer asks for every cell.
+fn linear() -> &'static [f64; 256] {
+    static LINEAR: std::sync::LazyLock<[f64; 256]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|i| {
+            let c = i as f64 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    });
+    &LINEAR
+}
+
 /// WCAG 2 relative luminance of `0xRRGGBB`.
 fn luminance(rgb: u32) -> f64 {
     let [_, r, g, b] = rgb.to_be_bytes();
-    let lin = |c: u8| {
-        let c = f64::from(c) / 255.0;
-        if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    let lin = linear();
+    0.2126 * lin[usize::from(r)] + 0.7152 * lin[usize::from(g)] + 0.0722 * lin[usize::from(b)]
 }
 
 /// WCAG 2 contrast ratio between two `0xRRGGBB` colours.
-fn contrast(a: u32, b: u32) -> f64 {
+pub fn contrast(a: u32, b: u32) -> f64 {
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `fg`, or when it stands less than `min`:1 from `bg`, `fg` moved toward
+/// white or black, whichever has room, just far enough to. Moving in
+/// linear light keeps its hue.
+pub fn readable(fg: u32, bg: u32, min: f64) -> u32 {
+    let (f, b) = (luminance(fg), luminance(bg));
+    if (f.max(b) + 0.05) / (f.min(b) + 0.05) >= min {
+        return fg;
+    }
+    // The luminance `fg` needs, above `bg` or below it.
+    let (up, down) = (min * (b + 0.05) - 0.05, (b + 0.05) / min - 0.05);
+    let lighter = if f >= b { up <= 1.0 } else { down < 0.0 };
+    let lin = linear();
+    let ch = |s: u32| {
+        let c = lin[(fg >> s & 0xff) as usize];
+        // Each channel moves by the share luminance must, and rounds
+        // away from `bg`.
+        let i = if lighter {
+            let want = c + (1.0 - c) * (up - f) / (1.0 - f);
+            lin.partition_point(|&l| l < want).min(255)
+        } else {
+            let want = c * down / f;
+            lin.partition_point(|&l| l <= want).saturating_sub(1)
+        };
+        (i as u32) << s
+    };
+    ch(16) | ch(8) | ch(0)
 }
 
 /// `%APPDATA%\blitz\themes`.
@@ -888,6 +925,38 @@ mod tests {
             assert_eq!(current_of(all(), "light:x,dark:y", light).name, want);
             assert_eq!(current_of(Vec::new(), "nope", light).name, want);
         }
+    }
+
+    #[test]
+    fn readable_moves_text_just_far_enough_from_its_background() {
+        let d = dark();
+        // Palette 0 on the blitz dark background, near-black text on black
+        // and grey on white all come out at 1.3:1, a step past it at most.
+        for (fg, bg) in [
+            (d.ansi[0], d.bg),
+            (0x000000, 0x000001),
+            (0x101010, 0x000000),
+            (0xf0f0f0, 0xffffff),
+            (0x777777, 0x808080),
+            (0x808080, 0x777777),
+        ] {
+            let r = readable(fg, bg, 1.3);
+            let c = contrast(r, bg);
+            assert!(
+                (1.3..1.36).contains(&c),
+                "{fg:06x} on {bg:06x}: {r:06x} {c:.3}"
+            );
+        }
+        // Lighter text gets lighter and darker text darker, where there
+        // is room.
+        assert!(luminance(readable(0x101010, 0x000000, 1.3)) > luminance(0x101010));
+        assert!(luminance(readable(0xf0f0f0, 0xffffff, 1.3)) < luminance(0xf0f0f0));
+        assert!(luminance(readable(0x000000, 0x020202, 1.3)) > luminance(0x020202));
+        // Text that already shows keeps its colour; a dark red stays red.
+        assert_eq!(readable(d.fg, d.bg, 1.3), d.fg);
+        assert_eq!(readable(0x2e7a45, 0xfcfcfb, 1.3), 0x2e7a45);
+        let [_, r, g, b] = readable(0x300000, 0x000000, 1.3).to_be_bytes();
+        assert!(r > g && g == b, "{r} {g} {b}");
     }
 
     #[test]

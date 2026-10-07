@@ -161,6 +161,7 @@ mod gpu {
     use super::d3d11::{ATLAS_SIZE, CURLY, DASHED, DOTTED, GLYPH, Gpu, MASK, Quad, SOLID, rgba};
     use super::font::{BOLD, DEFAULT_FAMILIES, E_PENDING, Font, ITALIC};
     use super::{builtin, text_snapshot, write_bmp};
+    use crate::theme::readable;
 
     /// Default font size: 12 pt at 96 DPI.
     pub const DEFAULT_PX: f32 = 16.0;
@@ -175,6 +176,10 @@ mod gpu {
 
     /// [`RenderCell::attrs`] bits drawn as lines.
     const LINES: u16 = attr::UNDERLINE | attr::STRIKE | attr::OVERLINE;
+
+    /// The least contrast text keeps with its background: black on a dark
+    /// background shows, and a theme's quiet greys keep their look.
+    const MIN_CONTRAST: f64 = 1.3;
 
     pub struct Renderer {
         pub gpu: Gpu,
@@ -288,7 +293,8 @@ mod gpu {
 
         /// Adds `snap` with its top-left corner at (`x`, `y`). Cell colours
         /// are used as given (the snapshot has already applied inverse and
-        /// the palette), except that dim text is drawn halfway to its
+        /// the palette), except that text too close to its background is
+        /// moved away from it, and dim text is drawn halfway to its
         /// background.
         pub fn snapshot(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
             self.grid(snap, pal, x, y, false, false, true);
@@ -428,6 +434,19 @@ mod gpu {
             for r in 0..rows {
                 for c in 0..cols {
                     let mut cl = cell(c, r);
+                    // Text too close to its background to read moves just
+                    // far enough from it, before any dimming. Box drawing
+                    // and blocks keep their colours: they draw shapes,
+                    // often meant to blend in. Text in its own background
+                    // is hidden on purpose.
+                    let fg = readable(cl.fg, cl.bg, MIN_CONTRAST);
+                    let text = &cl.text[..usize::from(cl.len).min(cl.text.len())];
+                    if fg != cl.fg && cl.fg != cl.bg && !is_builtin(text) {
+                        if cl.ul == cl.fg {
+                            cl.ul = fg;
+                        }
+                        cl.fg = fg;
+                    }
                     // Faint text is dimmer already than a pane without
                     // focus makes text; both at once is unreadable.
                     let faint = cl.attrs & attr::DIM != 0;
@@ -1464,6 +1483,32 @@ mod tests {
         let px = r.gpu.read(&t).expect("read");
         assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), 0x7f4020);
         assert_eq!(pixel(&px, w, cw / 2, ch / 2), toward(p.fg, p.bg));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_text_close_to_its_background_shows_but_shapes_keep_their_colour() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        // Black text on the dark background, underlined so its colour
+        // shows exactly; a block and a dim cell in the same colours.
+        let mut snap = text_snapshot("x\u{2588}x", 3, 1, &p);
+        for c in &mut snap.cells {
+            (c.fg, c.ul) = (0x000000, 0x000000);
+        }
+        snap.cells[0].attrs = 1 << vt::snapshot::attr::UNDERLINE_SHIFT;
+        snap.cells[2].attrs = snap.cells[0].attrs | vt::snapshot::attr::DIM;
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let uy = r.font.underline_y as u32;
+        let shown = crate::theme::readable(0x000000, p.bg, 1.3);
+        assert_eq!(pixel(&px, w, 1, uy), shown, "the text's line");
+        assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), 0x000000, "the block");
+        assert_eq!(
+            pixel(&px, w, 2 * cw + 1, uy),
+            mix(shown, p.bg),
+            "then dimmed"
+        );
     }
 
     #[cfg(windows)]
