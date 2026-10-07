@@ -4563,7 +4563,8 @@ impl App {
         let Some(s) = self.sessions().into_iter().find(|s| s.id == id) else {
             return false;
         };
-        let lines = toast_text(&s);
+        let titled = self.view(id).is_some_and(|v| v.pane.msg.is_empty());
+        let lines = toast_text(&s, titled);
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
         let xml = crate::notify::toast_xml(&lines, !self.config.sound);
         match crate::notify::toast(id, &xml, &self.proxy) {
@@ -6387,19 +6388,22 @@ fn untoasts(attended: bool, state: Attn) -> bool {
 
 /// The lines of a notification about session `s`: its name, numbered as
 /// the sidebar numbers it, and what it wants, its last message, and its
-/// folder.
-fn toast_text(s: &chrome::Session) -> [String; 3] {
+/// folder. A message that is only the pane's title (`titled`), which any
+/// program sets, is left out, or it would speak as blitz; an exit gives
+/// its code there instead.
+fn toast_text(s: &chrome::Session, titled: bool) -> [String; 3] {
     let what = match s.state {
         Attn::NeedsYou => "needs you",
         Attn::Error => "failed",
         _ => "finished",
     };
     let num = s.num.map(|n| format!(" {n}")).unwrap_or_default();
-    [
-        format!("{}{num} {what}", s.name),
-        s.msg.clone(),
-        s.cwd.clone(),
-    ]
+    let msg = match s.exit_code {
+        _ if !titled => s.msg.clone(),
+        Some(code) => crate::attention::exit_text(code),
+        None => String::new(),
+    };
+    [format!("{}{num} {what}", s.name), msg, s.cwd.clone()]
 }
 
 /// How many rows of `cell_h` pixels the find bar covers at the top of a
@@ -9909,18 +9913,29 @@ mod tests {
             below: 0,
         };
         assert_eq!(
-            toast_text(&s(Attn::NeedsYou)),
+            toast_text(&s(Attn::NeedsYou), false),
             ["pwsh 3 needs you", "Bash: cargo test", r"C:\dev\blitz"]
         );
-        assert_eq!(toast_text(&s(Attn::Error))[0], "pwsh 3 failed");
-        assert_eq!(toast_text(&s(Attn::DoneUnseen))[0], "pwsh 3 finished");
+        assert_eq!(toast_text(&s(Attn::Error), false)[0], "pwsh 3 failed");
+        assert_eq!(
+            toast_text(&s(Attn::DoneUnseen), false)[0],
+            "pwsh 3 finished"
+        );
+        // A title, which any program sets, never shows: an exit's code does.
+        let exited = chrome::Session {
+            msg: "Windows Security: sign in".into(),
+            exit_code: Some(1),
+            ..s(Attn::Error)
+        };
+        assert_eq!(toast_text(&exited, true)[1], "exit 1");
+        assert_eq!(toast_text(&s(Attn::Error), true)[1], "");
         // A session that shares its name has its number, as in the sidebar.
         let twin = chrome::Session {
             name: "claude".into(),
             num: Some(2),
             ..s(Attn::NeedsYou)
         };
-        assert_eq!(toast_text(&twin)[0], "claude 2 needs you");
+        assert_eq!(toast_text(&twin, false)[0], "claude 2 needs you");
     }
 
     #[test]
