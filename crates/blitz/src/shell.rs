@@ -719,17 +719,18 @@ pub struct Launch {
 fn parts(shell: &str) -> (&str, &str) {
     let shell = shell.trim();
     let spaces = shell.rmatch_indices([' ', '\t']).map(|m| m.0);
+    // `\Program Files\...`, with no drive, is a path too, and so is
+    // `tools\nu.exe`, from the current folder as `CreateProcessW` reads it.
+    let path = (shell.split([' ', '\t']).next()).is_some_and(|w| w.contains(['\\', '/']));
     let program = |&i: &usize| {
         let p = Path::new(&shell[..i]);
         let ext = p.extension().unwrap_or_default();
         let runs = ["exe", "com", "bat", "cmd"]
             .iter()
             .any(|e| ext.eq_ignore_ascii_case(e));
-        // `\Program Files\...`, with no drive, is a path too.
-        p.has_root() && runs && p.is_file()
+        path && runs && p.is_file()
     };
     let unquoted = !shell.starts_with('"');
-    let path = (shell.split([' ', '\t']).next()).is_some_and(|w| w.contains(['\\', '/']));
     match (std::iter::once(shell.len()).chain(spaces)).find(|i| unquoted && program(i)) {
         Some(i) => shell.split_at(i),
         None if unquoted && path => (shell, ""),
@@ -1071,6 +1072,18 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
         assert_eq!(got, format!("\"{}\"", sh.display()));
         assert_eq!(with, format!("\"{}\" --login -i", sh.display()));
         assert_eq!(shown, "sh.exe --login -i");
+    }
+
+    /// A program from the current folder takes arguments too.
+    #[test]
+    fn a_relative_path_takes_arguments() {
+        let dir = format!("blitz-rel-{}", std::process::id());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(Path::new(&dir).join("nu.exe"), b"").unwrap();
+        let (program, shell) = (format!("{dir}/nu.exe"), format!("{dir}/nu.exe -l"));
+        let got = parts(&shell);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, (program.as_str(), " -l"));
     }
 
     /// Cut at its first space, a missing program would run as the first
