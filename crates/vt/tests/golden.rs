@@ -306,6 +306,20 @@ fn line_text(t: &Terminal, n: usize) -> Option<String> {
 }
 
 #[test]
+fn a_held_view_stays_on_its_text() {
+    let mut t = run(10, 2, "a\r\nb");
+    t.hold(true);
+    feed(&mut t, "\r\nc\r\nd");
+    assert_eq!(t.view_top(), 0, "at the bottom, still");
+    t.hold(false);
+    feed(&mut t, "\r\ne");
+    assert_eq!(t.view_top(), 0, "scrolled back now, so it stays");
+    t.scroll_viewport(isize::MIN);
+    feed(&mut t, "\r\nf");
+    assert_eq!(t.view_top(), t.screen_top(), "follows output again");
+}
+
+#[test]
 fn lines_keep_their_numbers_until_they_leave_scrollback() {
     let mut t = Terminal::new(Options {
         cols: 10,

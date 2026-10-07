@@ -142,6 +142,8 @@ pub struct Terminal {
     viewport: usize,
     /// The main screen's view while the alternate screen is up.
     other_viewport: usize,
+    /// The view stays on its text while output scrolls, even at the bottom.
+    hold: bool,
     /// Counts the times line numbers started over on both screens; see
     /// [`Self::line_epoch`].
     line_epoch: u32,
@@ -224,6 +226,7 @@ impl Terminal {
             cluster: None,
             viewport: 0,
             other_viewport: 0,
+            hold: false,
             line_epoch: 0,
             changed: true,
             modes: Modes::default(),
@@ -335,6 +338,13 @@ impl Terminal {
     /// How many lines the view is scrolled back from the bottom.
     pub fn viewport(&self) -> usize {
         self.viewport
+    }
+
+    /// While `on`, output that scrolls the main screen leaves the view on
+    /// the text it shows, as it does once scrolled back: text being
+    /// selected stays under the pointer.
+    pub fn hold(&mut self, on: bool) {
+        self.hold = on;
     }
 
     /// The line at the top of the view, numbered as [`Grid::dropped`]
@@ -822,7 +832,7 @@ impl Terminal {
             self.screen
                 .grid
                 .scroll_up(self.top, self.bottom, 1, blank, keep);
-            if keep && self.viewport > 0 {
+            if keep && (self.viewport > 0 || self.hold) {
                 // Keep a scrolled-back view on the same text. Once the
                 // scrollback is full its length stays put while every row
                 // moves up one, so count the row, not the change in length.
@@ -1009,6 +1019,7 @@ impl Terminal {
         t.focused = self.focused;
         t.cell_px = self.cell_px;
         t.pal = self.pal;
+        t.hold = self.hold;
         // ConPTY turns these on for itself at startup and is not told that
         // a program reset the terminal, so they stay.
         t.modes.input.w32im = self.modes.input.w32im;
