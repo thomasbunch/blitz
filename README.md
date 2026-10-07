@@ -315,6 +315,7 @@ go to the program.
 | Ctrl+Shift+P | Command palette |
 | Ctrl+=, Ctrl+-, Ctrl+0 | Font size up, down, and back to the setting, until blitz restarts |
 | F11 | Full screen |
+| Alt+Space | Window menu: move, size, minimize, close |
 | Ctrl+C, Ctrl+Shift+C, Ctrl+Insert | Copy, when text is selected |
 | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Paste |
 | Shift+PgUp, Shift+PgDn | Scroll |
@@ -352,16 +353,16 @@ defaults stay; Ctrl+1 to Ctrl+9 go to a tab unless a binding takes them.
 Lines blitz cannot read are skipped.
 
 The actions are `copy`, `paste`, `scroll_page_up`, `scroll_page_down`,
-`new_tab`, `close_pane`, `close_tab`, `reopen_closed`,
-`rename_session`, `rename_tab`, `next_tab`, `previous_tab`,
-`split_right`, `split_down`, `focus_left`, `focus_right`, `focus_up`,
-`focus_down`, `jump_to_attention`, `toggle_sidebar`, `update`,
-`theme_picker`, `settings`, `zoom`, `resize_left`, `resize_right`,
-`resize_up`, `resize_down`, `swap_left`, `swap_right`, `swap_up`,
-`swap_down`, `equalize`, `font_size_up`, `font_size_down`,
-`font_size_reset`, `fullscreen`, `command_palette`, `find`,
-`previous_prompt`, `next_prompt` and `claude_setup`. Typing a name in
-the command palette finds its action.
+`new_tab`, `close_pane`, `close_tab`, `reopen_closed`, `rename_session`,
+`rename_tab`, `next_tab`, `previous_tab`, `split_right`, `split_down`,
+`focus_left`, `focus_right`, `focus_up`, `focus_down`,
+`jump_to_attention`, `toggle_sidebar`, `update`, `theme_picker`,
+`settings`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
+`resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
+`equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
+`fullscreen`, `command_palette`, `find`, `previous_prompt`,
+`next_prompt`, `system_menu` and `claude_setup`. Typing a name in the
+command palette finds its action.
 
 ## License
 
