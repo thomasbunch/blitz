@@ -216,6 +216,7 @@ writes it.
 | `check_updates` | `true` | Look for a newer release |
 | `flash` | `true` | Flash the taskbar button when a session needs you |
 | `bell_attention` | `true` | Treat a bell or a notification in a background pane as needing you |
+| `editor_uri` | `""` | Ctrl+click on a file path opens it at its line through this URI, such as `"vscode://file/{path}:{line}:{col}"`. Empty opens the file with its program, or shows it in Explorer when it has none |
 | `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
 | `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
 | `keybind` | | Binds a key to an action; one line per key. See [Key bindings](#key-bindings) |
@@ -298,9 +299,17 @@ lines share.
 
 Holding Ctrl underlines the link under the pointer: a hyperlink a
 program printed, a web address, or the path of a file that exists,
-relative ones from the pane's folder. Only web, mail and local file
-links open. A file that would run when opened, such as a program,
-script, shortcut or installer, is shown selected in Explorer instead.
+relative ones from the pane's folder and `~` from your user folder. A
+path counts in Claude Code's `Update(src/app.rs)`, in a Markdown link,
+and as a bare `name.ext` when that file is in the pane's folder. Only
+web, mail and local file links open. A file that would run when
+opened, such as a program, script, shortcut or installer, is shown
+selected in Explorer instead, and so is one no program opens.
+
+With an editor set in `editor_uri`, Ctrl+click opens a file there at
+the line and column after its path, as in `src/app.rs:12:5` or
+`src/app.ts(12,5)`. This works in Claude Code's fullscreen too, where
+other clicks go to Claude Code.
 
 When a program takes the mouse itself, as Claude Code does in
 fullscreen, clicks go to it. Hold Shift as well to use blitz's
