@@ -272,6 +272,12 @@ pub fn sidebar_w(width: i32, scale: f32, tw: i32) -> i32 {
     let least = (SIDEBAR_W * scale).round() as i32;
     (SIDEBAR_CELLS * tw).max(least).min(width * 2 / 5)
 }
+/// A pane header's height for chrome text `th` pixels high, which a large
+/// font size makes taller than the strip.
+fn header_h(scale: f32, th: i32) -> i32 {
+    let s = |v: f32| (v * scale).round() as i32;
+    s(HEADER_H).max(th + s(6.0))
+}
 
 /// The part of a `size` window that the active tab's panes share: all of
 /// it but the sidebar or rail, shown once there are two sessions, and the
@@ -307,14 +313,15 @@ pub fn dims(split: bool, state: Attn) -> bool {
 }
 
 /// What a pane's tile holds besides its terminal grid: the padding left
-/// and right, and the header strip and padding above the grid. A tab of
-/// one pane has no header. Beside the rail, the pane's name goes in a
-/// band above the grid, `th` high text and a margin, so it covers no
-/// output, such as the footer on Claude Code's last row.
+/// and right, and the header strip and padding above the grid, with
+/// chrome text `th` pixels high. A tab of one pane has no header. Beside
+/// the rail, the pane's name goes in a band above the grid, text and a
+/// margin, so it covers no output, such as the footer on Claude Code's
+/// last row.
 pub fn pane_frame(scale: f32, expanded: bool, multi: bool, th: i32) -> (i32, i32) {
     let s = |v: f32| (v * scale).round() as i32;
     let (px, top) = match (expanded, multi) {
-        (true, true) => (14.0, s(HEADER_H) + s(8.0)),
+        (true, true) => (14.0, header_h(scale, th) + s(8.0)),
         (true, false) => (14.0, s(8.0)),
         (false, true) => (16.0, th + s(6.0)),
         (false, false) => (16.0, s(12.0)),
@@ -418,7 +425,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
         let reported = sess.and_then(|x| x.progress);
         let focused = id == tab.focus;
         if multi && expanded {
-            let hh = s(HEADER_H);
+            let hh = header_h(m.scale, th);
             if focused {
                 p.push(Prim::Rect(Rect { h: hh, ..r }, c.hdr_bg));
             }
@@ -2127,6 +2134,18 @@ mod tests {
     }
 
     #[test]
+    fn headers_fit_large_chrome_text() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.text_cell = (14, 30);
+        let c = build(&m);
+        assert!(c.panes.iter().all(|(_, r)| r.y == 36 + 8));
+        let line =
+            |p: &Prim| matches!(p, Prim::Rect(r, color) if *color == m.ui.hdr_line && r.y == 35);
+        assert!(c.prims.iter().any(line));
+    }
+
+    #[test]
     fn sidebar_rows_keep_their_height() {
         let (win, mut sessions, now) = fleet(true);
         sessions[2].msg = "title".into();
@@ -2765,6 +2784,8 @@ mod tests {
         assert_eq!(pane_frame(1.0, false, true, 15), (32, 21));
         assert_eq!(pane_frame(1.0, false, false, 15), (32, 12));
         assert_eq!(pane_frame(1.5, true, true, 22), (42, 45));
+        // A header grows to fit large chrome text.
+        assert_eq!(pane_frame(1.0, true, true, 30), (28, 36 + 8));
     }
 
     #[test]

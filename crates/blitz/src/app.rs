@@ -1163,8 +1163,12 @@ impl App {
         }
     }
 
-    fn font_px(&self) -> f32 {
-        (self.config.font_size + self.font_zoom) * 96.0 / 72.0 * self.scale as f32
+    /// The terminal font's size in pixels, zoomed, and the size the
+    /// settings give it, which the chrome follows.
+    fn font_px(&self) -> (f32, f32) {
+        let px = |pt: f32| pt * 96.0 / 72.0 * self.scale as f32;
+        let set = self.config.font_size;
+        (px(set + self.font_zoom), px(set))
     }
 
     /// Creates the window and starts the first session.
@@ -1643,7 +1647,7 @@ impl App {
         self.gfx.as_ref().map_or((8, 16), |g| g.r.cell())
     }
 
-    /// Cell size of the sidebar font.
+    /// Cell size of the chrome font.
     fn text_cell(&self) -> (u32, u32) {
         self.gfx.as_ref().map_or((6, 12), |g| g.r.small_cell())
     }
@@ -2007,10 +2011,10 @@ impl App {
     /// Loads the configured font at the size the window's DPI and the font
     /// zoom need, and tells each terminal its new cell size.
     fn reload_font(&mut self) {
-        let px = self.font_px();
+        let (px, base) = self.font_px();
         if let Some(g) = &mut self.gfx
             && let Err(e) =
-                g.r.set_font(&self.config.font_family, px, self.scale as f32)
+                g.r.set_font(&self.config.font_family, px, base, self.scale as f32)
         {
             eprintln!("blitz: font: {e}");
         }
@@ -2228,12 +2232,13 @@ impl App {
         };
         let size = window.inner_size();
         let early = self.gpu.take().and_then(|h| h.join().ok()?.ok());
-        let (family, px, scale) = (&self.config.font_family, self.font_px(), self.scale as f32);
+        let (family, (px, base), scale) =
+            (&self.config.font_family, self.font_px(), self.scale as f32);
         let built = match early {
             Some(gpu) => Ok(gpu),
             None => Gpu::new(false),
         }
-        .and_then(|gpu| Renderer::with_gpu(gpu, family, px, scale));
+        .and_then(|gpu| Renderer::with_gpu(gpu, family, px, base, scale));
         let built = built.and_then(|r| {
             let hwnd = HWND(self.hwnd as *mut c_void);
             let chain = Swapchain::new(&r.gpu, hwnd, size.width, size.height)?;

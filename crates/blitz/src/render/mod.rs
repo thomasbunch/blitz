@@ -190,27 +190,36 @@ mod gpu {
         pending: bool,
     }
 
-    /// The terminal font and the chrome font: `family`, or the first of
-    /// the defaults installed, at DPI `scale`.
-    fn fonts(family: &str, px: f32, scale: f32) -> Result<(Font, Font)> {
+    /// The terminal font at `px` and the chrome font, sized from `base`,
+    /// the terminal font's size before any zoom, so the sidebar keeps its
+    /// text while the terminal zooms: `family`, or the first of the
+    /// defaults installed, at DPI `scale`.
+    fn fonts(family: &str, px: f32, base: f32, scale: f32) -> Result<(Font, Font)> {
         let families: Vec<&str> = (std::iter::once(family).filter(|f| !f.is_empty()))
             .chain(DEFAULT_FAMILIES.iter().copied())
             .collect();
         Ok((
             Font::new(&families, px)?,
-            Font::new(&families, super::chrome_px(px, scale))?,
+            Font::new(&families, super::chrome_px(base, scale))?,
         ))
     }
 
     impl Renderer {
         pub fn new(warp: bool, px: f32) -> Result<Self> {
-            Self::with_gpu(Gpu::new(warp)?, "", px, px / DEFAULT_PX)
+            Self::with_gpu(Gpu::new(warp)?, "", px, px, px / DEFAULT_PX)
         }
 
         /// [`Self::new`] on a device made elsewhere, in font `family`, at
-        /// DPI `scale`.
-        pub fn with_gpu(mut gpu: Gpu, family: &str, px: f32, scale: f32) -> Result<Self> {
-            let (font, small) = fonts(family, px, scale)?;
+        /// DPI `scale`, with the chrome sized from `base` as
+        /// [`Self::set_font`] does.
+        pub fn with_gpu(
+            mut gpu: Gpu,
+            family: &str,
+            px: f32,
+            base: f32,
+            scale: f32,
+        ) -> Result<Self> {
+            let (font, small) = fonts(family, px, base, scale)?;
             gpu.set_text_params(font.gamma, font.contrast);
             Ok(Self {
                 gpu,
@@ -224,9 +233,11 @@ mod gpu {
             })
         }
 
-        /// Loads another font, or the same at a new size after a DPI change.
-        pub fn set_font(&mut self, family: &str, px: f32, scale: f32) -> Result<()> {
-            (self.font, self.small) = fonts(family, px, scale)?;
+        /// Loads another font, or the same at a new size after a DPI change
+        /// or a zoom. The chrome font follows `base`, the size before any
+        /// zoom.
+        pub fn set_font(&mut self, family: &str, px: f32, base: f32, scale: f32) -> Result<()> {
+            (self.font, self.small) = fonts(family, px, base, scale)?;
             self.atlas.clear();
             Ok(())
         }
@@ -1341,9 +1352,10 @@ mod tests {
         let snap = text_snapshot("\u{2588}", 1, 1, &p);
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         render_offscreen(&mut r, &snap, &p).expect("render");
-        let small = r.cell();
-        r.set_font("", 24.0, 1.0).expect("font");
+        let (small, chrome) = (r.cell(), r.small_cell());
+        r.set_font("", 24.0, 16.0, 1.0).expect("font");
         assert!(r.cell().1 > small.1, "{:?} after {small:?}", r.cell());
+        assert_eq!(r.small_cell(), chrome, "a zoom leaves the chrome be");
         let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
         assert_eq!((w, h), r.cell());
         // The block was drawn again at the new size, not taken from the
@@ -1351,7 +1363,7 @@ mod tests {
         assert_eq!(pixel(&px, w, w - 1, h - 1), p.fg, "bottom right");
         assert_eq!(pixel(&px, w, 0, 0), p.fg, "top left");
         // A family that is not installed falls back to the defaults.
-        r.set_font("No Such Font 4b1d", 16.0, 1.0)
+        r.set_font("No Such Font 4b1d", 16.0, 16.0, 1.0)
             .expect("fallback font");
         assert_eq!(r.cell(), small);
     }
