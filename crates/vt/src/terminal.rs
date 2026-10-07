@@ -599,15 +599,15 @@ impl Terminal {
             // screen go to scrollback. Full-screen programs draw their
             // transcript this way above a fixed status area.
             let keep = self.top == 0 && !self.alt;
-            let before = self.screen.grid.scrollback_len();
             let blank = self.blank();
             self.screen
                 .grid
                 .scroll_up(self.top, self.bottom, 1, blank, keep);
-            if self.viewport > 0 {
-                // Keep a scrolled-back view on the same text.
-                let added = self.screen.grid.scrollback_len().saturating_sub(before);
-                self.viewport = (self.viewport + added).min(self.screen.grid.scrollback_len());
+            if keep && self.viewport > 0 {
+                // Keep a scrolled-back view on the same text. Once the
+                // scrollback is full its length stays put while every row
+                // moves up one, so count the row, not the change in length.
+                self.viewport = (self.viewport + 1).min(self.screen.grid.scrollback_len());
             }
         } else if self.cur.y + 1 < self.rows() {
             self.cur.y += 1;

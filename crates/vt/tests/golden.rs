@@ -403,6 +403,32 @@ fn viewport_follows_its_text() {
 }
 
 #[test]
+fn viewport_holds_its_text_once_scrollback_is_full() {
+    let mut t = Terminal::new(Options {
+        cols: 10,
+        rows: 3,
+        scrollback_lines: 5,
+        ambiguous_wide: false,
+    });
+    for i in 10..30 {
+        feed(&mut t, &format!("{i}\r\n"));
+    }
+    let top = |t: &mut Terminal| {
+        let s = snap(t);
+        format!("{}{}", text(&cell(&s, 0, 0)), text(&cell(&s, 1, 0)))
+    };
+    t.scroll_viewport(2);
+    assert_eq!(top(&mut t), "26");
+    feed(&mut t, "x\r\n");
+    assert_eq!(top(&mut t), "26", "each new row evicts the oldest");
+    // At the oldest row, the row it showed is gone; the view stays on top.
+    t.scroll_viewport(100);
+    assert_eq!(top(&mut t), "24");
+    feed(&mut t, "y\r\n");
+    assert_eq!(top(&mut t), "25");
+}
+
+#[test]
 fn snapshot_reports_changes() {
     let mut t = run(4, 2, "hi");
     let mut s = Snapshot::default();
