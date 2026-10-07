@@ -875,11 +875,14 @@ struct App {
     /// A newer release: its version and the banner text.
     update: Option<(String, String)>,
     /// The installer is downloading, or Ctrl+Shift+U is looking for a
-    /// release; this pane shows that.
+    /// release; this pane hears how it went.
     updating: Option<PaneId>,
     /// The folder and Claude Code session of the pane closed last, which
     /// the palette can reopen.
     closed: Option<(String, Option<String>)>,
+    /// Said in the banner in place of the offer for now: the question that
+    /// running Update again answers, or that the update is downloading.
+    banner_note: Option<(String, Ask)>,
     /// The banner strip in the last frame, for clicks.
     banner: Option<Rect>,
     /// The chips on panes scrolled back in the last frame, for clicks.
@@ -1143,6 +1146,7 @@ impl App {
             update: None,
             updating: None,
             closed: None,
+            banner_note: None,
             banner: None,
             below: Vec::new(),
             eaten: Eaten::default(),
@@ -1690,7 +1694,10 @@ impl App {
             text_cell: self.text_cell(),
             term_cell: self.cell(),
             now: Instant::now(),
-            banner: self.update.as_ref().map(|u| u.1.as_str()),
+            banner: banner_text(
+                self.update.as_ref(),
+                self.banner_note.as_ref().map(|n| n.0.as_str()),
+            ),
             preedit,
             picker: self.picker.as_ref().map(|p| chrome::Picker {
                 filter: &p.filter,
@@ -2382,6 +2389,8 @@ impl App {
             let here = Some(v.pane.id) == focus;
             gone |= v.notice.take_if(|n| n.ask.gone(a, here)).is_some();
         }
+        // The update's question in the banner goes the same way.
+        gone |= (self.banner_note.take_if(|n| n.1.gone(a, true))).is_some();
         if gone {
             self.request_redraw();
         }
@@ -2773,7 +2782,8 @@ impl App {
                 }
                 // Updating restarts blitz, which ends every session.
                 let busy = self.views.iter().filter(|v| v.busy().is_some()).count();
-                if busy > 0 && !self.confirmed(id, &Ask::Update) {
+                let asked = self.banner_note.take_if(|n| n.1 == Ask::Update);
+                if busy > 0 && asked.is_none() {
                     let what = if busy == 1 {
                         "A session is"
                     } else {
@@ -2781,11 +2791,14 @@ impl App {
                     };
                     let again = again(a, &self.config.keys);
                     let text = format!("{what} busy, and updating restarts blitz. {again}");
-                    self.ask(id, text, Ask::Update);
+                    self.banner_note = Some((text, Ask::Update));
+                    self.request_redraw();
                     return true;
                 }
                 self.updating = Some(id);
-                self.set_notice(id, format!("Downloading blitz {v}\u{2026}"), None, true);
+                let text = format!("Downloading blitz {v}\u{2026}");
+                self.banner_note = Some((text, Ask::Nothing));
+                self.request_redraw();
                 let proxy = self.proxy.clone();
                 std::thread::spawn(move || {
                     let done = std::panic::catch_unwind(move || crate::update::install(&v))
@@ -4401,6 +4414,12 @@ fn window_title(waiting: usize, pane: &str, admin: bool) -> String {
     }
 }
 
+/// What the banner says about the update in hand: the note on it for now,
+/// else its offer; nothing without one.
+fn banner_text<'a>(update: Option<&'a (String, String)>, note: Option<&'a str>) -> Option<&'a str> {
+    update.map(|u| note.unwrap_or(&u.1))
+}
+
 /// How to flash the taskbar for a session that just changed to `state`
 /// while the window is in the background: urgently when it needs the
 /// user or failed, gently when it finished, and at most once per session
@@ -5082,6 +5101,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Installed(Ok(())) => el.exit(),
             UserEvent::Installed(Err(e)) => {
                 eprintln!("blitz: update: {e}");
+                self.banner_note = None;
                 if let Some(id) = self.updating.take() {
                     self.error(id, format!("Update failed: {e}"));
                 }
@@ -5473,6 +5493,18 @@ mod tests {
     /// What a copy of the selection dragged from `a` to `b` takes.
     fn copy(t: &vt::Terminal, a: Pos, b: Pos) -> String {
         selection_text(t, &crate::theme::dark(), &select(t, a, b), 0)
+    }
+
+    #[test]
+    fn app_update_notes_take_the_banner_while_there_is_one() {
+        let update = ("0.2.0".to_string(), "blitz 0.2.0 is available".to_string());
+        assert_eq!(
+            banner_text(Some(&update), None),
+            Some("blitz 0.2.0 is available")
+        );
+        let note = Some("Downloading blitz 0.2.0\u{2026}");
+        assert_eq!(banner_text(Some(&update), note), note);
+        assert_eq!(banner_text(None, note), None);
     }
 
     #[test]
