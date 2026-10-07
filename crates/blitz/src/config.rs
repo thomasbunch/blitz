@@ -38,6 +38,11 @@ pub struct Config {
     pub scenery: String,
     /// The spark at the foot of the sidebar.
     pub mascot: bool,
+    /// Ctrl+click opens a file at its line through this URI, with
+    /// `{path}`, `{line}` and `{col}` filled in, as in
+    /// `vscode://file/{path}:{line}:{col}`. Empty opens files with their
+    /// program.
+    pub editor_uri: String,
     /// Key bindings from `keybind` lines, one per chord, which take the
     /// place of the default for that chord; see [`keymap::binding`].
     pub keys: Vec<keymap::Binding>,
@@ -63,6 +68,7 @@ impl Default for Config {
             restore_scrollback: false,
             scenery: "off".into(),
             mascot: false,
+            editor_uri: String::new(),
             keys: Vec::new(),
             texts: Vec::new(),
         }
@@ -187,6 +193,16 @@ pub const SETTINGS: &[Setting] = &[
         applies: NEW_PANES,
     },
     Setting {
+        key: "editor_uri",
+        group: "Mouse",
+        label: "Editor",
+        help: "Ctrl+click on a file path opens it at its line in this editor. \
+               Without one, a file opens with its program, or shows in \
+               Explorer when it has none.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
         key: "flash",
         group: "Notifications",
         label: "Flash taskbar",
@@ -277,6 +293,7 @@ impl Config {
             "check_updates" => flag(self.check_updates),
             "scenery" => quote(&self.scenery),
             "mascot" => flag(self.mascot),
+            "editor_uri" => quote(&self.editor_uri),
             _ => String::new(),
         }
     }
@@ -312,6 +329,7 @@ impl Config {
             "theme" => self.theme = text,
             "font_family" => self.font_family = text,
             "shell" => self.shell = text,
+            "editor_uri" => self.editor_uri = text,
             "scenery" => match text.to_lowercase() {
                 s if crate::arcade::scenery::SCENES.contains(&s.as_str()) => self.scenery = s,
                 _ => return false,
@@ -810,6 +828,7 @@ scenery = stars
             ("check_updates", "false"),
             ("scenery", "\"snow\""),
             ("mascot", "true"),
+            ("editor_uri", "\"cursor://file/{path}:{line}:{col}\""),
         ] {
             assert!(c.set(k, v), "{k} = {v}");
         }

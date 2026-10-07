@@ -4,17 +4,20 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_FRIENDLYAPPNAME, AssocQueryStringW, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 /// What Ctrl+click on a link opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     /// An OSC 8 hyperlink's URI, or a URL in the text.
     Uri(String),
-    /// A file or folder named in the text.
-    Path(PathBuf),
+    /// A file or folder named in the text, and the line and column after
+    /// it.
+    Path(PathBuf, Option<(u32, u32)>),
 }
 
 /// A link in the text.
@@ -320,7 +323,7 @@ pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
 pub fn plan(t: &Target, pathext: &str) -> Option<Open> {
     let p = match t {
         Target::Uri(u) => plan_uri(u, pathext)?,
-        Target::Path(p) => plan_path(p, pathext)?,
+        Target::Path(p, _) => plan_path(p, pathext)?,
     };
     match p {
         Open::Uri(_) => Some(p),
@@ -335,13 +338,92 @@ pub fn plan(t: &Target, pathext: &str) -> Option<Open> {
     }
 }
 
-/// Opens `t` as [`plan`] allows.
-pub fn open(t: &Target) -> Result<(), &'static str> {
+/// What opening a file that [`plan`] allows does with `editor`, the
+/// `editor_uri` setting: with one, a file opens there at `place`, else at
+/// line 1, whatever its type, as an editor never runs it. Without one, a
+/// file no program opens (`has_program` says) is shown in Explorer, so
+/// Windows does not ask what to open it with. Folders open as they are.
+pub fn with_editor(
+    how: Open,
+    editor: &str,
+    place: Option<(u32, u32)>,
+    has_program: impl Fn(&Path) -> bool,
+) -> Result<Open, &'static str> {
+    Ok(match how {
+        Open::File(p) | Open::Reveal(p) if !editor.is_empty() && !p.is_dir() => {
+            let uri = editor_uri(editor, &p, place.unwrap_or((1, 1)));
+            Open::Uri(uri.ok_or("editor_uri must be a URI such as vscode://file/{path}")?)
+        }
+        Open::File(p) if !p.is_dir() && !has_program(&p) => Open::Reveal(p),
+        how => how,
+    })
+}
+
+/// `template`, the `editor_uri` setting, with `{path}`, `{line}` and
+/// `{col}` filled in. `None` unless it is a URI that is not a `file:` one,
+/// so the setting never names a program or a file to run.
+pub fn editor_uri(template: &str, path: &Path, (line, col): (u32, u32)) -> Option<String> {
+    let (scheme, _) = template.split_once(':')?;
+    let named = scheme.len() > 1
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+    let odd = |c: char| c.is_control() || c.is_whitespace() || c == '"';
+    if !named || scheme.eq_ignore_ascii_case("file") || template.chars().any(odd) {
+        return None;
+    }
+    let mut p = String::new();
+    for b in path.to_str()?.replace('\\', "/").bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                p.push(char::from(b));
+            }
+            _ => p.push_str(&format!("%{b:02X}")),
+        }
+    }
+    Some(
+        (template.replace("{path}", &p))
+            .replace("{line}", &line.to_string())
+            .replace("{col}", &col.to_string()),
+    )
+}
+
+/// Whether Windows has a program to open files of `path`'s type.
+fn has_program(path: &Path) -> bool {
+    let Some(ext) = path.extension() else {
+        return false;
+    };
+    let ext = HSTRING::from(format!(".{}", ext.to_string_lossy()));
+    let mut len = 0;
+    // SAFETY: a NUL-terminated type that outlives the call; with no buffer
+    // it only writes the length.
+    let found = unsafe {
+        AssocQueryStringW(
+            ASSOCF_INIT_IGNOREUNKNOWN,
+            ASSOCSTR_FRIENDLYAPPNAME,
+            &ext,
+            PCWSTR::null(),
+            None,
+            &mut len,
+        )
+    };
+    found.is_ok()
+}
+
+/// Opens `t` as [`plan`] and [`with_editor`] allow.
+pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
     let pathext = std::env::var("PATHEXT").unwrap_or_default();
-    let (file, args) = match plan(t, &pathext) {
-        Some(Open::Uri(u)) => (u, String::new()),
-        Some(Open::File(p)) => (p.display().to_string(), String::new()),
-        Some(Open::Reveal(p)) => {
+    let how = plan(t, &pathext)
+        .ok_or("blitz opens only web and mail links and files on this computer")?;
+    let place = match t {
+        Target::Path(_, place) => *place,
+        Target::Uri(_) => None,
+    };
+    let (file, args) = match with_editor(how, editor, place, has_program)? {
+        Open::Uri(u) => (u, String::new()),
+        Open::File(p) => (p.display().to_string(), String::new()),
+        Open::Reveal(p) => {
             let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
             let explorer = Path::new(&root).join("explorer.exe");
             (
@@ -349,7 +431,6 @@ pub fn open(t: &Target) -> Result<(), &'static str> {
                 format!("/select,\"{}\"", p.display()),
             )
         }
-        None => return Err("blitz opens only web and mail links and files on this computer"),
     };
     // SAFETY: NUL-terminated strings that outlive the call, and no window.
     let done = unsafe {
@@ -611,12 +692,83 @@ mod tests {
         let tool = resolve("tool.cmd", &cwd);
         let gone = resolve("sub/gone.txt", &cwd);
         let far = resolve("sub/notes.txt", r"\\server\share");
-        let plan = |p: &Option<PathBuf>| plan(&Target::Path(p.clone().expect("found")), "");
+        let plan = |p: &Option<PathBuf>| plan(&Target::Path(p.clone().expect("found"), None), "");
         let notes_plan = plan(&notes);
         let tool_plan = plan(&tool);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(notes_plan, Some(Open::File(p)) if p.ends_with(r"sub\notes.txt")));
         assert!(matches!(tool_plan, Some(Open::Reveal(p)) if p.ends_with("tool.cmd")));
         assert_eq!((gone, far), (None, None));
+    }
+
+    const VSCODE: &str = "vscode://file/{path}:{line}:{col}";
+
+    #[test]
+    fn links_fill_in_the_editor_uri() {
+        let uri = |t, p: &str| editor_uri(t, Path::new(p), (12, 5));
+        assert_eq!(
+            uri(VSCODE, r"C:\my code\a.rs").as_deref(),
+            Some("vscode://file/C:/my%20code/a.rs:12:5")
+        );
+        assert_eq!(
+            uri("idea://open?file={path}&line={line}", r"C:\x\%#&é.rs").as_deref(),
+            Some("idea://open?file=C:/x/%25%23%26%C3%A9.rs&line=12")
+        );
+        // Only a URI: never a program, a file, or text for a command line.
+        for bad in [
+            r"C:\tools\code.exe {path}",
+            "code {path}",
+            "c:{path}",
+            "file:///{path}",
+            "FILE:{path}",
+            "vscode://file/{path} --x",
+            "vscode://\"{path}\"",
+            "1x:{path}",
+            "",
+        ] {
+            assert_eq!(uri(bad, r"C:\a.rs"), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn links_open_files_in_the_editor_or_show_them() {
+        let dir = std::env::temp_dir().join(format!("blitz-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "x").expect("write");
+        let (yes, no) = (|_: &Path| true, |_: &Path| false);
+        let go = |how, editor, program: &dyn Fn(&Path) -> bool| {
+            with_editor(how, editor, Some((3, 4)), program)
+        };
+        let at = editor_uri(VSCODE, &file, (3, 4)).map(Open::Uri).ok_or("");
+        let seen = [
+            go(Open::File(file.clone()), VSCODE, &no),
+            go(Open::Reveal(file.clone()), VSCODE, &no),
+            go(Open::File(dir.clone()), VSCODE, &no),
+            go(Open::File(file.clone()), "", &no),
+            go(Open::File(file.clone()), "", &yes),
+            go(Open::Reveal(file.clone()), "", &yes),
+            go(Open::File(dir.clone()), "", &no),
+            go(Open::File(file.clone()), "notepad {path}", &yes),
+        ];
+        let line_one = with_editor(Open::File(file.clone()), VSCODE, None, no);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(seen[0], at, "at its line");
+        assert_eq!(seen[1], at, "an editor never runs a script");
+        assert_eq!(seen[2], Ok(Open::File(dir.clone())), "a folder");
+        assert_eq!(seen[3], Ok(Open::Reveal(file.clone())), "no program");
+        assert_eq!(seen[4], Ok(Open::File(file.clone())));
+        assert_eq!(seen[5], Ok(Open::Reveal(file.clone())));
+        assert_eq!(seen[6], Ok(Open::File(dir.clone())));
+        assert!(seen[7].is_err(), "not a URI");
+        let one = editor_uri(VSCODE, &file, (1, 1)).map(Open::Uri).ok_or("");
+        assert_eq!(line_one, one);
+    }
+
+    #[test]
+    fn links_know_which_types_have_a_program() {
+        assert!(has_program(Path::new(r"C:\x\a.txt")), "Notepad");
+        assert!(!has_program(Path::new(r"C:\x\a.blitz-no-such-type")));
+        assert!(!has_program(Path::new(r"C:\x\Makefile")));
     }
 }

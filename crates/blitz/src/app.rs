@@ -3830,6 +3830,13 @@ impl App {
                 self.request_redraw();
             }
         }
+        if pressed
+            && b == 0
+            && let Some((target, _)) = self.ctrl_link(&mods)
+        {
+            self.open_link(&target);
+            return;
+        }
         let program = self.mouse_to_program(&mods).and(self.focus_id());
         if let Some(id) = route_button(&mut self.mouse.reported, b, pressed, program) {
             let kind = if pressed {
@@ -3848,14 +3855,6 @@ impl App {
             return;
         }
         if pressed {
-            // Ctrl+click opens a link; with mouse reporting on, the click
-            // got here because Shift was held too.
-            if (mods.lctrl || mods.rctrl)
-                && let Some((target, _)) = self.link_under(self.mouse.pos)
-            {
-                self.open_link(&target);
-                return;
-            }
             // With mouse reporting on, Shift is what brought the click
             // here, so it does not extend.
             let shift = mods.lshift || mods.rshift;
@@ -3990,23 +3989,31 @@ impl App {
             (crate::links::scan(&l.text).into_iter()).find(|(r, _)| r.contains(&here))?;
         let target = match found {
             Link::Url(u) => Target::Uri(u),
-            Link::Path(p, _) => Target::Path(crate::links::resolve(&p, &v.pane.cwd)?),
+            Link::Path(p, at) => Target::Path(crate::links::resolve(&p, &v.pane.cwd)?, at),
         };
         Some((target, l.span(range)))
     }
 
-    /// Underlines the link under the pointer, and shows the hand, while
-    /// Ctrl is held; with mouse reporting on, Ctrl and Shift.
+    /// The link under the pointer that a click with `mods` held opens,
+    /// with the cells it covers: Ctrl must be held, and a program that
+    /// takes the mouse gets the click unless [`opens_link`] says otherwise.
+    fn ctrl_link(&self, mods: &Mods) -> Option<(Target, (Pos, Pos))> {
+        if !(mods.lctrl || mods.rctrl) || self.mouse.drag.is_some() {
+            return None;
+        }
+        let found = self.link_under(self.mouse.pos)?;
+        let program = self.mouse_to_program(mods).is_some();
+        let claude = self.current().is_some_and(|v| v.pane.claude.is_some());
+        opens_link(&found.0, program, claude, &self.config.editor_uri).then_some(found)
+    }
+
+    /// Underlines the link under the pointer, and shows the hand, while a
+    /// click would open it; see [`Self::ctrl_link`].
     fn update_hover(&mut self) {
-        let mods = mods_now();
-        let ctrl = (mods.lctrl || mods.rctrl) && self.mouse_to_program(&mods).is_none();
-        let hover = (ctrl && self.mouse.drag.is_none())
-            .then(|| self.link_under(self.mouse.pos))
-            .flatten()
-            .and_then(|(_, (a, b))| {
-                let epoch = lock(&self.current()?.pane.term).line_epoch();
-                Some((epoch, a, b))
-            });
+        let hover = (self.ctrl_link(&mods_now())).and_then(|(_, (a, b))| {
+            let epoch = lock(&self.current()?.pane.term).line_epoch();
+            Some((epoch, a, b))
+        });
         self.set_hover(hover);
     }
 
@@ -4040,7 +4047,7 @@ impl App {
 
     /// Opens a link, or says in the pane why not.
     fn open_link(&mut self, target: &Target) {
-        if let Err(e) = crate::links::open(target)
+        if let Err(e) = crate::links::open(target, &self.config.editor_uri)
             && let Some(id) = self.focus_id()
         {
             self.error(id, e);
@@ -4629,6 +4636,13 @@ fn hidden_target(
         let h = hidden.get(next).or(hidden.first())?;
         (Some(h.0) != focus).then_some(h.0)
     })
+}
+
+/// Whether Ctrl+click on `target` is blitz's to open rather than the
+/// `program`'s, when that takes the mouse. Claude Code (`claude`) does in
+/// fullscreen, so with an `editor` set blitz opens its file paths there.
+fn opens_link(target: &Target, program: bool, claude: bool, editor: &str) -> bool {
+    !program || claude && !editor.is_empty() && matches!(target, Target::Path(..))
 }
 
 /// Whether Windows shows animations; off under Accessibility, Visual
@@ -6525,6 +6539,27 @@ mod tests {
         let (range, found) = crate::links::scan(&l.text).remove(0);
         assert_eq!(found, Link::Url("https://e.com/abc".into()));
         assert_eq!(l.span(range), ((0, 3), (1, 9)), "across the wrap");
+    }
+
+    #[test]
+    fn app_ctrl_click_in_claude_fullscreen_opens_paths_in_the_editor() {
+        let file = Target::Path(PathBuf::from(r"C:\x\a.rs"), Some((3, 1)));
+        let web = Target::Uri("https://example.com".into());
+        let code = "vscode://file/{path}:{line}:{col}";
+        for t in [&file, &web] {
+            assert!(
+                opens_link(t, false, false, ""),
+                "no program takes the mouse"
+            );
+            assert!(opens_link(t, false, true, code));
+        }
+        assert!(opens_link(&file, true, true, code));
+        assert!(
+            !opens_link(&web, true, true, code),
+            "Claude Code opens its own URLs"
+        );
+        assert!(!opens_link(&file, true, true, ""), "no editor");
+        assert!(!opens_link(&file, true, false, code), "not Claude Code");
     }
 
     #[test]
