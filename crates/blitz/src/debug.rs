@@ -90,13 +90,15 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
+    // Past the timeout every wait ends at once and the script stops with a
+    // failure, rather than ending a process that may be a test runner.
     let (done, finished) = mpsc::channel::<()>();
     let (shared, timeout) = (runner.s.clone(), opts.timeout);
     std::thread::spawn(move || {
         let waited = finished.recv_timeout(Duration::from_millis(timeout));
         if waited == Err(mpsc::RecvTimeoutError::Timeout) {
-            shared.fail(&format!("timed out after {timeout} ms"));
-            std::process::exit(1);
+            shared.lock().timed_out = Some(timeout);
+            shared.changed.notify_all();
         }
     });
     let code = runner.script(&script);
@@ -234,6 +236,8 @@ struct State {
     last_ms: f64,
     counters: Counters,
     exit: Option<u32>,
+    /// The `--timeout` that ran out, once it has.
+    timed_out: Option<u64>,
     /// The `--trace` log: one `ms<TAB>kind<TAB>text` line per event.
     log: Option<File>,
 }
@@ -280,8 +284,8 @@ impl Shared {
         self.lock().log(ms, "note", text);
     }
 
-    /// Waits until `done` holds, the child exits or `ms` pass, checking
-    /// again after every chunk of output.
+    /// Waits until `done` holds, the child exits, the run times out or `ms`
+    /// pass, checking again after every chunk of output.
     fn wait(&self, ms: u64, mut done: impl FnMut(&State) -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_millis(ms);
         let mut st = self.lock();
@@ -290,7 +294,7 @@ impl Shared {
                 return true;
             }
             let now = Instant::now();
-            if now >= deadline || st.exit.is_some() {
+            if now >= deadline || st.exit.is_some() || st.timed_out.is_some() {
                 return false;
             }
             st = self
@@ -298,6 +302,32 @@ impl Shared {
                 .wait_timeout(st, deadline - now)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
+        }
+    }
+
+    /// Sleeps `ms`, or less if the run times out. False once it has.
+    fn pause(&self, ms: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        let mut st = self.lock();
+        while st.timed_out.is_none() {
+            let now = Instant::now();
+            if now >= deadline {
+                return true;
+            }
+            st = self
+                .changed
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        false
+    }
+
+    /// Why a wait gave up after `ms`: the time, or the program exiting.
+    fn gave_up(&self, ms: u64) -> String {
+        match self.lock().exit {
+            Some(code) => format!("before the program exited with code {code}"),
+            None => format!("in {ms} ms"),
         }
     }
 
@@ -395,6 +425,7 @@ impl Runner {
                 last_ms: 0.0,
                 counters: Counters::default(),
                 exit: None,
+                timed_out: None,
                 log,
             }),
             changed: Condvar::new(),
@@ -441,7 +472,13 @@ impl Runner {
             for (name, value) in &self.vars {
                 line = line.replace(&format!("${{{name}}}"), value);
             }
-            if let Err(e) = self.step(&line) {
+            let step = self.step(&line);
+            // A step cut short by the timeout fails for that reason.
+            let step = match self.s.lock().timed_out {
+                Some(ms) => Err(format!("timed out after {ms} ms")),
+                None => step,
+            };
+            if let Err(e) = step {
                 self.s.fail(&format!("line {}: {e}", n + 1));
                 return 1;
             }
@@ -456,7 +493,9 @@ impl Runner {
             "type" => {
                 for c in String::from_utf8_lossy(&unesc(rest)).chars() {
                     self.send(c.encode_utf8(&mut [0; 4]).as_bytes());
-                    std::thread::sleep(Duration::from_millis(40));
+                    if !self.s.pause(40) {
+                        break;
+                    }
                 }
             }
             "key" => {
@@ -524,26 +563,25 @@ impl Runner {
                 let seen = self.seen;
                 let mut from = seen;
                 let mut hit = None;
-                self.s.wait(num(ms)?, |st| {
-                    let hay = plain(st.out_from(from));
+                let ms = num(ms)?;
+                self.s.wait(ms, |st| {
+                    // Where `out_from(from)` starts, trimmed output aside.
+                    let base = from.max(st.dropped).min(st.out_end());
+                    hit = find_plain(st.out_from(from), &squashed).map(|(i, end)| (i, base + end));
                     // Rescan a little of the old output in case a match
                     // straddles two chunks.
                     from = st.out_end().saturating_sub(4096).max(seen);
-                    hit = squashed
-                        .iter()
-                        .position(|w| hay.contains(w.as_str()))
-                        .map(|i| (i, st.out_end()));
                     hit.is_some()
                 });
-                let (i, end) = hit.ok_or_else(|| format!("{text:?} did not show up in {ms} ms"))?;
+                let (i, end) =
+                    hit.ok_or_else(|| format!("{text:?} did not show up {}", self.s.gave_up(ms)))?;
                 self.seen = end;
                 self.s.note(&format!("{cmd} ok: {}", wanted[i]));
             }
             "idle" => {
                 let (quiet, max): (f64, f64) = two(rest)?;
                 let start = self.s.ms();
-                loop {
-                    std::thread::sleep(Duration::from_millis(20));
+                while self.s.pause(20) {
                     let st = self.s.lock();
                     let now = self.s.ms();
                     if now - st.last_ms.max(start) >= quiet
@@ -571,6 +609,11 @@ impl Runner {
             }
             "resize" => {
                 let (cols, rows) = two(rest)?;
+                // The console would keep its size while the screen shrank
+                // to 1x1.
+                if cols == 0 || rows == 0 {
+                    return Err(format!("cannot resize to {cols}x{rows}"));
+                }
                 self.pty.resize(cols, rows);
                 self.s.lock().term.resize(cols, rows);
                 self.s.note(&format!("resize {cols}x{rows}"));
@@ -583,10 +626,20 @@ impl Runner {
                     let from = self.s.lock().out_end();
                     let t = Instant::now();
                     self.pty.writer().send(echo.as_slice());
-                    self.s
-                        .wait(2000, |st| find(st.out_from(from), &echo).is_some());
+                    // A time for an echo that never came would be made up.
+                    if !self
+                        .s
+                        .wait(2000, |st| find(st.out_from(from), &echo).is_some())
+                    {
+                        return Err(format!(
+                            "{text:?} did not come back {}",
+                            self.s.gave_up(2000)
+                        ));
+                    }
                     times.push(t.elapsed().as_secs_f64() * 1000.0);
-                    std::thread::sleep(Duration::from_millis(30));
+                    if !self.s.pause(30) {
+                        break;
+                    }
                 }
                 times.sort_by(f64::total_cmp);
                 let at = |q: usize| times.get(times.len() * q / 100).copied().unwrap_or(0.0);
@@ -609,7 +662,7 @@ impl Runner {
                     .s
                     .wait(ms, |st| re.matches_a_row(&st.term.screen_text()))
                 {
-                    return Err(format!("no row matched {pattern:?} within {ms} ms"));
+                    return Err(format!("no row matched {pattern:?} {}", self.s.gave_up(ms)));
                 }
                 self.s.note(&format!("expect ok: {pattern}"));
             }
@@ -632,7 +685,9 @@ impl Runner {
                 let code = self.s.lock().exit.unwrap_or_default();
                 self.s.note(&format!("exited with code {code}"));
             }
-            "sleep" => std::thread::sleep(Duration::from_millis(num(rest)?)),
+            "sleep" => {
+                self.s.pause(num(rest)?);
+            }
             "note" => self.s.note(rest),
             _ => return Err(format!("unknown command {cmd:?}")),
         }
@@ -841,10 +896,26 @@ fn unesc(s: &str) -> Vec<u8> {
     out
 }
 
+/// The first of `wanted` (each as [`squash`] leaves it) that shows up in
+/// `out`, and the offset in `out` just past where it ends.
+fn find_plain(out: &[u8], wanted: &[String]) -> Option<(usize, usize)> {
+    let (hay, at) = plain(out);
+    wanted.iter().enumerate().find_map(|(i, w)| {
+        let start = find(&hay, w.as_bytes())?;
+        let end = match w.len() {
+            0 => 0,
+            n => at[start + n - 1] + 1,
+        };
+        Some((i, end))
+    })
+}
+
 /// Output with escape sequences, whitespace and control bytes removed and
-/// ASCII lowercased, for "did this text appear" checks.
-fn plain(b: &[u8]) -> String {
+/// ASCII lowercased, for "did this text appear" checks, with the offset in
+/// `b` each byte left came from.
+fn plain(b: &[u8]) -> (Vec<u8>, Vec<usize>) {
     let mut out = Vec::with_capacity(b.len());
+    let mut at = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == 0x1b && i + 1 < b.len() {
@@ -870,12 +941,29 @@ fn plain(b: &[u8]) -> String {
             }
             continue;
         }
+        // Whitespace beyond ASCII goes too, as `squash` drops it: Claude
+        // Code draws a no-break space after its `>` prompt.
+        let n = match b[i] {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        let space = n > 1
+            && (b.get(i..i + n))
+                .and_then(|c| std::str::from_utf8(c).ok())
+                .is_some_and(|c| c.chars().all(char::is_whitespace));
+        if space {
+            i += n;
+            continue;
+        }
         if b[i] > 0x20 {
             out.push(b[i].to_ascii_lowercase());
+            at.push(i);
         }
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    (out, at)
 }
 
 /// A small regular expression for `expect`, matched against one screen
@@ -1190,12 +1278,37 @@ mod tests {
         );
         assert_eq!(esc(b"\x1b[1mA\\\r\n\x07"), r"\e[1mA\\\r\n\x07");
         assert_eq!(
-            plain(b"\x1b[1mHello \x1b]0;title\x07Wo\x1b]8;;x\x1b\\rld\r\n"),
-            "helloworld"
+            plain(b"\x1b[1mHello \x1b]0;title\x07Wo\x1b]8;;x\x1b\\rld\r\n").0,
+            b"helloworld"
         );
         assert_eq!(squash("Claude Code"), "claudecode");
         assert!(!past_prelude(b"\x1b[1t\x1b[c\x1b[?1004h"));
         assert!(past_prelude(b"\x1b[1thi"));
+    }
+
+    #[test]
+    fn debug_find_plain() {
+        let find = |out: &[u8], wanted: &[&str]| {
+            let wanted: Vec<String> = wanted.iter().map(|w| squash(w)).collect();
+            find_plain(out, &wanted)
+        };
+        // The end of the match, so the next wait looks after it.
+        let out = b"foo bar\r\n";
+        assert_eq!(find(out, &["foo"]), Some((0, 3)));
+        assert_eq!(find(&out[3..], &["bar"]), Some((0, 4)));
+        // Through escape sequences, ending on the match's last byte.
+        assert_eq!(find(b"\x1b[1mfo\x1b[0mo\x1b[K!", &["foo"]), Some((0, 11)));
+        // The first wanted text that shows up, wherever it is.
+        assert_eq!(find(b"one two", &["two", "one"]), Some((0, 7)));
+        assert_eq!(find(b"one two", &["six", "one"]), Some((1, 3)));
+        assert_eq!(find(b"one", &["six"]), None);
+        // Claude Code's prompt: `>` and a no-break space.
+        assert_eq!(find(">\u{a0}hi".as_bytes(), &["> hi"]), Some((0, 5)));
+        assert_eq!(find("a\u{3000}b".as_bytes(), &["a b"]), Some((0, 5)));
+        // Other text beyond ASCII is kept, and matched as is.
+        assert_eq!(find("café".as_bytes(), &["CAFÉ"]), None);
+        assert_eq!(find("café".as_bytes(), &["café"]), Some((0, 5)));
+        assert_eq!(find(b"\xffx", &["x"]), Some((0, 2)));
     }
 
     #[test]
@@ -1371,6 +1484,7 @@ mod tests {
             last_ms: 0.0,
             counters: Counters::default(),
             exit: None,
+            timed_out: None,
             log: None,
         };
         let chunk = vec![b'x'; 1 << 20];
@@ -1394,5 +1508,19 @@ mod tests {
         assert_eq!(o.setenv, [("A".to_owned(), "b=c".to_owned())]);
         assert!(Opts::parse(&args[2..]).is_err());
         assert!(Opts::parse(&["--script".to_owned()]).is_err());
+        let with = |extra: &[&str]| {
+            let args: Vec<String> = ["--script", "s.txt"]
+                .iter()
+                .chain(extra)
+                .map(|a| a.to_string())
+                .collect();
+            Opts::parse(&args)
+        };
+        assert_eq!(with(&[]).map(|o| o.timeout), Ok(120_000));
+        assert_eq!(with(&["--timeout", "500"]).map(|o| o.timeout), Ok(500));
+        assert!(with(&["--timeout", "-1"]).is_err());
+        assert!(with(&["--bogus", "1"]).is_err());
+        assert!(with(&["--setenv", "novalue"]).is_err());
+        assert!(with(&["--cols", "70000"]).is_err());
     }
 }
