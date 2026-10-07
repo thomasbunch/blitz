@@ -811,8 +811,9 @@ struct View {
     flashed: Option<Instant>,
     /// A thread is reading the git branch of the session's directory.
     finding_branch: bool,
-    /// A restored Claude Code session: the line to type at the shell's
-    /// first prompt, and when to type it anyway.
+    /// A line to type at the shell's first prompt, and when to type it
+    /// anyway: what resumes a restored Claude Code session, or starts a
+    /// new one.
     resume: Option<(String, Instant)>,
     /// The shell has shown blitz's prompt mark, so the next one means
     /// what ran in it has ended.
@@ -2907,6 +2908,14 @@ impl App {
                     self.resume(id, claude);
                 } else {
                     self.closed = Some((cwd, claude));
+                }
+            }
+            // Typed at the shell's first prompt, as a restored session is.
+            Action::NewClaude => {
+                let id = PaneId(self.next_id);
+                self.act(el, Action::SplitRight);
+                if let Some(v) = self.view_mut(id) {
+                    v.resume = Some(("claude\r".into(), Instant::now() + RESUME_AFTER));
                 }
             }
             Action::ToggleSidebar => {
@@ -7253,6 +7262,11 @@ mod tests {
         c.filter = "claude".into();
         assert_eq!(c.matches(), [(Action::ClaudeSetup, "Claude Code setup")]);
         // Actions with no keys are here too.
+        c.filter = "claude".into();
+        assert_eq!(
+            c.matches(),
+            [(Action::NewClaude, "New Claude Code session")]
+        );
         c.filter = "reset term".into();
         assert_eq!(c.matches(), [(Action::Reset, "Reset the terminal")]);
         c.filter = "clear".into();
