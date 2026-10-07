@@ -406,7 +406,8 @@ fn pty_shells_print_prompt_marks() {
 /// PowerShell marks where each command starts, and ends it with the code
 /// of the program it ran, even the same as last time, or 1 for a failed
 /// cmdlet, which leaves the last program's code behind in `$LASTEXITCODE`.
-/// It does so too when the user's profile turns strict mode on.
+/// It does so too when the user's profile turns strict mode on, and the
+/// script runs as written under each PowerShell.
 #[test]
 fn pty_powershell_reports_how_commands_end() {
     let shells = shells().into_iter().filter(|p| !p.ends_with("cmd.exe"));
@@ -417,12 +418,11 @@ fn pty_powershell_reports_how_commands_end() {
                 "Set-StrictMode -Version Latest\n{}",
                 blitz::shell::POWERSHELL_INTEGRATION
             );
-            let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            let encoded = blitz::shell::base64(&utf16);
-            l.cmdline = format!(
-                "{} -NoProfile -NoLogo -NoExit -EncodedCommand {encoded}",
-                blitz::shell::quote(&program)
-            );
+            let integration = blitz::shell::quote(blitz::shell::POWERSHELL_INTEGRATION);
+            l.cmdline = l
+                .cmdline
+                .replace(&integration, &blitz::shell::quote(&script));
+            assert!(l.cmdline.contains("Set-StrictMode"), "{}", l.cmdline);
         }
         let (pty, _, rx) = spawn(&l.cmdline, &l.env);
         let mut out = Vec::new();

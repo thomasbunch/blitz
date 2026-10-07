@@ -91,7 +91,11 @@ fn registry_path(machine: bool) -> Option<String> {
         }
         r.ok().ok()?;
         let units = &buf[..(size as usize / 2).min(buf.len())];
-        return Some(String::from_utf16_lossy(units).trim_end_matches('\0').into());
+        return Some(
+            String::from_utf16_lossy(units)
+                .trim_end_matches('\0')
+                .into(),
+        );
     }
     None
 }
@@ -261,31 +265,35 @@ pub fn quote(arg: &str) -> String {
 /// last program's code through later commands, so it counts when it changed
 /// or no new error says a cmdlet failed. A user's strict mode would stop
 /// the script reading what is not set yet, so it is off in its own scopes.
-pub const POWERSHELL_INTEGRATION: &str = r#"if (-not (Test-Path variable:global:__blitz)) {
+///
+/// It goes on the command line as it is, so `Get-Process` or Task Manager
+/// shows what blitz runs. It holds no double quote, which Windows
+/// PowerShell and PowerShell 7 read differently in an argument.
+pub const POWERSHELL_INTEGRATION: &str = r"if (-not (Test-Path variable:global:__blitz)) {
   $global:__blitz = @{ Orig = $function:prompt; Exec = $false; Token = $env:BLITZ_PANE_TOKEN }
   function global:prompt {
     $ok = $global:?; Set-StrictMode -Off; $c = $global:LASTEXITCODE
     $new = $global:Error.Count -and -not [object]::ReferenceEquals($global:Error[0], $global:__blitz.Err)
     $code = if ($ok) { 0 } elseif ($c -and ($c -ne $global:__blitz.Last -or -not $new)) { $c } else { 1 }
-    $e = [char]27; $b = [char]7; $s = "$e[?1049h$e[?1049l$e[!p$e[?5W"
-    if ($global:__blitz.Exec) { $s += "$e]133;D;$code$b"; $global:__blitz.Exec = $false }
-    $s += "$e]133;A;blitz=$($global:__blitz.Token)$b"
+    $e = [string][char]27; $b = [char]7; $s = '$e[?1049h$e[?1049l$e[!p$e[?5W'.Replace('$e', $e)
+    if ($global:__blitz.Exec) { $s += $e + ']133;D;' + $code + $b; $global:__blitz.Exec = $false }
+    $s += $e + ']133;A;blitz=' + $global:__blitz.Token + $b
     if ($PWD.Provider.Name -eq 'FileSystem') {
       $p = $PWD.ProviderPath -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
-      try { $s += "$e]7;" + [Uri]::new($p).AbsoluteUri + $b } catch {}
+      try { $s += $e + ']7;' + [Uri]::new($p).AbsoluteUri + $b } catch {}
     }
     if (-not $ok) { Write-Error 'x' -ErrorAction Ignore }
-    $s + (& $global:__blitz.Orig) + "$e]133;B$b"
+    $s + (& $global:__blitz.Orig) + $e + ']133;B' + $b
   }
   if (Get-Module PSReadLine) {
     $global:__blitz.RL = $function:PSConsoleHostReadLine
     function global:PSConsoleHostReadLine {
       $l = & $global:__blitz.RL; Set-StrictMode -Off; $global:__blitz.Exec = $true
       $global:__blitz.Last = $global:LASTEXITCODE; $global:__blitz.Err = if ($global:Error.Count) { $global:Error[0] }
-      [Console]::Write("$([char]27)]133;C$([char]7)"); $l
+      [Console]::Write([string][char]27 + ']133;C' + [char]7); $l
     }
   }
-}"#;
+}";
 
 /// cmd's prompt with the same marks and reset. cmd cannot report exit
 /// codes, nor expand variables in its prompt, so the token is written in.
@@ -369,14 +377,10 @@ pub fn launch(shell: &str, integrate: bool, token: &str) -> Launch {
         match kind(&program) {
             Kind::PowerShell if runs_command(args) => {}
             Kind::PowerShell => {
-                // -EncodedCommand still runs when the execution policy forbids
+                // -Command still runs when the execution policy forbids
                 // scripts, and the user's profile has already loaded by then.
-                let utf16: Vec<u8> = POWERSHELL_INTEGRATION
-                    .encode_utf16()
-                    .flat_map(u16::to_le_bytes)
-                    .collect();
-                out.cmdline += " -NoLogo -NoExit -EncodedCommand ";
-                out.cmdline += &base64(&utf16);
+                out.cmdline += " -NoLogo -NoExit -Command ";
+                out.cmdline += &quote(POWERSHELL_INTEGRATION);
             }
             Kind::Cmd if std::env::var_os("PROMPT").is_none_or(|p| is_blitz_prompt(&p)) => {
                 out.env.push(("PROMPT".into(), cmd_prompt(token)));
@@ -387,43 +391,14 @@ pub fn launch(shell: &str, integrate: bool, token: &str) -> Launch {
     out
 }
 
-pub fn base64(bytes: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for c in bytes.chunks(3) {
-        let n = (u32::from(c[0]) << 16)
-            | (u32::from(c.get(1).copied().unwrap_or(0)) << 8)
-            | u32::from(c.get(2).copied().unwrap_or(0));
-        for i in 0..4 {
-            if i <= c.len() {
-                s.push(char::from(T[((n >> (18 - 6 * i)) & 63) as usize]));
-            } else {
-                s.push('=');
-            }
-        }
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn base64_vectors() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        // "hi" as UTF-16LE, the form -EncodedCommand expects.
-        assert_eq!(base64(&[b'h', 0, b'i', 0]), "aABpAA==");
-    }
-
-    #[test]
     fn prompts_leave_the_alternate_screen() {
         let reset = "$e[?1049h$e[?1049l$e[!p$e[?5W";
-        assert!(POWERSHELL_INTEGRATION.contains(&format!("$s = \"{reset}\"")));
+        assert!(POWERSHELL_INTEGRATION.contains(&format!("$s = '{reset}'.Replace('$e', $e)")));
         assert!(cmd_prompt("1").starts_with(reset));
         let prompt = cmd_prompt("1").replace("$e", "\x1b");
         let mut t = vt::Terminal::new(vt::Options::default());
@@ -533,7 +508,12 @@ mod tests {
         assert!(p.contains(r"\system32"), "{p}");
         assert!(!p.contains("%systemroot%"), "{p}");
         let fresh = pane_var("path").expect("a PATH");
-        assert!(fresh.to_string_lossy().to_lowercase().contains(r"\system32"));
+        assert!(
+            fresh
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(r"\system32")
+        );
     }
 
     /// The setting once took only a path, written without quotes.
@@ -629,13 +609,36 @@ mod tests {
     #[test]
     fn launch_integration() {
         let ps = launch(r#""C:\Program Files\PowerShell\7\pwsh.exe""#, true, "t");
-        let (head, b64) = ps.cmdline.rsplit_once(' ').unwrap();
+        let script = format!("\"{POWERSHELL_INTEGRATION}\"");
+        let head = ps
+            .cmdline
+            .strip_suffix(&script)
+            .expect("the script, readable");
         assert_eq!(
             head,
-            r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit -EncodedCommand"#
+            r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit -Command "#
         );
-        assert!(b64.len() > 1000 && b64.len() < 8000);
+        assert!(!POWERSHELL_INTEGRATION.contains('"'));
         assert_eq!(launch("pwsh.exe", false, "t").cmdline, "pwsh.exe");
+    }
+
+    /// The script reaches PowerShell as one argument, as written.
+    #[test]
+    #[cfg(windows)]
+    fn the_powershell_script_is_one_argument() {
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::UI::Shell::CommandLineToArgvW;
+        let line = windows::core::HSTRING::from(launch("pwsh", true, "t").cmdline);
+        let mut n = 0;
+        // SAFETY: a valid string and out pointer; the array is freed below.
+        let last = unsafe {
+            let argv = CommandLineToArgvW(&line, &mut n);
+            assert!(!argv.is_null());
+            let last = (*argv.add(n as usize - 1)).to_string().unwrap();
+            let _ = LocalFree(Some(HLOCAL(argv.cast())));
+            last
+        };
+        assert_eq!((n, last.as_str()), (5, POWERSHELL_INTEGRATION));
     }
 
     #[test]
