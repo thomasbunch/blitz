@@ -21,15 +21,20 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// GitHub could not say.
 pub fn check() -> Result<Option<String>, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let body = curl(&["-H", "Accept: application/vnd.github+json", &url])?;
-    let json = std::str::from_utf8(&body)
+    // Someone is waiting on this one, so it gives up sooner.
+    let accept = "Accept: application/vnd.github+json";
+    let body = curl(&["--max-time", "30", "-H", accept, &url])?;
+    latest(&body, env!("CARGO_PKG_VERSION"))
+}
+
+/// The version in GitHub's latest-release `body` when it is newer than
+/// `current`.
+fn latest(body: &[u8], current: &str) -> Result<Option<String>, String> {
+    let json = std::str::from_utf8(body)
         .ok()
         .and_then(crate::hook::Json::parse);
     let tag = json.as_ref().and_then(|j| j.get("tag_name")?.as_str());
-    Ok(newer(
-        env!("CARGO_PKG_VERSION"),
-        tag.ok_or("GitHub sent no release")?,
-    ))
+    Ok(newer(current, tag.ok_or("GitHub sent no release")?))
 }
 
 /// The version `tag` names when it is newer than `current`, rebuilt from
@@ -40,16 +45,57 @@ pub fn newer(current: &str, tag: &str) -> Option<String> {
 }
 
 /// `1.2.3` or `v1.2.3`; anything else, prereleases included, is `None`.
+/// No leading zeros, as in semver: the version rebuilt from the numbers
+/// must name the same tag.
 fn version(s: &str) -> Option<(u64, u64, u64)> {
     let mut n = s.strip_prefix('v').unwrap_or(s).split('.').map(|p| {
         // Digits only: `parse` also takes a leading `+`.
-        p.bytes()
-            .all(|b| b.is_ascii_digit())
+        let digits = p.bytes().all(|b| b.is_ascii_digit());
+        (digits && (p == "0" || !p.starts_with('0')))
             .then(|| p.parse().ok())
             .flatten()
     });
     let v = (n.next()??, n.next()??, n.next()??);
     n.next().is_none().then_some(v)
+}
+
+/// The banner text for release `v`, or for the update to it that failed
+/// and wrote `log`; `installed` when blitz can update itself. `None` keeps
+/// the banner shown now, `shown`: a later look finding the same release
+/// keeps a failure in view. The action comes before the log's long path,
+/// so a narrow window that cuts the text keeps it.
+pub fn banner(
+    shown: Option<&(String, String)>,
+    v: &str,
+    log: Option<&Path>,
+    installed: bool,
+) -> Option<String> {
+    if log.is_none() && shown.is_some_and(|u| u.0 == v) {
+        return None;
+    }
+    Some(match log {
+        Some(log) => format!(
+            "Updating to blitz {v} failed \u{b7} Ctrl+Shift+U to try again \u{b7} log: {}",
+            log.display()
+        ),
+        None => {
+            let how = if installed {
+                "update and restart"
+            } else {
+                "open the download page"
+            };
+            format!("blitz {v} is available \u{b7} Ctrl+Shift+U to {how}")
+        }
+    })
+}
+
+/// What Ctrl+Shift+U says when it looked for a release itself.
+pub fn found(r: &Result<Option<String>, String>) -> String {
+    match r {
+        Ok(Some(v)) => format!("blitz {v} is available"),
+        Ok(None) => format!("blitz {} is up to date", env!("CARGO_PKG_VERSION")),
+        Err(e) => format!("Could not look for an update: {e}"),
+    }
 }
 
 /// Whether blitz runs from the installer's folder rather than an unzipped
@@ -78,28 +124,48 @@ pub fn open_page() -> bool {
     h.0 as isize > 32
 }
 
-/// The update that `install` started and that did not happen, with the
-/// installer's log: its folder is for a version newer than this build.
-/// The folders of updates that did happen are removed.
+/// The newest update that `install` started and that did not happen, with
+/// the installer's log: its folder is for a version newer than this build.
+/// The folders of updates to this version or older are removed.
 pub fn failed() -> Option<(String, PathBuf)> {
     failed_in(&std::env::temp_dir(), env!("CARGO_PKG_VERSION"))
 }
 
 fn failed_in(temp: &Path, current: &str) -> Option<(String, PathBuf)> {
-    let mut out = None;
+    let mut out: Option<((u64, u64, u64), String, PathBuf)> = None;
     for e in std::fs::read_dir(temp).ok()?.flatten() {
         let name = e.file_name();
         let Some(v) = name.to_str().and_then(|n| n.strip_prefix("blitz-update-")) else {
             continue;
         };
-        // No log: the installer never ran, so there is nothing to show.
+        if !e.path().is_dir() {
+            continue;
+        }
+        let Some(v) = newer(current, v) else {
+            // Done, or no longer wanted.
+            let _ = std::fs::remove_dir_all(e.path());
+            continue;
+        };
+        // No log: the installer has not run, or another blitz is about to
+        // start it. A log that says it worked comes from an install this
+        // older copy of blitz did not do.
         let log = e.path().join("setup.log");
-        match newer(current, v) {
-            Some(v) if log.is_file() => out = Some((v, log)),
-            _ => drop(std::fs::remove_dir_all(e.path())),
+        let worked = std::fs::read(&log)
+            .is_ok_and(|b| String::from_utf8_lossy(&b).contains("Installation process succeeded"));
+        let Some(n) = version(&v).filter(|_| log.is_file() && !worked) else {
+            continue;
+        };
+        if out.as_ref().is_none_or(|o| n > o.0) {
+            out = Some((n, v, log));
         }
     }
-    out
+    out.map(|(_, v, log)| (v, log))
+}
+
+/// The installer's file name in release `v`, as `.github/blitz.iss`
+/// names it.
+fn installer_name(v: &str) -> String {
+    format!("blitz-{v}-windows-x64-setup.exe")
 }
 
 /// Downloads the installer for version `v` (from `newer`), checks it
@@ -110,7 +176,7 @@ fn failed_in(temp: &Path, current: &str) -> Option<(String, PathBuf)> {
 // are signed.
 pub fn install(v: &str) -> Result<(), String> {
     let base = format!("https://github.com/{REPO}/releases/download/v{v}");
-    let name = format!("blitz-{v}-windows-x64-setup.exe");
+    let name = installer_name(v);
     let sums = curl(&[&format!("{base}/SHA256SUMS.txt")])?;
     let sums = String::from_utf8_lossy(&sums);
     let want = sum_for(&sums, &name).ok_or("the release has no checksum for its installer")?;
@@ -129,13 +195,8 @@ pub fn install(v: &str) -> Result<(), String> {
     // what `failed` finds on the next start.
     let log = format!("/LOG={}", dir.join("setup.log").display());
     Command::new(&path)
-        .args([
-            "/VERYSILENT",
-            "/SUPPRESSMSGBOXES",
-            "/NORESTART",
-            "/relaunch=1",
-            &log,
-        ])
+        .args(INSTALLER_ARGS)
+        .arg(&log)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -143,6 +204,15 @@ pub fn install(v: &str) -> Result<(), String> {
         .map_err(|e| format!("could not start the installer: {e}"))?;
     Ok(())
 }
+
+/// A silent install that starts blitz again; `.github/blitz.iss` reads
+/// `/relaunch=1`.
+const INSTALLER_ARGS: [&str; 4] = [
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    "/relaunch=1",
+];
 
 /// The hex SHA-256 that a `sha256sum` listing gives for file `name`.
 fn sum_for<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
@@ -168,19 +238,33 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
 // ponytail: curl ignores the system proxy; WinHTTP if that bites.
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let ua = concat!("blitz/", env!("CARGO_PKG_VERSION"));
+    // A slow line still finishes the download; one that stalls gives up.
     let out = Command::new("curl.exe")
         .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https"])
-        .args(["--max-time", "120", "-A", ua])
+        .args(["--connect-timeout", "20", "--speed-limit", "1000"])
+        .args(["--speed-time", "30", "-A", ua])
         .args(args)
         .stdin(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("could not run curl: {e}"))?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(crate::hook::one_line(err.trim()));
+        return Err(curl_error(&out.stderr, out.status.code()));
     }
     Ok(out.stdout)
+}
+
+/// Why curl failed: what it printed, or its exit code when it printed
+/// nothing.
+fn curl_error(stderr: &[u8], code: Option<i32>) -> String {
+    let err = crate::hook::one_line(String::from_utf8_lossy(stderr).trim());
+    if !err.is_empty() {
+        return err;
+    }
+    match code {
+        Some(c) => format!("curl stopped with code {c}"),
+        None => "curl stopped".into(),
+    }
 }
 
 #[cfg(test)]
@@ -202,10 +286,121 @@ mod tests {
             "v0.0.2/../x",
             "",
             "v99999999999999999999.0.0",
+            // The rebuilt version would name another tag.
+            "v00.0.002",
+            "v0.01.0",
+            "V0.0.2",
+            " v0.0.2",
+            "v0.0.2\n",
+            "vv0.0.2",
+            "v-1.0.0",
+            "v1..0",
         ] {
             assert_eq!(newer("0.0.1", tag), None, "{tag:?}");
         }
-        assert_eq!(newer("0.0.1", "v00.0.002").as_deref(), Some("0.0.2"));
+        assert_eq!(newer("0.0.1", "v0.0.10").as_deref(), Some("0.0.10"));
+        assert_eq!(newer("0.0.1", "v0.10.0").as_deref(), Some("0.10.0"));
+        let max = format!("v{0}.{0}.{0}", u64::MAX);
+        assert_eq!(newer("0.0.1", &max), Some(max[1..].to_string()));
+        // Never a downgrade, and nothing without a version to compare.
+        assert_eq!(newer("0.1.0", "v0.0.9"), None);
+        assert_eq!(newer("0.0.2", "v0.0.2"), None);
+        assert_eq!(newer("", "v0.0.2"), None);
+        assert_eq!(newer("0.0.2-dev", "v0.0.3"), None);
+    }
+
+    #[test]
+    fn latest_reads_the_tag_or_says_why_not() {
+        let tag = |t: &str| format!(r#"{{"tag_name":"{t}","name":"x"}}"#).into_bytes();
+        assert_eq!(latest(&tag("v0.0.5"), "0.0.4"), Ok(Some("0.0.5".into())));
+        assert_eq!(latest(&tag("v0.0.4"), "0.0.4"), Ok(None));
+        assert_eq!(latest(&tag("v0.0.5-rc.1"), "0.0.4"), Ok(None));
+        for body in [
+            &b"<html>rate limited</html>"[..],
+            b"",
+            b"{}",
+            br#"{"tag_name":5}"#,
+            br#"{"tag_name":null}"#,
+            b"\xff\xfe",
+            br#"{"message":"Not Found"}"#,
+        ] {
+            assert_eq!(
+                latest(body, "0.0.4"),
+                Err("GitHub sent no release".into()),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn installer_matches_the_setup_script() {
+        let iss = include_str!("../../../.github/blitz.iss");
+        let base = (iss.lines())
+            .find_map(|l| l.strip_prefix("OutputBaseFilename="))
+            .expect("OutputBaseFilename");
+        let built = format!("{}.exe", base.replace("{#AppVersion}", "1.2.3"));
+        assert_eq!(installer_name("1.2.3"), built);
+        // Setup starts blitz again only when told to.
+        assert!(INSTALLER_ARGS.contains(&"/relaunch=1"));
+        assert!(iss.contains("ExpandConstant('{param:relaunch|0}') = '1'"));
+        assert!(INSTALLER_ARGS.contains(&"/VERYSILENT") && iss.contains("WizardSilent"));
+    }
+
+    #[test]
+    fn the_banner_offers_a_release_and_keeps_a_failure_in_view() {
+        let log = Path::new(r"C:\Users\someone\AppData\Local\Temp\blitz-update-0.0.5\setup.log");
+        let offer = banner(None, "0.0.5", None, true).expect("a banner");
+        assert_eq!(
+            offer,
+            "blitz 0.0.5 is available \u{b7} Ctrl+Shift+U to update and restart"
+        );
+        let zip = banner(None, "0.0.5", None, false).expect("a banner");
+        assert!(
+            zip.ends_with("Ctrl+Shift+U to open the download page"),
+            "{zip}"
+        );
+        let failed = banner(None, "0.0.5", Some(log), true).expect("a banner");
+        let action = failed
+            .find("Ctrl+Shift+U to try again")
+            .expect("the action");
+        assert!(
+            action < failed.find(r"C:\Users").expect("the log"),
+            "{failed}"
+        );
+        // A later look at the same release keeps the failure; a newer one
+        // replaces it, and a failure replaces an offer.
+        let shown = ("0.0.5".to_string(), failed.clone());
+        assert_eq!(banner(Some(&shown), "0.0.5", None, true), None);
+        assert!(banner(Some(&shown), "0.0.6", None, true).is_some());
+        let offered = ("0.0.5".to_string(), offer);
+        assert_eq!(
+            banner(Some(&offered), "0.0.5", Some(log), true),
+            Some(failed)
+        );
+    }
+
+    #[test]
+    fn a_look_by_hand_says_what_it_found() {
+        assert_eq!(found(&Ok(Some("9.9.9".into()))), "blitz 9.9.9 is available");
+        let now = env!("CARGO_PKG_VERSION");
+        assert_eq!(found(&Ok(None)), format!("blitz {now} is up to date"));
+        let err = found(&Err("Could not resolve host: api.github.com".into()));
+        assert_eq!(
+            err,
+            "Could not look for an update: Could not resolve host: api.github.com"
+        );
+    }
+
+    #[test]
+    fn curl_errors_always_say_something() {
+        let said = b"curl: (6) Could not resolve host: api.github.com\r\n";
+        assert_eq!(
+            curl_error(said, Some(6)),
+            "curl: (6) Could not resolve host: api.github.com"
+        );
+        assert_eq!(curl_error(b"", Some(28)), "curl stopped with code 28");
+        assert_eq!(curl_error(b" \r\n", None), "curl stopped");
     }
 
     #[test]
@@ -219,30 +414,90 @@ mod tests {
         assert_eq!(sum_for("abc *x.exe", "x.exe"), None, "short hash");
     }
 
-    #[test]
-    fn a_newer_update_with_a_log_failed() {
-        let temp = std::env::temp_dir().join(format!("blitz-failed-{}", std::process::id()));
-        for (dir, log) in [
-            ("blitz-update-0.0.1", true),
-            ("blitz-update-0.0.3", true),
-            ("blitz-update-0.0.4", false),
-            ("other", true),
-        ] {
+    /// Makes `temp` hold these folders, each with a setup.log of the given
+    /// text if any, and returns what `failed_in` finds and what is left.
+    fn failed_with(
+        name: &str,
+        dirs: &[(&str, Option<&str>)],
+        current: &str,
+    ) -> (Option<(String, PathBuf)>, Vec<String>, PathBuf) {
+        let temp = std::env::temp_dir().join(format!("blitz-failed-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        for &(dir, log) in dirs {
             std::fs::create_dir_all(temp.join(dir)).unwrap();
-            if log {
-                std::fs::write(temp.join(dir).join("setup.log"), "").unwrap();
+            if let Some(text) = log {
+                std::fs::write(temp.join(dir).join("setup.log"), text).unwrap();
             }
         }
-        let got = failed_in(&temp, "0.0.2");
+        // Not a folder: left alone.
+        std::fs::write(temp.join("blitz-update-0.0.99"), "").unwrap();
+        let got = failed_in(&temp, current);
         let mut left: Vec<_> = (std::fs::read_dir(&temp).unwrap().flatten())
             .map(|e| e.file_name().into_string().unwrap())
             .collect();
         left.sort();
-        std::fs::remove_dir_all(&temp).unwrap();
+        let _ = std::fs::remove_dir_all(&temp);
+        (got, left, temp)
+    }
+
+    #[test]
+    fn a_newer_update_with_a_log_failed() {
+        let failed = Some("Setup failed: file in use");
+        let (got, left, temp) = failed_with(
+            "one",
+            &[
+                ("blitz-update-0.0.1", failed),
+                ("blitz-update-0.0.2", failed),
+                ("blitz-update-0.0.3", failed),
+                ("blitz-update-0.0.4", None),
+                ("other", failed),
+            ],
+            "0.0.2",
+        );
         let log = temp.join("blitz-update-0.0.3").join("setup.log");
         assert_eq!(got, Some(("0.0.3".into(), log)));
-        // Done, and never started, are gone; what is not blitz's stays.
-        assert_eq!(left, ["blitz-update-0.0.3", "other"]);
+        // Updates to this version or older are gone, this one included. One
+        // not started yet stays, as another blitz may be about to start it;
+        // what is not blitz's stays.
+        assert_eq!(
+            left,
+            [
+                "blitz-update-0.0.3",
+                "blitz-update-0.0.4",
+                "blitz-update-0.0.99",
+                "other"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_newest_failure_is_the_one_shown() {
+        let failed = Some("");
+        let (got, _, temp) = failed_with(
+            "newest",
+            &[
+                ("blitz-update-0.0.9", failed),
+                ("blitz-update-0.0.10", failed),
+                ("blitz-update-0.0.3", failed),
+            ],
+            "0.0.2",
+        );
+        let log = temp.join("blitz-update-0.0.10").join("setup.log");
+        assert_eq!(got, Some(("0.0.10".into(), log)));
+    }
+
+    #[test]
+    fn an_install_that_worked_is_no_failure() {
+        let worked = "2026-10-07 10:00:05.000   Installation process succeeded.\r\n";
+        let (got, left, _) =
+            failed_with("worked", &[("blitz-update-0.0.5", Some(worked))], "0.0.2");
+        assert_eq!(got, None, "an older copy of blitz is running");
+        assert_eq!(left, ["blitz-update-0.0.5", "blitz-update-0.0.99"]);
+        let (got, _, _) = failed_with("nothing", &[], "0.0.2");
+        assert_eq!(got, None);
+        let missing = std::env::temp_dir().join(format!("blitz-no-temp-{}", std::process::id()));
+        assert_eq!(failed_in(&missing, "0.0.2"), None);
     }
 
     #[test]

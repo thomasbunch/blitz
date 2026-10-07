@@ -70,6 +70,8 @@ const NOTICE: Duration = Duration::from_secs(5);
 /// one runs every few hours.
 const UPDATE_FIRST: Duration = Duration::from_secs(10);
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// Why an update or a look for one stopped when its thread panicked.
+const INTERNAL: &str = "blitz stopped after an internal error";
 /// Taskbar flashes per session are at least this far apart.
 const FLASH_GAP: Duration = Duration::from_secs(10);
 /// How long a restored pane waits for its shell's first prompt before it
@@ -637,12 +639,18 @@ impl App {
             });
         }
         let scripted = self.args.selftest.is_some() || self.args.exit_after.is_some();
-        if self.config.check_updates && !scripted && !cfg!(debug_assertions) {
+        if !scripted && !cfg!(debug_assertions) {
             let proxy = self.proxy.clone();
+            let look = self.config.check_updates;
             std::thread::spawn(move || {
                 std::thread::sleep(UPDATE_FIRST);
+                // Ctrl+Shift+U updates with checks off too, so a failed
+                // update is shown, and old ones cleared, either way.
                 if let Some((v, log)) = crate::update::failed() {
                     let _ = proxy.send_event(UserEvent::Update(v, Some(log)));
+                }
+                if !look {
+                    return;
                 }
                 loop {
                     // Quiet when it fails, as offline is normal; Ctrl+Shift+U
@@ -1353,26 +1361,12 @@ impl App {
     /// Shows the banner for release `v`, or for the update to it that
     /// failed and wrote `log`.
     fn offer_update(&mut self, v: String, log: Option<PathBuf>) {
-        // A later look finding the same release keeps a failure in view.
-        if log.is_none() && self.update.as_ref().is_some_and(|u| u.0 == v) {
-            return;
+        let installed = crate::update::installed();
+        let shown = self.update.as_ref();
+        if let Some(text) = crate::update::banner(shown, &v, log.as_deref(), installed) {
+            self.update = Some((v, text));
+            self.request_redraw();
         }
-        let text = match log {
-            Some(log) => format!(
-                "Updating to blitz {v} failed, see {} \u{b7} Ctrl+Shift+U to try again",
-                log.display()
-            ),
-            None => {
-                let how = if crate::update::installed() {
-                    "update and restart"
-                } else {
-                    "open the download page"
-                };
-                format!("blitz {v} is available \u{b7} Ctrl+Shift+U to {how}")
-            }
-        };
-        self.update = Some((v, text));
-        self.request_redraw();
     }
 
     fn set_notice(
@@ -1661,7 +1655,10 @@ impl App {
                     self.set_notice(id, "Looking for a newer blitz\u{2026}", None, true);
                     let proxy = self.proxy.clone();
                     std::thread::spawn(move || {
-                        let _ = proxy.send_event(UserEvent::Checked(crate::update::check()));
+                        // Always answered, or Ctrl+Shift+U stays busy.
+                        let found = std::panic::catch_unwind(crate::update::check)
+                            .unwrap_or_else(|_| Err(INTERNAL.into()));
+                        let _ = proxy.send_event(UserEvent::Checked(found));
                     });
                     return true;
                 };
@@ -1699,7 +1696,9 @@ impl App {
                 self.set_notice(id, format!("Downloading blitz {v}\u{2026}"), None, true);
                 let proxy = self.proxy.clone();
                 std::thread::spawn(move || {
-                    let _ = proxy.send_event(UserEvent::Installed(crate::update::install(&v)));
+                    let done = std::panic::catch_unwind(move || crate::update::install(&v))
+                        .unwrap_or_else(|_| Err(INTERNAL.into()));
+                    let _ = proxy.send_event(UserEvent::Installed(done));
                 });
             }
         }
@@ -2731,15 +2730,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Update(v, log) => self.offer_update(v, log),
             UserEvent::Checked(found) => {
-                let text = match found {
-                    Ok(Some(v)) => {
-                        let text = format!("blitz {v} is available");
-                        self.offer_update(v, None);
-                        text
-                    }
-                    Ok(None) => format!("blitz {} is up to date", env!("CARGO_PKG_VERSION")),
-                    Err(e) => format!("Could not look for an update: {e}"),
-                };
+                let text = crate::update::found(&found);
+                if let Ok(Some(v)) = found {
+                    self.offer_update(v, None);
+                }
                 if let Some(id) = self.updating.take() {
                     self.set_notice(id, text, Some(Instant::now() + NOTICE), false);
                 }
