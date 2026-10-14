@@ -22,6 +22,10 @@ vt = { path = "../vt" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "gles", "wgsl"] }
+swash = "=0.2.10"
+fontdb = { version = "=0.24.0", default-features = false, features = ["std", "fs", "fontconfig"] }
+pollster = "=1.0.1"
 
 [target.'cfg(windows)'.dependencies]
 winit = "=0.30.13"

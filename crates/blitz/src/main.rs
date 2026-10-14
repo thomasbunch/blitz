@@ -77,9 +77,33 @@ fn console(args: &[&str]) -> bool {
 }
 
 #[cfg(not(windows))]
+const USAGE: &str = "usage: blitz --version | --help
+       blitz debug render (--vt FILE | --text FILE | --demo) --bmp OUT
+             [--cols N --rows N] [--px N] [--warp] [--light] [--theme NAME]
+             [--collapsed] [--banner TEXT] [--picker FILTER] [--settings N]
+             [--find TEXT]
+The blitz window is Windows only for now.";
+
+#[cfg(not(windows))]
 fn main() {
-    eprintln!("blitz: only Windows is supported for now");
-    std::process::exit(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    let code = match a.as_slice() {
+        ["--version"] => {
+            println!("blitz {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        ["--help" | "-h"] => {
+            println!("{USAGE}");
+            0
+        }
+        ["debug", "render", ..] => blitz::render::debug_render(&args[2..]),
+        _ => {
+            eprintln!("{USAGE}");
+            2
+        }
+    };
+    std::process::exit(code);
 }
 
 #[cfg(all(test, windows))]

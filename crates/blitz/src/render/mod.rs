@@ -10,11 +10,25 @@ pub mod chrome;
 pub mod d3d11;
 #[cfg(windows)]
 pub mod font;
+#[cfg(unix)]
+#[path = "swash_font.rs"]
+pub mod font;
+pub mod quad;
+#[cfg(unix)]
+pub mod wgpu_gpu;
 
 use std::io::Write as _;
 use std::path::Path;
 
 use vt::{Palette, RenderCell, Snapshot};
+
+#[cfg(windows)]
+pub use windows::core::{Error, Result};
+/// What a renderer backend or font fails with outside Windows.
+#[cfg(not(windows))]
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+#[cfg(not(windows))]
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Sidebar and label text size relative to the terminal font.
 const CHROME_TEXT: f32 = 0.75;
@@ -114,7 +128,7 @@ fn mix(a: u32, b: u32) -> u32 {
 }
 
 /// `fg` a quarter of the way to `bg`: text in a pane without focus.
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn toward(fg: u32, bg: u32) -> u32 {
     let ch = |s: u32| {
         let (f, b) = ((fg >> s & 0xff) as i32, (bg >> s & 0xff) as i32);
@@ -126,7 +140,7 @@ fn toward(fg: u32, bg: u32) -> u32 {
 /// `blitz debug render`: renders a terminal screen offscreen and writes it
 /// to a BMP. Returns the process exit code.
 pub fn debug_render(args: &[String]) -> i32 {
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     match gpu::debug_render(args) {
         Ok(msg) => {
             println!("{msg}");
@@ -137,31 +151,34 @@ pub fn debug_render(args: &[String]) -> i32 {
             1
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = args;
-        eprintln!("blitz debug render: only Windows is supported for now");
+        eprintln!("blitz debug render: not supported on this system");
         2
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 pub use gpu::{Renderer, render_offscreen};
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 mod gpu {
     use std::path::{Path, PathBuf};
 
     use vt::{CursorShape, Palette, RenderCell, Snapshot, snapshot::attr};
-    use windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView;
-    use windows::core::Result;
 
+    use super::Result;
     use super::atlas::{Atlas, GlyphKey, Slot};
     use super::chrome::{Chrome, Prim, branch_mask, shape_mask};
-    use super::d3d11::{ATLAS_SIZE, CURLY, DASHED, DOTTED, GLYPH, Gpu, MASK, Quad, SOLID, rgba};
-    use super::font::{BOLD, DEFAULT_FAMILIES, E_PENDING, Font, ITALIC};
+    #[cfg(windows)]
+    use super::d3d11 as backend;
+    use super::font::{BOLD, DEFAULT_FAMILIES, Font, ITALIC, is_pending};
+    #[cfg(unix)]
+    use super::wgpu_gpu as backend;
     use super::{builtin, text_snapshot, write_bmp};
     use crate::theme::readable;
+    use backend::{ATLAS_SIZE, CURLY, DASHED, DOTTED, GLYPH, Gpu, MASK, Quad, SOLID, Target, rgba};
 
     /// Default font size: 12 pt at 96 DPI.
     pub const DEFAULT_PX: f32 = 16.0;
@@ -751,7 +768,7 @@ mod gpu {
                 let text = std::str::from_utf8(text).ok()?;
                 match font.raster(text, key.style & (BOLD | ITALIC), key.width) {
                     Ok(Some(r)) => Some((r.w, r.h, r.dx, r.dy, r.alpha)),
-                    Err(e) if e.code() == E_PENDING => {
+                    Err(e) if is_pending(&e) => {
                         self.pending = true;
                         return None;
                     }
@@ -795,13 +812,7 @@ mod gpu {
         /// glyph atlas filled up and left glyphs out, and an empty atlas
         /// may hold them, in which case the caller should build and draw
         /// the frame again.
-        pub fn draw(
-            &mut self,
-            rtv: &ID3D11RenderTargetView,
-            w: u32,
-            h: u32,
-            bg: u32,
-        ) -> Result<bool> {
+        pub fn draw(&mut self, rtv: &Target, w: u32, h: u32, bg: u32) -> Result<bool> {
             self.gpu.draw(rtv, w, h, bg, &self.quads)?;
             Ok(self.overflowed && !self.cleared)
         }
@@ -847,7 +858,14 @@ mod gpu {
         q.size = [(right - left) as u16, (bottom - top) as u16];
     }
 
+    /// The system's text cursor thickness in pixels at 100 %.
+    #[cfg(not(windows))]
+    fn caret_width() -> u32 {
+        1
+    }
+
     /// Windows' text cursor thickness in pixels at 100 %.
+    #[cfg(windows)]
     fn caret_width() -> u32 {
         use windows::Win32::UI::WindowsAndMessaging::{
             SPI_GETCARETWIDTH, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
@@ -1319,7 +1337,7 @@ mod tests {
         assert_eq!(s.cells[14].len, 0);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn dim_keeps_three_quarters_of_the_contrast() {
         assert_eq!(toward(0xffffff, 0x000000), 0xbfbfbf);
@@ -1330,7 +1348,7 @@ mod tests {
     }
 
     /// The colour of the pixel at (`x`, `y`) of `w`-wide BGRA pixels.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn pixel(px: &[u8], w: u32, x: u32, y: u32) -> u32 {
         let i = ((y * w + x) * 4) as usize;
         u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
@@ -1338,7 +1356,7 @@ mod tests {
 
     /// A terminal not yet resized to its smaller pane draws only inside the
     /// pane, never over its neighbour.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_clipped_keeps_a_grid_inside_its_pane() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1365,7 +1383,7 @@ mod tests {
         assert_eq!(pixel(&px, w, 2 * cw + cw / 2, mid), 0x00ff00, "not past it");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_unfocused_pane_hollows_cursor_and_hides_selection() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1398,7 +1416,7 @@ mod tests {
         assert_eq!(pixel(&px, w, 2 * cw + cw / 2, mid), p.selection_bg);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_glyph_under_a_block_cursor_takes_the_background() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1431,7 +1449,7 @@ mod tests {
         assert_eq!(pixel(&px, w, cw / 2, ch / 2), p.fg);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_strike_and_overline_cross_the_cell() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1467,7 +1485,7 @@ mod tests {
         assert_eq!(pixel(&px, w, cw / 2, ch - 1), p.bg, "no underline");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_set_font_draws_at_the_new_size() {
         let p = pal();
@@ -1531,7 +1549,7 @@ mod tests {
         assert_eq!(&bmp[..2], b"BM");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_snapshot_draws_glyphs_and_cursor() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1558,7 +1576,7 @@ mod tests {
         assert_eq!(at(0, 0), p.bg);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_dim_text_is_halfway_to_its_background() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1581,7 +1599,7 @@ mod tests {
         assert_eq!(pixel(&px, w, cw / 2, ch / 2), toward(p.fg, p.bg));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_text_close_to_its_background_shows_but_shapes_keep_their_colour() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1607,7 +1625,7 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_underline_selection_and_bar_cursor() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1638,7 +1656,7 @@ mod tests {
         assert!(ink, "wide glyph spans two cells");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_program_cursor_colour_and_hollow_cursor() {
         let p = pal();
@@ -1674,7 +1692,7 @@ mod tests {
         assert_eq!(frame(darker, 1, true)(cw, 0), p.fg, "hollow");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_bar_and_underline_cursors_show_over_text_at_any_scale() {
         let p = pal();
@@ -1713,7 +1731,7 @@ mod tests {
         assert_eq!(at(&mut r, &blank, true, cw + cw / 2, ch / 2), p.bg);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_lines_and_underline_colours() {
         use vt::snapshot::attr;
@@ -1761,7 +1779,7 @@ mod tests {
         assert_eq!(at(4 * cw + 1, 0), p.fg, "overline");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_selection_shows_text_close_to_its_background() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1776,7 +1794,7 @@ mod tests {
         assert_eq!(at, p.fg);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_theme_colours_for_selected_text_and_text_on_the_cursor() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1803,7 +1821,7 @@ mod tests {
         assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), p.fg);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_search_matches_and_the_current_one() {
         use vt::snapshot::Highlight;
@@ -1845,7 +1863,7 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_block_selection_takes_the_same_columns_of_each_row() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1864,7 +1882,7 @@ mod tests {
         assert_eq!(at(2 * cw + 1, 1), p.bg, "not the rest of the first row");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_link_under_the_pointer_is_underlined() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1884,7 +1902,7 @@ mod tests {
         assert_eq!(at(cw + 1, ch + uy), p.bg, "nothing after it");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_chrome_shapes_and_text() {
         use crate::layout::Rect;
@@ -1944,7 +1962,7 @@ mod tests {
         assert!(branch, "branch icon");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_italic_text_draws_another_face() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1963,7 +1981,7 @@ mod tests {
         assert_ne!(cell(0), cell(1), "italic is not the upright glyph");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_full_atlas_leaves_earlier_glyphs_alone() {
         let p = pal();
@@ -1977,7 +1995,7 @@ mod tests {
         assert!(px[..row] == want[..row], "the first row is drawn as usual");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_glyph_too_big_for_the_atlas_is_left_out() {
         let p = pal();
@@ -1993,7 +2011,7 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_wide_clusters_stay_inside_their_grid() {
         let p = pal();
@@ -2022,7 +2040,7 @@ mod tests {
         assert!(!spill, "nothing is drawn right of the grid");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_combining_marks_stay_on_their_character() {
         let p = pal();
@@ -2056,7 +2074,7 @@ mod tests {
         assert!(ink("e\u{301}").0 > plain, "the accent is drawn");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_spreads_font_lookups_over_frames() {
         let p = pal();
