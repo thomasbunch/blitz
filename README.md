@@ -3,8 +3,8 @@
 A fast terminal for running several Claude Code sessions, or any other
 shells, side by side, and seeing at a glance which one is waiting for you.
 
-> **Early alpha. Windows only for now.** Expect rough edges and missing
-> features.
+> **Early alpha.** Windows and macOS; Linux builds are experimental and
+> untested. Expect rough edges and missing features.
 
 - Tabs and splits; every pane is its own shell.
 - With two or more sessions, a sidebar lists them with their directory,
@@ -34,9 +34,12 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   file paths.
 - Files dropped on a pane paste as their paths, and Ctrl+V pastes a
   screenshot into Claude Code.
-- Direct3D 11 and DirectWrite rendering, with a software fallback.
+- Direct3D 11 and DirectWrite rendering on Windows, with a software
+  fallback; Metal on macOS and Vulkan or OpenGL on Linux, through wgpu.
 
 ## Install
+
+### Windows
 
 Windows 10 1809 or later, x64. From
 [Releases](https://github.com/thomasbunch/blitz/releases), run the
@@ -78,6 +81,29 @@ installer's log. With nothing shown, Ctrl+Shift+U asks GitHub right away
 and says what it found. The settings panel, under **Check for updates**,
 says why the last look or update failed.
 
+### macOS
+
+macOS 11 or later, Apple silicon or Intel. From
+[Releases](https://github.com/thomasbunch/blitz/releases), unzip
+`-macos.zip` and drag `blitz.app` to Applications. The app is not
+notarized yet, so the first time, right-click it and choose **Open**,
+then **Open** again; after that it starts like any other app. If macOS
+still refuses, run `xattr -d com.apple.quarantine /Applications/blitz.app`.
+
+The shell is your login shell (`$SHELL`, usually zsh). Shortcuts use Cmd
+where Windows uses Ctrl or Ctrl+Shift; see [Default keys](#default-keys).
+Settings are in `~/.config/blitz`. blitz tells you about a newer release
+but does not install it: the notice opens the release page.
+
+### Linux (experimental)
+
+x64, built on Ubuntu but not tested beyond CI. Unpack
+`-linux-x64-experimental.tar.gz` and run `blitz` from it, keeping
+`blitz-hook` beside it. It needs a Vulkan or OpenGL driver; copy and
+paste use `wl-copy` and `wl-paste`, `xclip` or `xsel`, and notifications
+use `notify-send`. Settings are in `~/.config/blitz`. Reports of what
+works and what does not are welcome as issues.
+
 ## Build
 
 Needs [Rust](https://rustup.rs); `rust-toolchain.toml` pins the toolchain.
@@ -86,8 +112,9 @@ Needs [Rust](https://rustup.rs); `rust-toolchain.toml` pins the toolchain.
 cargo build --release
 ```
 
-This produces `target\release\blitz.exe` and `blitz-hook.exe`; keep them
-together. Releases also ship Microsoft's `conpty.dll` and `OpenConsole.exe`
+This produces `target\release\blitz.exe` and `blitz-hook.exe` on Windows,
+or `target/release/blitz` and `blitz-hook` elsewhere; keep them together.
+The rest of this section is about Windows. Releases also ship Microsoft's `conpty.dll` and `OpenConsole.exe`
 (NuGet `Microsoft.Windows.Console.ConPTY` 1.25 or later, from
 `runtimes\win-x64` and `build\native\runtimes\x64`). Put them next to
 `blitz.exe` or set `BLITZ_CONPTY_DIR` to the full path of their folder.

@@ -7,7 +7,25 @@ people who use blitz.
 ## [0.0.5] - Unreleased
 
 The biggest release yet: a command palette, your own key bindings, find,
-notifications, and Claude Code marks that need no setup. Windows only.
+notifications, Claude Code marks that need no setup, and the first builds
+for macOS. Linux builds are experimental.
+
+### macOS and Linux
+
+- blitz runs on macOS 11 or later, as a universal `blitz.app` for Apple
+  silicon and Intel. It is not notarized yet: right-click it and choose
+  **Open** the first time.
+- An experimental Linux x64 build. It passes CI on Ubuntu but has had no
+  other testing, so please report what breaks.
+- Shortcuts on a Mac use Cmd, as Terminal does: **Cmd+T** opens a tab,
+  **Cmd+D** splits, **Cmd+W** closes, **Cmd+F** finds and **Cmd+click**
+  opens links. Option types its own characters, and is Meta where it types
+  none. Key bindings take `cmd` (or `super`) and `opt`.
+- Drawing goes through Metal on macOS and Vulkan or OpenGL on Linux.
+- Notifications through Notification Center or `notify-send`, a badge and a
+  bounce on the Dock icon, and `keep_awake` keeps the Mac from sleeping.
+- Settings live in `~/.config/blitz`. blitz says when there is a new release,
+  and the notice opens its page; it updates itself only on Windows.
 
 ### Keys and the palette
 
@@ -94,7 +112,8 @@ notifications, and Claude Code marks that need no setup. Windows only.
 
 ### Known gaps
 
-- No macOS or Linux builds yet.
+- On macOS and Linux: no `global_jump`, no progress on the Dock icon, no
+  window menu on Alt+Space, and glyphs come from swash rather than Core Text.
 - Shell output is saved only when blitz exits normally, not at sign-out.
 - No screen reader support in the panes.
 
