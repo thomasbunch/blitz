@@ -109,10 +109,15 @@ jobs:
           unknown-git = "deny"
           EOF
           # Licenses cover what ships, on each system, without dev
-          # dependencies.
-          cargo deny --config "$RUNNER_TEMP/deny.toml" --locked --exclude-dev \
-            --target x86_64-pc-windows-msvc --target x86_64-apple-darwin \
-            --target aarch64-apple-darwin --target x86_64-unknown-linux-gnu check licenses
+          # dependencies. cargo-deny takes one --target, so the systems are
+          # listed in a config of their own.
+          cat "$RUNNER_TEMP/deny.toml" - > "$RUNNER_TEMP/deny-ship.toml" <<'EOF'
+
+          [graph]
+          targets = ["x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+          exclude-dev = true
+          EOF
+          cargo deny --config "$RUNNER_TEMP/deny-ship.toml" --locked check licenses
           # Sources cover every crate CI builds, on every target.
           cargo deny --config "$RUNNER_TEMP/deny.toml" --locked check sources
 
