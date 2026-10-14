@@ -99,11 +99,28 @@ fn login_shell(var: Option<OsString>) -> PathBuf {
         .unwrap_or_else(|| "/bin/sh".into())
 }
 
+/// The shell the user's account names, as Terminal starts it.
+fn account_shell() -> Option<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: getpwuid returns this user's entry in static storage or
+    // null; its shell is copied out at once, on the one thread that asks.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_shell.is_null() {
+            return None;
+        }
+        let shell = std::ffi::CStr::from_ptr((*pw).pw_shell);
+        Some(std::ffi::OsStr::from_bytes(shell.to_bytes()).to_owned())
+    }
+}
+
 /// `cmdline` run by `/bin/sh`, or with none, the login shell as a login
 /// shell, as terminals on macOS start it, so its profile sets `PATH`.
 fn command(cmdline: &str) -> Command {
     if cmdline.trim().is_empty() {
-        let shell = login_shell(std::env::var_os("SHELL"));
+        // An app started from the Finder or the Dock has no SHELL; the
+        // user's account names it.
+        let shell = login_shell(std::env::var_os("SHELL").or_else(account_shell));
         let name = shell.file_name().unwrap_or_default().to_string_lossy();
         let mut c = Command::new(&shell);
         c.arg0(format!("-{name}"));
