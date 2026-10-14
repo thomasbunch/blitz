@@ -56,7 +56,7 @@ jobs:
       # crates/ or .github/ gets past the check above.
       - name: Only expected kinds of files are tracked
         run: |
-          ok='\.gitignore|\.gitattributes|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|LICENSE|README\.md'
+          ok='\.gitignore|\.gitattributes|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|LICENSE|README\.md|CHANGELOG\.md'
           ok="$ok|\.cargo/config\.toml|\.github/workflows/[a-z0-9-]+\.yml|\.github/(blitz\.iss|about\.toml|about\.hbs|dependabot\.yml)"
           ok="$ok|crates/[a-z0-9-]+/(Cargo\.toml|build\.rs)|crates/[a-z0-9-]+/(src|tests|examples)/.+\.rs"
           ok="$ok|crates/[a-z0-9-]+/tests/.+\.vt|crates/blitz/src/render/[a-z0-9_]+\.hlsl"
