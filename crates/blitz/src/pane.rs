@@ -588,12 +588,11 @@ mod tests {
                 cmdline: if cfg!(windows) {
                     "cmd.exe /d /k echo pane-one"
                 } else {
-                    "echo pane-one; exec sh -i"
+                    // The terminal echoes what is typed after the prompt,
+                    // as a shell's line editor would.
+                    "echo pane-one; printf 'pane-two>'; read x"
                 },
-                env: &[
-                    ("PROMPT".into(), "pane-two$G".into()),
-                    ("PS1".into(), "pane-two>".into()),
-                ],
+                env: &[("PROMPT".into(), "pane-two$G".into())],
                 cwd: None,
                 cols: 40,
                 rows: 5,
