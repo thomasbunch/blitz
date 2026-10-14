@@ -187,16 +187,24 @@ pub fn numbers(saved: &[u32]) -> (Vec<u32>, u32) {
     (nums, next)
 }
 
-/// `%LOCALAPPDATA%\blitz`. It is created on the first save. Debug builds
-/// use their own, so `cargo run` never restores, resumes or deletes the
-/// installed blitz's sessions.
+/// `%LOCALAPPDATA%\blitz`; on macOS `~/Library/Application Support/blitz`,
+/// and on Linux `~/.local/state/blitz` or under `XDG_STATE_HOME`. It is
+/// created on the first save. Debug builds use their own, so `cargo run`
+/// never restores, resumes or deletes the installed blitz's sessions.
 pub fn dir() -> Option<PathBuf> {
     let name = if cfg!(debug_assertions) {
         "blitz.dev"
     } else {
         "blitz"
     };
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(name))
+    let root = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        crate::config::xdg(None, "Library/Application Support")
+    } else {
+        crate::config::xdg(Some("XDG_STATE_HOME"), ".local/state")
+    };
+    root.map(|d| d.join(name))
 }
 
 fn file() -> Option<PathBuf> {

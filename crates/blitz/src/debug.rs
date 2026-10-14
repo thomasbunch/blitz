@@ -46,7 +46,6 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use vt::{Key, KeyInput, Locks, Mods, MouseEv, MouseKind, Terminal};
-use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
 
 use crate::keymap::unesc;
 use crate::pty::{Pty, PtyEvent, SpawnOpts, Writer};
@@ -843,9 +842,8 @@ fn chord<'a>(spec: &str, text: &'a mut String) -> Result<Vec<KeyInput<'a>>, Stri
     };
     let input = |key: Key, vk: u16, down: bool, mods: Mods, text: &'a str, uc: u16| KeyInput {
         vk,
-        // SAFETY: a table lookup with no pointers involved.
-        scan: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) } as u16,
-        extended: matches!(vk, 0x21..=0x28 | 0x2d | 0x2e | 0x5b),
+        scan: crate::keymap::scan_code(vk).0,
+        extended: crate::keymap::scan_code(vk).1,
         down,
         repeat: 1,
         mods,

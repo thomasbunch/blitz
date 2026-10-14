@@ -1,6 +1,6 @@
 //! The session and its saved output on disk. The only test in this binary:
-//! it points `LOCALAPPDATA` at a folder of its own, and no other thread may
-//! read the environment meanwhile.
+//! it points the state folder at a folder of its own, and no other thread
+//! may read the environment meanwhile.
 
 use std::path::{Path, PathBuf};
 
@@ -34,11 +34,20 @@ fn session_files_round_trip() {
         .join(format!("session-io-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("root");
+    // Where each system keeps it: under LOCALAPPDATA, XDG_STATE_HOME, or
+    // the home folder's Library.
+    let (var, parent) = if cfg!(windows) {
+        ("LOCALAPPDATA", root.clone())
+    } else if cfg!(target_os = "macos") {
+        ("HOME", root.join("Library").join("Application Support"))
+    } else {
+        ("XDG_STATE_HOME", root.clone())
+    };
     // SAFETY: the only test in this binary, so nothing else reads the
     // environment while it changes.
-    unsafe { std::env::set_var("LOCALAPPDATA", &root) };
+    unsafe { std::env::set_var(var, &root) };
     let dir = session::dir().expect("state folder");
-    assert_eq!(dir.parent(), Some(root.as_path()));
+    assert_eq!(dir.parent(), Some(parent.as_path()));
 
     // Nothing saved yet.
     assert_eq!(session::load(), None);
@@ -134,8 +143,13 @@ fn session_files_round_trip() {
     assert_eq!(session::load_output(A), None);
     assert!(!dir.join("scrollback").exists());
 
+    // With nowhere to keep it, nothing is kept. Elsewhere the home folder
+    // is where it falls back to.
     // SAFETY: as above.
-    unsafe { std::env::remove_var("LOCALAPPDATA") };
+    unsafe {
+        std::env::remove_var(var);
+        std::env::remove_var("HOME");
+    }
     assert_eq!(session::dir(), None);
     assert!(session::save(&one).is_err());
     assert!(session::save_output(&[]).is_err());

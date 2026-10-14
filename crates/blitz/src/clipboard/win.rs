@@ -1,4 +1,4 @@
-//! Clipboard text, and the files and images a paste can find instead.
+//! The Windows clipboard.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -100,10 +100,11 @@ pub fn get_files() -> Option<Vec<PathBuf>> {
     }
 }
 
-/// Puts `text` on the clipboard. Returns false if that failed.
-pub fn set_text(owner: Option<HWND>, text: &str) -> bool {
+/// Puts `text` on the clipboard for window `owner`. Returns false if that
+/// failed.
+pub fn set_text(owner: Option<isize>, text: &str) -> bool {
     let utf16: Vec<u16> = text.encode_utf16().chain([0]).collect();
-    let Some(_open) = Open::new(owner) else {
+    let Some(_open) = Open::new(owner.map(|h| HWND(h as *mut _))) else {
         return false;
     };
     // SAFETY: the clipboard is open; the allocation is large enough for the

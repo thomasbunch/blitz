@@ -2,25 +2,35 @@
 //!
 //! Only full releases count: GitHub's latest release skips drafts and
 //! prereleases. HTTP goes through Windows' own curl.exe, by way of the
-//! proxy Windows is set to use.
+//! proxy Windows is set to use, or elsewhere through the system's curl.
+//! Only Windows has an installer for blitz to run; elsewhere the banner
+//! opens the release page.
 
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
+#[cfg(windows)]
 use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
+#[cfg(windows)]
 use windows::Win32::Networking::WinHttp::{
     WINHTTP_CURRENT_USER_IE_PROXY_CONFIG, WinHttpGetIEProxyConfigForCurrentUser,
 };
+#[cfg(windows)]
 use windows::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
+#[cfg(windows)]
 use windows::Win32::UI::Shell::ShellExecuteW;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+#[cfg(windows)]
 use windows::core::{HSTRING, PWSTR, w};
 
 const REPO: &str = "thomasbunch/blitz";
 /// The latest release's page.
 pub const PAGE: &str = "https://github.com/thomasbunch/blitz/releases/latest";
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The latest release's version when it is newer than this build, or why
@@ -157,7 +167,16 @@ pub fn found(r: &Result<Option<String>, String>) -> String {
 }
 
 /// Whether blitz runs from the installer's folder rather than an unzipped
+/// copy, which has to be replaced by hand. Only Windows has an installer:
+/// elsewhere the banner opens the release page.
+#[cfg(not(windows))]
+pub fn installed() -> bool {
+    false
+}
+
+/// Whether blitz runs from the installer's folder rather than an unzipped
 /// copy, which has to be replaced by hand.
+#[cfg(windows)]
 pub fn installed() -> bool {
     std::env::current_exe()
         .ok()
@@ -171,6 +190,29 @@ pub fn notes(v: &str) -> String {
 }
 
 /// Opens a web page in the browser; false if it could not.
+#[cfg(not(windows))]
+pub fn open(url: &str) -> bool {
+    let opener = if cfg!(target_os = "macos") {
+        "/usr/bin/open"
+    } else {
+        "xdg-open"
+    };
+    // Only web pages: `open` and xdg-open would take anything.
+    url.starts_with("https://")
+        && Command::new(opener)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|mut c| {
+                std::thread::spawn(move || c.wait());
+            })
+            .is_ok()
+}
+
+/// Opens a web page in the browser; false if it could not.
+#[cfg(windows)]
 pub fn open(url: &str) -> bool {
     // SAFETY: valid strings and no window.
     let h = unsafe {
@@ -299,6 +341,7 @@ fn failed_in(temp: &Path, current: &str, now: Option<SystemTime>) -> Option<(Str
 
 /// The installer's file name in release `v`, as `.github/blitz.iss`
 /// names it.
+#[cfg(windows)]
 fn installer_name(v: &str) -> String {
     format!("blitz-{v}-windows-x64-setup.exe")
 }
@@ -315,6 +358,7 @@ pub struct Installer {
 // ponytail: the checksum comes from the same release, so it catches a bad
 // download, not a bad release. Check an Authenticode signer once releases
 // are signed.
+#[cfg(windows)]
 pub fn fetch(v: &str) -> Result<Installer, String> {
     let base = format!("https://github.com/{REPO}/releases/download/v{v}");
     let name = installer_name(v);
@@ -345,10 +389,26 @@ pub fn fetch(v: &str) -> Result<Installer, String> {
     })
 }
 
+/// Only Windows has an installer to fetch.
+#[cfg(not(windows))]
+pub fn fetch(_v: &str) -> Result<Installer, String> {
+    Err(UNIX_UPDATE.into())
+}
+
+/// Only Windows has an installer to run.
+#[cfg(not(windows))]
+pub fn run(_installer: &Installer, _relaunch: bool) -> Result<(), String> {
+    Err(UNIX_UPDATE.into())
+}
+
+#[cfg(not(windows))]
+const UNIX_UPDATE: &str = "blitz updates itself only on Windows; download it from the release page";
+
 /// Starts the `installer` that `fetch` saved. It closes what is left of
 /// blitz and installs, and with `relaunch` starts blitz again. One left
 /// for when blitz closes may wait hours, so the file is checked again,
 /// held open so nothing can change it until the installer has started.
+#[cfg(windows)]
 pub fn run(installer: &Installer, relaunch: bool) -> Result<(), String> {
     use std::io::Read;
     use std::os::windows::fs::OpenOptionsExt;
@@ -392,6 +452,7 @@ pub fn run(installer: &Installer, relaunch: bool) -> Result<(), String> {
 
 /// A silent install writing `log`; `.github/blitz.iss` starts blitz again
 /// after it when told `/relaunch=1`.
+#[cfg(windows)]
 fn installer_args(log: &Path, relaunch: bool) -> Vec<String> {
     let relaunch = relaunch.then_some("/relaunch=1");
     (["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"].into_iter())
@@ -402,6 +463,7 @@ fn installer_args(log: &Path, relaunch: bool) -> Vec<String> {
 }
 
 /// The hex SHA-256 that a `sha256sum` listing gives for file `name`.
+#[cfg(windows)]
 fn sum_for<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
     sums.lines().find_map(|l| {
         let (hex, file) = l.trim_end().split_once(' ')?;
@@ -410,6 +472,7 @@ fn sum_for<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+#[cfg(windows)]
 fn sha256_hex(data: &[u8]) -> Option<String> {
     let mut out = [0u8; 32];
     // SAFETY: valid slices; the pseudo-handle needs no setup.
@@ -421,6 +484,7 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
 
 /// Runs System32's curl.exe over HTTPS only, redirects included, and
 /// returns what it downloaded.
+#[cfg(windows)]
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let ua = concat!("blitz/", env!("CARGO_PKG_VERSION"));
     let exe = curl_exe();
@@ -443,8 +507,34 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
+#[cfg(not(windows))]
+fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
+    let ua = concat!("blitz/", env!("CARGO_PKG_VERSION"));
+    // The system's own, by its full path on macOS. curl reads the proxy
+    // from the environment itself.
+    let exe = if cfg!(target_os = "macos") {
+        "/usr/bin/curl"
+    } else {
+        "curl"
+    };
+    // A slow line still finishes the download; one that stalls gives up.
+    let out = Command::new(exe)
+        .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https"])
+        .args(["--connect-timeout", "20", "--speed-limit", "1000"])
+        .args(["--speed-time", "30", "-A", ua])
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run curl: {e}"))?;
+    if !out.status.success() {
+        return Err(curl_error(&out.stderr, out.status.code()));
+    }
+    Ok(out.stdout)
+}
+
 /// System32's curl.exe, named by its full path: a bare name is looked for
 /// in blitz's own folder first, where a planted curl.exe would run instead.
+#[cfg(windows)]
 fn curl_exe() -> PathBuf {
     crate::shell::system_root(|k| std::env::var_os(k))
         .join("System32")
@@ -454,6 +544,7 @@ fn curl_exe() -> PathBuf {
 /// curl's options to go through `proxy`. One that asks who is there, as a
 /// work network's often does, is answered as the Windows user, the way
 /// browsers do, and with no password asked for.
+#[cfg(windows)]
 fn proxy_args(proxy: &str) -> [&str; 5] {
     ["--proxy", proxy, "--proxy-anyauth", "--proxy-user", ":"]
 }
@@ -461,6 +552,7 @@ fn proxy_args(proxy: &str) -> [&str; 5] {
 /// The proxy for HTTPS that Windows' proxy settings name, if any.
 // ponytail: a fixed proxy only; a setup script or automatic detection
 // needs WinHttpGetProxyForUrl, and the bypass list is not read.
+#[cfg(windows)]
 fn system_proxy() -> Option<String> {
     let mut ie = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
     // SAFETY: a struct for the call to fill.
@@ -488,6 +580,7 @@ fn system_proxy() -> Option<String> {
 
 /// The proxy for HTTPS in a WinHTTP proxy list: `host:port` for every
 /// scheme, or entries such as `http=a:80;https=b:443`.
+#[cfg(windows)]
 fn https_proxy(list: &str) -> Option<String> {
     let mut all = None;
     for e in list.split([';', ' ']).filter(|e| !e.is_empty()) {
@@ -583,6 +676,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn installer_matches_the_setup_script() {
         let iss = include_str!("../../../.github/blitz.iss");
@@ -823,6 +917,7 @@ mod tests {
         assert_eq!(curl_error(b" \r\n", None), "curl stopped");
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_proxy_for_https_comes_from_the_windows_list() {
         assert_eq!(https_proxy("proxy:8080").as_deref(), Some("proxy:8080"));
@@ -846,6 +941,7 @@ mod tests {
 
     /// curl tells a proxy that asks who is there the Windows user, signed
     /// in by Windows itself.
+    #[cfg(windows)]
     #[test]
     fn a_proxy_that_asks_is_told_the_windows_user() {
         use std::io::{Read, Write};
@@ -883,6 +979,7 @@ mod tests {
         assert!(seen.contains(auth), "{seen}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn checksum_lines() {
         let a = "9481ceb1a4ca53426744bc64bd7ac424bda929775334bd604336db3f5865795c";
@@ -1003,6 +1100,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn sha256_known_answer() {
         assert_eq!(
@@ -1013,6 +1111,7 @@ mod tests {
 
     /// An installer left for when blitz closes is checked again before it
     /// starts: hours may have passed since the download.
+    #[cfg(windows)]
     #[test]
     fn an_installer_changed_since_its_check_does_not_start() {
         let dir = std::env::temp_dir().join(format!("blitz-recheck-{}", std::process::id()));

@@ -489,7 +489,7 @@ impl Swapchain {
     }
 
     /// Presents with vsync. Returns false while the window is occluded.
-    pub fn present(&self) -> Result<bool> {
+    pub fn present(&self, _gpu: &Gpu) -> Result<bool> {
         // SAFETY: COM call on a live swap chain.
         let hr = unsafe { self.chain.Present(1, DXGI_PRESENT(0)) };
         if hr == DXGI_STATUS_OCCLUDED {
@@ -696,7 +696,7 @@ mod tests {
         };
         gpu.draw(&rtv, chain.w, chain.h, 0x101010, &[quad])
             .expect("draw");
-        chain.present().expect("present");
+        chain.present(gpu).expect("present");
     }
 
     #[test]

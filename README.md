@@ -473,6 +473,45 @@ that, or typing, goes back to the bottom.
 | Ctrl+Shift+Space | Quick select a link, path or hash to copy or open |
 | Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
+On Linux the keys are the same, but for Alt+Space, which does nothing.
+On macOS shortcuts take Cmd, as in Terminal, and every Ctrl key goes to
+the program:
+
+| Keys | Action |
+|---|---|
+| Cmd+T | New tab |
+| Cmd+W, Shift+Cmd+W | Close pane, close tab |
+| Shift+Cmd+T | Reopen the last closed pane |
+| Shift+Cmd+], Shift+Cmd+[, Ctrl+Tab, Ctrl+Shift+Tab | Next, previous tab |
+| Shift+Cmd+PgUp, Shift+Cmd+PgDn | Move the tab left, right |
+| Cmd+1 to Cmd+8, Cmd+9 | Go to that tab, to the last tab |
+| Cmd+D, Shift+Cmd+D | Split right, split down |
+| Opt+Cmd+Arrows | Move focus between panes |
+| Ctrl+Cmd+Arrows | Resize the focused pane |
+| Opt+Shift+Cmd+Arrows | Swap the focused pane with its neighbour |
+| Shift+Cmd+Enter | Zoom the focused pane |
+| Shift+Cmd+J | Jump to the next session that needs you |
+| Shift+Cmd+O | Go to a session |
+| Shift+Cmd+B | Expand or collapse the sidebar |
+| Shift+Cmd+U | Look for a newer release |
+| Shift+Cmd+K | Pick a theme |
+| Cmd+, | Settings |
+| Shift+Cmd+P | Command palette |
+| Cmd+=, Shift+Cmd+=, Cmd+-, Cmd+0 | Font size up, down, and back to the setting |
+| Ctrl+Cmd+F | Full screen |
+| Cmd+C, Cmd+V, Cmd+A | Copy, paste, select all |
+| Cmd+K | Clear the scrollback |
+| Shift+PgUp, Shift+PgDn, Cmd+PgUp, Cmd+PgDn | Scroll |
+| Cmd+Home, Cmd+End | Scroll to the top, to the bottom |
+| Cmd+F | Find in the scrollback |
+| Shift+Cmd+Space | Quick select a link, path or hash |
+| Cmd+Up, Cmd+Down | Previous, next prompt |
+
+Option types the character it makes on your layout, as Option+E does
+for an accent; on a key where it makes none, such as an arrow, it is
+Meta, or Alt, for the shell. Cmd+click opens links, where other systems
+take Ctrl+click.
+
 A zoomed pane stays zoomed until you zoom again, move focus to another
 pane, split or resize. With `global_jump` on, Ctrl+Alt+J jumps from any
 program: it brings blitz to the front on the session that needs you.
@@ -509,7 +548,8 @@ keybind = ctrl+shift+r=none
 keybind = alt+f11=command_palette
 ```
 
-A chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`:
+A chord is any of `ctrl`, `shift`, `alt` (or `opt`) and `cmd` (or
+`super`, the Windows key) and one key, joined by `+`:
 a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
 `end`, `pageup`, `pagedown`, `insert`, `delete`, `tab`, `enter`, `esc`,
 `space`, `backspace`, or a punctuation key by its character or its name,

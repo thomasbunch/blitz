@@ -27,6 +27,12 @@ pub fn inbox_notice() -> Option<&'static str> {
     None
 }
 
+/// A child here gets SIGHUP when its pseudoterminal closes, which is when
+/// blitz exits; nothing to set up.
+pub fn kill_children_on_exit() -> io::Result<()> {
+    Ok(())
+}
+
 /// A new secret for one pane: 128 bits from the system's random number
 /// generator, in hex. See the Windows version for what it is for.
 pub fn pane_token() -> io::Result<String> {
@@ -110,10 +116,12 @@ fn command(cmdline: &str) -> Command {
 }
 
 /// The exit code a pane reports: the child's own, or 128 plus the signal
-/// that ended it, as shells report it.
+/// that ended it, as shells report it. Ctrl+C reads as it does on Windows,
+/// so the pane closes as it does there.
 fn code(status: ExitStatus) -> u32 {
     match (status.code(), status.signal()) {
         (Some(c), _) => c as u32,
+        (None, Some(libc::SIGINT)) => crate::attention::CTRL_C_EXIT,
         (None, Some(sig)) => 128 + sig as u32,
         (None, None) => 1,
     }

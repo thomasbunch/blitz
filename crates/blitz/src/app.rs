@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -17,60 +18,52 @@ use vt::grid::Found;
 use vt::{
     Event, InputModes, KeyInput, Mods, MouseEv, MouseKind, MouseMode, Palette, PromptMark, Snapshot,
 };
-use windows::UI::Notifications::ToastNotification;
-use windows::Win32::Foundation::{HANDLE, HWND, POINT};
-use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DwmSetWindowAttribute,
-};
-use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-use windows::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows::Win32::System::Power::{
-    PowerClearRequest, PowerCreateRequest, PowerRequestSystemRequired, PowerSetRequest,
-};
-use windows::Win32::System::Threading::{
-    POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetKeyState, GetKeyboardState, GetLastInputInfo, LASTINPUTINFO,
-};
-use windows::Win32::UI::Shell::{
-    ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
-    TaskbarList,
-};
+#[cfg(windows)]
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState};
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateCaret, DestroyCaret, DestroyIcon, GetCursorPos, GetSystemMetrics, MB_OK, MSG,
-    SM_CXSMICON, SetCaretPos, SetForegroundWindow, TranslateMessage, WM_CHAR, WM_DEADCHAR,
-    WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    MSG, TranslateMessage, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSDEADCHAR,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
-use windows::core::{HSTRING, PWSTR};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+#[cfg(windows)]
 use winit::platform::windows::{
     EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows,
 };
+#[cfg(windows)]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorIcon, Fullscreen, Icon, Window, WindowAttributes, WindowId};
+#[cfg(windows)]
+use winit::window::Icon;
+use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::arcade::run::{self, Run};
 use crate::attention::{Attn, Ev, claude_title, exit_text};
 use crate::config::{Config, Kind};
 use crate::debug::Counters;
+use crate::desktop::{
+    animations_on, elevated, idle_for, local_stamp, mouse_vanish, not_a_start, place_caret,
+    restart_after_reboot, scroll_lines, starts_at_sign_in,
+};
 use crate::keymap::{self, Action};
 use crate::layout::{self, Axis, Dir, PaneId, Rect, Tab};
 use crate::links::{Link, Target};
 use crate::pane::{Note, Pane, Spawn, git_branch, lock, program_name};
 use crate::render::chrome::{self, ChromeModel, Side};
+#[cfg(windows)]
 use crate::render::d3d11::{Gpu, Swapchain, is_device_lost};
+#[cfg(not(windows))]
+use crate::render::wgpu_gpu::{Gpu, Swapchain, is_device_lost};
 use crate::render::{Renderer, text_snapshot, write_bmp};
 use crate::session::{self, Geometry, PaneMeta};
 use crate::settings::Panel;
 use crate::theme::Theme;
 
+#[cfg(windows)]
 const VK_PROCESSKEY: u16 = 0xe5;
+#[cfg(windows)]
 const VK_PACKET: u16 = 0xe7;
 const VK_RETURN: u16 = 0x0d;
 const VK_ESCAPE: u16 = 0x1b;
@@ -85,6 +78,7 @@ const VK_DELETE: u16 = 0x2e;
 const VK_SPACE: u16 = 0x20;
 const VK_W: u16 = 0x57;
 const VK_F3: u16 = 0x72;
+#[cfg(windows)]
 const VK_F4: u16 = 0x73;
 
 /// How long a notice that is neither a question nor an error stays up.
@@ -204,6 +198,10 @@ impl Args {
                 a.new_window = true;
                 continue;
             }
+            // The Finder of older macOS adds the process serial number.
+            if cfg!(target_os = "macos") && flag.starts_with("-psn_") {
+                continue;
+            }
             // A folder alone, as in `blitz .`, is `--cwd`. Anything else is
             // a mistyped command, which must not open a window.
             if !flag.starts_with("--") {
@@ -300,11 +298,15 @@ pub fn run(args: &[String]) -> Result<i32, String> {
     let keys = Rc::new(RefCell::new(Keys::default()));
     let hook_keys = keys.clone();
     let mut builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(windows)]
     builder.with_msg_hook(move |msg| {
         // SAFETY: winit passes a pointer to the MSG it just peeked.
         let msg = unsafe { &*msg.cast::<MSG>() };
         hook(&hook_keys, msg)
     });
+    // Elsewhere keys come as winit's key events; see `App::winit_key`.
+    #[cfg(not(windows))]
+    drop(hook_keys);
     let event_loop = match builder.build() {
         Ok(l) => l,
         Err(e) => {
@@ -346,14 +348,18 @@ pub fn catch_crashes() {
 struct Keys {
     queue: Vec<Input>,
     /// A dead key was pressed; the next key's text comes as WM_CHAR.
+    #[cfg(windows)]
     dead: bool,
     /// WM_CHAR messages carry text to send: Unicode packets from
     /// SendInput, and what a dead key composed.
+    #[cfg(windows)]
     chars: bool,
     /// High half of a surrogate pair from WM_CHAR.
+    #[cfg(windows)]
     high: Option<u16>,
     /// Keys whose release was already handled as text. Several can be
     /// down at once, as digits typed fast for an Alt code.
+    #[cfg(windows)]
     skip_up: Eaten,
 }
 
@@ -362,12 +368,14 @@ enum Input {
     /// it is an auto-repeat of a held key.
     Key(KeyInput<'static>, String, bool),
     /// Text to send as is.
+    #[cfg(windows)]
     Text(String),
 }
 
 /// The message hook: takes keyboard messages before winit sees them, so
 /// every transition is encoded from the raw message, including modifier
 /// keys and releases. Returns true for messages it consumed.
+#[cfg(windows)]
 fn hook(keys: &RefCell<Keys>, msg: &MSG) -> bool {
     let mut k = keys.borrow_mut();
     match msg.message {
@@ -416,6 +424,7 @@ fn hook(keys: &RefCell<Keys>, msg: &MSG) -> bool {
     }
 }
 
+#[cfg(windows)]
 impl Keys {
     /// Whether this is the release of a key whose text came as WM_CHAR,
     /// which was handled along with it.
@@ -506,7 +515,29 @@ fn owned(k: &KeyInput) -> KeyInput<'static> {
     }
 }
 
+thread_local! {
+    /// The modifier keys held, as winit last said.
+    #[cfg(not(windows))]
+    static MODS: std::cell::Cell<Mods> = const { std::cell::Cell::new(Mods {
+        lshift: false,
+        rshift: false,
+        lctrl: false,
+        rctrl: false,
+        lalt: false,
+        ralt: false,
+        lsuper: false,
+        rsuper: false,
+    }) };
+}
+
 /// Modifier keys held right now, for mouse events.
+#[cfg(not(windows))]
+fn mods_now() -> Mods {
+    MODS.with(std::cell::Cell::get)
+}
+
+/// Modifier keys held right now, for mouse events.
+#[cfg(windows)]
 fn mods_now() -> Mods {
     // SAFETY: plain state queries.
     let held = |vk: i32| unsafe { GetKeyState(vk) } < 0;
@@ -1032,7 +1063,7 @@ struct View {
     /// When blitz last alerted the user about this session.
     alerted: Option<Instant>,
     /// The notification about this session, while it is up.
-    toast: Option<ToastNotification>,
+    toast: Option<crate::notify::Toast>,
     /// A thread is reading the git branch of the session's directory.
     finding_branch: bool,
     /// A line to type at the shell's first prompt, and when to type it
@@ -1081,7 +1112,7 @@ struct App {
     config: Config,
     keys: Rc<RefCell<Keys>>,
     proxy: EventLoopProxy<UserEvent>,
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
     hwnd: isize,
     gfx: Option<Gfx>,
     theme: Theme,
@@ -1212,9 +1243,9 @@ struct App {
     watched: Option<Arc<selftest::Focus>>,
     started: Instant,
     /// The device started at launch, until the first renderer takes it.
-    gpu: Option<std::thread::JoinHandle<windows::core::Result<Gpu>>>,
+    gpu: Option<std::thread::JoinHandle<crate::render::Result<Gpu>>>,
     /// The taskbar button, for progress; made the first time it is needed.
-    taskbar: Option<ITaskbarList3>,
+    taskbar: crate::desktop::Taskbar,
     /// The progress the taskbar button shows.
     taskbar_shows: Option<chrome::Progress>,
     /// blitz's Claude Code plugin, which every pane loads; `None` when it
@@ -1226,9 +1257,8 @@ struct App {
     badge_shows: Option<Attn>,
     /// Ctrl+Alt+J comes to this window from every program.
     jump_key: bool,
-    /// The power request that keeps the PC awake; made the first time it
-    /// is needed.
-    power: Option<HANDLE>,
+    /// What keeps the PC awake; made the first time it is needed.
+    power: crate::desktop::Awake,
     /// The PC is kept awake.
     awake: bool,
     counters: Counters,
@@ -1594,47 +1624,15 @@ fn hashes(text: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// Sends [`UserEvent::Settings`] whenever a file in `%APPDATA%\blitz`, or
-/// its themes folder, is written. Creates the themes folder, so there is
-/// a place to drop theme files.
+/// Sends [`UserEvent::Settings`] whenever a file in blitz's settings
+/// folder, or its themes folder, is written. Creates the themes folder, so
+/// there is a place to drop theme files.
 fn watch_settings(proxy: EventLoopProxy<UserEvent>) {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::WAIT_OBJECT_0;
-    use windows::Win32::Storage::FileSystem::{
-        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindFirstChangeNotificationW,
-        FindNextChangeNotification,
-    };
-    use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-    use windows::core::PCWSTR;
-
     let (Some(dir), Some(themes)) = (crate::config::dir(), crate::theme::dir()) else {
         return;
     };
     let _ = std::fs::create_dir_all(themes);
-    std::thread::spawn(move || {
-        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: a NUL-terminated path that outlives the call.
-        let Ok(h) = (unsafe {
-            FindFirstChangeNotificationW(
-                PCWSTR(wide.as_ptr()),
-                true,
-                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
-            )
-        }) else {
-            return;
-        };
-        // SAFETY: `h` stays open for the life of the thread, which is the
-        // life of the process.
-        while unsafe { WaitForSingleObject(h, INFINITE) } == WAIT_OBJECT_0 {
-            // Editors save in several writes; take them as one.
-            std::thread::sleep(Duration::from_millis(100));
-            // SAFETY: as above.
-            let next = unsafe { FindNextChangeNotification(h) };
-            if next.is_err() || proxy.send_event(UserEvent::Settings).is_err() {
-                return;
-            }
-        }
-    });
+    crate::desktop::watch_dir(dir, move || proxy.send_event(UserEvent::Settings).is_ok());
 }
 
 impl App {
@@ -1709,13 +1707,13 @@ impl App {
             watched: None,
             started: Instant::now(),
             gpu: None,
-            taskbar: None,
+            taskbar: Default::default(),
             taskbar_shows: None,
             plugin: None,
             hooks_hinted: false,
             badge_shows: None,
             jump_key: false,
-            power: None,
+            power: Default::default(),
             awake: false,
             counters: Counters::default(),
             code: 0,
@@ -1738,12 +1736,17 @@ impl App {
         let mut attrs = Window::default_attributes()
             .with_title(window_title(0, "", self.args.admin))
             .with_visible(false)
-            .with_inner_size(LogicalSize::new(980.0, 620.0))
-            // Icon group 1, which build.rs links in.
-            .with_window_icon(Icon::from_resource(1, Some(small_icon_size())).ok())
-            .with_taskbar_icon(Icon::from_resource(1, None).ok())
-            // Only the main window takes folders from other launches.
-            .with_class_name(crate::handoff::class(self.args.separate()));
+            .with_inner_size(LogicalSize::new(980.0, 620.0));
+        #[cfg(windows)]
+        {
+            let small = Some(crate::desktop::small_icon_size());
+            attrs = attrs
+                // Icon group 1, which build.rs links in.
+                .with_window_icon(Icon::from_resource(1, small).ok())
+                .with_taskbar_icon(Icon::from_resource(1, None).ok())
+                // Only the main window takes folders from other launches.
+                .with_class_name(crate::handoff::class(self.args.separate()));
+        }
         let saved = (self.persist && self.config.restore_session)
             .then(session::load)
             .flatten();
@@ -1760,6 +1763,7 @@ impl App {
         let window = el.create_window(attrs).map_err(|e| e.to_string())?;
         window.set_ime_allowed(true);
         self.scale = window.scale_factor();
+        #[cfg(windows)]
         if let Ok(h) = window.window_handle()
             && let RawWindowHandle::Win32(h) = h.as_raw()
         {
@@ -1769,8 +1773,8 @@ impl App {
         crate::notify::install(self.hwnd, self.proxy.clone());
         watch_settings(self.proxy.clone());
         self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
+        self.window = Some(Arc::new(window));
         self.frame_theme();
-        self.window = Some(window);
         self.ensure_gfx();
         // The background, before sessions start, so the window shows at
         // once however long they take.
@@ -1797,7 +1801,10 @@ impl App {
                 None => first_dir(
                     std::env::current_dir().ok(),
                     &not_a_start(),
-                    std::env::var_os("SystemRoot").map(PathBuf::from).as_deref(),
+                    std::env::var_os("SystemRoot")
+                        .filter(|_| cfg!(windows))
+                        .map(PathBuf::from)
+                        .as_deref(),
                 ),
             };
             let id = PaneId(self.next_id);
@@ -2442,29 +2449,22 @@ impl App {
     /// Windows refuses those and keeps the dark or light frame). So is what
     /// a live resize shows past the last frame.
     fn frame_theme(&self) {
-        let hwnd = HWND(self.hwnd as *mut c_void);
-        let dark = windows::core::BOOL::from(!self.theme.light);
-        // SAFETY: a live window and a BOOL-sized value.
-        let _ = unsafe {
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                (&raw const dark).cast(),
-                size_of_val(&dark) as u32,
-            )
-        };
         let ui = &self.theme.ui;
-        for (attr, rgb) in [
-            (DWMWA_CAPTION_COLOR, ui.term_bg),
-            (DWMWA_TEXT_COLOR, ui.term_fg),
-            (DWMWA_BORDER_COLOR, ui.border),
-        ] {
-            // COLORREF is 0x00BBGGRR.
-            let c = rgb.swap_bytes() >> 8;
-            // SAFETY: a live window and a COLORREF-sized value.
-            let _ = unsafe {
-                DwmSetWindowAttribute(hwnd, attr, (&raw const c).cast(), size_of_val(&c) as u32)
-            };
+        crate::desktop::frame_theme(
+            self.hwnd,
+            self.theme.light,
+            ui.term_bg,
+            ui.term_fg,
+            ui.border,
+        );
+        #[cfg(not(windows))]
+        if let Some(w) = &self.window {
+            let light = winit::window::Theme::Light;
+            w.set_theme(Some(if self.theme.light {
+                light
+            } else {
+                winit::window::Theme::Dark
+            }));
         }
         if let Some(g) = &self.gfx {
             g.chain.set_background(self.theme.pal.bg);
@@ -2865,8 +2865,7 @@ impl App {
             self.open_link(t);
             return;
         }
-        let hwnd = HWND(self.hwnd as *mut c_void);
-        let said = if crate::clipboard::set_text(Some(hwnd), text) {
+        let said = if crate::clipboard::set_text(Some(self.hwnd), text) {
             format!("Copied {text}")
         } else {
             "Could not copy to the clipboard".into()
@@ -3058,8 +3057,11 @@ impl App {
         .and_then(|gpu| Renderer::with_gpu(gpu, &c.font_family, px, base, scale, c.line_height));
         let built = built.and_then(|mut r| {
             r.set_scale(scale);
-            let hwnd = HWND(self.hwnd as *mut c_void);
-            let chain = Swapchain::new(&r.gpu, hwnd, size.width, size.height)?;
+            #[cfg(windows)]
+            let target = windows::Win32::Foundation::HWND(self.hwnd as *mut c_void);
+            #[cfg(not(windows))]
+            let target = window.clone();
+            let chain = Swapchain::new(&r.gpu, target, size.width, size.height)?;
             chain.set_background(self.theme.pal.bg);
             Ok(Gfx { r, chain })
         });
@@ -3359,11 +3361,36 @@ impl App {
         }
     }
 
+    /// Queues a key from winit, as the message hook does on Windows.
+    #[cfg(not(windows))]
+    fn winit_key(&mut self, ev: &winit::event::KeyEvent) {
+        let mut text = String::new();
+        let input = keymap::winit_key(&keymap::WinitKey::of(ev), mods_now(), &mut text);
+        let modifier = matches!(
+            input.key,
+            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
+        );
+        // A Cmd chord blitz has no use for does nothing, as in other Mac
+        // apps, rather than type its letter.
+        let cmd = input.mods.lsuper || input.mods.rsuper;
+        if cfg!(target_os = "macos")
+            && cmd
+            && input.down
+            && !modifier
+            && keymap::action(&input, &self.config.keys).is_none()
+        {
+            return;
+        }
+        let queued = Input::Key(owned(&input), text.clone(), ev.repeat);
+        self.keys.borrow_mut().queue.push(queued);
+    }
+
     /// Handles queued key input.
     fn drain_keys(&mut self, el: &ActiveEventLoop) {
         let inputs = std::mem::take(&mut self.keys.borrow_mut().queue);
         for input in inputs {
             match input {
+                #[cfg(windows)]
                 Input::Text(t) => {
                     if !self.filter_text(&t) {
                         // As any other key, it takes questions away.
@@ -3382,7 +3409,7 @@ impl App {
 
     /// A key transition; `held` when it is the auto-repeat of a held key.
     fn key(&mut self, el: &ActiveEventLoop, k: &KeyInput, held: bool) {
-        if matches!(k.key, vt::Key::Control | vt::Key::Shift) {
+        if matches!(k.key, vt::Key::Control | vt::Key::Shift | vt::Key::Super) {
             self.update_hover();
             // Shift takes the mouse back from a program.
             self.update_pointer();
@@ -3698,7 +3725,7 @@ impl App {
         } else {
             text
         };
-        let owner = Some(HWND(self.hwnd as *mut c_void));
+        let owner = Some(self.hwnd);
         let copied = crate::clipboard::set_text(owner, &text);
         if copied {
             if let Some(v) = self.current_mut() {
@@ -4127,8 +4154,7 @@ impl App {
                         return true;
                     }
                 };
-                let copied =
-                    crate::clipboard::set_text(Some(HWND(self.hwnd as *mut c_void)), &text);
+                let copied = crate::clipboard::set_text(Some(self.hwnd), &text);
                 let text = if copied {
                     "Copied hooks for Claude Code's settings.json; Claude Code 2.1.280 and later need none"
                 } else {
@@ -4167,8 +4193,11 @@ impl App {
             }
             // Windows opens it on Alt+Space itself, but blitz takes every
             // key before Windows sees it.
+            #[cfg(not(windows))]
+            Action::SystemMenu => {}
+            #[cfg(windows)]
             Action::SystemMenu => {
-                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
                 use windows::Win32::UI::WindowsAndMessaging::{
                     PostMessageW, SC_KEYMENU, WM_SYSCOMMAND,
                 };
@@ -4194,25 +4223,33 @@ impl App {
     /// Opens a new GitHub issue with what a report needs to know about
     /// this blitz filled in.
     fn report_issue(&mut self) {
+        #[cfg(windows)]
         let renderer = match self.gfx.as_ref().map(|g| g.r.gpu.warp) {
             Some(false) => "Direct3D 11",
             Some(true) => "Direct3D 11 WARP, in software",
             None => "none",
-        };
-        let conpty = match crate::pty::inbox_notice() {
-            Some(_) => "the Windows console host",
-            None => "bundled",
-        };
+        }
+        .to_owned();
+        #[cfg(not(windows))]
+        let renderer = (self.gfx.as_ref()).map_or_else(|| "none".into(), |g| g.r.gpu.name.clone());
         let hooks = if self.hooked { "seen" } else { "not seen" };
-        let windows = windows_version();
-        let facts = [
+        let os = crate::desktop::os_version();
+        let mut facts = vec![
             ("blitz", env!("CARGO_PKG_VERSION")),
-            ("Windows", &windows),
-            ("renderer", renderer),
-            ("ConPTY", conpty),
+            (crate::desktop::OS, &os),
+            ("renderer", &renderer),
+        ];
+        if cfg!(windows) {
+            let conpty = match crate::pty::inbox_notice() {
+                Some(_) => "the Windows console host",
+                None => "bundled",
+            };
+            facts.push(("ConPTY", conpty));
+        }
+        facts.extend([
             ("Claude Code hooks", hooks),
             ("last update error", self.update_trouble().unwrap_or("none")),
-        ];
+        ]);
         let url = crate::update::issue(&facts);
         if !crate::update::open(&url)
             && let Some(id) = self.focus_id()
@@ -4400,7 +4437,7 @@ impl App {
             // output in another cannot swap the clipboard under them.
             Event::Clipboard(text) => {
                 let here = Some(id) == self.focus_id() && self.focused;
-                let owner = Some(HWND(self.hwnd as *mut c_void));
+                let owner = Some(self.hwnd);
                 let copied = here && crate::clipboard::set_text(owner, &text);
                 self.notice_copy(id, program_copy_notice(&text, here, copied), copied);
             }
@@ -4450,41 +4487,9 @@ impl App {
         if latest == self.taskbar_shows {
             return;
         }
-        let Some(t) = self.taskbar() else {
-            return;
-        };
-        self.taskbar_shows = latest;
-        let hwnd = HWND(self.hwnd as *mut c_void);
-        let (flag, pct) = match latest {
-            None => (TBPF_NOPROGRESS, None),
-            Some(p) => match p.state {
-                2 => (TBPF_ERROR, p.pct),
-                3 => (TBPF_INDETERMINATE, None),
-                4 => (TBPF_PAUSED, p.pct),
-                _ => (TBPF_NORMAL, p.pct),
-            },
-        };
-        // SAFETY: a live window. A value set after the state keeps its
-        // error or pause colour; with none known the bar is full, as in
-        // the sidebar.
-        unsafe {
-            let _ = t.SetProgressState(hwnd, flag);
-            if flag != TBPF_NOPROGRESS && flag != TBPF_INDETERMINATE {
-                let _ = t.SetProgressValue(hwnd, u64::from(pct.unwrap_or(100)), 100);
-            }
+        if self.taskbar.progress(self.hwnd, latest) {
+            self.taskbar_shows = latest;
         }
-    }
-
-    /// The taskbar button, made the first time it is needed.
-    fn taskbar(&mut self) -> Option<ITaskbarList3> {
-        if self.taskbar.is_none() {
-            // SAFETY: COM calls on the window's thread, where winit has
-            // started OLE for drag and drop.
-            self.taskbar = unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) }
-                .ok()
-                .filter(|t: &ITaskbarList3| unsafe { t.HrInit() }.is_ok());
-        }
-        self.taskbar.clone()
     }
 
     /// Badges the taskbar button with the sidebar dot of the session that
@@ -4494,24 +4499,11 @@ impl App {
         if top == self.badge_shows {
             return;
         }
-        let Some(t) = self.taskbar() else {
-            return;
-        };
-        self.badge_shows = top;
         let ui = &self.theme.ui;
         let (fg, ring, label) = badge_look(top, ui);
-        let icon = top.and_then(|_| {
-            let size = small_icon_size().width;
-            crate::notify::badge_icon(size, fg, ui.term_bg, ring)
-        });
-        let hwnd = HWND(self.hwnd as *mut c_void);
-        // SAFETY: a live window; the taskbar keeps a copy of the icon, so
-        // it is destroyed once set.
-        unsafe {
-            let _ = t.SetOverlayIcon(hwnd, icon.unwrap_or_default(), &HSTRING::from(label));
-            if let Some(i) = icon {
-                let _ = DestroyIcon(i);
-            }
+        let dot = top.map(|_| (fg, ui.term_bg, ring));
+        if self.taskbar.badge(self.hwnd, dot, label) {
+            self.badge_shows = top;
         }
     }
 
@@ -4526,32 +4518,7 @@ impl App {
         if on == self.awake {
             return;
         }
-        if self.power.is_none() {
-            let mut why: Vec<u16> = "A session is working".encode_utf16().chain([0]).collect();
-            let context = REASON_CONTEXT {
-                // POWER_REQUEST_CONTEXT_VERSION
-                Version: 0,
-                Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
-                Reason: REASON_CONTEXT_0 {
-                    SimpleReasonString: PWSTR(why.as_mut_ptr()),
-                },
-            };
-            // SAFETY: the context and its string outlive the call, which
-            // copies them. The request lives as long as blitz.
-            self.power = unsafe { PowerCreateRequest(&context) }.ok();
-        }
-        let Some(r) = self.power else {
-            return;
-        };
-        // SAFETY: a power request blitz made and never closes.
-        let done = unsafe {
-            if on {
-                PowerSetRequest(r, PowerRequestSystemRequired)
-            } else {
-                PowerClearRequest(r, PowerRequestSystemRequired)
-            }
-        };
-        if done.is_ok() {
+        if self.power.set(on) {
             self.awake = on;
         }
     }
@@ -4614,6 +4581,11 @@ impl App {
     fn alert(&mut self, id: PaneId, a: Alert) {
         if a.flashes > 0 {
             crate::notify::flash(self.hwnd, a.flashes);
+            // Bounces the Dock icon once, or marks the window urgent.
+            #[cfg(not(windows))]
+            if let Some(w) = &self.window {
+                w.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+            }
         }
         // Never from a test run.
         if self.args.scripted() {
@@ -4621,8 +4593,7 @@ impl App {
         }
         let shown = a.toast && self.toast(id);
         if a.beeps(shown) {
-            // SAFETY: a plain call.
-            let _ = unsafe { MessageBeep(MB_OK) };
+            crate::desktop::beep();
         }
     }
 
@@ -4635,8 +4606,7 @@ impl App {
         let titled = self.view(id).is_some_and(|v| v.pane.msg.is_empty());
         let lines = toast_text(&s, titled);
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let xml = crate::notify::toast_xml(&lines, !self.config.sound);
-        match crate::notify::toast(id, &xml, &self.proxy) {
+        match crate::notify::show(id, &lines, !self.config.sound, &self.proxy) {
             Ok(Some(t)) => {
                 if let Some(v) = self.view_mut(id) {
                     v.toast = Some(t);
@@ -4702,8 +4672,11 @@ impl App {
         if let Some(w) = &self.window {
             w.set_minimized(false);
         }
-        // SAFETY: our own window.
-        let _ = unsafe { SetForegroundWindow(HWND(self.hwnd as *mut c_void)) };
+        crate::desktop::to_front(self.hwnd);
+        #[cfg(not(windows))]
+        if let Some(w) = &self.window {
+            w.focus_window();
+        }
     }
 
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> (u16, u16) {
@@ -4768,17 +4741,13 @@ impl App {
 
     /// Where the pointer is now, in client pixels. A drag from another
     /// program moves it without telling the window, so `mouse.pos` is old.
+    /// Elsewhere it is where the window last saw it.
     fn pointer(&self) -> Option<PhysicalPosition<f64>> {
-        let mut pt = POINT::default();
-        // SAFETY: plain queries that write one POINT; a stale window only
-        // fails the second.
-        unsafe {
-            GetCursorPos(&mut pt).ok()?;
-            ScreenToClient(HWND(self.hwnd as *mut c_void), &mut pt)
-                .ok()
-                .ok()?;
+        match crate::desktop::pointer(self.hwnd) {
+            Some((x, y)) => Some(PhysicalPosition::new(x, y)),
+            None if cfg!(windows) => None,
+            None => Some(self.mouse.pos),
         }
-        Some(PhysicalPosition::new(f64::from(pt.x), f64::from(pt.y)))
     }
 
     /// Handles the files dropped since the last turn of the event loop,
@@ -4977,8 +4946,7 @@ impl App {
             .divider_at(self.mouse.pos)
             .filter(|_| pressed && b == 0)
         {
-            // SAFETY: a plain query.
-            let within = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+            let within = crate::desktop::double_click();
             if evens(&mut self.mouse.divider_click, i, Instant::now(), within) {
                 self.act(el, Action::Equalize);
             } else {
@@ -5100,8 +5068,7 @@ impl App {
             self.extend_drag();
             return;
         }
-        // SAFETY: a plain query.
-        let within = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+        let within = crate::desktop::double_click();
         let now = Instant::now();
         let n = clicks(self.mouse.click, here, now, within);
         self.mouse.click = Some((now, here, n));
@@ -5219,7 +5186,7 @@ impl App {
     /// with the cells it covers: Ctrl must be held, and a program that
     /// takes the mouse gets the click unless [`opens_link`] says otherwise.
     fn ctrl_link(&self, mods: &Mods) -> Option<(Target, (Pos, Pos))> {
-        if !(mods.lctrl || mods.rctrl) || self.mouse.drag.is_some() {
+        if !link_key(mods) || self.mouse.drag.is_some() {
             return None;
         }
         let found = self.link_under(self.mouse.pos)?;
@@ -5233,7 +5200,7 @@ impl App {
     fn update_hover(&mut self) {
         let mods = mods_now();
         // A file made since Ctrl was last held counts.
-        if !(mods.lctrl || mods.rctrl) {
+        if !link_key(&mods) {
             *self.resolved.get_mut() = None;
         }
         let hover = (self.ctrl_link(&mods)).and_then(|(_, (a, b))| {
@@ -5682,7 +5649,7 @@ impl App {
                 }
             }
             let t = Instant::now();
-            let shown = g.chain.present();
+            let shown = g.chain.present(&g.r.gpu);
             waited += t.elapsed();
             shown
         })();
@@ -6059,44 +6026,6 @@ fn pointer(divider: Option<Axis>, hand: bool, grid: Option<bool>) -> CursorIcon 
     }
 }
 
-/// Whether Windows hides the pointer while typing: Mouse settings,
-/// Pointer Options. Read once at start.
-fn mouse_vanish() -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SPI_GETMOUSEVANISH, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
-    };
-    let mut on = windows::core::BOOL(0);
-    // SAFETY: SPI_GETMOUSEVANISH writes one BOOL.
-    let read = unsafe {
-        SystemParametersInfoW(
-            SPI_GETMOUSEVANISH,
-            0,
-            Some((&raw mut on).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-    };
-    read.is_ok() && on.as_bool()
-}
-
-/// Whether Windows shows animations; off under Accessibility, Visual
-/// effects. Read once at start.
-fn animations_on() -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
-    };
-    let mut on = windows::core::BOOL(1);
-    // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL.
-    let read = unsafe {
-        SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION,
-            0,
-            Some((&raw mut on).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-    };
-    read.is_err() || on.as_bool()
-}
-
 /// Where a jump to the session that needs you goes from `at`: to
 /// `waiting`, or with nothing waiting back to where the last jump came
 /// from, unless that is `at`. `jumped` is the last jump, from and to. A
@@ -6296,24 +6225,6 @@ fn present(focused: bool, idle: Duration) -> bool {
     focused && idle < AWAY_AFTER
 }
 
-/// How long ago the last key or mouse input anywhere was; zero when
-/// Windows cannot say.
-fn idle_for() -> Duration {
-    let mut info = LASTINPUTINFO {
-        cbSize: size_of::<LASTINPUTINFO>() as u32,
-        dwTime: 0,
-    };
-    // SAFETY: `info` is a LASTINPUTINFO with its size set, as the call
-    // requires.
-    if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
-        return Duration::ZERO;
-    }
-    // SAFETY: plain Win32 call with no arguments.
-    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
-    // Both are milliseconds since boot, kept in 32 bits, so they wrap.
-    Duration::from_millis(u64::from(now.wrapping_sub(info.dwTime)))
-}
-
 /// Whether a hook's `ev` ends a stretch of Claude Code's work. It may have
 /// switched branches meanwhile, which the shell, still waiting under it,
 /// never reports.
@@ -6341,6 +6252,7 @@ fn busy_text(busy: &[&str], place: &str) -> String {
 /// Whether a key message for Alt+F4 goes on to Windows, which closes the
 /// window on a press: all but the auto-repeat of a held one, so holding it
 /// cannot answer the question a busy session asks.
+#[cfg(windows)]
 fn alt_f4_passes(down: bool, lparam: isize) -> bool {
     !down || !keymap::held_before(lparam)
 }
@@ -6561,6 +6473,16 @@ enum Wheel {
     Nothing,
 }
 
+/// Whether `m` holds the key a click on a link takes: Ctrl, or Cmd on a
+/// Mac.
+fn link_key(m: &Mods) -> bool {
+    if cfg!(target_os = "macos") {
+        m.lsuper || m.rsuper
+    } else {
+        m.lctrl || m.rctrl
+    }
+}
+
 /// What the wheel does over a pane in modes `m`, with modifiers `mods`.
 /// Ctrl changes the font size, unless the program takes the mouse; Shift
 /// keeps it from such a program, which hears of it only over its own
@@ -6600,24 +6522,6 @@ fn wheel_lines(setting: u32, rows: u16) -> isize {
         WHEEL_PAGESCROLL => rows.saturating_sub(1).max(1) as isize,
         n => n.min(100) as isize,
     }
-}
-
-/// Windows' "lines to scroll" for each wheel notch; 3 if it cannot be read.
-fn scroll_lines() -> u32 {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
-    };
-    let mut n = 3u32;
-    // SAFETY: SPI_GETWHEELSCROLLLINES writes one UINT.
-    let read = unsafe {
-        SystemParametersInfoW(
-            SPI_GETWHEELSCROLLLINES,
-            0,
-            Some((&raw mut n).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-    };
-    if read.is_ok() { n } else { 3 }
 }
 
 /// `n` presses of Up, or of Down for a negative `n`, each with its
@@ -6739,32 +6643,6 @@ fn draw_notice(r: &mut Renderer, pal: &Palette, at: Rect, grid: (u16, u16), text
     r.snapshot(&s, &banner, at.x, y);
 }
 
-/// The Windows version, such as `10.0.26200`. The manifest build.rs links
-/// in keeps Windows from giving an older one.
-fn windows_version() -> String {
-    use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
-    let mut v = OSVERSIONINFOW {
-        dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: a struct to fill, its size set as the call needs.
-    match unsafe { GetVersionExW(&mut v) } {
-        Ok(()) => format!(
-            "{}.{}.{}",
-            v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber
-        ),
-        Err(_) => "unknown".into(),
-    }
-}
-
-/// The title bar icon size, so Windows picks the hand-tuned small icon
-/// rather than shrinking the big one.
-fn small_icon_size() -> PhysicalSize<u32> {
-    // SAFETY: reads a system metric; no pointers.
-    let n = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
-    PhysicalSize::new(n, n)
-}
-
 /// The smallest pane, frame included, that holds `MIN_COLS` by `MIN_ROWS`
 /// cells of `cw` by `ch` pixels in a tab of several panes, at `scale`,
 /// with chrome text `th` pixels high.
@@ -6846,61 +6724,6 @@ fn resize_wait(last: Option<Instant>, now: Instant) -> Option<Instant> {
 /// leaves a window to see.
 fn shows(until: Option<Instant>, presented: bool, now: Instant) -> bool {
     until.is_some_and(|t| presented || now >= t)
-}
-
-/// Asks Windows to start blitz again, with its saved session, after it
-/// restarts for an update or the user signs back in with "restart apps"
-/// on. Not after a crash or a hang, which could happen again at once,
-/// nor after an installer closes it: blitz's own starts it again itself,
-/// and one run as administrator would start it elevated.
-fn restart_after_reboot() {
-    use windows::Win32::System::Recovery::{
-        RESTART_NO_CRASH, RESTART_NO_HANG, RESTART_NO_PATCH, RegisterApplicationRestart,
-    };
-    let flags = RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_PATCH;
-    // SAFETY: no command line, so blitz starts with none.
-    let _ = unsafe { RegisterApplicationRestart(None, flags) };
-}
-
-/// Whether setup made blitz start when the user signs in, and the user has
-/// not since turned that off in Task Manager or Settings.
-fn starts_at_sign_in() -> bool {
-    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_ANY, RegGetValueW};
-    let value = |sub, buf: Option<&mut [u8; 12]>| {
-        let mut size = 12u32;
-        let (data, size) = match buf {
-            Some(b) => (Some(b.as_mut_ptr().cast()), Some(&mut size as *mut u32)),
-            None => (None, None),
-        };
-        // SAFETY: with a buffer, it holds the `size` bytes given; without
-        // one, only whether the value is there comes back.
-        let r = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                sub,
-                windows::core::w!("blitz"),
-                RRF_RT_ANY,
-                None,
-                data,
-                size,
-            )
-        };
-        r.is_ok()
-    };
-    let run = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
-    let approved = windows::core::w!(
-        r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
-    );
-    let mut flags = [0u8; 12];
-    let set = value(approved, Some(&mut flags)).then_some(flags[0]);
-    sign_in_starts(value(run, None), set)
-}
-
-/// Whether a `Run` value starts blitz. Turning it off in Task Manager
-/// leaves the value and sets the first byte of blitz's `StartupApproved`
-/// entry, `approved`, to an odd one.
-fn sign_in_starts(run: bool, approved: Option<u8>) -> bool {
-    run && approved.is_none_or(|b| b & 1 == 0)
 }
 
 /// Whether a session `now` differs from the one last `saved`. The window's
@@ -7099,45 +6922,6 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// Moves the system caret to `at`, in client pixels, first making one of
-/// `size` when `made`, the size of the caret there is, differs. It is
-/// never shown, as blitz draws its own cursor, but Magnifier and other
-/// tools that follow the text cursor follow it. Returns the caret's size.
-fn place_caret(
-    hwnd: isize,
-    at: (i32, i32),
-    size: (u32, u32),
-    made: Option<(u32, u32)>,
-) -> Option<(u32, u32)> {
-    let made = match made {
-        Some(s) if s == size => made,
-        // SAFETY: our own window, on its thread; it replaces any old caret.
-        _ => unsafe {
-            CreateCaret(
-                HWND(hwnd as *mut c_void),
-                None,
-                size.0 as i32,
-                size.1 as i32,
-            )
-        }
-        .ok()
-        .map(|()| size),
-    };
-    // SAFETY: plain call; it moves this thread's caret, if there is one.
-    let _ = unsafe { SetCaretPos(at.0, at.1) };
-    made
-}
-
-/// The local time as `2026-10-02 14:32`.
-fn local_stamp() -> String {
-    // SAFETY: plain Win32 call with no arguments.
-    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    format!(
-        "{}-{:02}-{:02} {:02}:{:02}",
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute
-    )
-}
-
 /// Where a new pane starts: `cwd` if it is still a directory, else the
 /// user's profile folder.
 fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
@@ -7145,7 +6929,8 @@ fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
     if !dir.as_os_str().is_empty() && dir.is_dir() {
         return Some(dir.to_path_buf());
     }
-    std::env::var_os("USERPROFILE").map(PathBuf::from)
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(home).map(PathBuf::from)
 }
 
 /// Splits the focused pane of the active tab, putting the new one on the
@@ -7165,35 +6950,6 @@ fn split(dir: Dir) -> impl FnOnce(&mut layout::Window, PaneId) -> bool {
     }
 }
 
-/// Whether blitz runs elevated, as administrator.
-fn elevated() -> bool {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let mut token = HANDLE::default();
-    let mut e = TOKEN_ELEVATION::default();
-    let mut len = 0;
-    // SAFETY: the out value is as large as the call is told; the token is
-    // closed after use.
-    unsafe {
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-            return false;
-        }
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            Some((&raw mut e).cast()),
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut len,
-        )
-        .is_ok();
-        let _ = CloseHandle(token);
-        ok && e.TokenIsElevated != 0
-    }
-}
-
 /// Where the first pane starts when no folder was given: `cwd`, where
 /// blitz was started, unless that is one of `avoid` or inside Windows' own
 /// folder, `system_root`, as for blitz started when the user signs in;
@@ -7209,21 +6965,6 @@ fn first_dir(
         Some(d) if !avoid.iter().any(|a| key(a) == key(&d)) && !inside(&d) => Some(d),
         _ => start_dir(""),
     }
-}
-
-/// Folders nobody means to work in that the Start menu, a pinned icon or
-/// Win+R start blitz in: its own folder and the Windows system folder.
-fn not_a_start() -> Vec<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
-    let mut buf = [0u16; 260];
-    // SAFETY: a buffer the call is told the length of.
-    let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
-    let system =
-        (n > 0 && n < buf.len()).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])));
-    let exe = std::env::current_exe().ok();
-    let own = exe.as_deref().and_then(Path::parent).map(Path::to_path_buf);
-    [system, own].into_iter().flatten().collect()
 }
 
 /// Puts pane `id` in a new tab after the others and shows that tab. It
@@ -7706,17 +7447,7 @@ impl ApplicationHandler<UserEvent> for App {
         if let Err(e) = self.start(el) {
             eprintln!("blitz: {e}");
             if !self.args.scripted() {
-                use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-                let text = start_failed(&e, crate::config::dir().as_deref());
-                // SAFETY: two strings that outlive the call, and no owner.
-                unsafe {
-                    MessageBoxW(
-                        None,
-                        &windows::core::HSTRING::from(text),
-                        &windows::core::HSTRING::from("blitz"),
-                        MB_OK | MB_ICONERROR,
-                    )
-                };
+                crate::desktop::error_box(&start_failed(&e, crate::config::dir().as_deref()));
             }
             self.code = 1;
             el.exit();
@@ -7751,6 +7482,17 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
+            #[cfg(not(windows))]
+            WindowEvent::ModifiersChanged(m) => MODS.with(|c| c.set(keymap::winit_mods(&m))),
+            #[cfg(not(windows))]
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } => {
+                self.winit_key(&event);
+                self.drain_keys(el);
+            }
             // Closing ends every session, so a busy one asks first.
             WindowEvent::CloseRequested => {
                 let busy: Vec<_> = self.views.iter().filter_map(View::busy).collect();
@@ -7811,8 +7553,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Only the window with the keys has a caret; the next frame
                 // makes it again.
                 if !f && self.caret.take().is_some() {
-                    // SAFETY: plain call on the thread that made the caret.
-                    let _ = unsafe { DestroyCaret() };
+                    crate::desktop::drop_caret();
                 }
                 self.ime_at = None;
                 // High contrast mode may have been turned on or off while
@@ -7939,14 +7680,17 @@ impl ApplicationHandler<UserEvent> for App {
             // Explorer restarted. A new TaskbarList too, as the old one
             // may still talk to the Explorer that is gone.
             UserEvent::TaskbarButton => {
-                self.taskbar = None;
+                self.taskbar.lost();
                 self.taskbar_shows = None;
                 self.badge_shows = None;
                 self.taskbar_progress();
                 self.taskbar_badge();
             }
             UserEvent::Handoff(ask) => {
-                crate::handoff::to_current_desktop(HWND(self.hwnd as *mut c_void));
+                #[cfg(windows)]
+                crate::handoff::to_current_desktop(windows::Win32::Foundation::HWND(
+                    self.hwnd as *mut c_void,
+                ));
                 // The launch that sent this let this process take the
                 // foreground.
                 self.to_front();
@@ -8007,6 +7751,23 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// The self-test needs Windows' `SendInput`; elsewhere it says so.
+#[cfg(not(windows))]
+mod selftest {
+    use std::sync::{Arc, Mutex};
+
+    pub type Focus = Mutex<Arc<Mutex<vt::Terminal>>>;
+
+    pub fn screen(term: &Focus) -> String {
+        let t = crate::pane::lock(term).clone();
+        crate::pane::lock(&t).screen_text()
+    }
+
+    pub fn run(_script: &str, _hwnd: isize, _term: &Focus) -> Result<(), String> {
+        Err("the self-test presses keys through Windows; it runs only there".into())
+    }
+}
+
 /// The GUI self-test: real key presses through `SendInput`, checked
 /// against the screen of the focused pane.
 ///
@@ -8021,6 +7782,7 @@ impl ApplicationHandler<UserEvent> for App {
 /// - `click X Y`: click the left button at the client pixel X, Y.
 /// - `snap`: print the screen.
 /// - `sleep MS`, `note TEXT`.
+#[cfg(windows)]
 mod selftest {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -9081,11 +8843,12 @@ mod tests {
 
     /// The caret goes where the cursor is, and is made again only for a
     /// new cell size.
+    #[cfg(windows)]
     #[test]
     fn app_caret_follows_the_cursor() {
         use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, GetCaretPos, WINDOW_EX_STYLE, WS_POPUP,
+            CreateWindowExW, DestroyCaret, DestroyWindow, GetCaretPos, WINDOW_EX_STYLE, WS_POPUP,
         };
         // A hidden window of this thread, which then owns the caret.
         // SAFETY: a system class with no parent; destroyed below.
@@ -9192,6 +8955,7 @@ mod tests {
     }
 
     /// The queued input: `+vk` and `-vk` for keys, text as itself.
+    #[cfg(windows)]
     fn queued(k: &mut Keys) -> Vec<String> {
         (k.queue.drain(..))
             .map(|i| match i {
@@ -9201,6 +8965,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(windows)]
     #[test]
     fn app_alt_and_keypad_digits_type_by_code() {
         let mut k = Keys::default();
@@ -9235,6 +9000,7 @@ mod tests {
         assert_eq!(queued(&mut k), ["+12", "-12"]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn app_text_from_wm_char_joins_surrogates_and_drops_controls() {
         let mut k = Keys::default();
@@ -9609,7 +9375,8 @@ mod tests {
     fn app_new_panes_start_in_the_focused_directory() {
         let here = std::env::temp_dir();
         assert_eq!(start_dir(here.display().to_string()), Some(here.clone()));
-        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+        let home = home.map(PathBuf::from);
         let gone = here.join(format!("blitz-gone-{}", std::process::id()));
         assert_eq!(start_dir(&gone), home);
         // A file is not a folder to start in.
@@ -9771,6 +9538,7 @@ mod tests {
     /// Windows ends blitz for an update restart without the save at exit,
     /// so a moved window is saved like a new split, and blitz asks to be
     /// started again.
+    #[cfg(windows)]
     #[test]
     fn app_a_restart_for_an_update_finds_the_window_where_it_was() {
         use windows::Win32::System::Recovery::{
@@ -9937,6 +9705,7 @@ mod tests {
 
     /// Started from the Start menu, a pin or Win+R, blitz runs in its own
     /// folder or System32; the first pane opens in the profile instead.
+    #[cfg(windows)]
     #[test]
     fn app_the_first_pane_never_opens_in_the_install_or_system_folder() {
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
@@ -10401,6 +10170,7 @@ mod tests {
         assert!(!parse(&["--cwd", "C:\\", "--new-window"]).scripted());
     }
 
+    #[cfg(windows)]
     #[test]
     fn open_here_options() {
         let parse = |args: &[&str]| {
@@ -10455,6 +10225,8 @@ mod tests {
         assert!(!a.main() && a.separate());
     }
 
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_first_hint_names_the_keys_as_bound() {
         assert_eq!(
@@ -10473,6 +10245,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_launch_from_the_windows_folder_starts_at_home() {
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
@@ -10529,18 +10302,6 @@ mod tests {
             Some(left("0.0.5", false))
         );
         assert_eq!(kept_at_close(None, true), None);
-    }
-
-    /// Startup apps in Task Manager turn the start off without the value.
-    #[test]
-    fn a_sign_in_start_turned_off_does_not_count() {
-        assert!(sign_in_starts(true, None));
-        assert!(sign_in_starts(true, Some(0x02)));
-        assert!(sign_in_starts(true, Some(0x06)));
-        assert!(!sign_in_starts(true, Some(0x03)));
-        assert!(!sign_in_starts(true, Some(0x07)));
-        assert!(!sign_in_starts(false, None));
-        assert!(!sign_in_starts(false, Some(0x02)));
     }
 
     #[test]
@@ -10780,6 +10541,7 @@ mod tests {
 
     /// Holding Alt+F4 closes the window once, so a busy session's question
     /// waits for a second, deliberate press.
+    #[cfg(windows)]
     #[test]
     fn a_held_alt_f4_closes_once() {
         let (first, repeat, up) = (0x003e_0001, 0x403e_0001, 0xc03e_0001_u32 as i32 as isize);
@@ -10803,6 +10565,8 @@ mod tests {
         assert!(!split(Dir::Down)(&mut none, PaneId(3)), "no tab");
     }
 
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_question_names_the_key_that_answers_it() {
         assert_eq!(again(Action::ClosePane, &[]), "Press Ctrl+Shift+W again");
@@ -10941,6 +10705,7 @@ mod tests {
         assert!(!Ask::Nothing.gone(None, true));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_failed_start_names_the_settings_file() {
         let dir = Path::new(r"C:\Users\me\AppData\Roaming\blitz");

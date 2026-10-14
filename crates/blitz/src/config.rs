@@ -694,8 +694,25 @@ const STALE: std::time::Duration = std::time::Duration::from_secs(60);
 pub const FALLBACK_FONTS: &[&str] = &["Cascadia Mono", "Consolas", "Courier New"];
 
 /// `%APPDATA%\blitz`, which holds `config.toml` and the themes folder.
+/// On macOS and Linux, `~/.config/blitz`, or under `XDG_CONFIG_HOME`.
 pub fn dir() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("blitz"))
+    if cfg!(windows) {
+        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("blitz"));
+    }
+    xdg(Some("XDG_CONFIG_HOME"), ".config").map(|d| d.join("blitz"))
+}
+
+/// The folder an XDG variable `var` names, when it is an absolute path, or
+/// else `fallback` in the home folder.
+pub fn xdg(var: Option<&str>, fallback: &str) -> Option<PathBuf> {
+    let set = var.and_then(std::env::var_os).map(PathBuf::from);
+    match set.filter(|d| d.is_absolute()) {
+        Some(d) => Some(d),
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute())
+            .map(|h| h.join(fallback)),
+    }
 }
 
 /// `config.toml`, for the user to open in an editor: an empty one is

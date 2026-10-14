@@ -190,11 +190,14 @@ pub type Binding = (u8, u16, Option<Action>);
 const CTRL: u8 = 1;
 const SHIFT: u8 = 2;
 const ALT: u8 = 4;
+/// Command on a Mac, the Windows key or Super elsewhere.
+const CMD: u8 = 8;
 
 /// Default shortcuts as (modifiers, virtual key, action). Keys are matched
 /// by virtual-key code: letter codes follow the key labels on Latin
 /// layouts and the US positions on others, and digits and arrows are
 /// physical keys everywhere.
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL, b'C' as u16, Action::Copy),
     (CTRL | SHIFT, b'C' as u16, Action::Copy),
@@ -254,6 +257,67 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (ALT, 0x20, Action::SystemMenu),
     (CTRL | SHIFT, 0x20, Action::QuickSelect),
 ];
+
+/// The defaults on a Mac, where shortcuts take Command, as in Terminal,
+/// and Ctrl keys all go to the program.
+#[cfg(target_os = "macos")]
+const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
+    (CMD, b'C' as u16, Action::Copy),
+    (CMD, b'V' as u16, Action::Paste),
+    (CMD, b'A' as u16, Action::SelectAll),
+    (CMD, b'K' as u16, Action::ClearScrollback),
+    (SHIFT, 0x21, Action::ScrollPage(1)),
+    (SHIFT, 0x22, Action::ScrollPage(-1)),
+    (CMD, 0x21, Action::ScrollPage(1)),
+    (CMD, 0x22, Action::ScrollPage(-1)),
+    (CMD, 0x24, Action::ScrollEnd(1)),
+    (CMD, 0x23, Action::ScrollEnd(-1)),
+    (CMD, b'T' as u16, Action::NewTab),
+    (CMD, b'W' as u16, Action::ClosePane),
+    (CMD | SHIFT, b'W' as u16, Action::CloseTab),
+    (CMD | SHIFT, b'T' as u16, Action::ReopenClosed),
+    (CTRL, 0x09, Action::CycleTab(1)),
+    (CTRL | SHIFT, 0x09, Action::CycleTab(-1)),
+    // Cmd+Shift+] and Cmd+Shift+[.
+    (CMD | SHIFT, 0xdd, Action::CycleTab(1)),
+    (CMD | SHIFT, 0xdb, Action::CycleTab(-1)),
+    (CMD | SHIFT, 0x21, Action::MoveTab(-1)),
+    (CMD | SHIFT, 0x22, Action::MoveTab(1)),
+    (CMD, b'D' as u16, Action::SplitRight),
+    (CMD | SHIFT, b'D' as u16, Action::SplitDown),
+    (CMD | ALT, 0x25, Action::Focus(Dir::Left)),
+    (CMD | ALT, 0x26, Action::Focus(Dir::Up)),
+    (CMD | ALT, 0x27, Action::Focus(Dir::Right)),
+    (CMD | ALT, 0x28, Action::Focus(Dir::Down)),
+    (CMD | CTRL, 0x25, Action::Resize(Dir::Left)),
+    (CMD | CTRL, 0x26, Action::Resize(Dir::Up)),
+    (CMD | CTRL, 0x27, Action::Resize(Dir::Right)),
+    (CMD | CTRL, 0x28, Action::Resize(Dir::Down)),
+    (CMD | ALT | SHIFT, 0x25, Action::Swap(Dir::Left)),
+    (CMD | ALT | SHIFT, 0x26, Action::Swap(Dir::Up)),
+    (CMD | ALT | SHIFT, 0x27, Action::Swap(Dir::Right)),
+    (CMD | ALT | SHIFT, 0x28, Action::Swap(Dir::Down)),
+    (CMD | SHIFT, b'J' as u16, Action::JumpToAttention),
+    (CMD | SHIFT, b'O' as u16, Action::GoToSession),
+    (CMD | SHIFT, b'B' as u16, Action::ToggleSidebar),
+    (CMD | SHIFT, b'U' as u16, Action::Update),
+    (CMD | SHIFT, b'K' as u16, Action::ThemePicker),
+    (CMD, 0xbc, Action::Settings),
+    (CMD | SHIFT, 0x0d, Action::Zoom),
+    (CMD, 0xbb, Action::FontSize(1)),
+    (CMD | SHIFT, 0xbb, Action::FontSize(1)),
+    (CMD, 0xbd, Action::FontSize(-1)),
+    (CMD, b'0' as u16, Action::FontSize(0)),
+    (CMD | CTRL, b'F' as u16, Action::Fullscreen),
+    (CMD | SHIFT, b'P' as u16, Action::Palette),
+    (CMD, 0x26, Action::JumpToPrompt(1)),
+    (CMD, 0x28, Action::JumpToPrompt(-1)),
+    (CMD, b'F' as u16, Action::Find),
+    (CMD | SHIFT, 0x20, Action::QuickSelect),
+];
+
+/// The modifier that goes with a digit to pick a tab.
+const TAB_DIGIT: u8 = if cfg!(target_os = "macos") { CMD } else { CTRL };
 
 /// Key names for chords, matched ignoring case. The first name of each
 /// key is the one the command palette shows. Letters, digits, F1 to F24
@@ -315,8 +379,8 @@ const KEY_NAMES: &[(&str, u16)] = &[
 
 /// A binding as `config.toml` writes it: a chord, `=`, and an action's
 /// name from [`ACTIONS`] or `none`, as in `ctrl+shift+r=split_right`. The
-/// chord is any of `ctrl`, `shift` and `alt`, each once, and one key,
-/// joined by `+`. Case and spaces around the parts do not matter.
+/// chord is any of `ctrl`, `shift`, `alt` and `cmd` (or `super`, the
+/// Windows key), each once, and one key, joined by `+`. Case and spaces around the parts do not matter.
 pub fn binding(s: &str) -> Option<Binding> {
     let (chord, name) = s.rsplit_once('=')?;
     let action = match name.trim() {
@@ -387,7 +451,8 @@ fn parse_chord(chord: &str) -> Option<(u8, u16)> {
         let bit = match m.trim().to_ascii_lowercase().as_str() {
             "ctrl" => CTRL,
             "shift" => SHIFT,
-            "alt" => ALT,
+            "alt" | "opt" | "option" => ALT,
+            "cmd" | "command" | "super" | "win" => CMD,
             _ => return None,
         };
         if bits & bit != 0 {
@@ -419,7 +484,19 @@ fn key_code(name: &str) -> Option<u16> {
 /// A chord as the command palette shows it, such as `Ctrl+Shift+R`.
 fn chord_label(mods: u8, vk: u16) -> String {
     let mut s = String::new();
-    for (bit, name) in [(CTRL, "Ctrl+"), (ALT, "Alt+"), (SHIFT, "Shift+")] {
+    let cmd = if cfg!(target_os = "macos") {
+        "Cmd+"
+    } else if cfg!(windows) {
+        "Win+"
+    } else {
+        "Super+"
+    };
+    let alt = if cfg!(target_os = "macos") {
+        "Opt+"
+    } else {
+        "Alt+"
+    };
+    for (bit, name) in [(CTRL, "Ctrl+"), (ALT, alt), (SHIFT, "Shift+"), (CMD, cmd)] {
         if mods & bit != 0 {
             s.push_str(name);
         }
@@ -468,13 +545,11 @@ pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
         return None;
     }
     let m = &k.mods;
-    if m.lsuper || m.rsuper {
-        return None;
-    }
     let held = [
         (m.lctrl || m.rctrl, CTRL),
         (m.lshift || m.rshift, SHIFT),
         (m.lalt || m.ralt, ALT),
+        (m.lsuper || m.rsuper, CMD),
     ];
     let mods = held.iter().filter(|h| h.0).fold(0, |a, h| a | h.1);
     // Windows reports AltGr as Ctrl+Alt: a key it types a character with,
@@ -488,9 +563,11 @@ pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
     }
     // Ctrl and a digit go to a tab, 9 to the last, where the key types
     // that digit. On AZERTY the same keys type & é " ' ( - è _ ç, and
-    // Ctrl+- and Ctrl+_ are for the program.
-    let digit = (0x31..=0x39).contains(&k.vk) && k.key == Key::Char(char::from(k.vk as u8));
-    (mods == CTRL && digit).then(|| match k.vk {
+    // Ctrl+- and Ctrl+_ are for the program. On a Mac it is Cmd, and any
+    // digit key.
+    let typed_digit = k.key == Key::Char(char::from(k.vk as u8));
+    let digit = (0x31..=0x39).contains(&k.vk) && (typed_digit || TAB_DIGIT == CMD);
+    (mods == TAB_DIGIT && digit).then(|| match k.vk {
         0x39 => Action::LastTab,
         vk => Action::GoToTab((vk - 0x31) as u8),
     })
@@ -683,6 +760,420 @@ pub fn system_layout(vk: u16, scan: u16, keystate: &[u8; 256]) -> Option<String>
     Some(String::from_utf16_lossy(&buf[..n]))
 }
 
+/// The set-1 scan code of virtual key `vk` on a US keyboard, and whether
+/// it is an extended key, for programs that read win32-input-mode.
+pub fn scan_code(vk: u16) -> (u16, bool) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+        // SAFETY: a table lookup with no pointers involved.
+        let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) } as u16;
+        (scan, matches!(vk, 0x21..=0x28 | 0x2d | 0x2e | 0x5b))
+    }
+    #[cfg(not(windows))]
+    {
+        let ext = |s: u16| (s, true);
+        match vk {
+            0x21 => ext(0x49),
+            0x22 => ext(0x51),
+            0x23 => ext(0x4f),
+            0x24 => ext(0x47),
+            0x25 => ext(0x4b),
+            0x26 => ext(0x48),
+            0x27 => ext(0x4d),
+            0x28 => ext(0x50),
+            0x2d => ext(0x52),
+            0x2e => ext(0x53),
+            0x5b => ext(0x5b),
+            0x5c => ext(0x5c),
+            0x5d => ext(0x5d),
+            vk => (
+                US_SCANS.iter().find(|s| s.0 == vk).map_or(0, |s| s.1),
+                false,
+            ),
+        }
+    }
+}
+
+/// Virtual keys and the set-1 scan codes of their keys on a US keyboard,
+/// but for the extended keys.
+#[cfg(not(windows))]
+const US_SCANS: &[(u16, u16)] = &[
+    (0x08, 0x0e),
+    (0x09, 0x0f),
+    (0x0d, 0x1c),
+    (0x10, 0x2a),
+    (0x11, 0x1d),
+    (0x12, 0x38),
+    (0x14, 0x3a),
+    (0x1b, 0x01),
+    (0x20, 0x39),
+    (0x30, 0x0b),
+    (0x31, 0x02),
+    (0x32, 0x03),
+    (0x33, 0x04),
+    (0x34, 0x05),
+    (0x35, 0x06),
+    (0x36, 0x07),
+    (0x37, 0x08),
+    (0x38, 0x09),
+    (0x39, 0x0a),
+    (0x41, 0x1e),
+    (0x42, 0x30),
+    (0x43, 0x2e),
+    (0x44, 0x20),
+    (0x45, 0x12),
+    (0x46, 0x21),
+    (0x47, 0x22),
+    (0x48, 0x23),
+    (0x49, 0x17),
+    (0x4a, 0x24),
+    (0x4b, 0x25),
+    (0x4c, 0x26),
+    (0x4d, 0x32),
+    (0x4e, 0x31),
+    (0x4f, 0x18),
+    (0x50, 0x19),
+    (0x51, 0x10),
+    (0x52, 0x13),
+    (0x53, 0x1f),
+    (0x54, 0x14),
+    (0x55, 0x16),
+    (0x56, 0x2f),
+    (0x57, 0x11),
+    (0x58, 0x2d),
+    (0x59, 0x15),
+    (0x5a, 0x2c),
+    (0x60, 0x52),
+    (0x61, 0x4f),
+    (0x62, 0x50),
+    (0x63, 0x51),
+    (0x64, 0x4b),
+    (0x65, 0x4c),
+    (0x66, 0x4d),
+    (0x67, 0x47),
+    (0x68, 0x48),
+    (0x69, 0x49),
+    (0x6a, 0x37),
+    (0x6b, 0x4e),
+    (0x6d, 0x4a),
+    (0x6e, 0x53),
+    (0x6f, 0x35),
+    (0x70, 0x3b),
+    (0x71, 0x3c),
+    (0x72, 0x3d),
+    (0x73, 0x3e),
+    (0x74, 0x3f),
+    (0x75, 0x40),
+    (0x76, 0x41),
+    (0x77, 0x42),
+    (0x78, 0x43),
+    (0x79, 0x44),
+    (0x7a, 0x57),
+    (0x7b, 0x58),
+    (0x90, 0x45),
+    (0x91, 0x46),
+    (0xba, 0x27),
+    (0xbb, 0x0d),
+    (0xbc, 0x33),
+    (0xbd, 0x0c),
+    (0xbe, 0x34),
+    (0xbf, 0x35),
+    (0xc0, 0x29),
+    (0xdb, 0x1a),
+    (0xdc, 0x2b),
+    (0xdd, 0x1b),
+    (0xde, 0x28),
+    (0xe2, 0x56),
+];
+
+/// The modifier keys held, from winit's report of them. A side it does
+/// not tell counts as the left.
+#[cfg(not(windows))]
+pub fn winit_mods(m: &winit::event::Modifiers) -> Mods {
+    use winit::keyboard::ModifiersKeyState::Pressed;
+    let s = m.state();
+    let (rshift, rctrl, ralt, rsuper) = (
+        m.rshift_state() == Pressed,
+        m.rcontrol_state() == Pressed,
+        m.ralt_state() == Pressed,
+        m.rsuper_state() == Pressed,
+    );
+    Mods {
+        lshift: s.shift_key() && (m.lshift_state() == Pressed || !rshift),
+        rshift,
+        lctrl: s.control_key() && (m.lcontrol_state() == Pressed || !rctrl),
+        rctrl,
+        lalt: s.alt_key() && (m.lalt_state() == Pressed || !ralt),
+        ralt,
+        lsuper: s.super_key() && (m.lsuper_state() == Pressed || !rsuper),
+        rsuper,
+    }
+}
+
+/// The virtual key of a physical key, by its place on a US keyboard.
+#[cfg(not(windows))]
+fn vk_of(code: winit::keyboard::KeyCode) -> u16 {
+    use winit::keyboard::KeyCode as C;
+    match code {
+        C::Backquote => 0xc0,
+        C::Backslash | C::IntlYen => 0xdc,
+        C::BracketLeft => 0xdb,
+        C::BracketRight => 0xdd,
+        C::Comma => 0xbc,
+        C::Digit0 => 0x30,
+        C::Digit1 => 0x31,
+        C::Digit2 => 0x32,
+        C::Digit3 => 0x33,
+        C::Digit4 => 0x34,
+        C::Digit5 => 0x35,
+        C::Digit6 => 0x36,
+        C::Digit7 => 0x37,
+        C::Digit8 => 0x38,
+        C::Digit9 => 0x39,
+        C::Equal => 0xbb,
+        C::IntlBackslash | C::IntlRo => 0xe2,
+        C::KeyA => 0x41,
+        C::KeyB => 0x42,
+        C::KeyC => 0x43,
+        C::KeyD => 0x44,
+        C::KeyE => 0x45,
+        C::KeyF => 0x46,
+        C::KeyG => 0x47,
+        C::KeyH => 0x48,
+        C::KeyI => 0x49,
+        C::KeyJ => 0x4a,
+        C::KeyK => 0x4b,
+        C::KeyL => 0x4c,
+        C::KeyM => 0x4d,
+        C::KeyN => 0x4e,
+        C::KeyO => 0x4f,
+        C::KeyP => 0x50,
+        C::KeyQ => 0x51,
+        C::KeyR => 0x52,
+        C::KeyS => 0x53,
+        C::KeyT => 0x54,
+        C::KeyU => 0x55,
+        C::KeyV => 0x56,
+        C::KeyW => 0x57,
+        C::KeyX => 0x58,
+        C::KeyY => 0x59,
+        C::KeyZ => 0x5a,
+        C::Minus => 0xbd,
+        C::Period => 0xbe,
+        C::Quote => 0xde,
+        C::Semicolon => 0xba,
+        C::Slash => 0xbf,
+        C::AltLeft | C::AltRight => 0x12,
+        C::Backspace => 0x08,
+        C::CapsLock => 0x14,
+        C::ContextMenu => 0x5d,
+        C::ControlLeft | C::ControlRight => 0x11,
+        C::Enter | C::NumpadEnter => 0x0d,
+        C::SuperLeft => 0x5b,
+        C::SuperRight => 0x5c,
+        C::ShiftLeft | C::ShiftRight => 0x10,
+        C::Space => 0x20,
+        C::Tab => 0x09,
+        C::Delete => 0x2e,
+        C::End => 0x23,
+        C::Home => 0x24,
+        C::Insert => 0x2d,
+        C::PageDown => 0x22,
+        C::PageUp => 0x21,
+        C::ArrowDown => 0x28,
+        C::ArrowLeft => 0x25,
+        C::ArrowRight => 0x27,
+        C::ArrowUp => 0x26,
+        C::NumLock => 0x90,
+        C::Numpad0 => 0x60,
+        C::Numpad1 => 0x61,
+        C::Numpad2 => 0x62,
+        C::Numpad3 => 0x63,
+        C::Numpad4 => 0x64,
+        C::Numpad5 => 0x65,
+        C::Numpad6 => 0x66,
+        C::Numpad7 => 0x67,
+        C::Numpad8 => 0x68,
+        C::Numpad9 => 0x69,
+        C::NumpadAdd => 0x6b,
+        C::NumpadDecimal | C::NumpadComma => 0x6e,
+        C::NumpadDivide => 0x6f,
+        C::NumpadMultiply => 0x6a,
+        C::NumpadSubtract => 0x6d,
+        C::Escape => 0x1b,
+        C::F1 => 0x70,
+        C::F2 => 0x71,
+        C::F3 => 0x72,
+        C::F4 => 0x73,
+        C::F5 => 0x74,
+        C::F6 => 0x75,
+        C::F7 => 0x76,
+        C::F8 => 0x77,
+        C::F9 => 0x78,
+        C::F10 => 0x79,
+        C::F11 => 0x7a,
+        C::F12 => 0x7b,
+        C::F13 => 0x7c,
+        C::F14 => 0x7d,
+        C::F15 => 0x7e,
+        C::F16 => 0x7f,
+        C::F17 => 0x80,
+        C::F18 => 0x81,
+        C::F19 => 0x82,
+        C::F20 => 0x83,
+        C::F21 => 0x84,
+        C::F22 => 0x85,
+        C::F23 => 0x86,
+        C::F24 => 0x87,
+        C::PrintScreen => 0x2c,
+        C::ScrollLock => 0x91,
+        C::Pause => 0x13,
+        _ => 0,
+    }
+}
+
+/// What a winit key event says, for [`winit_key`].
+#[cfg(not(windows))]
+#[derive(Clone, Debug, Default)]
+pub struct WinitKey {
+    /// The physical key.
+    pub code: Option<winit::keyboard::KeyCode>,
+    /// What the key types on the layout with no modifiers held.
+    pub base: Option<String>,
+    /// The key's name, for keys that type nothing.
+    pub named: Option<winit::keyboard::NamedKey>,
+    /// What it types with every modifier held but Ctrl.
+    pub text: Option<String>,
+    pub down: bool,
+    /// A dead key, which types nothing itself.
+    pub dead: bool,
+}
+
+#[cfg(not(windows))]
+impl WinitKey {
+    pub fn of(ev: &winit::event::KeyEvent) -> WinitKey {
+        use winit::keyboard::{Key as K, PhysicalKey};
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+        WinitKey {
+            code: match ev.physical_key {
+                PhysicalKey::Code(c) => Some(c),
+                PhysicalKey::Unidentified(_) => None,
+            },
+            base: match ev.key_without_modifiers() {
+                K::Character(c) => Some(c.to_string()),
+                _ => None,
+            },
+            named: match &ev.logical_key {
+                K::Named(n) => Some(*n),
+                _ => None,
+            },
+            text: ev.text.as_ref().map(ToString::to_string),
+            down: ev.state == winit::event::ElementState::Pressed,
+            dead: matches!(ev.logical_key, K::Dead(_)),
+        }
+    }
+}
+
+/// Turns a winit key event, with the modifiers `mods` held, into key
+/// input for [`vt::encode_key`], as [`msg_to_key`] does a Windows key
+/// message. The virtual key follows the label of a letter key on Latin
+/// layouts and the US place of every other key, as on Windows. Option, or
+/// Alt, that types a character of its own types it, as AltGr does; on a
+/// key it changes nothing it is Meta. The text of the result is stored in
+/// `text`.
+#[cfg(not(windows))]
+pub fn winit_key<'a>(k: &WinitKey, mut mods: Mods, text: &'a mut String) -> KeyInput<'a> {
+    use winit::keyboard::NamedKey as N;
+    let base = (k.base.as_deref())
+        .and_then(|b| {
+            let mut c = b.chars();
+            c.next().filter(|_| c.next().is_none())
+        })
+        .filter(|c| !c.is_control());
+    let physical = k.code.map_or(0, vk_of);
+    let vk = match base {
+        Some(c) if c.is_ascii_alphabetic() && !(0x30..=0x39).contains(&physical) => {
+            u16::from(c.to_ascii_uppercase() as u8)
+        }
+        _ => physical,
+    };
+    let (scan, extended) = scan_code(physical);
+    let extended = extended || matches!(k.code, Some(winit::keyboard::KeyCode::NumpadEnter));
+
+    let typed = k.text.as_deref().filter(|t| printable(t)).unwrap_or("");
+    let alt = mods.lalt || mods.ralt;
+    let shifted = |c: char| c.to_uppercase().collect::<String>();
+    // Option+e and the like: a character of its own, not Meta.
+    let composed = alt
+        && !typed.is_empty()
+        && base.is_none_or(|b| typed != b.to_string() && typed != shifted(b));
+    if composed {
+        mods.lalt = false;
+        mods.ralt = false;
+    }
+    *text = if k.dead { String::new() } else { typed.into() };
+    let ctrl = mods.lctrl || mods.rctrl;
+    let first = text.chars().next();
+    let uc = match first {
+        Some(c) if ctrl && c.is_ascii_alphabetic() => c as u16 & 0x1f,
+        _ => text.encode_utf16().next().unwrap_or(0),
+    };
+
+    let key = match k.named {
+        Some(N::Backspace) => Key::Backspace,
+        Some(N::Tab) => Key::Tab,
+        Some(N::Enter) => Key::Enter,
+        Some(N::Escape) => Key::Escape,
+        Some(N::PageUp) => Key::PageUp,
+        Some(N::PageDown) => Key::PageDown,
+        Some(N::End) => Key::End,
+        Some(N::Home) => Key::Home,
+        Some(N::ArrowLeft) => Key::Left,
+        Some(N::ArrowUp) => Key::Up,
+        Some(N::ArrowRight) => Key::Right,
+        Some(N::ArrowDown) => Key::Down,
+        Some(N::Insert) => Key::Insert,
+        Some(N::Delete) => Key::Delete,
+        Some(N::Shift) => Key::Shift,
+        Some(N::Control) => Key::Control,
+        Some(N::Alt | N::AltGraph) => Key::Alt,
+        Some(N::Super | N::Meta) => Key::Super,
+        Some(N::Space) => Key::Char(' '),
+        _ if (0x70..=0x87).contains(&vk) => Key::F((vk - 0x6f) as u8),
+        _ if k.dead => Key::Other,
+        _ => base.or(first).map_or(Key::Other, Key::Char),
+    };
+    // winit does not say whether Caps Lock is on; a letter that comes out
+    // in the other case than Shift asks for says it is.
+    let caps = base.zip(first).is_some_and(|(b, t)| {
+        let shift = mods.lshift || mods.rshift;
+        b.is_alphabetic() && t.is_alphabetic() && t.is_uppercase() != shift && !composed
+    });
+    let us_base = US_BY_SCAN
+        .get(usize::from(scan))
+        .filter(|&&b| b != 0 && !extended)
+        .map(|&b| char::from(b));
+    KeyInput {
+        vk,
+        scan,
+        extended,
+        down: k.down,
+        repeat: 1,
+        mods,
+        locks: Locks {
+            caps,
+            num: false,
+            scroll: false,
+        },
+        text,
+        uc,
+        cs: 0,
+        key,
+        us_base,
+    }
+}
+
 #[cfg(test)]
 mod msg_to_key_tests {
     use super::*;
@@ -774,6 +1265,7 @@ mod msg_to_key_tests {
     ];
 
     /// French AZERTY: the digit keys type symbols, and digits with Shift.
+    #[cfg(not(target_os = "macos"))]
     const FR: &[(u16, &str, &str, &str)] = &[
         (0x31, "&", "1", ""),
         (0x36, "-", "6", "|"),
@@ -1141,6 +1633,8 @@ mod msg_to_key_tests {
         action(&k, &[])
     }
 
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn keymap_default_shortcuts() {
         const LCTRL: usize = 0xa2;
@@ -1194,6 +1688,8 @@ mod msg_to_key_tests {
         assert_eq!(action(&k, &[]), None);
     }
 
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn keymap_reads_bindings() {
         assert_eq!(
@@ -1208,6 +1704,11 @@ mod msg_to_key_tests {
             binding("ctrl+shift+w=none"),
             Some((CTRL | SHIFT, 0x57, None))
         );
+        assert_eq!(
+            binding("cmd+shift+]=next_tab"),
+            binding("Super+Shift+BracketRight=next_tab")
+        );
+        assert_eq!(binding("cmd+d=split_right").map(|b| b.0), Some(CMD));
         assert_eq!(
             binding("ctrl+shift+q=close_tab"),
             Some((CTRL | SHIFT, 0x51, Some(Action::CloseTab)))
@@ -1243,7 +1744,6 @@ mod msg_to_key_tests {
         for bad in [
             "ctrl+shift+r",
             "ctrl+shift+r=split_sideways",
-            "super+r=copy",
             "ctrl+f25=copy",
             "ctrl+caps=copy",
             "=copy",
@@ -1295,6 +1795,8 @@ mod msg_to_key_tests {
         assert_eq!(binding(r"ctrl+e=text:x"), None, "not an action");
     }
 
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn keymap_user_bindings_come_before_the_defaults() {
         const LCTRL: usize = 0xa2;
@@ -1327,6 +1829,8 @@ mod msg_to_key_tests {
         assert_eq!(press_for(Action::Paste, &[]), "Ctrl+V");
     }
 
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn keymap_ctrl_digits_go_to_tabs_where_the_key_types_the_digit() {
         let press_on = |vk, rows, user: &[Binding]| {
@@ -1356,6 +1860,8 @@ mod msg_to_key_tests {
         assert_eq!(binding("ctrl+0=go_to_tab_9"), None, "Ctrl+9 is the last");
     }
 
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn keymap_altgr_types_rather_than_running_a_ctrl_alt_binding() {
         let user: Vec<Binding> = [
@@ -1391,7 +1897,7 @@ mod msg_to_key_tests {
 
     /// The left-hand keys for a set of shortcut modifiers.
     fn held_for(m: u8) -> Vec<usize> {
-        [(CTRL, 0xa2), (SHIFT, 0xa0), (ALT, 0xa4)]
+        [(CTRL, 0xa2), (SHIFT, 0xa0), (ALT, 0xa4), (CMD, 0x5b)]
             .into_iter()
             .filter(|&(bit, _)| m & bit != 0)
             .map(|(_, vk)| vk)
@@ -1405,8 +1911,8 @@ mod msg_to_key_tests {
             // The right-hand modifier keys count the same.
             let right: Vec<usize> = held_for(m).into_iter().map(|k| k + 1).collect();
             assert_eq!(press(vk, &right), Some(a), "right-hand {m} {vk:#x}");
-            // One modifier more is another chord, and Win is never one.
-            for (bit, extra) in [(CTRL, 0xa2), (SHIFT, 0xa0), (ALT, 0xa4), (0, 0x5b)] {
+            // One modifier more is another chord.
+            for (bit, extra) in [(CTRL, 0xa2), (SHIFT, 0xa0), (ALT, 0xa4), (CMD, 0x5b)] {
                 let mut more = held_for(m);
                 if !more.contains(&extra) {
                     more.push(extra);
@@ -1417,14 +1923,16 @@ mod msg_to_key_tests {
                 }
             }
         }
+        // Ctrl, or Cmd on a Mac.
+        let tab = if TAB_DIGIT == CMD { 0x5b } else { 0xa2 };
         for i in 0..8 {
-            assert_eq!(press(0x31 + i, &[0xa2]), Some(Action::GoToTab(i as u8)));
+            assert_eq!(press(0x31 + i, &[tab]), Some(Action::GoToTab(i as u8)));
         }
-        assert_eq!(press(0x39, &[0xa2]), Some(Action::LastTab), "Ctrl+9");
-        assert_eq!(press(0x30, &[0xa2]), Some(Action::FontSize(0)), "Ctrl+0");
-        assert_eq!(press(0x31, &[0xa2, 0xa0]), None, "Ctrl+Shift+1");
-        assert_eq!(press(0x31, &[0xa2, 0xa4]), None, "AltGr+1");
-        assert_eq!(press(0x61, &[0xa2]), None, "Ctrl+keypad 1 is not tab 1");
+        assert_eq!(press(0x39, &[tab]), Some(Action::LastTab), "Ctrl+9");
+        assert_eq!(press(0x30, &[tab]), Some(Action::FontSize(0)), "Ctrl+0");
+        assert_eq!(press(0x31, &[tab, 0xa0]), None, "Ctrl+Shift+1");
+        assert_eq!(press(0x31, &[tab, 0xa4]), None, "AltGr+1");
+        assert_eq!(press(0x61, &[tab]), None, "Ctrl+keypad 1 is not tab 1");
     }
 
     #[test]
@@ -1433,7 +1941,7 @@ mod msg_to_key_tests {
             for b in &DEFAULT_KEYS[i + 1..] {
                 assert!((a.0, a.1) != (b.0, b.1), "{a:?} and {b:?}");
             }
-            let tab = a.0 == CTRL && (0x31..=0x39).contains(&a.1);
+            let tab = a.0 == TAB_DIGIT && (0x31..=0x39).contains(&a.1);
             assert!(!tab, "{a:?} is a Go to tab key");
         }
     }
@@ -1470,6 +1978,8 @@ mod msg_to_key_tests {
         }
     }
 
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn keymap_auto_repeat() {
         assert!(!held_before(lp(0x16, false, true, 1)), "a first press");
@@ -1583,6 +2093,8 @@ mod msg_to_key_tests {
         assert_eq!((k.key, k.uc, k.text), (Key::Char(' '), 32, " "));
     }
 
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn keymap_find_and_prompt_jumps() {
         const LCTRL: usize = 0xa2;
@@ -1599,6 +2111,8 @@ mod msg_to_key_tests {
 
     /// Alt+Space opens the window menu, as everywhere else on Windows,
     /// unless a binding gives it back to the program.
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn keymap_alt_space_opens_the_window_menu() {
         assert_eq!(press(0x20, &[0xa4]), Some(Action::SystemMenu));
@@ -1627,5 +2141,142 @@ mod msg_to_key_tests {
         for a in [Action::Copy, Action::Paste, Action::Resize(Dir::Left)] {
             assert!(passes_on(a), "{a:?}");
         }
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod winit_key_tests {
+    use winit::keyboard::{KeyCode, NamedKey};
+
+    use super::*;
+
+    fn press(code: KeyCode, base: &str, text: Option<&str>) -> WinitKey {
+        WinitKey {
+            code: Some(code),
+            base: Some(base.into()).filter(|b: &String| !b.is_empty()),
+            named: None,
+            text: text.map(Into::into),
+            down: true,
+            dead: false,
+        }
+    }
+
+    fn mods(f: impl FnOnce(&mut Mods)) -> Mods {
+        let mut m = Mods::default();
+        f(&mut m);
+        m
+    }
+
+    #[test]
+    fn letters_follow_the_layout_and_digits_their_place() {
+        let mut text = String::new();
+        // The A key of AZERTY is where US has Q.
+        let k = winit_key(
+            &press(KeyCode::KeyQ, "a", Some("a")),
+            Mods::default(),
+            &mut text,
+        );
+        assert_eq!((k.vk, k.key, k.text), (0x41, Key::Char('a'), "a"));
+        assert_eq!((k.scan, k.us_base), (0x10, Some('q')));
+        // AZERTY's 1 key types & and is still the 1 key.
+        let k = winit_key(
+            &press(KeyCode::Digit1, "&", Some("&")),
+            Mods::default(),
+            &mut text,
+        );
+        assert_eq!((k.vk, k.key), (0x31, Key::Char('&')));
+        // A Russian layout's letters keep their US places.
+        let k = winit_key(
+            &press(KeyCode::KeyF, "а", Some("а")),
+            Mods::default(),
+            &mut text,
+        );
+        assert_eq!(k.vk, 0x46);
+    }
+
+    #[test]
+    fn option_types_its_own_character_and_is_meta_otherwise() {
+        let mut text = String::new();
+        let opt = mods(|m| m.lalt = true);
+        // Option+2 types ™ on a US Mac.
+        let k = winit_key(&press(KeyCode::Digit2, "2", Some("™")), opt, &mut text);
+        assert!(!k.mods.lalt);
+        assert_eq!((k.text, k.uc), ("™", 0x2122));
+        // Where it changes nothing, it is Alt, as Meta for the shell.
+        let k = winit_key(&press(KeyCode::KeyB, "b", Some("b")), opt, &mut text);
+        assert!(k.mods.lalt);
+        assert_eq!(k.text, "b");
+        let left = WinitKey {
+            named: Some(NamedKey::ArrowLeft),
+            text: None,
+            ..press(KeyCode::ArrowLeft, "", None)
+        };
+        let k = winit_key(&left, opt, &mut text);
+        assert!(k.mods.lalt && k.extended);
+        assert_eq!((k.vk, k.key, k.scan), (0x25, Key::Left, 0x4b));
+    }
+
+    #[test]
+    fn ctrl_letters_carry_their_control_code() {
+        let mut text = String::new();
+        let ctrl = mods(|m| m.lctrl = true);
+        let k = winit_key(&press(KeyCode::KeyC, "c", Some("c")), ctrl, &mut text);
+        assert_eq!((k.vk, k.uc, k.text), (0x43, 3, "c"));
+    }
+
+    #[test]
+    fn caps_lock_shows_in_the_case_typed() {
+        let mut text = String::new();
+        let k = winit_key(
+            &press(KeyCode::KeyA, "a", Some("A")),
+            Mods::default(),
+            &mut text,
+        );
+        assert!(k.locks.caps);
+        let shift = mods(|m| m.lshift = true);
+        let k = winit_key(&press(KeyCode::KeyA, "a", Some("A")), shift, &mut text);
+        assert!(!k.locks.caps);
+    }
+
+    #[test]
+    fn a_dead_key_types_nothing() {
+        let mut text = String::new();
+        let dead = WinitKey {
+            dead: true,
+            ..press(KeyCode::KeyE, "e", Some("´"))
+        };
+        let k = winit_key(&dead, mods(|m| m.lalt = true), &mut text);
+        assert_eq!((k.key, k.text), (Key::Other, ""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_shortcuts_take_command() {
+        let mut text = String::new();
+        let cmd = mods(|m| m.lsuper = true);
+        let k = winit_key(&press(KeyCode::KeyC, "c", Some("c")), cmd, &mut text);
+        assert_eq!(action(&k, &[]), Some(Action::Copy));
+        let k = winit_key(&press(KeyCode::Digit3, "3", Some("3")), cmd, &mut text);
+        assert_eq!(action(&k, &[]), Some(Action::GoToTab(2)));
+        // Ctrl+C is the program's.
+        let ctrl = mods(|m| m.lctrl = true);
+        let k = winit_key(&press(KeyCode::KeyC, "c", Some("c")), ctrl, &mut text);
+        assert_eq!(action(&k, &[]), None);
+        assert_eq!(
+            keys_for(Action::SplitDown, &[]).as_deref(),
+            Some("Shift+Cmd+D")
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_keeps_the_windows_shortcuts() {
+        let mut text = String::new();
+        let both = mods(|m| (m.lctrl, m.lshift) = (true, true));
+        let k = winit_key(&press(KeyCode::KeyT, "t", Some("T")), both, &mut text);
+        assert_eq!(action(&k, &[]), Some(Action::NewTab));
+        let sup = mods(|m| m.lsuper = true);
+        let k = winit_key(&press(KeyCode::KeyC, "c", Some("c")), sup, &mut text);
+        assert_eq!(action(&k, &[]), None);
     }
 }

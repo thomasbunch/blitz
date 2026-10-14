@@ -13,6 +13,10 @@ pub type Target = wgpu::TextureView;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 pub struct Gpu {
+    /// What the device came from, which a window's surface must come from
+    /// too.
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     /// Running on a software rasterizer, as WARP is on Windows.
@@ -67,10 +71,10 @@ impl Gpu {
             // A Mac has no software rasterizer; its GPU stands in.
             (fallback, Err(_)) => pick(!fallback)?,
         };
-        Self::with_adapter(&adapter)
+        Self::with_adapter(instance, adapter)
     }
 
-    fn with_adapter(adapter: &wgpu::Adapter) -> Result<Self> {
+    fn with_adapter(instance: wgpu::Instance, adapter: wgpu::Adapter) -> Result<Self> {
         let info = adapter.get_info();
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -146,6 +150,8 @@ impl Gpu {
             ],
         });
         Ok(Self {
+            instance,
+            adapter,
             device,
             queue,
             warp: info.device_type == wgpu::DeviceType::Cpu,
@@ -380,4 +386,130 @@ fn quad_bytes(quads: &[Quad]) -> &[u8] {
     // SAFETY: Quad is repr(C), 20 bytes of plain integers with no padding,
     // so any of its bytes may be read.
     unsafe { std::slice::from_raw_parts(quads.as_ptr().cast(), std::mem::size_of_val(quads)) }
+}
+
+/// Whether a renderer error means the device is gone and everything on it
+/// has to be made again.
+pub fn is_device_lost(e: &super::Error) -> bool {
+    e.downcast_ref::<Lost>().is_some()
+}
+
+/// The surface was lost, and the device with it as far as blitz knows.
+#[derive(Debug)]
+struct Lost;
+
+impl std::fmt::Display for Lost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the window's surface was lost")
+    }
+}
+
+impl std::error::Error for Lost {}
+
+/// A window's surface, presented with vsync, as the swap chain is on
+/// Windows.
+pub struct Swapchain {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    /// The frame being drawn, from [`Swapchain::rtv`] until it is
+    /// presented.
+    frame: Option<(wgpu::SurfaceTexture, wgpu::TextureView)>,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl Swapchain {
+    /// A surface on `window`, `w` by `h` pixels.
+    pub fn new(
+        gpu: &Gpu,
+        window: std::sync::Arc<winit::window::Window>,
+        w: u32,
+        h: u32,
+    ) -> Result<Self> {
+        let (w, h) = (w.max(1), h.max(1));
+        let surface = (gpu.instance)
+            .create_surface(wgpu::SurfaceTarget::DisplayAndWindow(Box::new(window)))?;
+        let caps = surface.get_capabilities(&gpu.adapter);
+        // Never an sRGB format: blending is on the colours as given.
+        let format = [FORMAT, wgpu::TextureFormat::Rgba8Unorm]
+            .into_iter()
+            .find(|f| caps.formats.contains(f))
+            .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
+            .ok_or("the window takes no format blitz can draw")?;
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes.first().copied().unwrap_or_default()
+        };
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: w,
+            height: h,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 1,
+            alpha_mode,
+            view_formats: vec![],
+        };
+        surface.configure(&gpu.device, &config);
+        Ok(Self {
+            surface,
+            config,
+            frame: None,
+            w,
+            h,
+        })
+    }
+
+    /// The view of the frame to draw: the one being drawn, or the next.
+    pub fn rtv(&mut self, gpu: &Gpu) -> Result<wgpu::TextureView> {
+        if let Some((_, view)) = &self.frame {
+            return Ok(view.clone());
+        }
+        let mut again = true;
+        let texture = loop {
+            match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => break t,
+                wgpu::CurrentSurfaceTexture::Outdated if again => {
+                    again = false;
+                    self.surface.configure(&gpu.device, &self.config);
+                }
+                wgpu::CurrentSurfaceTexture::Lost => return Err(Lost.into()),
+                other => return Err(format!("no frame to draw: {other:?}").into()),
+            }
+        };
+        let view = texture.texture.create_view(&Default::default());
+        self.frame = Some((texture, view.clone()));
+        Ok(view)
+    }
+
+    pub fn resize(&mut self, gpu: &Gpu, w: u32, h: u32) -> Result<()> {
+        let (w, h) = (w.max(1), h.max(1));
+        if (w, h) == (self.w, self.h) {
+            return Ok(());
+        }
+        // A frame acquired at the old size is dropped unshown.
+        self.frame = None;
+        (self.config.width, self.config.height) = (w, h);
+        self.surface.configure(&gpu.device, &self.config);
+        (self.w, self.h) = (w, h);
+        Ok(())
+    }
+
+    /// The window shows the last frame while it is resized; nothing to set.
+    pub fn set_background(&self, _bg: u32) {}
+
+    /// Acquiring the next frame waits for it.
+    pub fn wait(&self, _ms: u32) {}
+
+    /// Presents the frame [`Swapchain::rtv`] gave. False with none drawn.
+    pub fn present(&mut self, gpu: &Gpu) -> Result<bool> {
+        let Some((texture, _)) = self.frame.take() else {
+            return Ok(false);
+        };
+        gpu.queue.present(texture);
+        Ok(true)
+    }
 }
