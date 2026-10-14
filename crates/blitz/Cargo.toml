@@ -19,6 +19,7 @@ path = "src/bin/blitz-hook.rs"
 
 [dependencies]
 vt = { path = "../vt" }
+winit = "=0.30.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
@@ -27,8 +28,11 @@ swash = "=0.2.10"
 fontdb = { version = "=0.24.0", default-features = false, features = ["std", "fs", "fontconfig"] }
 pollster = "=1.0.1"
 
-[target.'cfg(windows)'.dependencies]
-winit = "=0.30.13"
+# The versions winit already uses, so AppKit is linked once.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.5.2"
+objc2-foundation = { version = "=0.2.2", features = ["NSArray", "NSData", "NSDictionary", "NSString", "NSURL", "NSBundle", "NSProcessInfo", "NSThread", "NSValue"] }
+objc2-app-kit = { version = "=0.2.2", features = ["NSApplication", "NSDockTile", "NSGraphics", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSWorkspace", "NSWindow", "NSView", "NSColor", "NSAppearance", "NSEvent", "NSImage"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "=0.62.2"
