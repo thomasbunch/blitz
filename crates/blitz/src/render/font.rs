@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{E_FAIL, E_NOINTERFACE, S_OK};
 use windows::Win32::Graphics::DirectWrite::{
@@ -12,8 +13,8 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_MEASURING_MODE_NATURAL, DWRITE_READING_DIRECTION,
     DWRITE_READING_DIRECTION_LEFT_TO_RIGHT, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
     DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, DWRITE_TEXTURE_ALIASED_1x1, DWriteCreateFactory,
-    IDWriteFactory2, IDWriteFont1, IDWriteFontCollection, IDWriteFontFace, IDWriteFontFallback,
-    IDWriteRenderingParams1, IDWriteTextAnalysisSource,
+    IDWriteFactory2, IDWriteFont1, IDWriteFont2, IDWriteFontCollection, IDWriteFontFace,
+    IDWriteFontFallback, IDWriteFontFamily, IDWriteRenderingParams1, IDWriteTextAnalysisSource,
 };
 use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, w};
 
@@ -25,7 +26,7 @@ pub const ITALIC: u8 = 2;
 pub const E_PENDING: HRESULT = HRESULT(0x8000_000A_u32 as i32);
 
 /// Families tried in order; Consolas ships with every Windows.
-pub const DEFAULT_FAMILIES: &[&str] = &["Cascadia Mono", "Consolas", "Courier New"];
+pub const DEFAULT_FAMILIES: &[&str] = crate::config::FALLBACK_FONTS;
 
 /// Coverage of a rasterized glyph, placed relative to the top-left corner
 /// of its first cell.
@@ -61,6 +62,9 @@ pub struct Font {
     pub gamma: f32,
     pub contrast: f32,
     fallbacks: HashMap<(char, u8), Option<IDWriteFontFace>>,
+    /// The installed Nerd Font for icons, looked for at the first icon
+    /// the font lacks.
+    nerd: Option<Option<IDWriteFontFamily>>,
     /// Fallback lookups [`Font::raster`] may still make before it fails
     /// with `E_PENDING`. Each new character takes about a tenth of a
     /// millisecond, so a renderer allows a few per frame.
@@ -81,40 +85,105 @@ fn weight_style(style: u8) -> (DWRITE_FONT_WEIGHT, DWRITE_FONT_STYLE) {
     (weight, slant)
 }
 
-/// The names of the fixed-width font families installed, sorted. Empty
-/// when DirectWrite cannot list them.
-pub fn monospace_families() -> Vec<String> {
+/// The names of the font families installed, sorted, each with whether it
+/// is fixed-width and no symbol font. A family DirectWrite cannot read is
+/// left out. Empty when DirectWrite cannot list them, and listed again at
+/// the next call. Listed once, as that takes long enough to hitch a frame,
+/// so the app has another thread list them after its first frame.
+// ponytail: a font installed while blitz runs is listed after a restart
+pub fn families() -> &'static [(String, bool)] {
+    static FAMILIES: OnceLock<Vec<(String, bool)>> = OnceLock::new();
+    if let Some(f) = FAMILIES.get() {
+        return f;
+    }
+    match list_families() {
+        Ok(f) => FAMILIES.get_or_init(|| f),
+        Err(_) => &[],
+    }
+}
+
+fn list_families() -> Result<Vec<(String, bool)>> {
     // SAFETY: COM calls with valid out-pointers and buffers of the length
     // passed.
-    let list = || unsafe {
+    unsafe {
         let factory: IDWriteFactory2 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
         let mut collection = None;
         factory.GetSystemFontCollection(&mut collection, false)?;
         let collection = collection.ok_or(windows::core::Error::from(E_FAIL))?;
         let mut out = Vec::new();
         for i in 0..collection.GetFontFamilyCount() {
-            let fam = collection.GetFontFamily(i)?;
-            let font = fam.GetFont(0)?;
-            let mono = font.cast::<IDWriteFont1>()?.IsMonospacedFont().as_bool();
-            if !mono || font.IsSymbolFont().as_bool() {
-                continue;
-            }
-            let names = fam.GetFamilyNames()?;
-            let (mut index, mut exists) = (0u32, BOOL(0));
-            names.FindLocaleName(w!("en-us"), &mut index, &mut exists)?;
-            if !exists.as_bool() {
-                index = 0;
-            }
-            let mut name = vec![0u16; names.GetStringLength(index)? as usize + 1];
-            names.GetString(index, &mut name)?;
-            name.pop();
-            out.push(String::from_utf16_lossy(&name));
+            // One broken or unreachable font file costs its family only.
+            let family = || {
+                let fam = collection.GetFontFamily(i)?;
+                let font = fam.GetFont(0)?;
+                let mono = font.cast::<IDWriteFont1>()?.IsMonospacedFont().as_bool()
+                    && !font.IsSymbolFont().as_bool();
+                Result::Ok((family_name(&fam)?, mono))
+            };
+            out.extend(family());
         }
-        out.sort_by_key(|n| n.to_lowercase());
+        out.sort_by_key(|n| n.0.to_lowercase());
         out.dedup();
-        Result::Ok(out)
-    };
-    list().unwrap_or_default()
+        Ok(out)
+    }
+}
+
+/// The English name of `fam`, or its first.
+fn family_name(fam: &IDWriteFontFamily) -> Result<String> {
+    // SAFETY: COM calls with valid out-pointers and a buffer of the length
+    // asked for.
+    unsafe {
+        let names = fam.GetFamilyNames()?;
+        let (mut index, mut exists) = (0u32, BOOL(0));
+        names.FindLocaleName(w!("en-us"), &mut index, &mut exists)?;
+        if !exists.as_bool() {
+            index = 0;
+        }
+        let mut name = vec![0u16; names.GetStringLength(index)? as usize + 1];
+        names.GetString(index, &mut name)?;
+        name.pop();
+        Ok(String::from_utf16_lossy(&name))
+    }
+}
+
+/// Whether `c` is in a private use area, where Nerd Fonts keep their
+/// icons.
+fn is_private(c: char) -> bool {
+    matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..)
+}
+
+/// How well a family named `name` suits as the font for icons: 0 for a
+/// Nerd Font with icons one cell wide, as "JetBrainsMono Nerd Font Mono"
+/// or "CaskaydiaCove NFM", 1 for one with wider icons, as "Hack Nerd
+/// Font" or "Cascadia Code NF", and `None` for any other font.
+fn nerd_rank(name: &str) -> Option<u8> {
+    if name.ends_with(" Nerd Font Mono") || name.ends_with(" NFM") {
+        Some(0)
+    } else if name.ends_with(" Nerd Font") || name.ends_with(" NF") {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// The installed Nerd Font that suits best for icons.
+fn nerd_family(collection: &IDWriteFontCollection) -> Option<IDWriteFontFamily> {
+    let mut best: Option<(u8, IDWriteFontFamily)> = None;
+    // SAFETY: a plain query on a live collection.
+    let count = unsafe { collection.GetFontFamilyCount() };
+    for i in 0..count {
+        // SAFETY: an index below the collection's count.
+        let Ok(fam) = (unsafe { collection.GetFontFamily(i) }) else {
+            continue;
+        };
+        let rank = family_name(&fam).ok().as_deref().and_then(nerd_rank);
+        if let Some(rank) = rank
+            && best.as_ref().is_none_or(|b| rank < b.0)
+        {
+            best = Some((rank, fam));
+        }
+    }
+    best.map(|b| b.1)
 }
 
 /// The row strikethrough starts on, `up` pixels above the baseline, kept
@@ -122,6 +191,33 @@ pub fn monospace_families() -> Vec<String> {
 /// the baseline at row 0, which leaves only row 0.
 fn strike_row(baseline: i32, up: f32) -> i32 {
     (baseline - up.round() as i32).min(baseline - 1).max(0)
+}
+
+/// The face of `fam` closest to `style`.
+fn face_of(fam: &IDWriteFontFamily, style: u8) -> Result<IDWriteFontFace> {
+    let (weight, slant) = weight_style(style);
+    // SAFETY: COM calls on a live family.
+    unsafe {
+        fam.GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, slant)?
+            .CreateFontFace()
+    }
+}
+
+/// The face of the installed family `name` closest to `style`.
+fn named_face(
+    collection: &IDWriteFontCollection,
+    name: PCWSTR,
+    style: u8,
+) -> Option<IDWriteFontFace> {
+    let (mut index, mut exists) = (0u32, BOOL(0));
+    // SAFETY: `name` is NUL-terminated; the out-pointers are valid.
+    unsafe {
+        collection
+            .FindFamilyName(name, &mut index, &mut exists)
+            .ok()?;
+        let fam = exists.as_bool().then(|| collection.GetFontFamily(index))?;
+        face_of(&fam.ok()?, style).ok()
+    }
 }
 
 fn glyph_index(face: &IDWriteFontFace, c: char) -> u16 {
@@ -153,11 +249,7 @@ impl Font {
             }
             let (family, index) = found.ok_or(windows::core::Error::from(E_FAIL))?;
             let fam = collection.GetFontFamily(index)?;
-            let face = |style| -> Result<IDWriteFontFace> {
-                let (weight, slant) = weight_style(style);
-                fam.GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, slant)?
-                    .CreateFontFace()
-            };
+            let face = |style| face_of(&fam, style);
             let faces = [face(0)?, face(BOLD)?, face(ITALIC)?, face(BOLD | ITALIC)?];
             let fallback = factory.GetSystemFontFallback()?;
 
@@ -209,9 +301,23 @@ impl Font {
                 gamma,
                 contrast,
                 fallbacks: HashMap::new(),
+                nerd: None,
                 lookups: u32::MAX,
             })
         }
+    }
+
+    /// Spaces lines `k` times as far apart as the font does, with the text
+    /// centred in its taller or shorter cell.
+    pub fn set_line_height(&mut self, k: f32) {
+        let h = ((self.cell_h as f32 * k).round() as i32).max(2);
+        let shift = (h - self.cell_h as i32) / 2;
+        self.cell_h = h as u32;
+        self.baseline = (self.baseline + shift).min(h - 1).max(1);
+        self.underline_y = (self.underline_y + shift)
+            .min(h - self.underline_h as i32)
+            .max(0);
+        self.strike_y = (self.strike_y + shift).min(self.baseline - 1).max(0);
     }
 
     /// Rasterizes one grapheme cluster spanning `width` cells. Returns
@@ -221,12 +327,18 @@ impl Font {
     pub fn raster(&mut self, text: &str, style: u8, width: u8) -> Result<Option<Raster>> {
         // No shaping. A cluster is drawn as its base character
         // plus the marks the same font has; emoji ZWJ sequences show their
-        // first emoji only (color emoji are not drawn as color anyway).
+        // first emoji only (color emoji are not drawn as color anyway), and
+        // a skin tone, which in one colour would only cover its emoji, is
+        // left out.
         let chars: Vec<char> = if text.contains('\u{200D}') {
             text.chars().take(1).collect()
         } else {
-            text.chars()
-                .filter(|c| !matches!(c, '\u{FE0E}' | '\u{FE0F}'))
+            (text.chars().enumerate())
+                .filter(|&(i, c)| {
+                    !matches!(c, '\u{FE0E}' | '\u{FE0F}')
+                        && !(i > 0 && matches!(c, '\u{1F3FB}'..='\u{1F3FF}'))
+                })
+                .map(|(_, c)| c)
                 .collect()
         };
         let Some(&first) = chars.first() else {
@@ -242,13 +354,16 @@ impl Font {
                 None => (own, true),
             }
         };
+        // Each glyph with whether it takes a column of its own.
         let mut glyphs = vec![glyph_index(&face, first)];
-        glyphs.extend(
-            chars[1..]
-                .iter()
-                .map(|&c| glyph_index(&face, c))
-                .filter(|&g| g != 0),
-        );
+        let mut spacing = vec![true];
+        for &c in &chars[1..] {
+            let g = glyph_index(&face, c);
+            if g != 0 {
+                glyphs.push(g);
+                spacing.push(vt::width::char_width(c) > 0);
+            }
+        }
         let n = glyphs.len();
         let mut gm = vec![DWRITE_GLYPH_METRICS::default(); n];
         let mut fm = DWRITE_FONT_METRICS::default();
@@ -257,14 +372,33 @@ impl Font {
             face.GetDesignGlyphMetrics(glyphs.as_ptr(), n as u32, gm.as_mut_ptr(), false)?;
             face.GetMetrics(&mut fm);
         }
+        let g = &gm[0];
         let upem = f32::from(fm.designUnitsPerEm.max(1));
         let to_px = self.px / upem;
-        let g = &gm[0];
+        // Where each glyph's pen is, in design units. A combining mark
+        // starts where the glyph before it does: fixed-width fonts draw it
+        // over that character from there (Cascadia Mono's have no
+        // advance, Consolas' reach back), so the base's advance would push
+        // the mark into the next cell. A flag's second letter still goes
+        // after its first.
+        let mut pens = vec![0i32; n];
+        for i in 1..n {
+            let step = if spacing[i] {
+                gm[i - 1].advanceWidth
+            } else {
+                0
+            };
+            pens[i] = pens[i - 1] + step as i32;
+        }
         // Fallback fonts (Segoe UI Symbol and friends) have wide
         // advances around small ink, so fitting by advance shrinks symbols
-        // like U+273B to a dot. Fit and centre the ink box instead; the
-        // baseline stays put.
-        let ink_w = (g.advanceWidth as i32 - g.leftSideBearing - g.rightSideBearing) as f32 * to_px;
+        // like U+273B to a dot. Fit and centre the ink box of all the
+        // glyphs instead; the baseline stays put.
+        let (l, r) = (gm.iter().zip(&pens)).fold((i32::MAX, i32::MIN), |(l, r), (m, &p)| {
+            let right = p + m.advanceWidth as i32 - m.rightSideBearing;
+            (l.min(p + m.leftSideBearing), r.max(right))
+        });
+        let ink_w = (r - l) as f32 * to_px;
         let ink_h =
             (g.advanceHeight as i32 - g.topSideBearing - g.bottomSideBearing) as f32 * to_px;
         let cells = (self.cell_w * u32::from(width.max(1))) as f32;
@@ -274,12 +408,14 @@ impl Font {
             let k = (cells / ink_w)
                 .min(self.cell_h as f32 / ink_h.max(1.0))
                 .min(1.0);
-            let left = g.leftSideBearing as f32 * to_px * k;
+            let left = l as f32 * to_px * k;
             (self.px * k, ((cells - ink_w * k) / 2.0 - left).round())
         };
-        let advances: Vec<f32> = gm
-            .iter()
-            .map(|g| g.advanceWidth as f32 * em / upem)
+        let advances: Vec<f32> = (0..n)
+            .map(|i| {
+                pens.get(i + 1)
+                    .map_or(0.0, |&p| (p - pens[i]) as f32 * em / upem)
+            })
             .collect();
         let run = DWRITE_GLYPH_RUN {
             fontFace: ManuallyDrop::new(Some(face)),
@@ -327,7 +463,11 @@ impl Font {
         }
     }
 
-    /// The system's fallback font face for `c`, cached.
+    /// The font face for `c` when the font lacks it, cached: an installed
+    /// Nerd Font for an icon, which Windows has no font for, or else the
+    /// system's fallback. Emoji are drawn in one colour, so where the
+    /// system picks its emoji font, Segoe UI Symbol's text form of the
+    /// symbol comes first.
     fn fallback_face(&mut self, c: char, style: u8) -> Result<Option<IDWriteFontFace>> {
         if let Some(f) = self.fallbacks.get(&(c, style)) {
             return Ok(f.clone());
@@ -336,6 +476,16 @@ impl Font {
             return Err(E_PENDING.into());
         }
         self.lookups -= 1;
+        if is_private(c) {
+            let nerd = self
+                .nerd
+                .get_or_insert_with(|| nerd_family(&self.collection));
+            let face = (nerd.as_ref()).and_then(|f| face_of(f, style).ok());
+            if let Some(f) = face.filter(|f| glyph_index(f, c) != 0) {
+                self.fallbacks.insert((c, style), Some(f.clone()));
+                return Ok(Some(f));
+            }
+        }
         let mut text = [0u16; 2];
         let len = c.encode_utf16(&mut text).len() as u32;
         let source = Source {
@@ -365,6 +515,16 @@ impl Font {
                 &mut scale,
             )?;
             match font {
+                Some(f)
+                    if f.cast::<IDWriteFont2>()
+                        .is_ok_and(|f| f.IsColorFont().as_bool()) =>
+                {
+                    let symbol = named_face(&self.collection, w!("Segoe UI Symbol"), style);
+                    match symbol.filter(|s| glyph_index(s, c) != 0) {
+                        Some(s) => Some(s),
+                        None => Some(f.CreateFontFace()?),
+                    }
+                }
                 Some(f) => Some(f.CreateFontFace()?),
                 None => None,
             }
@@ -520,6 +680,19 @@ mod tests {
         assert_eq!(strike_row(-1, 0.0), 0);
     }
 
+    /// The list another thread made is the one the settings panel gets,
+    /// with no second walk over every font.
+    #[test]
+    fn font_families_are_listed_once_on_any_thread() {
+        let made = std::thread::spawn(families).join().expect("listed");
+        assert!(
+            made.iter().any(|f| f == &("Consolas".into(), true)),
+            "{made:?}"
+        );
+        assert!(made.is_sorted_by_key(|f| f.0.to_lowercase()));
+        assert!(std::ptr::eq(made, families()));
+    }
+
     #[test]
     fn metrics_and_ascii() {
         let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
@@ -546,6 +719,25 @@ mod tests {
         assert!(font.raster(" ", 0, 1).expect("raster").is_none());
         let bold = font.raster("A", BOLD, 1).expect("raster").expect("ink");
         assert!(ink(&bold) > ink(&a));
+    }
+
+    #[test]
+    fn line_height_spaces_lines_and_keeps_text_centred() {
+        let mut base = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        for k in [0.8, 1.0, 1.3, 2.0] {
+            let mut f = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+            f.set_line_height(k);
+            let h = (base.cell_h as f32 * k).round() as i32;
+            assert_eq!((f.cell_w, f.cell_h as i32), (base.cell_w, h), "{k}");
+            let shift = (h - base.cell_h as i32) / 2;
+            assert_eq!(f.baseline, base.baseline + shift, "{k}");
+            assert!(f.underline_y + f.underline_h as i32 <= h, "{k}");
+            assert!(f.strike_y > 0 && f.strike_y < f.baseline, "{k}");
+            // Glyphs sit on the new baseline.
+            let a = f.raster("A", 0, 1).expect("raster").expect("ink");
+            let b = base.raster("A", 0, 1).expect("raster").expect("ink");
+            assert_eq!(a.dy, b.dy + shift, "{k}");
+        }
     }
 
     #[test]
@@ -597,6 +789,65 @@ mod tests {
             a.alpha != i.alpha || a.dx != i.dx || a.w != i.w,
             "italic differs"
         );
+    }
+
+    #[test]
+    fn icons_come_from_a_nerd_font() {
+        for (name, rank) in [
+            ("JetBrainsMono Nerd Font Mono", Some(0)),
+            ("CaskaydiaCove NFM", Some(0)),
+            ("Hack Nerd Font", Some(1)),
+            ("Cascadia Code NF", Some(1)),
+            ("Cascadia Code", None),
+            ("Symbols Nerd Font Propo", None),
+            ("SNF", None),
+        ] {
+            assert_eq!(nerd_rank(name), rank, "{name}");
+        }
+        assert!(is_private('\u{E0A0}') && is_private('\u{F0001}'));
+        assert!(!is_private('\u{D7FF}') && !is_private('\u{F900}'));
+        // Without one installed, an icon is no error.
+        let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        let gear = font.raster("\u{F013}", 0, 1);
+        assert!(gear.is_ok());
+        assert!(font.nerd.is_some(), "looked for once");
+        // With one, it draws the icon.
+        if let Some(Some(fam)) = &font.nerd {
+            let name = family_name(fam).expect("name");
+            let r = gear.expect("raster").expect(&name);
+            assert!(ink(&r) > 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_flag_shows_both_letters_and_a_skin_tone_leaves_its_emoji() {
+        let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        let cells = 2 * font.cell_w as i32;
+        let mut raster = |s: &str| font.raster(s, 0, 2).expect("raster").expect("ink");
+        // A flag's two letters stand side by side, not on top of each other.
+        let (u, us) = (raster("\u{1F1FA}"), raster("\u{1F1FA}\u{1F1F8}"));
+        assert!(us.w > u.w * 3 / 2, "{} px for U, {} px for US", u.w, us.w);
+        assert!(
+            us.dx >= 0 && us.dx + us.w as i32 <= cells,
+            "within its cells"
+        );
+        // Drawn in one colour, a skin tone would only cover its emoji.
+        let (up, toned) = (raster("\u{1F44D}"), raster("\u{1F44D}\u{1F3FD}"));
+        assert_eq!((toned.w, toned.h, toned.alpha), (up.w, up.h, up.alpha));
+    }
+
+    #[test]
+    fn symbols_come_in_their_text_form_before_emoji() {
+        use windows::Win32::Graphics::DirectWrite::IDWriteFontFace2;
+
+        let mut font = Font::new(DEFAULT_FAMILIES, 16.0).expect("font");
+        // The system picks Segoe UI Emoji, a colour font, for these.
+        for c in ['\u{2714}', '\u{26A0}', '\u{2B50}'] {
+            let face = font.fallback_face(c, 0).expect("lookup").expect("a face");
+            let face = face.cast::<IDWriteFontFace2>().expect("face 2");
+            // SAFETY: a plain query on a live face.
+            assert!(!unsafe { face.IsColorFont() }.as_bool(), "{c}");
+        }
     }
 
     #[test]

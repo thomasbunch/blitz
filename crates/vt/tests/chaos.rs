@@ -11,7 +11,9 @@ const PAL: Palette = Palette {
     fg: 0xC0C0C0,
     bg: 0x101010,
     cursor: 0xFFFFFF,
+    cursor_text: None,
     selection_bg: 0x333333,
+    selection_fg: 0xC0C0C0,
     ansi: [0; 16],
 };
 

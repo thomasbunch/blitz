@@ -64,9 +64,12 @@ pub fn prompt_mark(body: &str, token: &str) -> Option<PromptMark> {
 
 /// The local path in an OSC 7 `file://host/path` URL, percent-decoded.
 /// `file:///C:/x` gives `C:\x`. On Windows a URL naming another host gives
-/// nothing: its path is not on this machine.
+/// nothing: its path is not on this machine. The scheme's case does not
+/// matter, as in any URL.
 pub fn file_url_path(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("file://")?;
+    let rest = url
+        .get(7..)
+        .filter(|_| url[..7].eq_ignore_ascii_case("file://"))?;
     let (host, path) = rest.split_at(rest.find('/')?);
     if cfg!(windows) && !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
         return None;
@@ -140,6 +143,30 @@ fn is_format(c: char) -> bool {
         | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
         | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
         | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// Decodes standard base64, padded or not, as OSC 52 carries it. `None`
+/// when it holds anything else.
+pub fn base64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 2);
+    let (mut acc, mut bits) = (0u32, 0);
+    for b in s.trim_end_matches('=').bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6 | u32::from(v)) & 0xffff;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Parses an X11 colour spec: `#rgb`, `#rrggbb`, `#rrrgggbbb`,
@@ -279,6 +306,7 @@ mod tests {
     fn file_urls() {
         let p = |u: &str| file_url_path(u);
         assert_eq!(p("file:///C:/x").as_deref(), Some("C:\\x"));
+        assert_eq!(p("FILE:///C:/x").as_deref(), Some("C:\\x"));
         assert_eq!(
             p("file:///C:/Users/me/My%20Dir/a%23b").as_deref(),
             Some("C:\\Users\\me\\My Dir\\a#b")
@@ -356,6 +384,21 @@ mod tests {
             out,
             b"\x1b]11;rgb:1313/1414/1717\x07\x1b]10;rgb:d6d6/d7d7/d9d9\x1b\\"
         );
+    }
+
+    #[test]
+    fn base64_decodes_padded_or_not() {
+        assert_eq!(base64("aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64("aGk").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64("YWJj").as_deref(), Some(&b"abc"[..]));
+        assert_eq!(base64("w6k=").as_deref(), Some("é".as_bytes()));
+        assert_eq!(base64("+/+/").as_deref(), Some(&[0xfb, 0xff, 0xbf][..]));
+        assert_eq!(base64("").as_deref(), Some(&[][..]));
+        for bad in ["?", "aG k", "a=b", "aGk=\n", "aGk-"] {
+            assert_eq!(base64(bad), None, "{bad:?}");
+        }
+        let long = "QUJD".repeat(1000);
+        assert_eq!(base64(&long), Some(b"ABC".repeat(1000)));
     }
 
     #[test]

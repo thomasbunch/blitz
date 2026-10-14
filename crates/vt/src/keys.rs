@@ -124,8 +124,7 @@ pub fn encode_key(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     // Ctrl+C and Ctrl+Break stay console key records under ConPTY even
     // when kitty flags are pushed: only then does conhost interrupt a
     // program that reads keys, and any program can print a push.
-    let interrupt = matches!(k.vk, VK_C | VK_CANCEL) && mod_bits(k) & 6 == 4;
-    if m.w32im && interrupt {
+    if m.w32im && is_interrupt(k) {
         win32(k, out);
     } else if m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0 {
         // Without disambiguate or all-keys, kitty flags leave presses legacy.
@@ -135,6 +134,25 @@ pub fn encode_key(k: &KeyInput, m: &InputModes, out: &mut Vec<u8>) {
     } else {
         legacy(k, m, out);
     }
+}
+
+/// Whether `k` is the interrupt chord: C or Break with Ctrl and not Alt,
+/// and C without Shift, as Ctrl+Shift+C is copy in most terminals.
+pub fn is_interrupt(k: &KeyInput) -> bool {
+    match k.vk {
+        VK_C => mod_bits(k) & 7 == 4,
+        VK_CANCEL => mod_bits(k) & 6 == 4,
+        _ => false,
+    }
+}
+
+/// Whether `k` reaches the program as Ctrl+C, which interrupts it: the
+/// interrupt chord always, and C with Ctrl and Shift too unless kitty
+/// flags send that as a key of its own.
+pub fn interrupts(k: &KeyInput, m: &InputModes) -> bool {
+    let bits = mod_bits(k);
+    let kitty = m.kitty & (DISAMBIGUATE | ALL_KEYS) != 0;
+    is_interrupt(k) || k.vk == VK_C && bits & 6 == 4 && !kitty
 }
 
 /// win32-input-mode: one console key record per transition, releases and
@@ -607,10 +625,15 @@ pub fn encode_paste(text: &str, bracketed: bool, out: &mut Vec<u8>) {
 /// `type` on a file can turn the mode on while cmd or another program
 /// that knows nothing of it reads the keys, and conhost then runs every
 /// line. So `trusted` is [`crate::Terminal::paste_trusted`]: bracketed
-/// paste on, and a paste under it already confirmed by the user.
-pub fn needs_paste_confirm(text: &str, trusted: bool) -> bool {
-    !trusted && text.contains(['\r', '\n'])
+/// paste on, and a paste under it already confirmed by the user. A paste
+/// of more than [`LARGE_PASTE`] bytes without bracketed paste is confirmed
+/// too, even on one line, as in Windows Terminal: it is typed in key by key.
+pub fn needs_paste_confirm(text: &str, bracketed: bool, trusted: bool) -> bool {
+    !trusted && (text.contains(['\r', '\n']) || !bracketed && text.len() > LARGE_PASTE)
 }
+
+/// Bytes of text above which a paste without bracketed paste is confirmed.
+pub const LARGE_PASTE: usize = 5 * 1024;
 
 /// Appends a focus report when mode 1004 is set.
 pub fn encode_focus(focused: bool, m: &InputModes, out: &mut Vec<u8>) {

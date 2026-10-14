@@ -10,19 +10,26 @@ fn term(s: &str) -> Terminal {
     t
 }
 
+/// All but wheel arrows, which pagers such as less never ask for.
 #[test]
 fn modes_start_off() {
-    assert_eq!(term("").input_modes(), InputModes::default());
+    let wheel = InputModes {
+        alt_scroll: true,
+        ..InputModes::default()
+    };
+    assert_eq!(term("").input_modes(), wheel);
+    assert_eq!(term("\x1b[?1007l").input_modes(), InputModes::default());
 }
 
 #[test]
 fn dec_modes_reach_input_modes() {
-    let mut t = term("\x1b[?1h\x1b=\x1b[?2004h\x1b[?1004h\x1b[?9001h\x1b[?1002;1006h");
+    let mut t = term("\x1b[?1h\x1b=\x1b[?2004h\x1b[?1004h\x1b[?9001h\x1b[?1002;1006;1007h");
     let m = t.input_modes();
     assert!(m.decckm && m.deckpam && m.bracketed && m.focus && m.w32im && m.mouse_sgr);
+    assert!(m.alt_scroll);
     assert_eq!(m.mouse, MouseMode::Drag);
 
-    t.feed(b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\x1b[?9001l\x1b[?1002l\x1b[?1006l");
+    t.feed(b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\x1b[?9001l\x1b[?1002l\x1b[?1006;1007l");
     assert_eq!(t.input_modes(), InputModes::default());
 
     t.feed(b"\x1b[?66h");
@@ -62,7 +69,8 @@ fn colon_in_a_mode_list_ignores_it() {
     t.feed(b"\x1b[?7$p\x1b[4$p");
     let mut r = Vec::new();
     t.take_replies(&mut r);
-    assert_eq!(r, b"\x1b[?7;1$y\x1b[4;2$y");
+    // After the focus report that turning 1004 on sends.
+    assert_eq!(r, b"\x1b[O\x1b[?7;1$y\x1b[4;2$y");
 }
 
 #[test]
@@ -74,7 +82,9 @@ fn modify_other_keys_is_not_sgr() {
         fg: 1,
         bg: 2,
         cursor: 3,
+        cursor_text: None,
         selection_bg: 4,
+        selection_fg: 1,
         ansi: [0; 16],
     };
     t.snapshot(&mut s, &pal);
@@ -100,11 +110,46 @@ fn ris_keeps_conpty_modes() {
     assert!(!t.input_modes().w32im);
 }
 
+/// The host starting a pane's screen over, as after a parser panic, is RIS
+/// but for the modes: the size, ConPTY's modes and the program's stay, and
+/// old line numbers name nothing.
+#[test]
+fn host_reset_is_ris_but_keeps_the_modes() {
+    let mut t = Terminal::new(Options {
+        cols: 10,
+        rows: 3,
+        ..Options::default()
+    });
+    t.feed(b"\x1b[?9001h\x1b[?1004h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1h");
+    t.feed(b"\x1b[?1049h\x1b[>1u\x1b[?2026hx");
+    // Even old numbers the alternate screen started over itself.
+    t.feed(b"\x1b[H\x1bM");
+    let (before, epoch) = (t.input_modes(), t.line_epoch());
+    t.reset();
+    let m = t.input_modes();
+    assert_eq!(m, before);
+    assert!(m.bracketed && m.mouse_sgr && m.decckm && m.alt_screen);
+    assert_eq!((m.kitty, m.mouse), (1, MouseMode::Click));
+    // An update the panic left open would hold the screen back.
+    assert!(!t.sync_pending(Instant::now()));
+    assert_eq!(t.screen_text(), "\n\n");
+    assert_ne!(t.line_epoch(), epoch);
+    t.feed(b"\x1b[?1049l");
+    assert_eq!(
+        (t.input_modes().kitty, t.screen_text().as_str()),
+        (0, "\n\n")
+    );
+    t.feed(b"0123456789ab");
+    assert_eq!(t.screen_text(), "0123456789\nab\n");
+}
+
 const PAL: vt::Palette = vt::Palette {
     fg: 1,
     bg: 2,
     cursor: 3,
+    cursor_text: None,
     selection_bg: 4,
+    selection_fg: 1,
     ansi: [0; 16],
 };
 
@@ -206,6 +251,30 @@ fn blitz_prompt_resets_input_modes() {
     assert_clean(&t);
 }
 
+#[test]
+fn the_host_resets_what_a_program_left() {
+    let mut t = leftovers();
+    t.feed(b"xyz\x1b[?25l\x1b[4h\x1b[31m");
+    t.reset_modes();
+    let m = t.input_modes();
+    assert_eq!(
+        (t.kitty_stack(false), t.kitty_stack(true)),
+        (&[][..], &[][..])
+    );
+    assert_eq!(
+        (m.mouse, m.mouse_sgr, m.bracketed, m.decckm),
+        (MouseMode::Off, false, false, false)
+    );
+    assert!(m.w32im && m.focus, "ConPTY's own modes stay");
+    assert!(t.cursor().2, "the cursor shows");
+    // Insert mode is off and the colour is gone; the text stays.
+    t.feed(b"\x1b[Ha");
+    assert_eq!(t.screen_text().lines().next(), Some("ayz"));
+    let mut s = vt::Snapshot::default();
+    t.snapshot(&mut s, &PAL);
+    assert_eq!(s.cells[0].fg, PAL.fg);
+}
+
 /// Display state a program can leave behind that would garble or hide
 /// whatever the shell and later programs print.
 #[test]
@@ -216,8 +285,9 @@ fn blitz_prompt_resets_display_state() {
         ..Options::default()
     });
     // Colours, margins, origin, insert mode, no wrap, line drawing in G0
-    // and G1 with G1 shifted in, no tab stops.
+    // and G1 with G1 shifted in, no tab stops, a bar cursor.
     t.feed(b"\x1b]10;#123456\x07\x1b]11;#123456\x07\x1b[2;3r\x1b[?6h\x1b[4h\x1b[?7l");
+    t.feed(b"\x1b[6 q");
     t.feed(b"\x1b(0\x1b)0\x0e\x1b[3g");
     t.feed(b"\x1b]133;A;blitz=1\x07");
     t.feed(b"\x1b[H\tq\rx\r\n\n\n\n");
@@ -227,6 +297,7 @@ fn blitz_prompt_resets_display_state() {
     let mut s = vt::Snapshot::default();
     t.snapshot(&mut s, &PAL);
     assert_eq!((s.cells[0].fg, s.cells[0].bg), (PAL.fg, PAL.bg));
+    assert_eq!(s.cursor.map(|c| c.2), Some(vt::CursorShape::Block));
 }
 
 /// The prompt mark leaves the screen alone. conhost stays on its

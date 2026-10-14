@@ -1,23 +1,37 @@
-//! Settings: built-in defaults, with the ones in [`SETTINGS`] read from
-//! `%APPDATA%\blitz\config.toml`.
+//! Settings: built-in defaults, with the ones in [`SETTINGS`] and key
+//! bindings read from `%APPDATA%\blitz\config.toml`.
 
 use std::path::{Path, PathBuf};
+
+use crate::keymap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub font_family: String,
     /// Points; pixels = pt * dpi / 72.
     pub font_size: f32,
+    /// Space between the panes' lines, as a multiple of the font's own.
+    pub line_height: f32,
     /// A theme name, or `light:NAME,dark:NAME` to follow the Windows app
     /// theme; see [`crate::theme::choose`].
     pub theme: String,
-    /// Empty means detect: pwsh, then Windows PowerShell, then cmd.
+    /// A program and its arguments; see [`crate::shell::launch`]. Empty
+    /// means detect: pwsh, then Windows PowerShell, then cmd.
     pub shell: String,
     pub shell_integration: bool,
     pub scrollback_lines: usize,
     /// Flash the taskbar button when a session needs attention.
     pub flash: bool,
-    /// Whether BEL in an unfocused pane asks for attention.
+    /// Which sessions get a Windows notification while blitz is in the
+    /// background; one of [`TOASTS`].
+    pub toasts: String,
+    /// Make a sound when a session needs attention.
+    pub sound: bool,
+    /// Ctrl+Alt+J brings the user to the session that needs them, from
+    /// any program.
+    pub global_jump: bool,
+    /// Whether BEL, or a notification without the pane's token, in an
+    /// unfocused pane asks for attention.
     pub bell_attention: bool,
     /// Look for a newer release on GitHub at start and every six hours.
     pub check_updates: bool,
@@ -28,11 +42,32 @@ pub struct Config {
     /// Save each pane's recent output and show it again on the next start.
     /// Off by default: old output can hold secrets.
     pub restore_scrollback: bool,
+    /// Keep the PC from going to sleep while a session works.
+    pub keep_awake: bool,
     /// Pixel scenery behind the panes, one of
     /// [`SCENES`](crate::arcade::scenery::SCENES).
     pub scenery: String,
     /// The spark at the foot of the sidebar.
     pub mascot: bool,
+    /// A right click copies the selection, or pastes without one.
+    pub right_click_paste: bool,
+    /// Ctrl+click opens a file at its line through this URI, with
+    /// `{path}`, `{line}` and `{col}` filled in, as in
+    /// `vscode://file/{path}:{line}:{col}`. Empty opens files with their
+    /// program.
+    pub editor_uri: String,
+    /// Key bindings from `keybind` lines, one per chord, which take the
+    /// place of the default for that chord; see [`keymap::binding`].
+    pub keys: Vec<keymap::Binding>,
+    /// What `text:` bindings type, by [`keymap::Action::SendText`] index.
+    pub texts: Vec<Vec<u8>>,
+    /// Variables from `env = NAME=VALUE` lines, one per name, for every
+    /// new pane's environment.
+    pub env: Vec<(String, String)>,
+    /// The lines of `config.toml` that set nothing, as (line number,
+    /// text): an unknown key, a value that does not fit, or no
+    /// `key = value` at all.
+    pub ignored: Vec<(usize, String)>,
 }
 
 impl Default for Config {
@@ -40,18 +75,29 @@ impl Default for Config {
         Self {
             font_family: "Cascadia Mono".into(),
             font_size: 11.0,
+            line_height: 1.0,
             theme: crate::theme::DEFAULT.into(),
             shell: String::new(),
             shell_integration: true,
             scrollback_lines: 10_000,
             flash: true,
+            toasts: "needs-you".into(),
+            sound: false,
+            global_jump: false,
             bell_attention: true,
             check_updates: true,
             restore_session: true,
             restore_claude: true,
             restore_scrollback: false,
+            keep_awake: false,
             scenery: "off".into(),
             mascot: false,
+            right_click_paste: true,
+            editor_uri: String::new(),
+            keys: Vec::new(),
+            texts: Vec::new(),
+            env: Vec::new(),
+            ignored: Vec::new(),
         }
     }
 }
@@ -80,6 +126,10 @@ pub struct Setting {
     /// When a change takes effect.
     pub applies: &'static str,
 }
+
+/// The values of `toasts`: none, sessions that need the user or failed,
+/// and finished ones too.
+pub const TOASTS: &[&str] = &["off", "needs-you", "all"];
 
 const NOW: &str = "Applies now";
 const NEW_PANES: &str = "Applies to new panes";
@@ -113,6 +163,15 @@ pub const SETTINGS: &[Setting] = &[
         applies: NOW,
     },
     Setting {
+        key: "line_height",
+        group: "Appearance",
+        label: "Line height",
+        help: "Space between the lines in the panes, from 0.8 to 2 times the \
+               font's own. The sidebar keeps its spacing.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
         key: "restore_session",
         group: "Sessions",
         label: "Reopen tabs",
@@ -139,11 +198,21 @@ pub const SETTINGS: &[Setting] = &[
         applies: RESTART,
     },
     Setting {
+        key: "keep_awake",
+        group: "Sessions",
+        label: "Keep the PC awake",
+        help: "Keep the PC from going to sleep by itself while a session is \
+               working. The screen can still turn off.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
         key: "shell",
         group: "Shell",
         label: "Shell",
-        help: "The program each new pane runs. Automatic picks PowerShell 7, \
-               then Windows PowerShell, then cmd.",
+        help: "The program each new pane runs, with any arguments, as in \
+               wsl.exe -d Ubuntu. Automatic picks PowerShell 7, then Windows \
+               PowerShell, then cmd.",
         kind: Kind::Choice,
         applies: NEW_PANES,
     },
@@ -165,6 +234,25 @@ pub const SETTINGS: &[Setting] = &[
         applies: NEW_PANES,
     },
     Setting {
+        key: "right_click_paste",
+        group: "Mouse",
+        label: "Right-click copy and paste",
+        help: "A right click copies the selection, or pastes when nothing is \
+               selected. Hold Shift when a program takes the mouse.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
+        key: "editor_uri",
+        group: "Mouse",
+        label: "Editor",
+        help: "Ctrl+click on a file path opens it at its line in this editor. \
+               Without one, a file opens with its program, or shows in \
+               Explorer when it has none.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
         key: "flash",
         group: "Notifications",
         label: "Flash taskbar",
@@ -174,11 +262,42 @@ pub const SETTINGS: &[Setting] = &[
         applies: NOW,
     },
     Setting {
+        key: "toasts",
+        group: "Notifications",
+        label: "Windows notifications",
+        help: "Show a notification when a session needs you or fails while \
+               blitz is in the background; All adds finished ones. Clicking it \
+               takes you to the session.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
+        key: "sound",
+        group: "Notifications",
+        label: "Sound",
+        help: "Play a sound when a session needs you while blitz is in the \
+               background: the notification's, or the Windows default beep \
+               without one.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
+        key: "global_jump",
+        group: "Notifications",
+        label: "Jump from anywhere",
+        help: "Ctrl+Alt+J brings blitz to the front from any program, on the \
+               session that needs you. The main window takes it; others leave \
+               it alone.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
         key: "bell_attention",
         group: "Notifications",
         label: "Bell needs you",
-        help: "A bell in a pane you are not looking at marks its session as \
-               needing you, as a question from Claude Code does.",
+        help: "A bell or a notification in a pane you are not looking at marks \
+               its session as needing you until you look. A pane Claude Code's \
+               hooks report for leaves it to them.",
         kind: Kind::Toggle,
         applies: NOW,
     },
@@ -221,17 +340,50 @@ pub const SETTINGS: &[Setting] = &[
 
 impl Config {
     /// The defaults with the settings from a `config.toml` applied: one
-    /// `key = value` per line, `#` starts a comment. Lines it doesn't
-    /// understand are skipped, so a typo never stops blitz from starting.
+    /// `key = value` per line, `#` after a space starts a comment. Lines it
+    /// doesn't understand are skipped, so a typo never stops blitz from
+    /// starting, and listed in `ignored`.
     pub fn parse(text: &str) -> Config {
         let mut c = Config::default();
         // Notepad may save with a byte order mark.
-        for line in split_lines(text.trim_start_matches('\u{feff}')).0 {
-            if let Some((key, value, _)) = entry(line) {
-                c.set(key, value);
+        let lines = split_lines(text.trim_start_matches('\u{feff}')).0;
+        for (i, line) in lines.into_iter().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if !entry(line).is_some_and(|(key, value, _)| c.set(key, value)) {
+                c.ignored.push((i + 1, line.into()));
             }
         }
         c
+    }
+
+    /// One line that tells the user which lines of `config.toml` were
+    /// skipped; `None` when none were. It names the first one's key, not
+    /// its value, which may be a token the screen must not show. Nor is
+    /// what only looks like a key shown, such as a padded base64 secret
+    /// on a line of its own: keys are short, lowercase and snake_case, or
+    /// kebab-case as other terminals spell them.
+    pub fn ignored_notice(&self) -> Option<String> {
+        let ((n, line), more) = self.ignored.split_first()?;
+        let key = (line.split_once('=').map(|(k, _)| k.trim())).filter(|k| {
+            let word = |b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
+            k.len() <= 32 && k.bytes().all(word)
+        });
+        let key = key.map_or_else(String::new, |k| format!(" ({k})"));
+        Some(match more.len() {
+            0 => format!("config.toml line {n}{key} was skipped"),
+            k => format!("config.toml line {n}{key} and {k} more were skipped"),
+        })
+    }
+
+    /// Whether `other` skips lines this one does not, or the other way
+    /// round. Only their text counts: a save from the settings panel can
+    /// move a skipped line without changing it.
+    pub fn skips_other_lines(&self, other: &Config) -> bool {
+        let text = |c: &Config| c.ignored.iter().map(|l| l.1.clone()).collect::<Vec<_>>();
+        text(self) != text(other)
     }
 
     /// Setting `key` as `config.toml` writes it: `true`, `11` or
@@ -242,17 +394,24 @@ impl Config {
             "theme" => quote(&self.theme),
             "font_family" => quote(&self.font_family),
             "font_size" => self.font_size.to_string(),
+            "line_height" => self.line_height.to_string(),
             "shell" => quote(&self.shell),
             "shell_integration" => flag(self.shell_integration),
             "scrollback_lines" => self.scrollback_lines.to_string(),
             "restore_session" => flag(self.restore_session),
             "restore_claude" => flag(self.restore_claude),
             "restore_scrollback" => flag(self.restore_scrollback),
+            "keep_awake" => flag(self.keep_awake),
             "flash" => flag(self.flash),
+            "toasts" => quote(&self.toasts),
+            "sound" => flag(self.sound),
+            "global_jump" => flag(self.global_jump),
             "bell_attention" => flag(self.bell_attention),
             "check_updates" => flag(self.check_updates),
             "scenery" => quote(&self.scenery),
             "mascot" => flag(self.mascot),
+            "right_click_paste" => flag(self.right_click_paste),
+            "editor_uri" => quote(&self.editor_uri),
             _ => String::new(),
         }
     }
@@ -260,22 +419,59 @@ impl Config {
     /// Sets `key` from a value as `config.toml` holds it. Returns false,
     /// changing nothing, for an unknown key or a value of the wrong type or
     /// out of range. On/off and numbers must not be quoted; names may be.
+    /// Each `keybind` adds a binding, replacing only one for the same chord,
+    /// and each `env` a variable, replacing only one of the same name.
     pub fn set(&mut self, key: &str, value: &str) -> bool {
         let text = unquote(value);
         let bare = text.is_none().then_some(value);
         let num = bare.and_then(number);
         let text = text.unwrap_or_else(|| value.to_string());
         match key {
+            "keybind" => {
+                let b = match keymap::text_binding(&text) {
+                    Some((mods, vk, t)) => {
+                        let Ok(i) = u16::try_from(self.texts.len()) else {
+                            return false;
+                        };
+                        self.texts.push(t);
+                        (mods, vk, Some(keymap::Action::SendText(i)))
+                    }
+                    None => match keymap::binding(&text) {
+                        Some(b) => b,
+                        None => return false,
+                    },
+                };
+                self.keys.retain(|k| (k.0, k.1) != (b.0, b.1));
+                self.keys.push(b);
+            }
+            "env" => match text.split_once('=') {
+                Some((k, v)) if !k.trim().is_empty() && !text.contains(char::is_control) => {
+                    let k = k.trim();
+                    self.env.retain(|e| !e.0.eq_ignore_ascii_case(k));
+                    // `FOO = bar`, spaced as the line's own `=`.
+                    self.env.push((k.into(), v.trim_start().into()));
+                }
+                _ => return false,
+            },
             "theme" | "font_family" if text.is_empty() => return false,
             "theme" => self.theme = text,
             "font_family" => self.font_family = text,
             "shell" => self.shell = text,
+            "editor_uri" => self.editor_uri = text,
             "scenery" => match text.to_lowercase() {
                 s if crate::arcade::scenery::SCENES.contains(&s.as_str()) => self.scenery = s,
                 _ => return false,
             },
+            "toasts" => match text.to_lowercase() {
+                s if TOASTS.contains(&s.as_str()) => self.toasts = s,
+                _ => return false,
+            },
             "font_size" => match num.filter(|n| (4.0..=72.0).contains(n)) {
                 Some(n) => self.font_size = n as f32,
+                None => return false,
+            },
+            "line_height" => match num.filter(|n| (0.8..=2.0).contains(n)) {
+                Some(n) => self.line_height = n as f32,
                 None => return false,
             },
             "scrollback_lines" => match num.filter(|n| (0.0..=100_000.0).contains(n)) {
@@ -296,10 +492,14 @@ impl Config {
             "restore_session" => &mut self.restore_session,
             "restore_claude" => &mut self.restore_claude,
             "restore_scrollback" => &mut self.restore_scrollback,
+            "keep_awake" => &mut self.keep_awake,
             "flash" => &mut self.flash,
+            "sound" => &mut self.sound,
+            "global_jump" => &mut self.global_jump,
             "bell_attention" => &mut self.bell_attention,
             "check_updates" => &mut self.check_updates,
             "mascot" => &mut self.mascot,
+            "right_click_paste" => &mut self.right_click_paste,
             _ => return None,
         })
     }
@@ -399,14 +599,16 @@ fn number(v: &str) -> Option<f64> {
 }
 
 /// The key and value of a `key = value` line, and what follows the value,
-/// such as a comment. A quoted value keeps its quotes and may hold a `#`.
+/// such as a comment. A quoted value keeps its quotes and may hold a `#`;
+/// so may another inside a word, as in `env = COLOR=#ff0000`.
 fn entry(line: &str) -> Option<(&str, &str, &str)> {
     let (key, rest) = line.split_once('=')?;
     let rest = rest.trim_start();
+    let comment = |(i, _): &(usize, &str)| *i == 0 || rest[..*i].ends_with([' ', '\t']);
     let (value, after) = match rest.chars().next() {
         Some(q @ ('"' | '\'')) => rest.split_at(closing(rest, q)? + 1),
-        _ => match rest.find('#') {
-            Some(i) => (rest[..i].trim(), &rest[i..]),
+        _ => match rest.match_indices('#').find(comment) {
+            Some((i, _)) => (rest[..i].trim(), &rest[i..]),
             None => (rest.trim(), ""),
         },
     };
@@ -487,9 +689,27 @@ const FILE: &str = "config.toml";
 /// a crash left.
 const STALE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Font families tried in order when `font_family` is not installed;
+/// Consolas ships with every Windows.
+pub const FALLBACK_FONTS: &[&str] = &["Cascadia Mono", "Consolas", "Courier New"];
+
 /// `%APPDATA%\blitz`, which holds `config.toml` and the themes folder.
 pub fn dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("blitz"))
+}
+
+/// `config.toml`, for the user to open in an editor: an empty one is
+/// made first when there is none, so the editor does not ask.
+pub fn file() -> std::io::Result<PathBuf> {
+    file_in(&dir().ok_or_else(|| std::io::Error::other("no APPDATA"))?)
+}
+
+fn file_in(dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(FILE);
+    // Appending never changes one that is there.
+    (std::fs::OpenOptions::new().append(true).create(true)).open(&path)?;
+    Ok(path)
 }
 
 /// Sets `key = value` in `config.toml`, keeping the rest of the file; with
@@ -629,8 +849,37 @@ mod tests {
              theme = \"unterminated\n\
              [section]\n",
         );
-        assert_eq!(c, Config::default());
+        // Each line but the comment, by number.
+        let lines: Vec<usize> = c.ignored.iter().map(|l| l.0).collect();
+        assert_eq!(lines, [1, 2, 3, 4, 5, 6, 7, 9, 10]);
+        let notice = "config.toml line 1 (font_size) and 8 more were skipped";
+        assert_eq!(c.ignored_notice().as_deref(), Some(notice));
+        assert_eq!(
+            Config {
+                ignored: Vec::new(),
+                ..c
+            },
+            Config::default()
+        );
         assert_eq!(Config::parse(""), Config::default());
+        let one = Config::parse("\u{feff}\n  # x = 1\nflash = false # ok\r\n  flash = maybe  \r\n");
+        let notice = "config.toml line 4 (flash) was skipped";
+        assert_eq!(one.ignored_notice().as_deref(), Some(notice));
+        // A mistyped key's value stays off the screen.
+        let typo = Config::parse("evn = GITHUB_TOKEN=ghp_x\nghp_y\n");
+        let notice = "config.toml line 1 (evn) and 1 more were skipped";
+        assert_eq!(typo.ignored_notice().as_deref(), Some(notice));
+        let other = Config::parse("font-size = 14\n");
+        let notice = "config.toml line 1 (font-size) was skipped";
+        assert_eq!(other.ignored_notice().as_deref(), Some(notice));
+        let secret = Config::parse(
+            "env = API_KEY=
+dGhpcyBpcyBhIHNlY3JldA==
+",
+        );
+        let notice = "config.toml line 2 was skipped";
+        assert_eq!(secret.ignored_notice().as_deref(), Some(notice));
+        assert_eq!(Config::parse("flash = false # ok\n").ignored_notice(), None);
     }
 
     #[test]
@@ -661,6 +910,89 @@ mod tests {
         assert!(!c.shell_integration);
         // An empty shell is the automatic one.
         assert_eq!(Config::parse("shell = \"cmd\"\nshell = \"\"").shell, "");
+    }
+
+    #[test]
+    fn config_reads_key_bindings() {
+        let c = Config::parse(
+            "keybind = ctrl+shift+r=new_tab\n\
+             keybind = \"ctrl+shift+w=none\" # mine\n\
+             keybind = ctrl+shift+r=split_down\n\
+             keybind = ctrl+shift+q=quit\n\
+             keybind = ctrl+shift\n",
+        );
+        let want: Vec<keymap::Binding> = ["ctrl+shift+w=none", "ctrl+shift+r=split_down"]
+            .into_iter()
+            .filter_map(keymap::binding)
+            .collect();
+        assert_eq!(c.keys, want, "the last line for a chord counts");
+        assert_eq!(c.font_size, Config::default().font_size);
+    }
+
+    #[test]
+    fn config_reads_text_bindings() {
+        let c = Config::parse(
+            r#"keybind = ctrl+shift+e=text:claude\r # start it
+keybind = "ctrl+shift+y=text:a=b # not a comment\e"
+keybind = ctrl+shift+e=text:git status\r
+keybind = ctrl+shift+n=text:
+"#,
+        );
+        let send = |i| Some(keymap::Action::SendText(i));
+        assert_eq!(c.keys, [(3, 0x59, send(1)), (3, 0x45, send(2))]);
+        assert_eq!(c.texts[0], b"claude\r", "replaced, but kept");
+        assert_eq!(c.texts[1], b"a=b # not a comment\x1b");
+        assert_eq!(c.texts[2], b"git status\r");
+    }
+
+    #[test]
+    fn a_skipped_line_moved_by_a_save_is_no_news() {
+        let old = Config::parse(
+            "flash = false
+[colors]
+",
+        );
+        // The panel adds a setting before the first table.
+        let saved = Config::parse(&with_value(
+            "flash = false
+[colors]
+",
+            "font_size",
+            Some("12"),
+        ));
+        assert_ne!(saved.ignored, old.ignored, "the line moved");
+        assert!(!saved.skips_other_lines(&old));
+        assert!(
+            Config::parse(
+                "[x]
+"
+            )
+            .skips_other_lines(&old)
+        );
+        assert!(Config::default().skips_other_lines(&old));
+    }
+
+    #[test]
+    fn config_reads_variables_for_panes() {
+        let c = Config::parse(
+            "env = RUST_LOG=debug\n\
+             env = \"EDITOR=code --wait\" # mine\n\
+             env = rust_log=info\n\
+             env = EMPTY=\n\
+             env = =C:=x\n\
+             env = NOEQUALS\n\
+             env = COLOR=#ff0000 # red\n\
+             env = SPACED = out\n",
+        );
+        // The last line for a name counts, whatever its case.
+        let want = [
+            ("EDITOR", "code --wait"),
+            ("rust_log", "info"),
+            ("EMPTY", ""),
+            ("COLOR", "#ff0000"),
+            ("SPACED", "out"),
+        ];
+        assert_eq!(c.env, want.map(|(k, v)| (k.to_string(), v.to_string())));
     }
 
     #[test]
@@ -753,6 +1085,15 @@ scenery = stars
     }
 
     #[test]
+    fn config_reads_which_sessions_get_notifications() {
+        assert_eq!(Config::default().toasts, "needs-you");
+        assert_eq!(Config::parse("toasts = \"All\"").toasts, "all");
+        assert_eq!(Config::parse("toasts = off").toasts, "off");
+        let c = Config::parse("toasts = \"all\"\ntoasts = \"done\"\n");
+        assert_eq!(c.toasts, "all", "an unknown value is skipped");
+    }
+
+    #[test]
     fn config_missing_file_gives_defaults() {
         let t = Temp::new("missing");
         let path = t.0.join(FILE);
@@ -785,17 +1126,24 @@ scenery = stars
             ("theme", "\"Rose Pine\""),
             ("font_family", "\"Consolas\""),
             ("font_size", "13.5"),
+            ("line_height", "1.2"),
             ("shell", r"'C:\x\sh.exe'"),
             ("shell_integration", "false"),
             ("scrollback_lines", "0"),
             ("restore_session", "false"),
             ("restore_claude", "false"),
             ("restore_scrollback", "true"),
+            ("keep_awake", "true"),
             ("flash", "false"),
+            ("toasts", "\"all\""),
+            ("sound", "true"),
+            ("global_jump", "true"),
             ("bell_attention", "false"),
             ("check_updates", "false"),
             ("scenery", "\"snow\""),
             ("mascot", "true"),
+            ("right_click_paste", "false"),
+            ("editor_uri", "\"cursor://file/{path}:{line}:{col}\""),
         ] {
             assert!(c.set(k, v), "{k} = {v}");
         }
@@ -825,7 +1173,9 @@ scenery = stars
         }
         for line in readme.lines().filter(|l| l.starts_with("| `")) {
             let key = line[3..].split('`').next().unwrap_or_default();
-            let known = SETTINGS.iter().any(|s| s.key == key);
+            // Key bindings and variables are read too, though the panel does
+            // not show them.
+            let known = ["keybind", "env"].contains(&key) || SETTINGS.iter().any(|s| s.key == key);
             assert!(
                 known,
                 "README.md documents {key}, which blitz does not read"
@@ -892,6 +1242,12 @@ scenery = stars
         }
         for v in ["-1", "100001", "1e400", "0.5", "inf", "NaN"] {
             assert!(!ok("scrollback_lines", v), "scrollback_lines = {v}");
+        }
+        for v in ["0.8", "1", "1.25", "2"] {
+            assert!(ok("line_height", v), "line_height = {v}");
+        }
+        for v in ["0.79", "2.01", "0", "-1", "NaN", "\"1.2\""] {
+            assert!(!ok("line_height", v), "line_height = {v}");
         }
         let c = Config::parse("font_size = 1_2\nscrollback_lines = 20_000");
         assert_eq!((c.font_size, c.scrollback_lines), (12.0, 20_000));
@@ -978,7 +1334,14 @@ scenery = stars
     fn parse_ignores_what_toml_would_not_read() {
         // Keys and booleans are lower case.
         let c = Config::parse("Flash = false\nbell_attention = False\n");
-        assert_eq!(c, Config::default());
+        assert_eq!(c.ignored.len(), 2);
+        assert_eq!(
+            Config {
+                ignored: Vec::new(),
+                ..c
+            },
+            Config::default()
+        );
         // A later line that does not read keeps the earlier one.
         assert!(!Config::parse("flash = false\nflash = maybe\n").flash);
         // A later line that reads wins.
@@ -1044,6 +1407,18 @@ scenery = stars
             std::fs::read_to_string(dir.join(FILE)).unwrap(),
             "# Réglages\nflash = false\ntheme = \"B\"\n"
         );
+    }
+
+    #[test]
+    fn opening_the_file_makes_one_and_keeps_one_that_is_there() {
+        let t = Temp::new("open");
+        let dir = t.0.join("new");
+        let path = file_in(&dir).unwrap();
+        assert_eq!(path, dir.join(FILE));
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        std::fs::write(&path, "flash = false\n").unwrap();
+        file_in(&dir).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"flash = false\n");
     }
 
     #[test]

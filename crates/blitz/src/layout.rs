@@ -11,6 +11,12 @@ pub const MIN_COLS: i32 = 10;
 /// A split is refused if either half would be shorter than this.
 pub const MIN_ROWS: i32 = 3;
 
+/// Below this window width at 96 DPI the sidebar collapses to its rail,
+/// and from `WIDE` up it expands again; the gap keeps a window dragged
+/// across the line from flipping it back and forth.
+const NARROW: f32 = 800.0;
+const WIDE: f32 = 880.0;
+
 /// Never reused within a process. Exported to the child as `BLITZ_PANE_ID`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PaneId(pub u32);
@@ -55,6 +61,12 @@ impl Rect {
 
     pub fn bottom(self) -> i32 {
         self.y + self.h
+    }
+
+    /// Whether the point (`x`, `y`) is inside: the right and bottom edges
+    /// are the next rect's.
+    pub fn contains(self, x: i32, y: i32) -> bool {
+        (self.x..self.right()).contains(&x) && (self.y..self.bottom()).contains(&y)
     }
 
     /// Splits off a divider along `axis`. `a` gets `ratio` of what is left
@@ -523,6 +535,9 @@ pub struct Window {
     /// The session list when true, the narrow dot rail when false. Neither
     /// is shown while there is only one session.
     pub sidebar_expanded: bool,
+    /// Set while the window is too narrow for the sidebar, which it
+    /// collapsed: true when the sidebar expands again once there is room.
+    pub narrow: Option<bool>,
 }
 
 impl Default for Window {
@@ -531,11 +546,57 @@ impl Default for Window {
             tabs: Vec::new(),
             active: 0,
             sidebar_expanded: true,
+            narrow: None,
         }
     }
 }
 
 impl Window {
+    /// Whether the sidebar or its rail shows: there are two sessions or
+    /// more.
+    pub fn has_sidebar(&self) -> bool {
+        self.tabs.iter().map(|t| t.panes().len()).sum::<usize>() >= 2
+    }
+
+    /// Expands or collapses the sidebar. Returns false when there is none
+    /// to change, so the key goes to the program. The user's choice stands
+    /// when the window gets wide again.
+    pub fn toggle_sidebar(&mut self) -> bool {
+        if !self.has_sidebar() {
+            return false;
+        }
+        self.sidebar_expanded = !self.sidebar_expanded;
+        if let Some(back) = &mut self.narrow {
+            *back = false;
+        }
+        true
+    }
+
+    /// Collapses the sidebar when the window gets narrower than `NARROW`
+    /// px at 96 DPI, and expands it again once it is `WIDE`, unless the
+    /// user chose otherwise in between. Returns whether the sidebar changed.
+    pub fn fit_width(&mut self, width: f32) -> bool {
+        let was = self.sidebar_expanded;
+        match self.narrow {
+            None if width < NARROW => {
+                self.narrow = Some(self.sidebar_expanded);
+                self.sidebar_expanded = false;
+            }
+            Some(back) if width >= WIDE => {
+                self.narrow = None;
+                self.sidebar_expanded |= back;
+            }
+            _ => {}
+        }
+        self.sidebar_expanded != was
+    }
+
+    /// Whether the sidebar is expanded by the user's choice, which is what
+    /// a session saves: a narrow window's collapse is not.
+    pub fn chosen_expanded(&self) -> bool {
+        self.sidebar_expanded || self.narrow == Some(true)
+    }
+
     /// Closes pane `p` wherever it is. Closing a tab's last pane removes
     /// the tab; the window should close once `tabs` is empty. Returns false
     /// if no tab has `p`.
@@ -549,6 +610,53 @@ impl Window {
                 self.active = self.active.saturating_sub(1);
             }
         }
+        true
+    }
+
+    /// Puts pane `new` where `p` is, with its focus, zoom and place in the
+    /// focus history. Returns false if no tab has `p`.
+    pub fn replace_pane(&mut self, p: PaneId, new: PaneId) -> bool {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.root.contains(p)) else {
+            return false;
+        };
+        if let Some(leaf) = t.root.leaf_mut(p) {
+            *leaf = Node::Leaf(new);
+        }
+        let ids = (t.mru.iter_mut())
+            .chain([&mut t.focus])
+            .chain(t.zoom.as_mut());
+        for q in ids.filter(|q| **q == p) {
+            *q = new;
+        }
+        true
+    }
+    /// Moves the active tab `by` places, stopping at either end. Returns
+    /// false when it is already there.
+    pub fn move_tab(&mut self, by: isize) -> bool {
+        let last = self.tabs.len().saturating_sub(1);
+        let to = self.active.saturating_add_signed(by).min(last);
+        if to == self.active {
+            return false;
+        }
+        let t = self.tabs.remove(self.active);
+        self.tabs.insert(to, t);
+        self.active = to;
+        true
+    }
+
+    /// Takes pane `p` out of its tab into a new tab named `name` after the
+    /// others, and shows that. Returns false when `p` is its tab's only
+    /// pane, or in no tab.
+    pub fn pane_to_new_tab(&mut self, p: PaneId, name: String) -> bool {
+        if !self
+            .tabs
+            .iter_mut()
+            .any(|t| t.root.contains(p) && t.close(p))
+        {
+            return false;
+        }
+        self.tabs.push(Tab::new(name, p));
+        self.active = self.tabs.len() - 1;
         true
     }
 }
@@ -582,6 +690,13 @@ mod tests {
 
     fn ids(v: &[u32]) -> Vec<PaneId> {
         v.iter().map(|&n| PaneId(n)).collect()
+    }
+
+    #[test]
+    fn rects_hold_points_up_to_their_right_and_bottom_edges() {
+        let a = r(10, 20, 5, 4);
+        assert!(a.contains(10, 20) && a.contains(14, 23));
+        assert!(!a.contains(15, 20) && !a.contains(10, 24) && !a.contains(9, 21));
     }
 
     #[test]
@@ -990,5 +1105,116 @@ mod tests {
         assert!(w.close_pane(PaneId(2)));
         assert!(w.tabs.is_empty());
         assert_eq!(w.active, 0);
+    }
+
+    #[test]
+    fn a_replaced_pane_keeps_its_place() {
+        let mut w = Window::default();
+        w.tabs.push(Tab::new("a".into(), PaneId(9)));
+        w.tabs.push(four());
+        let before = w.tabs[1].rects(AREA);
+        w.tabs[1].toggle_zoom();
+        assert!(w.replace_pane(PaneId(4), PaneId(7)));
+        let t = &w.tabs[1];
+        assert_eq!(t.panes(), ids(&[1, 2, 3, 7]));
+        assert_eq!((t.focus, t.zoom), (PaneId(7), Some(PaneId(7))));
+        assert_eq!(t.mru[0], PaneId(7));
+        assert!(!t.mru.contains(&PaneId(4)));
+        w.tabs[1].toggle_zoom();
+        let moved = before
+            .iter()
+            .map(|&(p, r)| (if p == PaneId(4) { PaneId(7) } else { p }, r));
+        assert_eq!(w.tabs[1].rects(AREA), moved.collect::<Vec<_>>());
+        assert!(!w.replace_pane(PaneId(4), PaneId(8)));
+        assert_eq!(w.tabs[0], Tab::new("a".into(), PaneId(9)));
+    }
+
+    #[test]
+    fn the_sidebar_key_needs_a_sidebar() {
+        let mut w = Window::default();
+        w.tabs.push(Tab::new("t".into(), PaneId(1)));
+        // One session: no sidebar, so the key is the program's.
+        assert!(!w.toggle_sidebar());
+        assert!(w.sidebar_expanded);
+        assert!(w.tabs[0].split(Dir::Right, PaneId(2), AREA, MIN));
+        assert!(w.toggle_sidebar());
+        assert!(!w.sidebar_expanded);
+        assert!(w.toggle_sidebar());
+        assert!(w.sidebar_expanded);
+    }
+
+    #[test]
+    fn a_narrow_window_collapses_the_sidebar_for_a_while() {
+        let mut w = Window::default();
+        w.tabs.push(Tab::new("t".into(), PaneId(1)));
+        assert!(w.tabs[0].split(Dir::Right, PaneId(2), AREA, MIN));
+        assert!(!w.fit_width(1200.0));
+        assert!(w.sidebar_expanded);
+        assert!(w.fit_width(790.0), "changed");
+        assert!(!w.sidebar_expanded && w.chosen_expanded());
+        // Back over the line, but not by enough to flip it back.
+        assert!(!w.fit_width(820.0));
+        assert!(!w.sidebar_expanded);
+        assert!(w.fit_width(880.0), "changed");
+        assert!(w.sidebar_expanded && w.narrow.is_none());
+
+        // Collapsed by hand, it stays collapsed when the window widens.
+        w.fit_width(700.0);
+        assert!(w.toggle_sidebar() && w.sidebar_expanded);
+        assert!(w.toggle_sidebar() && !w.sidebar_expanded);
+        assert!(!w.chosen_expanded());
+        w.fit_width(1000.0);
+        assert!(!w.sidebar_expanded);
+        // Expanded by hand while narrow, it stays until the window is
+        // made narrow again.
+        w.fit_width(700.0);
+        assert!(w.toggle_sidebar() && w.sidebar_expanded);
+        w.fit_width(750.0);
+        assert!(w.sidebar_expanded && w.chosen_expanded());
+        w.fit_width(1000.0);
+        w.fit_width(799.0);
+        assert!(!w.sidebar_expanded);
+    }
+
+    #[test]
+    fn tabs_move_and_panes_get_tabs_of_their_own() {
+        let mut w = Window::default();
+        for n in 1..=3 {
+            w.tabs.push(Tab::new(format!("t{n}"), PaneId(n)));
+        }
+        let names = |w: &Window| w.tabs.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert!(w.move_tab(1));
+        assert_eq!(
+            (names(&w), w.active),
+            (vec!["t2".into(), "t1".into(), "t3".into()], 1)
+        );
+        assert!(w.move_tab(5), "as far as the end");
+        assert_eq!(
+            (names(&w), w.active),
+            (vec!["t2".into(), "t3".into(), "t1".into()], 2)
+        );
+        assert!(!w.move_tab(1), "already last");
+        assert!(w.move_tab(-9));
+        assert_eq!(w.active, 0);
+        assert!(!w.move_tab(-1), "already first");
+
+        // A pane leaves its tab for a new one at the end, which shows.
+        let mut w = Window::default();
+        w.tabs.push(four());
+        w.tabs.push(Tab::new("t5".into(), PaneId(5)));
+        let before = w.clone();
+        assert!(
+            !w.pane_to_new_tab(PaneId(5), "x".into()),
+            "alone in its tab"
+        );
+        assert!(!w.pane_to_new_tab(PaneId(9), "x".into()));
+        assert_eq!(w, before);
+        assert!(w.pane_to_new_tab(PaneId(3), "x".into()));
+        assert_eq!(w.tabs[0].panes(), ids(&[1, 2, 4]));
+        assert_eq!((w.tabs.len(), w.active), (3, 2));
+        assert_eq!(
+            (w.tabs[2].name.as_str(), w.tabs[2].panes()),
+            ("x", ids(&[3]))
+        );
     }
 }

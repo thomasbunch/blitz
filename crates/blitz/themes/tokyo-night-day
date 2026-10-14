@@ -4,6 +4,7 @@ background = #e1e2e7
 foreground = #3760bf
 cursor-color = #3760bf
 selection-background = #b7c1e3
+accent = #e0af68
 palette = 0=#b4b5b9
 palette = 1=#f52a65
 palette = 2=#587539

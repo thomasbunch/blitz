@@ -16,6 +16,16 @@ use std::path::Path;
 
 use vt::{Palette, RenderCell, Snapshot};
 
+/// Sidebar and label text size relative to the terminal font.
+const CHROME_TEXT: f32 = 0.75;
+
+/// The chrome font size for a terminal font of `px` pixels at DPI
+/// `scale`: three quarters of it, but never under 12 px at 96 DPI, so the
+/// sidebar stays readable beside a small terminal font.
+pub fn chrome_px(px: f32, scale: f32) -> f32 {
+    (px * CHROME_TEXT).max(12.0 * scale)
+}
+
 /// Creates `path` as a new file for a capture or log. Whatever is there is
 /// removed first rather than opened, so a link planted at the path cannot
 /// send the write to another file.
@@ -58,6 +68,7 @@ pub fn text_snapshot(text: &str, cols: u16, rows: u16, pal: &Palette) -> Snapsho
     let blank = RenderCell {
         fg: pal.fg,
         bg: pal.bg,
+        ul: pal.fg,
         width: 1,
         ..RenderCell::default()
     };
@@ -92,6 +103,14 @@ pub fn text_snapshot(text: &str, cols: u16, rows: u16, pal: &Palette) -> Snapsho
         cells,
         ..Snapshot::default()
     }
+}
+
+/// The colour halfway between two `0xRRGGBB` colours.
+fn mix(a: u32, b: u32) -> u32 {
+    let [_, ar, ag, ab] = a.to_be_bytes();
+    let [_, br, bg, bb] = b.to_be_bytes();
+    let m = |x: u8, y: u8| u32::from(x.midpoint(y));
+    m(ar, br) << 16 | m(ag, bg) << 8 | m(ab, bb)
 }
 
 /// `fg` a quarter of the way to `bg`: text in a pane without focus.
@@ -139,14 +158,13 @@ mod gpu {
 
     use super::atlas::{Atlas, GlyphKey, Slot};
     use super::chrome::{Chrome, Prim, branch_mask, shape_mask};
-    use super::d3d11::{ATLAS_SIZE, GLYPH, Gpu, MASK, Quad, SOLID, rgba};
+    use super::d3d11::{ATLAS_SIZE, CURLY, DASHED, DOTTED, GLYPH, Gpu, MASK, Quad, SOLID, rgba};
     use super::font::{BOLD, DEFAULT_FAMILIES, E_PENDING, Font, ITALIC};
     use super::{builtin, text_snapshot, write_bmp};
+    use crate::theme::readable;
 
     /// Default font size: 12 pt at 96 DPI.
     pub const DEFAULT_PX: f32 = 16.0;
-    /// Sidebar and label text size relative to the terminal font.
-    pub const CHROME_TEXT: f32 = 0.75;
 
     /// [`GlyphKey::style`] bits beyond bold and italic: the glyph comes
     /// from the chrome font, or is a shape from [`shape_mask`].
@@ -155,6 +173,13 @@ mod gpu {
 
     /// Fallback font lookups per frame; the rest wait for the next one.
     const LOOKUPS: u32 = 256;
+
+    /// [`RenderCell::attrs`] bits drawn as lines.
+    const LINES: u16 = attr::UNDERLINE | attr::STRIKE | attr::OVERLINE;
+
+    /// The least contrast text keeps with its background: black on a dark
+    /// background shows, and a theme's quiet greys keep their look.
+    const MIN_CONTRAST: f64 = 1.3;
 
     pub struct Renderer {
         pub gpu: Gpu,
@@ -168,30 +193,50 @@ mod gpu {
         cleared: bool,
         /// Glyphs were left out waiting for a font lookup.
         pending: bool,
+        /// The least width in pixels of a bar cursor and of a hollow
+        /// cursor's lines; see [`Self::set_scale`].
+        caret: (u32, u32),
     }
 
-    /// The terminal font and the chrome font: `family`, or the first of
-    /// the defaults installed.
-    fn fonts(family: &str, px: f32) -> Result<(Font, Font)> {
+    /// The terminal font at `px` and the chrome font, sized from `base`,
+    /// the terminal font's size before any zoom, so the sidebar keeps its
+    /// text while the terminal zooms: `family`, or the first of the
+    /// defaults installed, at DPI `scale`. Only the terminal's lines are
+    /// `line_height` times the font's own.
+    fn fonts(
+        family: &str,
+        px: f32,
+        base: f32,
+        scale: f32,
+        line_height: f32,
+    ) -> Result<(Font, Font)> {
         let families: Vec<&str> = (std::iter::once(family).filter(|f| !f.is_empty()))
             .chain(DEFAULT_FAMILIES.iter().copied())
             .collect();
-        Ok((
-            Font::new(&families, px)?,
-            Font::new(&families, px * CHROME_TEXT)?,
-        ))
+        let mut font = Font::new(&families, px)?;
+        font.set_line_height(line_height);
+        Ok((font, Font::new(&families, super::chrome_px(base, scale))?))
     }
 
     impl Renderer {
         pub fn new(warp: bool, px: f32) -> Result<Self> {
-            Self::with_gpu(Gpu::new(warp)?, "", px)
+            Self::with_gpu(Gpu::new(warp)?, "", px, px, px / DEFAULT_PX, 1.0)
         }
 
-        /// [`Self::new`] on a device made elsewhere, in font `family`.
-        pub fn with_gpu(mut gpu: Gpu, family: &str, px: f32) -> Result<Self> {
-            let (font, small) = fonts(family, px)?;
+        /// [`Self::new`] on a device made elsewhere, in font `family` with
+        /// lines `line_height` times its own apart, at DPI `scale`, with the
+        /// chrome sized from `base` as [`Self::set_font`] does.
+        pub fn with_gpu(
+            mut gpu: Gpu,
+            family: &str,
+            px: f32,
+            base: f32,
+            scale: f32,
+            line_height: f32,
+        ) -> Result<Self> {
+            let (font, small) = fonts(family, px, base, scale, line_height)?;
             gpu.set_text_params(font.gamma, font.contrast);
-            Ok(Self {
+            let mut r = Self {
                 gpu,
                 font,
                 small,
@@ -200,12 +245,32 @@ mod gpu {
                 overflowed: false,
                 cleared: false,
                 pending: false,
-            })
+                caret: (0, 0),
+            };
+            r.set_scale(1.0);
+            Ok(r)
         }
 
-        /// Loads another font, or the same at a new size after a DPI change.
-        pub fn set_font(&mut self, family: &str, px: f32) -> Result<()> {
-            (self.font, self.small) = fonts(family, px)?;
+        /// Sizes the cursor for display scale `scale`: a bar at least as
+        /// thick as Windows' text cursor, which Accessibility settings can
+        /// widen, and a hollow block's lines at least 2 px at 100 %.
+        pub fn set_scale(&mut self, scale: f32) {
+            let px = |n: u32| (n as f32 * scale).round().max(1.0) as u32;
+            self.caret = (px(caret_width()), px(2));
+        }
+
+        /// Loads another font, or the same at a new size after a DPI change
+        /// or a zoom. The chrome font follows `base`, the size before any
+        /// zoom; only the terminal's lines are `line_height` apart.
+        pub fn set_font(
+            &mut self,
+            family: &str,
+            px: f32,
+            base: f32,
+            scale: f32,
+            line_height: f32,
+        ) -> Result<()> {
+            (self.font, self.small) = fonts(family, px, base, scale, line_height)?;
             self.atlas.clear();
             Ok(())
         }
@@ -256,23 +321,28 @@ mod gpu {
 
         /// Adds `snap` with its top-left corner at (`x`, `y`). Cell colours
         /// are used as given (the snapshot has already applied inverse and
-        /// the palette), except that dim text is drawn halfway to its
+        /// the palette), except that text too close to its background is
+        /// moved away from it, and dim text is drawn halfway to its
         /// background.
         pub fn snapshot(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
-            self.grid(snap, pal, x, y, false, true);
+            self.grid(snap, pal, x, y, false, false, true);
         }
 
-        /// [`Self::snapshot`] for a pane without focus: text at reduced
-        /// contrast, each cell's moved a quarter of the way to its
-        /// background, and no cursor or selection.
-        pub fn dimmed(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32) {
-            self.grid(snap, pal, x, y, true, true);
+        /// [`Self::snapshot`] for a pane that keys do not reach, because
+        /// another pane or another window has focus: a block cursor is
+        /// drawn as an outline. With `dim` the text is drawn at reduced
+        /// contrast too, each cell's moved a quarter of the way to its
+        /// background, and the selection is left out.
+        pub fn unfocused(&mut self, snap: &Snapshot, pal: &Palette, x: i32, y: i32, dim: bool) {
+            self.grid(snap, pal, x, y, dim, true, true);
         }
 
-        /// [`Self::snapshot`], or with `dim` as [`Self::dimmed`] draws it,
-        /// without copying the snapshot. Without `clear`, the grid's own
-        /// background is left to what is already drawn under it, such as
-        /// scenery; cells in other colours still cover it.
+        /// [`Self::snapshot`], or with `dim` and `hollow` as
+        /// [`Self::unfocused`] draws it, without copying the snapshot.
+        /// Without `clear`, the grid's own background is left to what is
+        /// already drawn under it, such as scenery; cells in other colours
+        /// still cover it.
+        #[allow(clippy::too_many_arguments)]
         pub fn grid(
             &mut self,
             snap: &Snapshot,
@@ -280,6 +350,7 @@ mod gpu {
             x: i32,
             y: i32,
             dim: bool,
+            hollow: bool,
             clear: bool,
         ) {
             let (cw, ch) = self.cell();
@@ -287,6 +358,7 @@ mod gpu {
             let blank = RenderCell {
                 fg: pal.fg,
                 bg: pal.bg,
+                ul: pal.fg,
                 width: 1,
                 ..RenderCell::default()
             };
@@ -300,9 +372,27 @@ mod gpu {
                         (b, a)
                     };
                     let p = (r as u16, c as u16);
-                    (a.1, a.0) <= p && p <= (b.1, b.0)
+                    if snap.block {
+                        let cols = a.0.min(b.0)..=a.0.max(b.0);
+                        (a.1..=b.1).contains(&p.0) && cols.contains(&p.1)
+                    } else {
+                        (a.1, a.0) <= p && p <= (b.1, b.0)
+                    }
                 })
             };
+            // Search matches by cell: 1 for a match, 2 for the current one.
+            let mut marks = Vec::new();
+            if !dim && !snap.highlights.is_empty() {
+                marks = vec![0u8; cols * rows];
+                let at = |(c, r): (u16, u16)| usize::from(r) * cols + usize::from(c);
+                for h in &snap.highlights {
+                    let end = (at(h.end) + 1).min(marks.len());
+                    for m in &mut marks[at(h.start).min(end)..end] {
+                        *m = (*m).max(1 + u8::from(h.current));
+                    }
+                }
+            }
+            let marked = |c: usize, r: usize| marks.get(r * cols + c).copied().unwrap_or(0);
             let px = |c: usize| x + (c as u32 * cw) as i32;
             let py = |r: usize| y + (r as u32 * ch) as i32;
 
@@ -313,8 +403,9 @@ mod gpu {
             for r in 0..rows {
                 let mut c = 0;
                 while c < cols {
+                    // Every match on the selection colour, so each one shows.
                     let bg = |c| {
-                        if selected(c, r) {
+                        if selected(c, r) || marked(c, r) != 0 {
                             pal.selection_bg
                         } else {
                             cell(c, r).bg
@@ -333,51 +424,103 @@ mod gpu {
 
             let cursor = snap
                 .cursor
-                .filter(|&(c, r, _)| !dim && c < snap.cols && r < snap.rows);
-            if let Some((c, r, shape)) = cursor {
-                let (c, r) = (usize::from(c), usize::from(r));
-                let w = u32::from(cell(c, r).width.max(1)) * cw;
-                match shape {
-                    CursorShape::Block => self.rect(px(c), py(r), w, ch, pal.cursor),
-                    CursorShape::Bar => self.rect(px(c), py(r), (cw / 5).max(2), ch, pal.cursor),
-                    CursorShape::Underline => {
-                        let h = (ch / 10).max(2);
-                        self.rect(px(c), py(r) + (ch - h) as i32, w, h, pal.cursor);
+                .filter(|&(c, r, _)| c < snap.cols && r < snap.rows);
+            let mut cursor_rgb = snap.cursor_color.unwrap_or(pal.cursor);
+            // A cursor too close to the colour under it takes the theme's
+            // text or background colour, whichever stands out more.
+            if let Some((c, r, _)) = cursor {
+                let under = cell(usize::from(c), usize::from(r)).bg;
+                let on = |rgb| crate::theme::contrast(rgb, under);
+                if on(cursor_rgb) < 1.5 {
+                    cursor_rgb = if on(pal.fg) >= on(pal.bg) {
+                        pal.fg
+                    } else {
+                        pal.bg
+                    };
+                }
+            }
+            let at = cursor.map(|(c, r, shape)| {
+                let w = u32::from(cell(usize::from(c), usize::from(r)).width.max(1)) * cw;
+                (px(usize::from(c)), py(usize::from(r)), w, shape)
+            });
+            // A block goes under its text; bars, underlines and outlines go
+            // over all text, so no glyph's ink can hide them.
+            let solid = cursor.is_some_and(|c| c.2 == CursorShape::Block && !hollow);
+            if solid && let Some((x, y, w, shape)) = at {
+                self.cursor(x, y, w, shape, hollow, cursor_rgb);
+            }
+            let on_cursor = match pal.cursor_text {
+                Some(text) if cursor_rgb == pal.cursor => text,
+                _ => on_cursor(cursor_rgb, pal),
+            };
+            // The current match is outlined in the cursor's colour, one run
+            // of cells a row.
+            for r in (0..rows).filter(|_| !marks.is_empty()) {
+                let mut c = 0;
+                while c < cols {
+                    let start = c;
+                    while c < cols && marked(c, r) == 2 {
+                        c += 1;
                     }
+                    if c > start {
+                        let (w, t) = ((c - start) as u32 * cw, self.font.underline_h);
+                        self.frame(px(start), py(r), w, ch, t, cursor_rgb);
+                    }
+                    c += 1;
                 }
             }
 
             for r in 0..rows {
                 for c in 0..cols {
                     let mut cl = cell(c, r);
-                    if dim {
-                        cl.fg = super::toward(cl.fg, cl.bg);
+                    // Text too close to its background to read moves just
+                    // far enough from it, before any dimming. Box drawing
+                    // and blocks keep their colours: they draw shapes,
+                    // often meant to blend in. Text in its own background
+                    // is hidden on purpose.
+                    let fg = readable(cl.fg, cl.bg, MIN_CONTRAST);
+                    let text = &cl.text[..usize::from(cl.len).min(cl.text.len())];
+                    if fg != cl.fg && cl.fg != cl.bg && !is_builtin(text) {
+                        if cl.ul == cl.fg {
+                            cl.ul = fg;
+                        }
+                        cl.fg = fg;
                     }
-                    let under_block = cursor.is_some_and(|(cc, cr, s)| {
-                        (usize::from(cc), usize::from(cr)) == (c, r) && s == CursorShape::Block
-                    });
+                    // Faint text is dimmer already than a pane without
+                    // focus makes text; both at once is unreadable.
+                    let faint = cl.attrs & attr::DIM != 0;
+                    if dim && !faint {
+                        cl.fg = super::toward(cl.fg, cl.bg);
+                        cl.ul = super::toward(cl.ul, cl.bg);
+                    }
+                    let under_block = solid
+                        && cursor.is_some_and(|(cc, cr, _)| {
+                            (usize::from(cc), usize::from(cr)) == (c, r)
+                        });
                     // Selected text is drawn in the theme's colour, so
                     // text close to its background shows before it is
-                    // copied.
+                    // copied. So is a match, on its new background.
                     let fg = if under_block {
-                        pal.bg
-                    } else if selected(c, r) {
-                        pal.fg
-                    } else if cl.attrs & attr::DIM != 0 {
-                        mix(cl.fg, cl.bg)
+                        on_cursor
+                    } else if selected(c, r) || marked(c, r) != 0 {
+                        pal.selection_fg
+                    } else if faint {
+                        super::mix(cl.fg, cl.bg)
                     } else {
                         cl.fg
                     };
-                    let w = u32::from(cl.width.max(1)) * cw;
-                    let f = &self.font;
-                    for (bit, y, h) in [
-                        (attr::UNDERLINE, f.underline_y, f.underline_h),
-                        (attr::STRIKE, f.strike_y, f.strike_h),
-                        (attr::OVERLINE, 0, f.underline_h),
-                    ] {
-                        if cl.attrs & bit != 0 {
-                            self.rect(px(c), py(r) + y, w, h, fg);
-                        }
+                    // The right half of a wide character is drawn with
+                    // its left.
+                    if cl.width > 0 && cl.attrs & LINES != 0 {
+                        // An underline of its own colour keeps it, except
+                        // on the block cursor.
+                        let ul = if under_block || cl.ul == cl.fg {
+                            fg
+                        } else {
+                            cl.ul
+                        };
+                        let w = u32::from(cl.width) * cw;
+                        self.lines(cl.attrs, px(c), py(r), w, fg, ul);
                     }
                     if cl.width == 0 || cl.len == 0 {
                         continue;
@@ -397,10 +540,107 @@ mod gpu {
                     self.push_glyph(key, px(c), py(r), fg);
                 }
             }
+            if !solid && let Some((x, y, w, shape)) = at {
+                self.cursor(x, y, w, shape, hollow, cursor_rgb);
+            }
+            if let Some((a, b)) = snap.hover.filter(|_| !dim) {
+                let (top, bottom) = (usize::from(a.1), usize::from(b.1));
+                for r in top..=bottom.min(rows.saturating_sub(1)) {
+                    let from = if r == top { usize::from(a.0) } else { 0 };
+                    let to = if r == bottom { usize::from(b.0) } else { cols };
+                    for c in from..=to.min(cols.saturating_sub(1)) {
+                        let cl = cell(c, r);
+                        // Nothing for the right half of a wide character.
+                        let w = u32::from(cl.width) * cw;
+                        let uy = py(r) + self.font.underline_y;
+                        self.rect(px(c), uy, w, self.font.underline_h, cl.fg);
+                    }
+                }
+            }
             // A cluster of several glyphs can be far wider than its cells;
             // keep it inside the grid so it cannot draw over another pane.
             for q in &mut self.quads[first..] {
                 clip(q, x, y, px(cols), py(rows));
+            }
+        }
+
+        /// Runs `draw`, keeping what it queues inside `r`.
+        pub fn clipped(&mut self, r: crate::layout::Rect, draw: impl FnOnce(&mut Self)) {
+            let first = self.quads.len();
+            draw(self);
+            for q in &mut self.quads[first..] {
+                clip(q, r.x, r.y, r.right(), r.bottom());
+            }
+        }
+
+        /// Queues the outline of a `w` by `h` box with its top-left corner
+        /// at (`x`, `y`), its lines `t` thick.
+        fn frame(&mut self, x: i32, y: i32, w: u32, h: u32, t: u32, rgb: u32) {
+            self.rect(x, y, w, t, rgb);
+            self.rect(x, y + h.saturating_sub(t) as i32, w, t, rgb);
+            self.rect(x, y, t, h, rgb);
+            self.rect(x + w.saturating_sub(t) as i32, y, t, h, rgb);
+        }
+
+        /// Queues a cursor of `shape`, `w` pixels wide with its top-left
+        /// corner at (`x`, `y`); with `hollow` a block is an outline.
+        fn cursor(&mut self, x: i32, y: i32, w: u32, shape: CursorShape, hollow: bool, rgb: u32) {
+            let (cw, ch) = self.cell();
+            let (bar, stroke) = self.caret;
+            match shape {
+                CursorShape::Block if hollow => {
+                    let t = self.font.underline_h.max(stroke);
+                    self.frame(x, y, w, ch, t, rgb);
+                }
+                CursorShape::Block => self.rect(x, y, w, ch, rgb),
+                CursorShape::Bar => self.rect(x, y, (cw / 5).max(2).max(bar), ch, rgb),
+                CursorShape::Underline => {
+                    let h = (ch / 10).max(2);
+                    self.rect(x, y + (ch - h) as i32, w, h, rgb);
+                }
+            }
+        }
+
+        /// Queues the lines `attrs` asks for across a cell, or both of a wide
+        /// character's, `w` pixels wide with its top-left corner at (`x`,
+        /// `y`): the underline in `ul`, overline and strikethrough in `fg`.
+        /// They are as thick as the font's own, so they follow its size.
+        fn lines(&mut self, attrs: u16, x: i32, y: i32, w: u32, fg: u32, ul: u32) {
+            let f = &self.font;
+            let (cw, ch, t) = (f.cell_w, f.cell_h, f.underline_h);
+            let (uy, sy, sh) = (f.underline_y, f.strike_y, f.strike_h);
+            match (attrs & attr::UNDERLINE) >> attr::UNDERLINE_SHIFT {
+                0 => {}
+                2 => {
+                    // Two lines a line apart, raised to fit in the cell.
+                    let top = uy.min(ch as i32 - 3 * t as i32).max(0);
+                    self.rect(x, y + top, w, t, ul);
+                    self.rect(x, y + top + 2 * t as i32, w, t, ul);
+                }
+                kind @ 3..=5 => {
+                    // A wave needs room to swing; dots and dashes do not.
+                    let h = if kind == 3 { (4 * t).max(ch / 5) } else { t }.min(ch);
+                    let top = (uy + t as i32 / 2 - h as i32 / 2).clamp(0, (ch - h) as i32);
+                    self.quads.push(Quad {
+                        pos: [x as i16, (y + top) as i16],
+                        size: [w as u16, h as u16],
+                        uv: [cw as u16, t as u16],
+                        color: rgba(ul),
+                        flags: match kind {
+                            3 => CURLY,
+                            4 => DOTTED,
+                            _ => DASHED,
+                        },
+                    });
+                }
+                // Single, and kinds no program can send.
+                _ => self.rect(x, y + uy, w, t, ul),
+            }
+            if attrs & attr::STRIKE != 0 {
+                self.rect(x, y + sy, w, sh, fg);
+            }
+            if attrs & attr::OVERLINE != 0 {
+                self.rect(x, y, w, t, fg);
             }
         }
 
@@ -607,12 +847,38 @@ mod gpu {
         q.size = [(right - left) as u16, (bottom - top) as u16];
     }
 
-    /// The colour halfway between two `0xRRGGBB` colours.
-    fn mix(a: u32, b: u32) -> u32 {
-        let [_, ar, ag, ab] = a.to_be_bytes();
-        let [_, br, bg, bb] = b.to_be_bytes();
-        let m = |x: u8, y: u8| u32::from(x.midpoint(y));
-        m(ar, br) << 16 | m(ag, bg) << 8 | m(ab, bb)
+    /// Windows' text cursor thickness in pixels at 100 %.
+    fn caret_width() -> u32 {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SPI_GETCARETWIDTH, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+        };
+        let mut w = 1u32;
+        // SAFETY: SPI_GETCARETWIDTH writes one DWORD.
+        let _ = unsafe {
+            SystemParametersInfoW(
+                SPI_GETCARETWIDTH,
+                0,
+                Some((&raw mut w).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+        };
+        w
+    }
+
+    /// Text on a block cursor of colour `cursor`: the background colour,
+    /// unless the cursor is closer to it than to the foreground, as one a
+    /// program chose can be.
+    fn on_cursor(cursor: u32, pal: &Palette) -> u32 {
+        let luma = |c: u32| {
+            let [_, r, g, b] = c.to_be_bytes();
+            2 * u32::from(r) + 5 * u32::from(g) + u32::from(b)
+        };
+        let l = luma(cursor);
+        if l.abs_diff(luma(pal.bg)) >= l.abs_diff(luma(pal.fg)) {
+            pal.bg
+        } else {
+            pal.fg
+        }
     }
 
     fn is_builtin(text: &[u8]) -> bool {
@@ -645,14 +911,15 @@ mod gpu {
     /// Renders a made-up window of five sessions, four of them split in
     /// one tab, for checking the chrome. With `--demo`, `--cols` and
     /// `--rows` give the window size in pixels, `--picker` opens the
-    /// theme picker filtered to `--picker`'s value, and `--settings N`
-    /// opens the settings panel with row N highlighted.
+    /// theme picker filtered to `--picker`'s value, `--settings N` opens
+    /// the settings panel with row N highlighted, and `--find TEXT` finds
+    /// TEXT in the focused pane.
     fn render_demo(
         r: &mut Renderer,
         theme: &crate::theme::Theme,
         collapsed: bool,
         banner: Option<&str>,
-        (picker, settings): (Option<&str>, Option<usize>),
+        (picker, settings, find): (Option<&str>, Option<usize>, Option<&str>),
         (w, h): (u32, u32),
         scale: f32,
     ) -> Result<Vec<u8>> {
@@ -681,19 +948,25 @@ mod gpu {
             tabs: vec![shop, Tab::new("migrate".into(), migrate)],
             active: 0,
             sidebar_expanded: !collapsed,
+            narrow: None,
         };
         let now = Instant::now();
         let ago = |s| now.checked_sub(Duration::from_secs(s)).unwrap_or(now);
         let session = |id, name: &str, cwd: &str, branch: &str, state, msg: &str| Session {
             id,
             name: name.into(),
+            num: None,
             cwd: cwd.into(),
             branch: Some(branch.into()),
             state,
             since: ago(72),
+            turn: None,
+            took: None,
+            seen: false,
             msg: msg.into(),
             progress: None,
             exit_code: None,
+            below: 0,
         };
         let sessions = [
             session(
@@ -705,7 +978,10 @@ mod gpu {
                 "Edit src/routes/users.rs?",
             ),
             Session {
-                progress: Some(42),
+                progress: Some(chrome::Progress {
+                    state: 1,
+                    pct: Some(42),
+                }),
                 ..session(
                     web,
                     "web",
@@ -810,6 +1086,7 @@ mod gpu {
         let mut model = ChromeModel {
             win: &win,
             sessions: &sessions,
+            hover: None,
             ui: theme.ui,
             size: (w as i32, h as i32),
             scale,
@@ -822,19 +1099,22 @@ mod gpu {
             settings: None,
             spark: None,
             game: None,
+            commands: None,
+            find: None,
         };
         // One setting changed, to show its mark and a switch that is off.
         let config = crate::config::Config {
             flash: false,
             ..Default::default()
         };
-        let mut panel =
-            crate::settings::Panel::new(super::font::monospace_families(), crate::shell::choices());
+        let themes = crate::theme::all().into_iter().map(|t| t.name).collect();
+        let fonts = super::font::families().to_vec();
+        let mut panel = crate::settings::Panel::new(fonts, crate::shell::choices(), themes);
         if let Some(sel) = settings {
             panel.sel = sel;
             model.settings = Some(chrome::Settings {
                 filter: "",
-                rows: panel.rows(&config),
+                rows: panel.rows(&config, None),
                 sel,
                 top: 0,
                 error: None,
@@ -870,6 +1150,21 @@ mod gpu {
             }
             let mut snap = Snapshot::default();
             term.snapshot(&mut snap, &pal);
+            if id == web
+                && let Some(query) = find
+            {
+                // The newest match is the current one.
+                let found = term.find(query);
+                let cur = found.len().checked_sub(1);
+                snap.highlight(&found, cur);
+                let count = cur.map(|i| (i + 1, found.len()));
+                model.find = Some(chrome::FindBar {
+                    query,
+                    count,
+                    fresh: false,
+                    screen_only: false,
+                });
+            }
             snaps.push((id, rect, snap));
         }
         let chrome = chrome::build(&model);
@@ -881,7 +1176,9 @@ mod gpu {
                 if *id == web {
                     r.snapshot(snap, &pal, rect.x, rect.y);
                 } else {
-                    r.dimmed(snap, &pal, rect.x, rect.y);
+                    let state = (sessions.iter().find(|s| s.id == *id)).map(|s| s.state);
+                    let dim = chrome::dims(true, state.unwrap_or_default());
+                    r.unfocused(snap, &pal, rect.x, rect.y, dim);
                 }
             }
             r.chrome(&chrome);
@@ -898,6 +1195,7 @@ mod gpu {
         let mut bmp = None;
         let (mut warp, mut light, mut demo, mut collapsed) = (false, false, false, false);
         let (mut banner, mut theme, mut picker, mut settings) = (None, None, None, None);
+        let mut find = None;
         let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
         let mut px = DEFAULT_PX;
         let mut it = args.iter();
@@ -919,6 +1217,7 @@ mod gpu {
                 "--theme" => theme = Some(val()?.clone()),
                 "--picker" => picker = Some(val()?.clone()),
                 "--settings" => settings = Some(usize::from(num(val()?)?)),
+                "--find" => find = Some(val()?.clone()),
                 "--script" => {
                     return Err("--script is not supported yet; pass --vt FILE".into());
                 }
@@ -940,12 +1239,13 @@ mod gpu {
                 u32::from(rows.unwrap_or(868)),
             );
             let scale = px / DEFAULT_PX;
+            r.set_scale(scale);
             let pixels = render_demo(
                 &mut r,
                 &theme,
                 collapsed,
                 banner.as_deref(),
-                (picker.as_deref(), settings),
+                (picker.as_deref(), settings, find.as_deref()),
                 (w, h),
                 scale,
             )
@@ -999,6 +1299,15 @@ mod tests {
     }
 
     #[test]
+    fn chrome_text_has_a_floor() {
+        assert_eq!(chrome_px(16.0, 1.0), 12.0);
+        assert_eq!(chrome_px(32.0, 1.0), 24.0);
+        // A 9 pt terminal font, at 96 and 144 DPI.
+        assert_eq!(chrome_px(12.0, 1.0), 12.0);
+        assert_eq!(chrome_px(18.0, 1.5), 18.0);
+    }
+
+    #[test]
     fn text_snapshot_lays_out_wide_and_narrow_cells() {
         let s = text_snapshot("a中b\n\u{2500}", 5, 3, &pal());
         assert_eq!((s.cols, s.rows, s.cells.len()), (5, 3, 15));
@@ -1027,9 +1336,38 @@ mod tests {
         u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
     }
 
+    /// A terminal not yet resized to its smaller pane draws only inside the
+    /// pane, never over its neighbour.
     #[cfg(windows)]
     #[test]
-    fn render_warp_unfocused_pane_hides_cursor_and_selection() {
+    fn render_warp_clipped_keeps_a_grid_inside_its_pane() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let snap = text_snapshot("\u{2588}\u{2588}\u{2588}", 3, 1, &p);
+        let (cw, ch) = r.cell();
+        let (w, h) = (3 * cw, ch);
+        let t = r.gpu.offscreen(w, h).expect("target");
+        let pane = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 2 * cw as i32,
+            h: ch as i32,
+        };
+        r.begin();
+        // The neighbour first, so a grid that spills over would cover it.
+        r.rect(2 * cw as i32, 0, cw, ch, 0x00ff00);
+        r.clipped(pane, |r| r.snapshot(&snap, &p, 0, 0));
+        r.draw(&t.rtv, w, h, p.bg).expect("draw");
+        let px = r.gpu.read(&t).expect("read");
+        let mid = ch / 2;
+        assert_eq!(pixel(&px, w, cw / 2, mid), p.fg);
+        assert_eq!(pixel(&px, w, 2 * cw - 1, mid), p.fg, "up to the edge");
+        assert_eq!(pixel(&px, w, 2 * cw + cw / 2, mid), 0x00ff00, "not past it");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_unfocused_pane_hollows_cursor_and_hides_selection() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}  ", 3, 1, &p);
@@ -1039,7 +1377,7 @@ mod tests {
         let (w, h) = (3 * cw, ch);
         let t = r.gpu.offscreen(w, h).expect("target");
         r.begin();
-        r.dimmed(&snap, &p, 0, 0);
+        r.unfocused(&snap, &p, 0, 0, true);
         r.draw(&t.rtv, w, h, p.bg).expect("draw");
         let px = r.gpu.read(&t).expect("read");
         let mid = ch / 2;
@@ -1048,7 +1386,7 @@ mod tests {
             toward(p.fg, p.bg),
             "text dimmed"
         );
-        assert_eq!(pixel(&px, w, cw + cw / 2, mid), p.bg, "no cursor");
+        assert_eq!(pixel(&px, w, cw + cw / 2, mid), p.bg, "a hollow cursor");
         assert_eq!(pixel(&px, w, 2 * cw + cw / 2, mid), p.bg, "no selection");
         // The same snapshot with focus shows both.
         r.begin();
@@ -1136,9 +1474,10 @@ mod tests {
         let snap = text_snapshot("\u{2588}", 1, 1, &p);
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         render_offscreen(&mut r, &snap, &p).expect("render");
-        let small = r.cell();
-        r.set_font("", 24.0).expect("font");
+        let (small, chrome) = (r.cell(), r.small_cell());
+        r.set_font("", 24.0, 16.0, 1.0, 1.0).expect("font");
         assert!(r.cell().1 > small.1, "{:?} after {small:?}", r.cell());
+        assert_eq!(r.small_cell(), chrome, "a zoom leaves the chrome be");
         let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
         assert_eq!((w, h), r.cell());
         // The block was drawn again at the new size, not taken from the
@@ -1146,9 +1485,19 @@ mod tests {
         assert_eq!(pixel(&px, w, w - 1, h - 1), p.fg, "bottom right");
         assert_eq!(pixel(&px, w, 0, 0), p.fg, "top left");
         // A family that is not installed falls back to the defaults.
-        r.set_font("No Such Font 4b1d", 16.0)
+        r.set_font("No Such Font 4b1d", 16.0, 16.0, 1.0, 1.0)
             .expect("fallback font");
         assert_eq!(r.cell(), small);
+        // Taller lines for the terminal only; blocks still fill them.
+        let chrome = r.small_cell();
+        r.set_font("", 16.0, 16.0, 1.0, 1.5).expect("font");
+        assert_eq!(r.cell(), (small.0, (small.1 as f32 * 1.5).round() as u32));
+        assert_eq!(r.small_cell(), chrome);
+        let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert_eq!(
+            (pixel(&px, w, 0, 0), pixel(&px, w, w - 1, h - 1)),
+            (p.fg, p.fg)
+        );
     }
 
     #[test]
@@ -1222,6 +1571,40 @@ mod tests {
         let (cw, ch) = r.cell();
         let i = ((ch / 2 * w + cw + cw / 2) * 4) as usize;
         assert_eq!(&px[i..i + 3], &[0x20, 0x40, 0x7f], "BGR of #7f4020");
+        // A pane without focus does not dim it again; other text, yes.
+        let t = r.gpu.offscreen(w, ch).expect("target");
+        r.begin();
+        r.unfocused(&snap, &p, 0, 0, true);
+        r.draw(&t.rtv, w, ch, p.bg).expect("draw");
+        let px = r.gpu.read(&t).expect("read");
+        assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), 0x7f4020);
+        assert_eq!(pixel(&px, w, cw / 2, ch / 2), toward(p.fg, p.bg));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_text_close_to_its_background_shows_but_shapes_keep_their_colour() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        // Black text on the dark background, underlined so its colour
+        // shows exactly; a block and a dim cell in the same colours.
+        let mut snap = text_snapshot("x\u{2588}x", 3, 1, &p);
+        for c in &mut snap.cells {
+            (c.fg, c.ul) = (0x000000, 0x000000);
+        }
+        snap.cells[0].attrs = 1 << vt::snapshot::attr::UNDERLINE_SHIFT;
+        snap.cells[2].attrs = snap.cells[0].attrs | vt::snapshot::attr::DIM;
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let uy = r.font.underline_y as u32;
+        let shown = crate::theme::readable(0x000000, p.bg, 1.3);
+        assert_eq!(pixel(&px, w, 1, uy), shown, "the text's line");
+        assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), 0x000000, "the block");
+        assert_eq!(
+            pixel(&px, w, 2 * cw + 1, uy),
+            mix(shown, p.bg),
+            "then dimmed"
+        );
     }
 
     #[cfg(windows)]
@@ -1230,7 +1613,7 @@ mod tests {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("_中x", 4, 2, &p);
-        snap.cells[0].attrs = vt::snapshot::attr::UNDERLINE;
+        snap.cells[0].attrs = 1 << vt::snapshot::attr::UNDERLINE_SHIFT;
         snap.cells[0].text[0] = b'a';
         snap.cells[3].bg = p.ansi[1];
         snap.selection = Some(((1, 1), (0, 1)));
@@ -1257,6 +1640,129 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn render_warp_program_cursor_colour_and_hollow_cursor() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let (cw, ch) = r.cell();
+        let (w, h) = (2 * cw, ch);
+        let target = r.gpu.offscreen(w, h).expect("target");
+        let mut snap = text_snapshot("\u{2588}", 2, 1, &p);
+        let mut frame = |rgb, col, hollow| {
+            snap.cursor_color = Some(rgb);
+            snap.cursor = Some((col, 0, vt::CursorShape::Block));
+            r.begin();
+            if hollow {
+                r.unfocused(&snap, &p, 0, 0, false);
+            } else {
+                r.snapshot(&snap, &p, 0, 0);
+            }
+            r.draw(&target.rtv, w, h, p.bg).expect("draw");
+            let px = r.gpu.read(&target).expect("read");
+            move |x: u32, y: u32| pixel(&px, w, x, y)
+        };
+        // Too close to the background to carry text, not to show.
+        let dark = 0x505050;
+        assert_eq!(frame(dark, 1, false)(cw + cw / 2, ch / 2), dark);
+        assert_eq!(frame(dark, 0, false)(cw / 2, ch / 2), p.fg, "text on it");
+        let at = frame(dark, 1, true);
+        assert_eq!(at(cw + cw / 2, ch / 2), p.bg, "hollow");
+        assert_eq!((at(cw, 0), at(2 * cw - 1, ch - 1)), (dark, dark));
+        // One too close to the background to show takes the text colour.
+        let darker = 0x202020;
+        assert_eq!(frame(darker, 1, false)(cw + cw / 2, ch / 2), p.fg);
+        assert_eq!(frame(darker, 0, false)(cw / 2, ch / 2), p.bg, "text on it");
+        assert_eq!(frame(darker, 1, true)(cw, 0), p.fg, "hollow");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_bar_and_underline_cursors_show_over_text_at_any_scale() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let (cw, ch) = r.cell();
+        let mut snap = text_snapshot("\u{2588}\u{2588}", 2, 1, &p);
+        let at = |r: &mut Renderer, snap: &Snapshot, hollow: bool, x: u32, y: u32| {
+            let target = r.gpu.offscreen(2 * cw, ch).expect("target");
+            r.begin();
+            r.grid(snap, &p, 0, 0, false, hollow, true);
+            r.draw(&target.rtv, 2 * cw, ch, p.bg).expect("draw");
+            pixel(&r.gpu.read(&target).expect("read"), 2 * cw, x, y)
+        };
+        // Over a glyph that fills its cell.
+        snap.cursor = Some((0, 0, vt::CursorShape::Bar));
+        assert_eq!(at(&mut r, &snap, false, 0, ch / 2), p.cursor, "bar");
+        snap.cursor = Some((1, 0, vt::CursorShape::Underline));
+        assert_eq!(
+            at(&mut r, &snap, false, cw + 1, ch - 1),
+            p.cursor,
+            "underline"
+        );
+        // At 400 % a bar is at least 4 px, and at 200 % so are a hollow
+        // block's lines.
+        let mut blank = text_snapshot("", 2, 1, &p);
+        blank.cursor = Some((0, 0, vt::CursorShape::Bar));
+        r.set_scale(4.0);
+        assert_eq!(at(&mut r, &blank, false, 3, ch / 2), p.cursor, "wide bar");
+        r.set_scale(2.0);
+        blank.cursor = Some((1, 0, vt::CursorShape::Block));
+        assert_eq!(
+            at(&mut r, &blank, true, cw + 3, ch / 2),
+            p.cursor,
+            "outline"
+        );
+        assert_eq!(at(&mut r, &blank, true, cw + cw / 2, ch / 2), p.bg);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_lines_and_underline_colours() {
+        use vt::snapshot::attr;
+
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let red = p.ansi[1];
+        let mut snap = text_snapshot("", 6, 1, &p);
+        let kind = |k: u16| k << attr::UNDERLINE_SHIFT;
+        for (c, attrs) in [kind(2), kind(3), kind(3), kind(4)].into_iter().enumerate() {
+            snap.cells[c].attrs = attrs;
+            snap.cells[c].ul = red;
+        }
+        snap.cells[3].ul = p.fg;
+        snap.cells[4].attrs = attr::STRIKE | attr::OVERLINE;
+        snap.cells[5].attrs = kind(5);
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        let (uy, t) = (r.font.underline_y as u32, r.font.underline_h);
+        let top = uy.min(ch - 3 * t);
+        let double = (at(1, top), at(1, top + t), at(1, top + 2 * t));
+        assert_eq!(double, (red, p.bg, red), "double, in its own colour");
+        // The wave runs on from each column to the next, across the two
+        // cells and where they meet.
+        let ink = |x| (0..ch).filter(move |&y| at(x, y) != p.bg);
+        for x in cw..3 * cw - 1 {
+            assert!(
+                ink(x).any(|y| ink(x + 1).any(|y2| y.abs_diff(y2) <= 1)),
+                "{x}"
+            );
+        }
+        for c in [3, 5] {
+            let row: Vec<u32> = (c * cw..(c + 1) * cw).map(|x| at(x, uy)).collect();
+            assert!(row.contains(&p.fg) && row.contains(&p.bg), "dots, dashes");
+        }
+        assert_eq!(
+            at(4 * cw + 1, r.font.strike_y as u32),
+            p.fg,
+            "strikethrough"
+        );
+        assert_eq!(at(4 * cw + 1, 0), p.fg, "overline");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn render_warp_selection_shows_text_close_to_its_background() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
@@ -1268,6 +1774,114 @@ mod tests {
         let i = ((ch / 2 * w + cw / 2) * 4) as usize;
         let at = u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]]);
         assert_eq!(at, p.fg);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_theme_colours_for_selected_text_and_text_on_the_cursor() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = Palette {
+            selection_fg: 0x00ff00,
+            cursor_text: Some(0xff0000),
+            ..pal()
+        };
+        let mut snap = text_snapshot("\u{2588}\u{2588}", 2, 1, &p);
+        snap.selection = Some(((0, 0), (0, 0)));
+        snap.cursor = Some((1, 0, vt::CursorShape::Block));
+        let (cw, ch) = r.cell();
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert_eq!(pixel(&px, w, cw / 2, ch / 2), 0x00ff00, "selected text");
+        assert_eq!(
+            pixel(&px, w, cw + cw / 2, ch / 2),
+            0xff0000,
+            "on the cursor"
+        );
+        // The theme's text colour is for its cursor colour, not one a
+        // program chose.
+        snap.cursor_color = Some(0x0000ff);
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        assert_eq!(pixel(&px, w, cw + cw / 2, ch / 2), p.fg);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_search_matches_and_the_current_one() {
+        use vt::snapshot::Highlight;
+
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        // Blank cells, so no glyph covers a pixel looked at.
+        let mut snap = text_snapshot("", 5, 1, &p);
+        snap.highlights = vec![
+            Highlight {
+                start: (0, 0),
+                end: (1, 0),
+                current: false,
+            },
+            Highlight {
+                start: (3, 0),
+                end: (4, 0),
+                current: true,
+            },
+        ];
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let at = |x: u32, y: u32| pixel(&px, w, x, y);
+        // Each match is as plain to see as a selection.
+        for x in [0, cw + cw / 2, 2 * cw - 1] {
+            assert_eq!(at(x, 0), p.selection_bg, "{x}");
+            assert_eq!(at(x, ch - 1), p.selection_bg, "{x}");
+        }
+        assert_eq!(at(2 * cw + 1, ch / 2), p.bg, "between the matches");
+        // The current one, too, in a frame of the cursor's colour.
+        assert_eq!(at(4 * cw, ch / 2), p.selection_bg, "inside");
+        for (x, y) in [
+            (3 * cw, ch / 2),
+            (5 * cw - 1, ch / 2),
+            (4 * cw, 0),
+            (4 * cw, ch - 1),
+        ] {
+            assert_eq!(at(x, y), p.cursor, "edge at {x},{y}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_block_selection_takes_the_same_columns_of_each_row() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("", 3, 2, &p);
+        snap.selection = Some(((1, 0), (1, 1)));
+        snap.block = true;
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        assert_eq!(at(cw + 1, 1), p.selection_bg);
+        assert_eq!(at(cw + 1, ch + 1), p.selection_bg);
+        assert_eq!(at(2 * cw + 1, 1), p.bg, "not the rest of the first row");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_link_under_the_pointer_is_underlined() {
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        let p = pal();
+        let mut snap = text_snapshot("", 3, 2, &p);
+        snap.hover = Some(((2, 0), (0, 1)));
+        let (w, _, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+        let (cw, ch) = r.cell();
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
+        };
+        let uy = r.font.underline_y as u32;
+        assert_eq!(at(2 * cw + 1, uy), p.fg, "its first cell");
+        assert_eq!(at(1, ch + uy), p.fg, "on into the next row");
+        assert_eq!(at(1, uy), p.bg, "nothing before it");
+        assert_eq!(at(cw + 1, ch + uy), p.bg, "nothing after it");
     }
 
     #[cfg(windows)]
@@ -1406,6 +2020,40 @@ mod tests {
         assert!(ink, "the cluster is drawn");
         let spill = (0..h).any(|y| (4 * cw..w).any(|x| at(x, y) != 0x123456));
         assert!(!spill, "nothing is drawn right of the grid");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_warp_combining_marks_stay_on_their_character() {
+        let p = pal();
+        let mut r = Renderer::new(true, 16.0).expect("renderer");
+        // Ink in the first and second cell of `text` on a 2x1 screen.
+        let mut ink = |text: &str| {
+            let mut t = vt::Terminal::new(vt::Options {
+                cols: 2,
+                rows: 1,
+                ..vt::Options::default()
+            });
+            t.feed(format!("{text}\x1b[?25l").as_bytes());
+            let mut snap = Snapshot::default();
+            t.snapshot(&mut snap, &p);
+            let (w, h, px) = render_offscreen(&mut r, &snap, &p).expect("render");
+            let cw = w / 2;
+            let count = |x0: u32| {
+                (0..h)
+                    .flat_map(|y| (x0..x0 + cw).map(move |x| (x, y)))
+                    .filter(|&(x, y)| pixel(&px, w, x, y) != p.bg)
+                    .count()
+            };
+            (count(0), count(cw))
+        };
+        let (plain, _) = ink("e");
+        for marked in ["e\u{301}", "a\u{308}", "o\u{303}"] {
+            let (first, second) = ink(marked);
+            assert_eq!(second, 0, "{marked:?} reaches the next cell");
+            assert!(first > plain / 2, "{marked:?} lost its character");
+        }
+        assert!(ink("e\u{301}").0 > plain, "the accent is drawn");
     }
 
     #[cfg(windows)]

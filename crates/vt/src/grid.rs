@@ -49,6 +49,12 @@ pub mod cf {
 pub mod rf {
     /// The row's text continues on the next row (soft wrap).
     pub const WRAPPED: u8 = 1 << 0;
+    /// A prompt of blitz's own shell integration starts on this row.
+    pub const PROMPT: u8 = 1 << 1;
+    /// A command's output starts on this row, as OSC 133;C marks it.
+    pub const OUTPUT: u8 = 1 << 2;
+    /// The marks a reflow keeps on the first row of their line.
+    pub const MARKS: u8 = PROMPT | OUTPUT;
 }
 
 /// Longest grapheme tail kept per cell, in bytes, so that with its first
@@ -270,18 +276,28 @@ impl Row {
 
     /// Appends the row's text: blanks as spaces, wide characters once.
     pub fn push_text(&self, out: &mut String) {
-        for (x, c) in self.cells.iter().enumerate() {
-            if c.has(cf::SPACER_TAIL | cf::SPACER_HEAD) {
-                continue;
-            }
-            out.push(match c.cp {
-                0 => ' ',
-                cp => char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
-            });
-            if c.has(cf::GRAPHEME) {
-                out.push_str(self.grapheme(x as u16).unwrap_or_default());
-            }
-        }
+        out.extend(self.chars(self.cells.len()).map(|(_, ch)| ch));
+    }
+
+    /// The text of the row's first `end` cells as [`Self::push_text`]
+    /// writes it, each character with the column it is in.
+    fn chars(&self, end: usize) -> impl Iterator<Item = (u16, char)> + '_ {
+        (self.cells[..end].iter().enumerate())
+            .filter(|(_, c)| !c.has(cf::SPACER_TAIL | cf::SPACER_HEAD))
+            .flat_map(move |(x, c)| {
+                let first = match c.cp {
+                    0 => ' ',
+                    cp => char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER),
+                };
+                let rest = if c.has(cf::GRAPHEME) {
+                    self.grapheme(x as u16).unwrap_or_default()
+                } else {
+                    ""
+                };
+                std::iter::once(first)
+                    .chain(rest.chars())
+                    .map(move |ch| (x as u16, ch))
+            })
     }
 }
 
@@ -294,6 +310,16 @@ pub struct Grid {
     cols: u16,
     lines: u16,
     max_scrollback: usize,
+    /// Rows dropped off the top so far; see [`Grid::dropped`].
+    dropped: usize,
+}
+
+/// One match of [`Grid::find`]: its first and last cell as (line, column),
+/// inclusive. A wide character's last cell is its right half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Found {
+    pub start: (usize, u16),
+    pub end: (usize, u16),
 }
 
 impl Grid {
@@ -304,6 +330,7 @@ impl Grid {
             cols,
             lines,
             max_scrollback,
+            dropped: 0,
         }
     }
 
@@ -347,6 +374,88 @@ impl Grid {
             .unwrap_or((0, 0))
     }
 
+    /// Rows dropped off the top of the scrollback so far. Row `i` of
+    /// [`Self::line`] is line `dropped() + i`, a number that stays with
+    /// the row while output scrolls it up and older rows drop away.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Every place `query` appears, oldest first. Rows joined by soft wraps
+    /// are searched as one line, so a match can run from one into the
+    /// next. Case is ignored unless the query has a capital letter. Matches
+    /// do not overlap. Characters are compared one code point at a time,
+    /// as written: `cafe` matches the start of a `café` written with a
+    /// combining accent, a `café` with the accent built in does not match
+    /// that one, and a letter whose lower case is more than one character,
+    /// such as `İ`, only matches itself.
+    // ponytail: plain substring, regex if asked
+    pub fn find(&self, query: &str) -> Vec<Found> {
+        let exact = query.chars().any(char::is_uppercase);
+        let fold = |c: char| if exact { c } else { lower(c) };
+        let needle: Vec<char> = query.chars().map(fold).collect();
+        let n = needle.len();
+        let mut out = Vec::new();
+        if n == 0 {
+            return out;
+        }
+        // The line so far, from where a match could still start: its text,
+        // the column each character came from, and where in the text each
+        // of its rows starts.
+        let mut text: Vec<char> = Vec::new();
+        let mut cols: Vec<u16> = Vec::new();
+        let mut starts: Vec<(usize, usize)> = Vec::new();
+        let last = self.rows.len() - 1;
+        for (i, row) in self.rows.iter().enumerate() {
+            let wrapped = row.flags & rf::WRAPPED != 0 && i < last;
+            let end = if wrapped {
+                row.cells.len()
+            } else {
+                text_len(&row.cells)
+            };
+            starts.push((text.len(), i));
+            for (x, ch) in row.chars(end) {
+                text.push(fold(ch));
+                cols.push(x);
+            }
+            let cell = |k: usize| {
+                let r = starts[starts.partition_point(|s| s.0 <= k) - 1].1;
+                (r, cols[k])
+            };
+            let mut k = 0;
+            while k + n <= text.len() {
+                if text[k] != needle[0] || text[k + 1..k + n] != needle[1..] {
+                    k += 1;
+                    continue;
+                }
+                let (start, (r, mut x)) = (cell(k), cell(k + n - 1));
+                if self.rows[r].cells[usize::from(x)].has(cf::WIDE) {
+                    x += 1;
+                }
+                out.push(Found {
+                    start: (self.dropped + start.0, start.1),
+                    end: (self.dropped + r, x),
+                });
+                k += n;
+            }
+            if wrapped {
+                // Only the end of the row can start a match that runs on
+                // into the next, so a long line is never held whole.
+                text.drain(..k);
+                cols.drain(..k);
+                starts.drain(..starts.partition_point(|s| s.0 <= k) - 1);
+                for s in &mut starts {
+                    s.0 = s.0.saturating_sub(k);
+                }
+                continue;
+            }
+            text.clear();
+            cols.clear();
+            starts.clear();
+        }
+        out
+    }
+
     /// Every cell, scrollback included.
     pub fn cells(&self) -> impl Iterator<Item = &Cell> {
         self.rows.iter().flat_map(|r| &r.cells)
@@ -365,8 +474,11 @@ impl Grid {
     /// Scrolls screen rows `top..=bottom` up by `n`; blank rows enter at the
     /// bottom. With `keep`, the rows leaving at the top go to scrollback
     /// instead of being dropped, which is only meaningful when `top` is 0.
-    pub fn scroll_up(&mut self, top: u16, bottom: u16, n: u16, blank: Cell, keep: bool) {
+    /// True when every screen row moved under its line number while the
+    /// scrollback stayed put, so the screen's numbers now name other text.
+    pub fn scroll_up(&mut self, top: u16, bottom: u16, n: u16, blank: Cell, keep: bool) -> bool {
         let n = n.min(bottom + 1 - top);
+        let mut moved = false;
         for _ in 0..n {
             let base = self.scrollback_len();
             if keep && self.max_scrollback > 0 {
@@ -378,14 +490,27 @@ impl Grid {
             } else if let Some(mut row) = self.rows.remove(base + top as usize) {
                 row.reset(self.cols, blank);
                 self.rows.insert(base + bottom as usize, row);
+                // Every row moved up, as when the top one goes to
+                // scrollback, so each keeps its line number. Scrollback
+                // above can't move with them.
+                if top == 0 && bottom + 1 == self.lines {
+                    if base == 0 {
+                        self.dropped += 1;
+                    } else {
+                        moved = true;
+                    }
+                }
             }
         }
         self.trim();
+        moved
     }
 
     /// Scrolls screen rows `top..=bottom` down by `n`; blank rows enter at
-    /// the top.
-    pub fn scroll_down(&mut self, top: u16, bottom: u16, n: u16, blank: Cell) {
+    /// the top. True when every screen row moved under its line number,
+    /// which a scroll of the whole screen down always does: no number
+    /// above the screen is free for its top row to take.
+    pub fn scroll_down(&mut self, top: u16, bottom: u16, n: u16, blank: Cell) -> bool {
         let n = n.min(bottom + 1 - top);
         let base = self.scrollback_len();
         for _ in 0..n {
@@ -394,16 +519,19 @@ impl Grid {
                 self.rows.insert(base + top as usize, row);
             }
         }
+        n > 0 && top == 0 && bottom + 1 == self.lines
     }
 
     /// Drops all scrollback, keeping the rows for reuse.
     pub fn clear_scrollback(&mut self) {
         let n = self.scrollback_len();
+        self.dropped += n;
         self.pool.extend(self.rows.drain(..n));
     }
 
     fn trim(&mut self) {
         let excess = self.scrollback_len().saturating_sub(self.max_scrollback);
+        self.dropped += excess;
         self.pool.extend(self.rows.drain(..excess));
     }
 
@@ -448,28 +576,45 @@ impl Grid {
     /// is the cursor's screen column, row and pending wrap; returns where
     /// it lands. Blank rows below the cursor go before rows above it move
     /// into scrollback. Needs `cols >= 2` so a wide character fits a row.
+    /// Each of `marks`, a cell as (line, column) numbered as
+    /// [`Self::dropped`] numbers lines, moves with its text; one whose row
+    /// is gone gets the line `usize::MAX`.
     // ponytail: walks all scrollback on each width change; rows whose line
     // already fits are moved, not copied.
-    pub fn reflow(&mut self, cols: u16, cur: (u16, u16, bool)) -> (u16, u16, bool) {
+    pub fn reflow(
+        &mut self,
+        cols: u16,
+        cur: (u16, u16, bool),
+        marks: &mut [(usize, u16)],
+    ) -> (u16, u16, bool) {
         let new = usize::from(cols);
         let cy = self.scrollback_len() + usize::from(cur.1);
+        let base = self.dropped;
+        // Each mark's row, and its place in the line being rewrapped.
+        let mut rows: Vec<Option<usize>> = (marks.iter())
+            .map(|m| m.0.checked_sub(base).filter(|&i| i < self.rows.len()))
+            .collect();
+        let mut at_k: Vec<Option<usize>> = vec![None; marks.len()];
         let old = std::mem::take(&mut self.rows);
         let last = old.len() - 1;
         self.cols = cols;
-        let text_len = |cells: &[Cell]| {
-            (cells.iter())
-                .rposition(|c| c.cp != 0 || c.flags != 0)
-                .map_or(0, |t| t + 1)
-        };
         let mut out = VecDeque::with_capacity(old.len());
         let mut at = (0, 0);
         let mut line = Vec::new();
         let mut graphemes = Vec::new();
         let mut cursor = None;
+        // A prompt or output mark anywhere in a line goes to its first
+        // new row.
+        let mut prompt = 0;
         for (i, mut row) in old.into_iter().enumerate() {
             let wrapped = row.flags & rf::WRAPPED != 0 && i < last;
             if line.is_empty() && !wrapped && i != cy && text_len(&row.cells) <= new {
-                row.flags = 0;
+                for (m, r) in marks.iter_mut().zip(&mut rows) {
+                    if r.take_if(|r| *r == i).is_some() {
+                        *m = (base + out.len(), m.1.min(cols - 1));
+                    }
+                }
+                row.flags &= rf::MARKS;
                 row.set_width(cols);
                 out.push_back(row);
                 continue;
@@ -479,9 +624,15 @@ impl Grid {
             let mut tails = row.extra.take().map(|e| e.graphemes).unwrap_or_default();
             tails.sort_unstable_by_key(|g| g.0);
             let mut tails = tails.into_iter().peekable();
+            prompt |= row.flags & rf::MARKS;
             for (x, c) in row.cells.iter().enumerate() {
                 if i == cy && x == usize::from(cur.0) {
                     cursor = Some(line.len());
+                }
+                for ((m, r), k) in marks.iter().zip(&mut rows).zip(&mut at_k) {
+                    if *r == Some(i) && usize::from(m.1) == x {
+                        (*r, *k) = (None, Some(line.len()));
+                    }
                 }
                 // Left where a wide character did not fit; placed anew below.
                 if c.has(cf::SPACER_HEAD) {
@@ -501,6 +652,12 @@ impl Grid {
             if i == cy && cursor.is_none() {
                 cursor = Some(line.len().saturating_sub(1));
             }
+            // Past the row's last cell, as a whole line's selection ends.
+            for (r, k) in rows.iter_mut().zip(&mut at_k) {
+                if r.take_if(|r| *r == i).is_some() {
+                    *k = Some(line.len().saturating_sub(1));
+                }
+            }
             self.pool.push(row);
             if wrapped {
                 continue;
@@ -509,6 +666,7 @@ impl Grid {
             let keep = line.len().min(len.div_ceil(new).max(1) * new).max(len);
             line.resize(keep.max(cursor.map_or(0, |c| c + 1)), Cell::default());
             let mut row = self.fresh(Cell::default());
+            row.flags = std::mem::take(&mut prompt);
             let mut x = 0;
             let mut tails = graphemes.drain(..).peekable();
             for (k, &c) in line.iter().enumerate() {
@@ -529,7 +687,18 @@ impl Grid {
                 if cursor == Some(k) {
                     at = (out.len(), x);
                 }
+                for (m, at_k) in marks.iter_mut().zip(&mut at_k) {
+                    if at_k.take_if(|a| *a == k).is_some() {
+                        *m = (base + out.len(), x as u16);
+                    }
+                }
                 x += 1;
+            }
+            // Blank space cut from the end of the line.
+            for (m, at_k) in marks.iter_mut().zip(&mut at_k) {
+                if at_k.take().is_some() {
+                    *m = (base + out.len(), x.saturating_sub(1) as u16);
+                }
             }
             out.push_back(row);
             line.clear();
@@ -551,6 +720,10 @@ impl Grid {
         let top = (out.len() - lines).min(at.0);
         while out.len() > top + lines {
             self.pool.extend(out.pop_back());
+        }
+        // Rows dropped from the bottom took their marks with them.
+        for m in marks.iter_mut().filter(|m| m.0 >= base + out.len()) {
+            m.0 = usize::MAX;
         }
         self.rows = out;
         self.trim();
@@ -574,6 +747,25 @@ impl Grid {
         };
         (self.rows.capacity() + self.pool.capacity()) * size_of::<Row>()
             + self.rows.iter().chain(&self.pool).map(row).sum::<usize>()
+    }
+}
+
+/// Cells up to the last one that was ever written.
+fn text_len(cells: &[Cell]) -> usize {
+    (cells.iter())
+        .rposition(|c| c.cp != 0 || c.flags != 0)
+        .map_or(0, |t| t + 1)
+}
+
+/// `c` in lower case, when that is a single character.
+fn lower(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    let mut l = c.to_lowercase();
+    match (l.next(), l.next()) {
+        (Some(l), None) => l,
+        _ => c,
     }
 }
 
@@ -620,8 +812,10 @@ mod tests {
             g.scroll_up(0, 1, 1, Cell::default(), true);
         }
         assert_eq!(g.scrollback_len(), 10);
+        assert_eq!(g.dropped(), 15, "rows keep their numbers");
         g.clear_scrollback();
         assert_eq!(g.scrollback_len(), 0);
+        assert_eq!(g.dropped(), 25);
         assert!(g.pool.len() >= 10);
     }
 
@@ -707,7 +901,7 @@ mod tests {
             r.flags |= rf::WRAPPED;
         }
         let t0 = std::time::Instant::now();
-        g.reflow(99, (0, 0, false));
+        g.reflow(99, (0, 0, false), &mut []);
         assert!(t0.elapsed().as_secs() < 5, "{:?}", t0.elapsed());
         for y in 0..4000u16 {
             for x in 0..99u16 {
@@ -727,13 +921,13 @@ mod tests {
             g.scroll_up(0, 9, 1, Cell::default(), true);
         }
         let before = g.bytes_used();
-        g.reflow(2, (0, 9, false));
+        g.reflow(2, (0, 9, false), &mut []);
         assert!(
             g.bytes_used() < 2 * before,
             "{} vs {before}",
             g.bytes_used()
         );
-        g.reflow(200, (0, 9, false));
+        g.reflow(200, (0, 9, false), &mut []);
         assert!(
             g.bytes_used() < 2 * before,
             "{} vs {before}",
@@ -787,5 +981,70 @@ mod tests {
         assert_eq!(g.scrollback_len(), 10_000);
         let used = g.bytes_used();
         assert!(used <= 10 << 20, "{used} bytes");
+    }
+
+    #[test]
+    fn rewrapping_keeps_prompt_marks_on_the_first_row_of_a_line() {
+        let mut g = grid_with(&["$ ab", "cd", "x", ""]);
+        g.row_mut(0).flags = rf::WRAPPED | rf::PROMPT;
+        g.row_mut(2).flags = rf::OUTPUT;
+        g.reflow(8, (0, 3, false), &mut []);
+        assert_eq!(text(&g), ["$ abcd", "x", "", ""]);
+        let flags: Vec<u8> = (0..4).map(|i| g.line(i).unwrap().flags).collect();
+        assert_eq!(flags, [rf::PROMPT, rf::OUTPUT, 0, 0]);
+        g.reflow(2, (0, 3, false), &mut []);
+        assert_eq!(text(&g), ["$", "ab", "cd", "x", "", ""]);
+        assert_eq!(g.line(0).unwrap().flags, rf::WRAPPED | rf::PROMPT);
+        assert_eq!(g.line(1).unwrap().flags, rf::WRAPPED);
+        assert_eq!(g.line(3).unwrap().flags, rf::OUTPUT);
+    }
+
+    #[test]
+    fn find_covers_both_halves_of_a_wide_character() {
+        let mut g = Grid::new(6, 1, 0);
+        let wide = Cell {
+            cp: '中' as u32,
+            style: 0,
+            flags: cf::WIDE,
+        };
+        g.row_mut(0).put_ascii(0, b"a", 0);
+        g.row_mut(0).put(1, wide);
+        g.row_mut(0).put_ascii(3, b"b", 0);
+        let found = g.find("中b");
+        assert_eq!(
+            found,
+            [Found {
+                start: (0, 1),
+                end: (0, 3)
+            }]
+        );
+        assert_eq!(g.find("a中")[0].end, (0, 2));
+    }
+
+    /// The scan the find bar runs on every keystroke, over the largest
+    /// scrollback the settings allow, at a width few windows reach.
+    #[test]
+    fn find_scans_100k_rows_of_200_columns_quickly() {
+        let mut g = Grid::new(200, 50, 100_000);
+        let line: Vec<u8> = (0..200)
+            .map(|i| b"lorem ipsum dolor sit amet, "[i % 28])
+            .collect();
+        for i in 0..100_050 {
+            g.row_mut(49).put_ascii(0, &line, 0);
+            if i % 1000 == 0 {
+                g.row_mut(49).put_ascii(0, b"needle", 0);
+            }
+            g.scroll_up(0, 49, 1, Cell::default(), true);
+        }
+        let t = std::time::Instant::now();
+        let found = g.find("needle");
+        let rare = t.elapsed();
+        let t = std::time::Instant::now();
+        let common = g.find("e").len();
+        let one_letter = t.elapsed();
+        eprintln!("100k x 200 scan: {rare:?} for a rare word, {one_letter:?} for {common} matches");
+        // The first needle went with the oldest rows.
+        assert_eq!(found.len(), 100);
+        assert!(rare.as_secs() < 5, "{rare:?}");
     }
 }
