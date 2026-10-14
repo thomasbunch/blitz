@@ -2,12 +2,12 @@
 
 use std::ffi::{OsString, c_void};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HMODULE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
@@ -32,6 +32,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
+use super::{PtyEvent, SpawnOpts, Writer, foreign, lock};
+
 /// Lay out glyphs by grapheme cluster, matching the terminal's width model.
 const PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES: u32 = 0x8;
 /// Each direction of the pipes buffers this much.
@@ -39,8 +41,6 @@ const PIPE_BYTES: u32 = 128 * 1024;
 /// The first bytes the bundled ConPTY writes. The inbox one starts with
 /// `ESC[?9001h` instead.
 const BUNDLED_PRELUDE: &[u8] = b"\x1b[1t";
-/// Bytes queued for the child's input beyond which replies are dropped.
-const MAX_PENDING: usize = 1 << 20;
 
 /// What `GetProcAddress` returns before it is cast.
 type Proc = unsafe extern "system" fn() -> isize;
@@ -158,58 +158,6 @@ pub fn pane_token() -> io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// What the reader thread reports.
-pub enum PtyEvent<'a> {
-    /// Output from the child, in order. Replies to queries go through the
-    /// [`Writer`] passed alongside, so they stay in stream order.
-    Data(&'a [u8]),
-    /// The pseudoconsole and every process attached to it are gone. Carries
-    /// the shell's exit code (`STILL_ACTIVE` if it outlived a forced close).
-    Exit(u32),
-}
-
-/// Sends bytes to the child's input. Cheap to clone; writes happen on the
-/// pane's writer thread, in the order they are sent.
-#[derive(Clone)]
-pub struct Writer {
-    tx: mpsc::Sender<Vec<u8>>,
-    /// Bytes sent but not yet written.
-    pending: Arc<AtomicUsize>,
-}
-
-impl Writer {
-    pub fn send(&self, bytes: impl Into<Vec<u8>>) {
-        let bytes = bytes.into();
-        self.pending.fetch_add(bytes.len(), Ordering::Relaxed);
-        // An error only means the child has gone.
-        let _ = self.tx.send(bytes);
-    }
-
-    /// [`Writer::send`] for answers to the child's queries. They are dropped
-    /// while its input is backed up, so a program that floods queries
-    /// cannot make blitz queue replies without limit.
-    pub fn reply(&self, bytes: impl Into<Vec<u8>>) {
-        if self.pending.load(Ordering::Relaxed) < MAX_PENDING {
-            self.send(bytes);
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SpawnOpts<'a> {
-    /// The full command line, e.g. from [`crate::shell::launch`].
-    pub cmdline: &'a str,
-    pub cwd: Option<&'a Path>,
-    /// Added to the child's environment after blitz's own variables.
-    pub env: &'a [(String, String)],
-    pub cols: u16,
-    pub rows: u16,
-    /// Exported to the child as `BLITZ_PANE_ID`.
-    pub pane_id: u32,
-    /// Window that owns the pseudoconsole's hidden console window.
-    pub parent: Option<isize>,
-}
-
 /// A child process attached to its own pseudoconsole.
 pub struct Pty {
     /// The pseudoconsole handle; 0 once closed.
@@ -218,10 +166,6 @@ pub struct Pty {
     writer: Writer,
     spawned: Instant,
     closing: AtomicBool,
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Closes the pseudoconsole once. This can block until its output has been
@@ -338,24 +282,7 @@ impl Pty {
             }
         }
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let writer = Writer {
-            tx,
-            pending: Arc::default(),
-        };
-        let mut input = File::from(in_w);
-        let pending = writer.pending.clone();
-        std::thread::Builder::new()
-            .name("pty-write".into())
-            .spawn(move || {
-                for bytes in rx {
-                    if input.write_all(&bytes).is_err() {
-                        break;
-                    }
-                    pending.fetch_sub(bytes.len(), Ordering::Relaxed);
-                }
-            })
-            .map_err(fail)?;
+        let writer = Writer::start(File::from(in_w)).map_err(fail)?;
 
         let (reply, hpc2, process2) = (writer.clone(), hpc.clone(), process.clone());
         let mut output = File::from(out_r);
@@ -596,61 +523,6 @@ fn with_path(
         .chain(path.map(|p| ("Path".into(), p)))
 }
 
-/// Variables that describe the terminal the parent runs in. A child that
-/// sees them would believe it runs in that terminal instead of blitz.
-const STRIP_PREFIXES: &[&str] = &[
-    "TERM_PROGRAM",
-    "KITTY_",
-    "GHOSTTY_",
-    "WEZTERM_",
-    "ITERM_",
-    "LC_TERMINAL",
-    "CONEMU",
-    "VSCODE_",
-    "ALACRITTY_",
-    // blitz's own settings, such as BLITZ_CONPTY_DIR and BLITZ_TRACE, are
-    // for the blitz they were set for, not for programs its panes start.
-    "BLITZ_",
-];
-
-const STRIP: &[&str] = &[
-    // TERM changes how Git for Windows tools draw; Windows terminals leave
-    // it unset.
-    "TERM",
-    "WT_SESSION",
-    "WT_PROFILE_ID",
-    "TERMINAL_EMULATOR",
-    "VTE_VERSION",
-    "ZED_TERM",
-    "CURSOR_TRACE_ID",
-    "TILIX_ID",
-    "KONSOLE_VERSION",
-    "GNOME_TERMINAL_SERVICE",
-    "TERMINATOR_UUID",
-    "XTERM_VERSION",
-    "TMUX",
-    "TMUX_PANE",
-    "ZELLIJ",
-    "STY",
-    "COLORTERM",
-    // Set when blitz itself was started from a Claude Code session. Each
-    // pane starts a fresh session, and the messaging token is a secret.
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_REMOTE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_PID",
-    "CLAUDE_EFFORT",
-    "CLAUDE_PLUGIN_DATA",
-    "CLAUDE_PROJECT_DIR",
-    "CLAUDE_ENV_FILE",
-];
-
 /// What WSL passes from a pane into Linux: how blitz describes itself, and
 /// the pane's token, which goes both ways so that a Windows hook run from
 /// Linux gets it back.
@@ -691,9 +563,7 @@ pub fn child_env(
         .into_iter()
         .filter(|(k, v)| {
             let k = upper(k);
-            !STRIP.contains(&k.as_str())
-                && !STRIP_PREFIXES.iter().any(|p| k.starts_with(p))
-                && !(k == "PROMPT" && crate::shell::is_blitz_prompt(v))
+            !foreign(&k) && !(k == "PROMPT" && crate::shell::is_blitz_prompt(v))
         })
         .collect();
     let id = pane_id.to_string();
@@ -748,6 +618,9 @@ pub fn env_block(env: &[(OsString, OsString)]) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
+    use super::super::MAX_PENDING;
     use super::*;
 
     #[test]

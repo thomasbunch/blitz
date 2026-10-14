@@ -20,6 +20,9 @@ path = "src/bin/blitz-hook.rs"
 [dependencies]
 vt = { path = "../vt" }
 
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
 [target.'cfg(windows)'.dependencies]
 winit = "=0.30.13"
 

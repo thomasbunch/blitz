@@ -6,6 +6,8 @@ pub mod config;
 pub mod hook;
 pub mod keymap;
 pub mod layout;
+pub mod pane;
+pub mod pty;
 pub mod render;
 pub mod session;
 pub mod settings;
@@ -24,9 +26,5 @@ pub mod handoff;
 pub mod links;
 #[cfg(windows)]
 pub mod notify;
-#[cfg(windows)]
-pub mod pane;
-#[cfg(windows)]
-pub mod pty;
 #[cfg(windows)]
 pub mod update;

@@ -334,9 +334,14 @@ pub fn git_branch(dir: &Path) -> Option<String> {
             // reading it makes Windows sign in to that host.
             let link = read_start(&git)?;
             let gitdir = d.join(link.strip_prefix("gitdir:")?.trim());
-            match gitdir.components().next() {
-                Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_)) => {}
-                _ => return None,
+            let local = match gitdir.components().next() {
+                Some(Component::Prefix(p)) => matches!(p.kind(), Prefix::Disk(_)),
+                // Outside Windows no path has a prefix, and reading one
+                // signs in nowhere.
+                _ => cfg!(unix) && gitdir.is_absolute(),
+            };
+            if !local {
+                return None;
             }
             gitdir.join("HEAD")
         } else {
@@ -368,9 +373,14 @@ mod tests {
 
     #[test]
     fn pane_program_names() {
-        let pwsh = r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit"#;
-        assert_eq!(program_name(pwsh), "pwsh");
-        assert_eq!(program_name(r"C:\Windows\system32\cmd.exe /d"), "cmd");
+        #[cfg(windows)]
+        {
+            let pwsh = r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit"#;
+            assert_eq!(program_name(pwsh), "pwsh");
+            assert_eq!(program_name(r"C:\Windows\system32\cmd.exe /d"), "cmd");
+        }
+        #[cfg(unix)]
+        assert_eq!(program_name("/opt/homebrew/bin/fish -l"), "fish");
         assert_eq!(program_name("claude"), "claude");
         assert_eq!(program_name(""), "");
     }
@@ -437,11 +447,13 @@ mod tests {
         assert_eq!(git_branch(&wt).as_deref(), Some("side"));
 
         // Only a git dir on a drive is read, not a share or device path.
+        #[cfg(windows)]
         std::fs::write(
             wt.join(".git"),
             format!("gitdir: \\\\?\\{}\n", root.join("meta").display()),
         )
         .expect("link");
+        #[cfg(windows)]
         assert_eq!(git_branch(&wt), None);
 
         // A huge HEAD is not read whole.
@@ -463,7 +475,11 @@ mod tests {
         let pane = Pane::spawn(
             PaneId(7),
             &Spawn {
-                cmdline: "cmd.exe /d /c echo pane-%BLITZ_PANE_ID%",
+                cmdline: if cfg!(windows) {
+                    "cmd.exe /d /c echo pane-%BLITZ_PANE_ID%"
+                } else {
+                    "echo pane-$BLITZ_PANE_ID"
+                },
                 env: &[],
                 cwd: None,
                 cols: 40,
@@ -547,7 +563,11 @@ mod tests {
     /// and output after it shows on a fresh one.
     #[test]
     fn pane_starts_its_screen_over_after_a_panic() {
-        let cmd = "cmd.exe /d /c echo pane-one& ping -n 2 127.0.0.1 >nul& echo pane-two";
+        let cmd = if cfg!(windows) {
+            "cmd.exe /d /c echo pane-one& ping -n 2 127.0.0.1 >nul& echo pane-two"
+        } else {
+            "echo pane-one; sleep 1; echo pane-two"
+        };
         let (pane, notes) = panicking(cmd, 1);
         assert!(notes.contains(&Note::Reset), "{notes:?}");
         assert!(!notes.contains(&Note::Dead), "{notes:?}");
@@ -565,8 +585,15 @@ mod tests {
         let pane = Pane::spawn(
             PaneId(9),
             &Spawn {
-                cmdline: "cmd.exe /d /k echo pane-one",
-                env: &[("PROMPT".into(), "pane-two$G".into())],
+                cmdline: if cfg!(windows) {
+                    "cmd.exe /d /k echo pane-one"
+                } else {
+                    "echo pane-one; exec sh -i"
+                },
+                env: &[
+                    ("PROMPT".into(), "pane-two$G".into()),
+                    ("PS1".into(), "pane-two>".into()),
+                ],
                 cwd: None,
                 cols: 40,
                 rows: 5,
@@ -616,8 +643,12 @@ mod tests {
     /// comes through, so the pane can close.
     #[test]
     fn pane_gives_up_on_the_third_panic_and_still_reports_its_exit() {
-        let pause = "ping -n 2 127.0.0.1 >nul";
-        let cmd = format!("cmd.exe /d /c echo pane-a& {pause}& echo pane-b& {pause}& echo pane-c");
+        let cmd = if cfg!(windows) {
+            let pause = "ping -n 2 127.0.0.1 >nul";
+            format!("cmd.exe /d /c echo pane-a& {pause}& echo pane-b& {pause}& echo pane-c")
+        } else {
+            "echo pane-a; sleep 1; echo pane-b; sleep 1; echo pane-c".into()
+        };
         let (pane, notes) = panicking(&cmd, usize::MAX);
         assert_eq!(notes, [Note::Reset, Note::Reset, Note::Dead, Note::Exit(0)]);
         let text = lock(&pane.term).screen_text();
@@ -687,5 +718,41 @@ mod tests {
         // The first is more than a minute old by now.
         assert!(!gives_up(&mut times, at(61)));
         assert!(gives_up(&mut times, at(62)));
+    }
+
+    /// A whole session outside Windows: the shell's output reaches the
+    /// screen, and its exit reaches the UI thread.
+    #[cfg(unix)]
+    #[test]
+    fn pane_runs_a_session_on_a_pseudo_terminal() {
+        let (tx, rx) = mpsc::channel();
+        let pane = Pane::spawn(
+            PaneId(1),
+            &Spawn {
+                cmdline: "printf '\\033[1mbold\\033[0m\\r\\n%s' \"$BLITZ_PANE_TOKEN\"",
+                env: &[],
+                cwd: None,
+                cols: 30,
+                rows: 4,
+                scrollback: 100,
+                dark: true,
+                pal: crate::theme::dark(),
+                parent: None,
+                token: "0123abcd",
+                restored: &[],
+            },
+            move |_, note| {
+                let _ = tx.send(note);
+            },
+        )
+        .expect("spawn");
+        let exit = std::iter::from_fn(|| rx.recv_timeout(Duration::from_secs(20)).ok())
+            .find(|n| matches!(n, Note::Exit(_)));
+        assert_eq!(exit, Some(Note::Exit(0)));
+        let text = lock(&pane.term).screen_text();
+        assert_eq!(
+            text.lines().take(2).collect::<Vec<_>>(),
+            ["bold", "0123abcd"]
+        );
     }
 }
