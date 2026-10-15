@@ -2,7 +2,7 @@
 
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Component, Path, Prefix};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -325,7 +325,9 @@ pub fn program_name(cmdline: &str) -> String {
 /// Blocks on the drive, so the app calls it off the UI thread.
 pub fn git_branch(dir: &Path) -> Option<String> {
     for d in dir.ancestors() {
-        let git = d.join(".git");
+        // A link from a download can point anywhere, and looking through
+        // it is looking at where it points.
+        let git = local(d, &d.join(".git"))?;
         let head = if git.is_dir() {
             git.join("HEAD")
         } else if git.is_file() {
@@ -333,18 +335,7 @@ pub fn git_branch(dir: &Path) -> Option<String> {
             // A folder from a download can name a share there, and just
             // reading it makes Windows sign in to that host.
             let link = read_start(&git)?;
-            let gitdir = d.join(link.strip_prefix("gitdir:")?.trim());
-            let local = match gitdir.components().next() {
-                Some(Component::Prefix(p)) => matches!(p.kind(), Prefix::Disk(_)),
-                // Outside Windows no path has a prefix, but some folders
-                // mount another machine's on first look, as a Mac's
-                // `/net/<host>` does.
-                _ => cfg!(unix) && gitdir.is_absolute() && !mounts_on_look(&gitdir),
-            };
-            if !local {
-                return None;
-            }
-            gitdir.join("HEAD")
+            local(d, &d.join(link.strip_prefix("gitdir:")?.trim()))?.join("HEAD")
         } else {
             continue;
         };
@@ -358,12 +349,84 @@ pub fn git_branch(dir: &Path) -> Option<String> {
     None
 }
 
-/// Whether looking at `path` can reach another machine: the automounter's
-/// `/net` and `/Network`, and the Mac's `/Volumes`, where shares mount.
-fn mounts_on_look(path: &Path) -> bool {
-    ["/net", "/Network", "/Volumes"]
-        .iter()
-        .any(|root| path.starts_with(root))
+/// `path`, named by a file blitz did not write in folder `d`, when it is
+/// surely on this machine: on Windows a path on a drive. Something right
+/// in `d`, which blitz is already looking at, is as local as `d`.
+#[cfg(windows)]
+fn local(d: &Path, path: &Path) -> Option<PathBuf> {
+    if path.parent() == Some(d) {
+        return Some(path.into());
+    }
+    match path.components().next() {
+        Some(Component::Prefix(p)) if matches!(p.kind(), std::path::Prefix::Disk(_)) => {
+            Some(path.into())
+        }
+        _ => None,
+    }
+}
+
+/// `path`, named by a file blitz did not write in folder `d`, with its
+/// links and `..` followed one step at a time, when it never steps into a
+/// folder that mounts another machine's on first look: the automounter's
+/// `/net/<host>` and `/Network/<host>`, and the Mac's `/Volumes/<share>`.
+/// One `d` is already in is fine.
+#[cfg(unix)]
+fn local(d: &Path, path: &Path) -> Option<PathBuf> {
+    let remote = |p: &Path| {
+        let mut parts = p.components();
+        let root = parts.nth(1)?.as_os_str();
+        let name = parts.next()?;
+        ["net", "Network", "Volumes"]
+            .iter()
+            .any(|r| root == *r)
+            .then(|| Path::new("/").join(root).join(name))
+    };
+    // The parts still to follow, last first, owned as links add their own.
+    let parts = |p: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = p
+            .components()
+            .map(|c| PathBuf::from(c.as_os_str()))
+            .collect();
+        v.reverse();
+        v
+    };
+    let mut out = PathBuf::from("/");
+    let mut rest = parts(path);
+    let (mut hops, mut gone) = (0, false);
+    while let Some(part) = rest.pop() {
+        match part.components().next() {
+            Some(Component::RootDir) => out = PathBuf::from("/"),
+            Some(Component::ParentDir) => {
+                out.pop();
+            }
+            Some(Component::Normal(name)) => {
+                out.push(name);
+                if remote(&out).is_some_and(|r| !d.starts_with(r)) {
+                    return None;
+                }
+                // Past a part that is not there, nothing is there to
+                // look at, but `..` and the folder checks still apply.
+                if gone {
+                    continue;
+                }
+                let Ok(m) = out.symlink_metadata() else {
+                    gone = true;
+                    continue;
+                };
+                if m.file_type().is_symlink() {
+                    hops += 1;
+                    if hops > 40 {
+                        return None;
+                    }
+                    let target = std::fs::read_link(&out).ok()?;
+                    out.pop();
+                    rest.extend(parts(&target));
+                }
+            }
+            _ => {}
+        }
+    }
+    path.is_absolute().then_some(out)
 }
 
 /// The first 4 KiB of a file that should hold one short line. Anything but
@@ -402,11 +465,29 @@ mod tests {
         // SAFETY: a NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         std::fs::write(share.join(".git"), "gitdir: /net/somehost/x\n").expect("write");
+        let (up, down, linked) = (dir.join("up"), dir.join("down"), dir.join("linked"));
+        for d in [&up, &down, &linked] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        std::fs::write(up.join(".git"), "gitdir: /tmp/../net/somehost/x\n").expect("write");
+        std::fs::write(down.join(".git"), "gitdir: ../../../../net/somehost/x\n").expect("write");
+        std::os::unix::fs::symlink("/net/somehost/r/.git", linked.join(".git")).expect("link");
         let (piped, shared) = (git_branch(&repo), git_branch(&share));
+        let tricks = [&up, &down, &linked].map(|d| git_branch(d));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!((piped, shared), (None, None));
-        assert!(mounts_on_look(Path::new("/Volumes/x/.git")));
-        assert!(!mounts_on_look(Path::new("/home/me/src/.git/worktrees/a")));
+        assert_eq!(tricks, [None, None, None]);
+        let here = Path::new("/home/me");
+        assert_eq!(local(here, Path::new("/tmp/../net/x")), None);
+        assert_eq!(local(here, Path::new("/Volumes/x/.git")), None);
+        let drive = Path::new("/Volumes/usb/repo");
+        let sub = Path::new("/Volumes/usb/repo/../repo/.git/modules/a");
+        assert_eq!(
+            local(drive, sub),
+            Some("/Volumes/usb/repo/.git/modules/a".into())
+        );
+        let wt = Path::new("/nowhere/src/.git/worktrees/a");
+        assert_eq!(local(here, wt), Some(wt.into()));
     }
 
     #[test]
