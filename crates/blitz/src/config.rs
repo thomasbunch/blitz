@@ -848,6 +848,8 @@ fn with_value(text: &str, key: &str, value: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    // XDG folders are Unix paths: `/s` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn xdg_folders_must_be_absolute() {
         let got = |vars: &[(&str, &str)], var| {
