@@ -336,9 +336,10 @@ pub fn git_branch(dir: &Path) -> Option<String> {
             let gitdir = d.join(link.strip_prefix("gitdir:")?.trim());
             let local = match gitdir.components().next() {
                 Some(Component::Prefix(p)) => matches!(p.kind(), Prefix::Disk(_)),
-                // Outside Windows no path has a prefix, and reading one
-                // signs in nowhere.
-                _ => cfg!(unix) && gitdir.is_absolute(),
+                // Outside Windows no path has a prefix, but some folders
+                // mount another machine's on first look, as a Mac's
+                // `/net/<host>` does.
+                _ => cfg!(unix) && gitdir.is_absolute() && !mounts_on_look(&gitdir),
             };
             if !local {
                 return None;
@@ -357,10 +358,27 @@ pub fn git_branch(dir: &Path) -> Option<String> {
     None
 }
 
-/// The first 4 KiB of a file that should hold one short line.
+/// Whether looking at `path` can reach another machine: the automounter's
+/// `/net` and `/Network`, and the Mac's `/Volumes`, where shares mount.
+fn mounts_on_look(path: &Path) -> bool {
+    ["/net", "/Network", "/Volumes"]
+        .iter()
+        .any(|root| path.starts_with(root))
+}
+
+/// The first 4 KiB of a file that should hold one short line. Anything but
+/// a plain file, as a pipe that never ends, gives nothing.
 fn read_start(path: &Path) -> Option<String> {
     let mut s = String::new();
-    let file = std::fs::File::open(path).ok()?;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    // Opening a pipe waits for a writer otherwise.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let file = open.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     file.take(4096).read_to_string(&mut s).ok()?;
     Some(s)
 }
@@ -370,6 +388,26 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_branch_never_reads_a_pipe_or_a_share() {
+        let dir = std::env::temp_dir().join(format!("blitz-git-{}", std::process::id()));
+        let repo = dir.join("repo");
+        let share = dir.join("share");
+        std::fs::create_dir_all(repo.join(".git")).expect("dir");
+        std::fs::create_dir_all(&share).expect("dir");
+        let fifo =
+            std::ffi::CString::new(repo.join(".git").join("HEAD").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::fs::write(share.join(".git"), "gitdir: /net/somehost/x\n").expect("write");
+        let (piped, shared) = (git_branch(&repo), git_branch(&share));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((piped, shared), (None, None));
+        assert!(mounts_on_look(Path::new("/Volumes/x/.git")));
+        assert!(!mounts_on_look(Path::new("/home/me/src/.git/worktrees/a")));
+    }
 
     #[test]
     fn pane_program_names() {

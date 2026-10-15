@@ -254,6 +254,8 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, 0x26, Action::JumpToPrompt(1)),
     (CTRL | SHIFT, 0x28, Action::JumpToPrompt(-1)),
     (CTRL | SHIFT, b'F' as u16, Action::Find),
+    // Only Windows has a window menu; elsewhere Alt+Space is Meta+Space.
+    #[cfg(windows)]
     (ALT, 0x20, Action::SystemMenu),
     (CTRL | SHIFT, 0x20, Action::QuickSelect),
 ];
@@ -1104,8 +1106,10 @@ pub fn winit_key<'a>(k: &WinitKey, mut mods: Mods, text: &'a mut String) -> KeyI
     let typed = k.text.as_deref().filter(|t| printable(t)).unwrap_or("");
     let alt = mods.lalt || mods.ralt;
     let shifted = |c: char| c.to_uppercase().collect::<String>();
-    // Option+e and the like: a character of its own, not Meta.
-    let composed = alt
+    // Option+e and the like: a character of its own, not Meta. Only a
+    // Mac's Option types one: elsewhere Alt+Shift+1's `!` is Meta+!.
+    let composed = cfg!(target_os = "macos")
+        && alt
         && !typed.is_empty()
         && base.is_none_or(|b| typed != b.to_string() && typed != shifted(b));
     if composed {
@@ -1115,8 +1119,11 @@ pub fn winit_key<'a>(k: &WinitKey, mut mods: Mods, text: &'a mut String) -> KeyI
     *text = if k.dead { String::new() } else { typed.into() };
     let ctrl = mods.lctrl || mods.rctrl;
     let first = text.chars().next();
+    // With Ctrl, a key gives its control code or none, as on Windows: a
+    // printable one with Ctrl+Alt would read as AltGr typing it.
     let uc = match first {
-        Some(c) if ctrl && c.is_ascii_alphabetic() => c as u16 & 0x1f,
+        Some(c) if ctrl && (c.is_ascii_alphabetic() || ('@'..='_').contains(&c)) => c as u16 & 0x1f,
+        Some(c) if ctrl && c != ' ' => 0,
         _ => text.encode_utf16().next().unwrap_or(0),
     };
 
@@ -1163,7 +1170,9 @@ pub fn winit_key<'a>(k: &WinitKey, mut mods: Mods, text: &'a mut String) -> KeyI
         mods,
         locks: Locks {
             caps,
-            num: false,
+            // winit does not say either; a keypad key that typed something
+            // says it is on.
+            num: (0x60..=0x6f).contains(&physical) && !typed.is_empty(),
             scroll: false,
         },
         text,
@@ -2111,8 +2120,7 @@ mod msg_to_key_tests {
 
     /// Alt+Space opens the window menu, as everywhere else on Windows,
     /// unless a binding gives it back to the program.
-    // Windows' and Linux's chords.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     #[test]
     fn keymap_alt_space_opens_the_window_menu() {
         assert_eq!(press(0x20, &[0xa4]), Some(Action::SystemMenu));
@@ -2146,7 +2154,7 @@ mod msg_to_key_tests {
 
 #[cfg(all(test, not(windows)))]
 mod winit_key_tests {
-    use winit::keyboard::{KeyCode, NamedKey};
+    use winit::keyboard::KeyCode;
 
     use super::*;
 
@@ -2194,6 +2202,7 @@ mod winit_key_tests {
         assert_eq!(k.vk, 0x46);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn option_types_its_own_character_and_is_meta_otherwise() {
         let mut text = String::new();
@@ -2207,7 +2216,7 @@ mod winit_key_tests {
         assert!(k.mods.lalt);
         assert_eq!(k.text, "b");
         let left = WinitKey {
-            named: Some(NamedKey::ArrowLeft),
+            named: Some(winit::keyboard::NamedKey::ArrowLeft),
             text: None,
             ..press(KeyCode::ArrowLeft, "", None)
         };
@@ -2222,6 +2231,59 @@ mod winit_key_tests {
         let ctrl = mods(|m| m.lctrl = true);
         let k = winit_key(&press(KeyCode::KeyC, "c", Some("c")), ctrl, &mut text);
         assert_eq!((k.vk, k.uc, k.text), (0x43, 3, "c"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn alt_is_meta_whatever_shift_types() {
+        let mut text = String::new();
+        let both = mods(|m| (m.lalt, m.lshift) = (true, true));
+        let k = winit_key(&press(KeyCode::Digit1, "1", Some("!")), both, &mut text);
+        assert!(k.mods.lalt);
+        let mut out = Vec::new();
+        vt::encode_key(&k, &Default::default(), &mut out);
+        assert_eq!(out, b"\x1b!");
+    }
+
+    #[test]
+    fn ctrl_gives_a_control_code_or_none() {
+        let mut text = String::new();
+        let ctrl_alt = mods(|m| (m.lctrl, m.lalt) = (true, true));
+        let k = winit_key(
+            &press(KeyCode::BracketLeft, "[", Some("[")),
+            ctrl_alt,
+            &mut text,
+        );
+        assert_eq!(k.uc, 0x1b);
+        let mut out = Vec::new();
+        vt::encode_key(&k, &Default::default(), &mut out);
+        assert_eq!(out, b"\x1b\x1b");
+        let k = winit_key(&press(KeyCode::Digit1, "1", Some("1")), ctrl_alt, &mut text);
+        assert_eq!(k.uc, 0);
+    }
+
+    #[test]
+    fn a_keypad_key_that_types_has_num_lock_on() {
+        let mut text = String::new();
+        let k = winit_key(
+            &press(KeyCode::NumpadAdd, "+", Some("+")),
+            Mods::default(),
+            &mut text,
+        );
+        assert!(k.locks.num);
+        let pam = vt::InputModes {
+            deckpam: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        vt::encode_key(&k, &pam, &mut out);
+        assert_eq!(out, b"+");
+        let k = winit_key(
+            &press(KeyCode::KeyA, "a", Some("a")),
+            Mods::default(),
+            &mut text,
+        );
+        assert!(!k.locks.num);
     }
 
     #[test]

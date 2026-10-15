@@ -34,6 +34,7 @@ pub const DEFAULT_FAMILIES: &[&str] = &[
 const FALLBACK_FAMILIES: &[&str] = &[
     "Menlo",
     "Apple Symbols",
+    "Apple Color Emoji",
     "Arial Unicode MS",
     "PingFang SC",
     "Hiragino Sans",
@@ -49,6 +50,7 @@ const FALLBACK_FAMILIES: &[&str] = &[
     "Noto Sans Symbols 2",
     "Noto Sans CJK SC",
     "Noto Sans CJK JP",
+    "Noto Color Emoji",
     "Noto Sans Math",
     "FreeSerif",
     "FreeMono",
@@ -160,6 +162,31 @@ fn face_of(family: &str, style: u8) -> Option<Face> {
         slant: style & ITALIC != 0 && info.style == fontdb::Style::Normal,
     };
     face.font().is_some().then_some(face)
+}
+
+/// The face fontconfig picks for `c` when no family listed has it, as an
+/// installed CJK font none of [`FALLBACK_FAMILIES`] names.
+#[cfg(not(target_os = "macos"))]
+fn covering(c: char, style: u8) -> Option<Face> {
+    let pattern = format!("monospace:charset={:x}", u32::from(c));
+    let mut cmd = std::process::Command::new(crate::desktop::tool("fc-match")?);
+    cmd.args(["-f", "%{file}\n%{index}", &pattern]);
+    let out = crate::desktop::output_within(&mut cmd, std::time::Duration::from_secs(1), 4096)?;
+    let out = String::from_utf8(out).ok()?;
+    let (path, index) = out.split_once('\n')?;
+    let face = Face {
+        data: file(&PathBuf::from(path))?,
+        index: index.trim().parse().ok()?,
+        embolden: style & BOLD != 0,
+        slant: style & ITALIC != 0,
+    };
+    (face.font().is_some() && face.glyph(c) != 0).then_some(face)
+}
+
+/// The Mac's fallback list covers what it ships with.
+#[cfg(target_os = "macos")]
+fn covering(_c: char, _style: u8) -> Option<Face> {
+    None
 }
 
 /// The names of the font families installed, sorted, each with whether it
@@ -328,9 +355,13 @@ impl Font {
             }
         }
         let cells = (self.cell_w * u32::from(width.max(1))) as f32;
+        // A colour glyph, as an emoji, draws as its shape in the text's
+        // colour.
         let sources = [
             Source::Outline,
             Source::Bitmap(swash::scale::StrikeWith::BestFit),
+            Source::ColorOutline(0),
+            Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
         ];
         let transform = face.slant.then(|| {
             Transform::skew(
@@ -394,9 +425,15 @@ impl Font {
         for (img, x) in &images {
             let p = img.placement;
             let (ox, oy) = (x + p.left - l, -p.top - t);
+            // A colour image's coverage is its alpha.
+            let (step, at) = match img.content {
+                swash::scale::image::Content::Mask => (1, 0),
+                swash::scale::image::Content::Color => (4, 3),
+                swash::scale::image::Content::SubpixelMask => (4, 1),
+            };
             for row in 0..p.height as i32 {
                 for col in 0..p.width as i32 {
-                    let src = img.data[(row * p.width as i32 + col) as usize];
+                    let src = img.data[(row * p.width as i32 + col) as usize * step + at];
                     let i = ((oy + row) * w as i32 + ox + col) as usize;
                     alpha[i] = alpha[i].max(src);
                 }
@@ -424,7 +461,8 @@ impl Font {
         let nerd = is_private(c).then(nerd_family).flatten();
         let face = (nerd.into_iter().chain(FALLBACK_FAMILIES.iter().copied()))
             .filter_map(|f| face_of(f, style))
-            .find(|f| f.glyph(c) != 0);
+            .find(|f| f.glyph(c) != 0)
+            .or_else(|| covering(c, style));
         self.fallbacks.insert((c, style), face.clone());
         Ok(face)
     }
@@ -441,6 +479,27 @@ mod tests {
                 println!("SKIPPED: {e}");
                 None
             }
+        }
+    }
+
+    /// A character only an unlisted or colour font has still draws, when
+    /// one is installed.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn any_installed_font_that_has_it_draws_it() {
+        let Some(mut f) = font() else { return };
+        for (c, hex) in [("中", "4e2d"), ("👍", "1f44d")] {
+            let listed = std::process::Command::new("fc-list")
+                .arg(format!(":charset={hex}"))
+                .output()
+                .is_ok_and(|o| !o.stdout.is_empty());
+            if !listed {
+                println!("SKIPPED: no font has {c}");
+                continue;
+            }
+            f.lookups = 8;
+            let r = f.raster(c, 0, 2).expect("raster");
+            assert!(r.is_some_and(|r| r.alpha.iter().any(|&a| a > 200)), "{c}");
         }
     }
 

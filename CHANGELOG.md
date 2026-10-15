@@ -13,8 +13,9 @@ for macOS. Linux builds are experimental.
 ### macOS and Linux
 
 - blitz runs on macOS 11 or later, as a universal `blitz.app` for Apple
-  silicon and Intel. It is not notarized yet: right-click it and choose
-  **Open** the first time.
+  silicon and Intel. It is not notarized yet, so macOS stops the first
+  start: choose **Open Anyway** in System Settings, Privacy & Security, or
+  run `xattr -d com.apple.quarantine /Applications/blitz.app`.
 - An experimental Linux x64 build. It passes CI on Ubuntu but has had no
   other testing, so please report what breaks.
 - Shortcuts on a Mac use Cmd, as Terminal does: **Cmd+T** opens a tab,

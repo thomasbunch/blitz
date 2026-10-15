@@ -86,9 +86,13 @@ says why the last look or update failed.
 macOS 11 or later, Apple silicon or Intel. From
 [Releases](https://github.com/thomasbunch/blitz/releases), unzip
 `-macos.zip` and drag `blitz.app` to Applications. The app is not
-notarized yet, so the first time, right-click it and choose **Open**,
-then **Open** again; after that it starts like any other app. If macOS
-still refuses, run `xattr -d com.apple.quarantine /Applications/blitz.app`.
+notarized yet, so macOS stops it the first time. On macOS 15 or later,
+open System Settings, Privacy & Security, and choose **Open Anyway** under
+the note about blitz; on older versions, right-click the app and choose
+**Open**, then **Open** again. Either way, after that it starts like any
+other app. Or, from a terminal, run
+`xattr -d com.apple.quarantine /Applications/blitz.app` before the first
+start.
 
 The shell is your login shell (`$SHELL`, usually zsh). Shortcuts use Cmd
 where Windows uses Ctrl or Ctrl+Shift; see [Default keys](#default-keys).
@@ -500,7 +504,7 @@ that, or typing, goes back to the bottom.
 | Ctrl+Shift+Space | Quick select a link, path or hash to copy or open |
 | Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
-On Linux the keys are the same, but for Alt+Space, which does nothing.
+On Linux the keys are the same, but for Alt+Space, which goes to the program.
 On macOS shortcuts take Cmd, as in Terminal, and every Ctrl key goes to
 the program:
 

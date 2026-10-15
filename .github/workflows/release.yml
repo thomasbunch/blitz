@@ -238,10 +238,16 @@ jobs:
           if-no-files-found: error
 
   # One app for Apple silicon and Intel Macs. Signed ad hoc, not by a
-  # developer ID, so the first start needs Open from the Finder's menu.
+  # developer ID, so the first start needs Open Anyway in System Settings.
   macos:
     runs-on: macos-latest
     timeout-minutes: 30
+    env:
+      # Both slices claim what Info.plist does.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -350,6 +356,9 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

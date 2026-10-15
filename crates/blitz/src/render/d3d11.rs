@@ -440,9 +440,11 @@ impl Swapchain {
     }
 
     /// The current back buffer's render target view.
-    pub fn rtv(&mut self, gpu: &Gpu) -> Result<ID3D11RenderTargetView> {
+    /// The back buffer to draw to. Always one: a hidden window still has
+    /// its back buffer here.
+    pub fn rtv(&mut self, gpu: &Gpu) -> Result<Option<ID3D11RenderTargetView>> {
         if let Some(rtv) = &self.rtv {
-            return Ok(rtv.clone());
+            return Ok(Some(rtv.clone()));
         }
         let mut rtv = None;
         // SAFETY: COM calls on live objects.
@@ -452,7 +454,7 @@ impl Swapchain {
                 .CreateRenderTargetView(&back, None, Some(&mut rtv))?;
         }
         self.rtv = rtv.clone();
-        rtv.ok_or_else(|| E_FAIL.into())
+        rtv.ok_or_else(|| E_FAIL.into()).map(Some)
     }
 
     pub fn resize(&mut self, gpu: &Gpu, w: u32, h: u32) -> Result<()> {
@@ -688,7 +690,7 @@ mod tests {
 
     fn present_one(gpu: &mut Gpu, chain: &mut Swapchain) {
         chain.wait(100);
-        let rtv = chain.rtv(gpu).expect("back buffer");
+        let rtv = chain.rtv(gpu).expect("back buffer").expect("one");
         let quad = Quad {
             size: [8, 8],
             color: rgba(0xffffff),

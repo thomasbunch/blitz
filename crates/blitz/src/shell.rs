@@ -10,14 +10,11 @@ use std::sync::{Mutex, PoisonError};
 /// PowerShell, then `%ComSpec%`. Looked up again when a new pane's PATH
 /// changed, so one installed while blitz runs is found.
 ///
-/// Outside Windows it is the login shell from `SHELL`, which a pane starts
-/// for an empty command line.
+/// Outside Windows it is the login shell, which a pane starts for an empty
+/// command line.
 #[cfg(not(windows))]
 pub fn detect() -> PathBuf {
-    std::env::var_os("SHELL")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| "/bin/sh".into())
+    crate::pty::user_shell()
 }
 
 #[cfg(windows)]

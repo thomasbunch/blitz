@@ -281,7 +281,8 @@ impl Taskbar {
 }
 
 /// Keeps the computer from going to sleep by itself while on: through
-/// macOS's activity, or on Linux `systemd-inhibit` where there is one.
+/// macOS's activity, or on Linux `systemd-inhibit` where there is one. A
+/// sleep the user asks for still happens.
 #[derive(Default)]
 pub struct Awake {
     #[cfg(target_os = "macos")]
@@ -319,6 +320,11 @@ impl Awake {
                 }
                 return true;
             }
+            // One that ended already, as without logind, holds nothing.
+            if (self.inhibit.as_mut()).is_some_and(|c| !matches!(c.try_wait(), Ok(None))) {
+                self.inhibit = None;
+                return false;
+            }
             if self.inhibit.is_none() {
                 self.inhibit = inhibit();
             }
@@ -342,7 +348,8 @@ fn inhibit() -> Option<Child> {
     let cat = tool("cat")?;
     Command::new(tool("systemd-inhibit")?)
         .args([
-            "--what=idle:sleep",
+            // Idle sleep only: a suspend the user asks for still happens.
+            "--what=idle",
             "--who=blitz",
             "--why=A session is working",
             "--mode=block",

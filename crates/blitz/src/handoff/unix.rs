@@ -63,10 +63,44 @@ fn decode(bytes: &[u8]) -> Option<Ask> {
     (bytes.len() <= MAX_BYTES && vt::osc::local_dir(text)).then(|| Ask::Open(text.into()))
 }
 
+/// The socket this launch took in [`send`], as no blitz was listening, for
+/// [`install`] to listen on once the window is up.
+static CLAIMED: std::sync::Mutex<Option<UnixListener>> = std::sync::Mutex::new(None);
+
+/// A connection to the blitz listening at `path`, or `None` when there is
+/// none, after this launch took the socket. Taking it first means two
+/// launches at once, as a double click starts, cannot both become the
+/// main window: the second finds the first's socket.
+fn connect_or_claim(path: &Path) -> Option<UnixStream> {
+    for _ in 0..2 {
+        match UnixListener::bind(path) {
+            Ok(l) => {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                *CLAIMED
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l);
+                return None;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                match UnixStream::connect(path) {
+                    Ok(s) => return Some(s),
+                    // Left by a blitz that is gone.
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    Err(_) => return None,
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// Sends this launch, and `dir` when it names one, to the running blitz.
 /// `None` when blitz is not running, else whether it took the launch.
 pub fn send(dir: Option<&Path>) -> Option<bool> {
-    let mut s = UnixStream::connect(socket()?).ok()?;
+    let mut s = connect_or_claim(&socket()?)?;
     let _ = s.set_read_timeout(Some(TIMEOUT));
     let _ = s.set_write_timeout(Some(TIMEOUT));
     // The receiver's directory is not ours.
@@ -101,19 +135,21 @@ pub fn forget_activating_click() {}
 /// `UserEvent::Handoff`. A socket left by a blitz that is gone is taken
 /// over.
 pub fn install(_hwnd: isize, proxy: EventLoopProxy<UserEvent>, launches: bool) {
+    let claimed = CLAIMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     let Some(path) = socket().filter(|_| launches) else {
         return;
     };
-    // `send` found no blitz answering there before this window opened.
-    let _ = std::fs::remove_file(&path);
-    let Ok(listener) = UnixListener::bind(&path) else {
+    // `send` took the socket when no blitz answered there.
+    let Some(listener) = claimed else {
         eprintln!(
             "blitz: cannot listen for other launches at {}",
             path.display()
         );
         return;
     };
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     std::thread::spawn(move || {
         for s in listener.incoming() {
             let Ok(mut s) = s else {
@@ -147,6 +183,20 @@ mod tests {
         }
         let long = format!("/{}", "a".repeat(MAX_BYTES));
         assert_eq!(decode(long.as_bytes()), None);
+    }
+
+    #[test]
+    fn handoff_the_first_launch_takes_the_socket() {
+        let dir = std::env::temp_dir().join(format!("blitz-handoff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("t.sock");
+        // A socket left by a blitz that is gone is taken over.
+        drop(UnixListener::bind(&path).expect("stale"));
+        assert!(connect_or_claim(&path).is_none(), "the first takes it");
+        assert!(connect_or_claim(&path).is_some(), "the second finds it");
+        let held = CLAIMED.lock().expect("lock").take();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(held.is_some());
     }
 
     #[test]

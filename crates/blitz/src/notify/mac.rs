@@ -11,9 +11,9 @@ use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability};
 use objc2_app_kit::NSApplication;
 use objc2_foundation::{MainThreadMarker, NSArray, NSBundle, NSError, NSString};
 use objc2_user_notifications::{
-    UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
-    UNNotificationResponse, UNNotificationSound, UNUserNotificationCenter,
-    UNUserNotificationCenterDelegate,
+    UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
+    UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
+    UNNotificationSound, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
 };
 use winit::event_loop::EventLoopProxy;
 
@@ -40,9 +40,26 @@ declare_class!(
         type Ivars = EventLoopProxy<UserEvent>;
     }
 
+    // SAFETY: NSObject already conforms; Delegate adds nothing to it.
     unsafe impl NSObjectProtocol for Delegate {}
 
+    // SAFETY: the methods below have the protocol's selectors and types.
     unsafe impl UNUserNotificationCenterDelegate for Delegate {
+        /// A notification while blitz is in front, as when the user is
+        /// away from it, shows as one in the background does. Without this
+        /// macOS shows nothing.
+        #[method(userNotificationCenter:willPresentNotification:withCompletionHandler:)]
+        fn will_present(
+            &self,
+            _center: &UNUserNotificationCenter,
+            _notification: &UNNotification,
+            done: &block2::Block<dyn Fn(UNNotificationPresentationOptions)>,
+        ) {
+            done.call((UNNotificationPresentationOptions::UNNotificationPresentationOptionBanner
+                | UNNotificationPresentationOptions::UNNotificationPresentationOptionList
+                | UNNotificationPresentationOptions::UNNotificationPresentationOptionSound,));
+        }
+
         #[method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:)]
         fn did_receive(
             &self,

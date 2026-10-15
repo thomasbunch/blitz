@@ -26,8 +26,14 @@ pub fn has_image() -> bool {
     has(&types)
 }
 
-/// The pasteboard's text, or `None` when it holds no text.
+/// The pasteboard's text, or `None` when it holds no text. Files copied in
+/// the Finder come with their names as text, but paste as their paths;
+/// see [`get_files`].
 pub fn get_text() -> Option<String> {
+    // SAFETY: the type name is AppKit's constant.
+    if has(&[unsafe { NSPasteboardTypeFileURL }]) {
+        return None;
+    }
     // SAFETY: as in `has`; the string is copied out before it is released.
     unsafe {
         let pb = NSPasteboard::generalPasteboard();

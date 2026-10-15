@@ -705,10 +705,21 @@ pub fn dir() -> Option<PathBuf> {
 /// The folder an XDG variable `var` names, when it is an absolute path, or
 /// else `fallback` in the home folder.
 pub fn xdg(var: Option<&str>, fallback: &str) -> Option<PathBuf> {
-    let set = var.and_then(std::env::var_os).map(PathBuf::from);
+    xdg_with(|k| std::env::var_os(k), var, fallback)
+}
+
+/// [`xdg`] with the environment supplied by the caller. An empty or
+/// relative value is ignored, as the XDG rules say: it would name a folder
+/// under whichever one blitz started in.
+fn xdg_with(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    var: Option<&str>,
+    fallback: &str,
+) -> Option<PathBuf> {
+    let set = var.and_then(&env).map(PathBuf::from);
     match set.filter(|d| d.is_absolute()) {
         Some(d) => Some(d),
-        None => std::env::var_os("HOME")
+        None => env("HOME")
             .map(PathBuf::from)
             .filter(|h| h.is_absolute())
             .map(|h| h.join(fallback)),
@@ -836,6 +847,28 @@ fn with_value(text: &str, key: &str, value: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xdg_folders_must_be_absolute() {
+        let got = |vars: &[(&str, &str)], var| {
+            let vars: Vec<(String, String)> = (vars.iter())
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect();
+            let env = move |k: &str| vars.iter().find(|v| v.0 == k).map(|v| v.1.clone().into());
+            xdg_with(env, var, ".local/state")
+        };
+        let state = Some("XDG_STATE_HOME");
+        let home = Some(PathBuf::from("/home/me/.local/state"));
+        let set = [("XDG_STATE_HOME", "/s"), ("HOME", "/home/me")];
+        assert_eq!(got(&set, state), Some("/s".into()));
+        for bad in ["", "rel", "./s"] {
+            let set = [("XDG_STATE_HOME", bad), ("HOME", "/home/me")];
+            assert_eq!(got(&set, state), home, "{bad:?}");
+        }
+        assert_eq!(got(&[("HOME", "/home/me")], None), home);
+        assert_eq!(got(&[("HOME", "me")], state), None, "a relative HOME");
+        assert_eq!(got(&[], state), None);
+    }
 
     #[test]
     fn config_reads_bools() {

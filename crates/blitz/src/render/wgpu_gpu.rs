@@ -93,6 +93,13 @@ impl Gpu {
             let mut first = to.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             first.get_or_insert_with(|| e.to_string());
         }));
+        // A lost device, as a GPU reset or an external one unplugged, is made
+        // again as an error is.
+        let to = failed.clone();
+        device.set_device_lost_callback(move |_why, e| {
+            let mut first = to.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            first.get_or_insert(e);
+        });
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
@@ -315,7 +322,10 @@ impl Gpu {
                 g2,
                 g3,
             ];
-            let bytes: Vec<u8> = frame.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let mut bytes = [0u8; 32];
+            for (b, f) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(frame) {
+                *b = f.to_le_bytes();
+            }
             self.queue.write_buffer(&self.frame, 0, &bytes);
         }
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -346,6 +356,9 @@ impl Gpu {
     }
 
     pub fn offscreen(&self, w: u32, h: u32) -> Result<Offscreen> {
+        if self.fit(w, h) != (w, h) {
+            return Err(format!("{w}x{h} is larger than the GPU draws").into());
+        }
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
             size: wgpu::Extent3d {
@@ -444,6 +457,9 @@ pub struct Swapchain {
     /// The frame being drawn, from [`Swapchain::rtv`] until it is
     /// presented.
     frame: Option<(wgpu::SurfaceTexture, wgpu::TextureView)>,
+    /// The surface no longer matches the window as well as it could, and
+    /// is made again once its frame is shown.
+    stale: bool,
     pub w: u32,
     pub h: u32,
 }
@@ -487,24 +503,35 @@ impl Swapchain {
             surface,
             config,
             frame: None,
+            stale: false,
             w,
             h,
         })
     }
 
     /// The view of the frame to draw: the one being drawn, or the next.
-    pub fn rtv(&mut self, gpu: &Gpu) -> Result<wgpu::TextureView> {
+    /// None when there is none to draw now: the window is hidden, as it is
+    /// until its first frame on a Mac, or the compositor is slow. Its next
+    /// redraw tries again.
+    pub fn rtv(&mut self, gpu: &Gpu) -> Result<Option<wgpu::TextureView>> {
         if let Some((_, view)) = &self.frame {
-            return Ok(view.clone());
+            return Ok(Some(view.clone()));
         }
         let mut again = true;
         let texture = loop {
             match self.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => break t,
+                wgpu::CurrentSurfaceTexture::Success(t) => break t,
+                // Drawn as it is; the surface is made again for the next.
+                wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                    self.stale = true;
+                    break t;
+                }
                 wgpu::CurrentSurfaceTexture::Outdated if again => {
                     again = false;
                     self.surface.configure(&gpu.device, &self.config);
+                }
+                wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+                    return Ok(None);
                 }
                 wgpu::CurrentSurfaceTexture::Lost => return Err(Lost.into()),
                 other => return Err(format!("no frame to draw: {other:?}").into()),
@@ -512,7 +539,7 @@ impl Swapchain {
         };
         let view = texture.texture.create_view(&Default::default());
         self.frame = Some((texture, view.clone()));
-        Ok(view)
+        Ok(Some(view))
     }
 
     pub fn resize(&mut self, gpu: &Gpu, w: u32, h: u32) -> Result<()> {
@@ -540,6 +567,9 @@ impl Swapchain {
             return Ok(false);
         };
         gpu.queue.present(texture);
+        if std::mem::take(&mut self.stale) {
+            self.surface.configure(&gpu.device, &self.config);
+        }
         // Made again, the renderer starts from what it knows is sound.
         if gpu.failure().is_some() {
             return Err(Lost.into());

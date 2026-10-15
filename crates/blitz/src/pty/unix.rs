@@ -147,20 +147,49 @@ fn account_shell() -> Option<OsString> {
     }
 }
 
+/// The shell a pane starts with no command: `SHELL`, or the one the
+/// account names for an app started from the Finder or the Dock, which
+/// has no SHELL.
+pub fn user_shell() -> PathBuf {
+    login_shell(std::env::var_os("SHELL").or_else(account_shell))
+}
+
+/// `cmdline` as `/bin/sh -c` gets it: a single command replaces the shell,
+/// so the program is the pane's own process, gets Ctrl+C and the hangup
+/// itself, and its exit code is the pane's. dash keeps itself around
+/// otherwise, and dies of a Ctrl+C its program caught. A line that is more
+/// than one command, or starts with a word `exec` would not run, stays as
+/// it is.
+fn sh_line(cmdline: &str) -> String {
+    // Shell words, and builtins with no program of their name to run.
+    const WORDS: &[&str] = &[
+        "!", "{", "}", "[[", "case", "do", "done", "elif", "else", "esac", "fi", "for", "function",
+        "if", "in", "select", "then", "time", "until", "while", "exec", ".", "alias", "cd", "eval",
+        "exit", "export", "local", "read", "readonly", "return", "set", "shift", "source", "trap",
+        "ulimit", "umask", "unset", "wait",
+    ];
+    let line = cmdline.trim();
+    let first = line.split([' ', '\t']).next().unwrap_or_default();
+    let several = line.contains([';', '&', '|', '\n', '(', ')', '`']);
+    if several || first.contains('=') || WORDS.contains(&first) {
+        line.to_owned()
+    } else {
+        format!("exec {line}")
+    }
+}
+
 /// `cmdline` run by `/bin/sh`, or with none, the login shell as a login
 /// shell, as terminals on macOS start it, so its profile sets `PATH`.
 fn command(cmdline: &str) -> Command {
     if cmdline.trim().is_empty() {
-        // An app started from the Finder or the Dock has no SHELL; the
-        // user's account names it.
-        let shell = login_shell(std::env::var_os("SHELL").or_else(account_shell));
+        let shell = user_shell();
         let name = shell.file_name().unwrap_or_default().to_string_lossy();
         let mut c = Command::new(&shell);
         c.arg0(format!("-{name}"));
         c
     } else {
         let mut c = Command::new("/bin/sh");
-        c.arg("-c").arg(cmdline);
+        c.arg("-c").arg(sh_line(cmdline));
         c
     }
 }
@@ -212,6 +241,22 @@ fn signal(child: &Mutex<Child>, sig: libc::c_int) {
 /// its standard input as its controlling one, so job control works and a
 /// hangup reaches it.
 fn take_terminal() -> io::Result<()> {
+    // A signal blitz was started ignoring, as under nohup, is the
+    // program's again: otherwise Ctrl+C and closing the pane do nothing.
+    for sig in [
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTERM,
+        libc::SIGCHLD,
+        libc::SIGALRM,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+    ] {
+        // SAFETY: async-signal-safe, with the default action.
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
+    }
     // SAFETY: plain syscall.
     if unsafe { libc::setsid() } < 0 {
         return Err(io::Error::last_os_error());
@@ -314,11 +359,28 @@ impl Pty {
             return;
         }
         let child = self.child.clone();
+        let master = self.master.try_clone().ok();
+        // A job the shell started runs in a group of its own, which a signal
+        // to the child's misses: the terminal's foreground group gets it too.
+        let foreground = move |sig| {
+            if let Some(m) = &master {
+                // SAFETY: plain calls on an open terminal; a group of this
+                // session, or none.
+                unsafe {
+                    let group = libc::tcgetpgrp(m.as_raw_fd());
+                    if group > 0 {
+                        libc::kill(-group, sig);
+                    }
+                }
+            }
+        };
         let _ = std::thread::Builder::new()
             .name("pty-close".into())
             .spawn(move || {
+                foreground(libc::SIGHUP);
                 signal(&child, libc::SIGHUP);
                 if wait(&child, CLOSE_GRACE).is_none() {
+                    foreground(libc::SIGKILL);
                     signal(&child, libc::SIGKILL);
                     // Reaped, so it does not stay a zombie until blitz exits.
                     let _ = wait(&child, CLOSE_GRACE);
@@ -527,6 +589,75 @@ mod tests {
             assert_eq!(get(gone), None, "{gone}");
         }
         assert_eq!(env.iter().filter(|(k, _)| k == "EDITOR").count(), 1);
+    }
+
+    #[test]
+    fn a_single_command_replaces_sh() {
+        assert_eq!(sh_line(" python3 -q "), "exec python3 -q");
+        assert_eq!(sh_line("/bin/zsh -l"), "exec /bin/zsh -l");
+        for kept in [
+            "a; b",
+            "a && b",
+            "a | b",
+            "(a)",
+            "FOO=1 a",
+            "exit 5",
+            "if true; then a; fi",
+            "exec sleep 1",
+            "read x",
+        ] {
+            assert_eq!(sh_line(kept), kept);
+        }
+    }
+
+    #[test]
+    fn the_program_gets_ctrl_c_and_its_exit_code_is_the_panes() {
+        // sh's trap stands in for a program that catches Ctrl+C, as Python
+        // does; the line is one command, so it replaces the outer sh.
+        let script = "trap 'exit 5' INT; echo ready; while :; do sleep 0.05; done";
+        let env = [("S".to_string(), script.to_string())];
+        let (pty, rx) = spawn(&SpawnOpts {
+            cmdline: "sh -c \"$S\"",
+            env: &env,
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        });
+        wait_for(&rx, "ready");
+        pty.writer().send(b"\x03".to_vec());
+        let (_, code) = finish(&rx);
+        assert_eq!(code, 5);
+    }
+
+    #[test]
+    fn closing_ends_a_job_in_a_group_of_its_own() {
+        // An interactive shell runs its job in a group of its own, and
+        // neither hears the hangup.
+        let script = "trap '' HUP; echo ready; sleep 123";
+        let env = [("S".to_string(), script.to_string())];
+        let (pty, rx) = spawn(&SpawnOpts {
+            cmdline: "/bin/sh -i -c \"$S\"",
+            env: &env,
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        });
+        wait_for(&rx, "ready");
+        std::thread::sleep(Duration::from_millis(200));
+        pty.close();
+        let (_, code) = finish(&rx);
+        assert_eq!(code, 128 + libc::SIGKILL as u32);
+    }
+
+    /// Reads output until it shows `what`.
+    fn wait_for(rx: &mpsc::Receiver<Got>, what: &str) {
+        let mut out = Vec::new();
+        while !String::from_utf8_lossy(&out).contains(what) {
+            match rx.recv_timeout(Duration::from_secs(20)).expect("output") {
+                Got::Data(b) => out.extend(b),
+                Got::Exit(c) => panic!("exited {c}: {}", String::from_utf8_lossy(&out)),
+            }
+        }
     }
 
     #[test]

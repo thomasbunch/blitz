@@ -1380,6 +1380,8 @@ impl Commands {
         let mut rows: Vec<(Pick, String)> = Vec::new();
         let actions = (keymap::ACTIONS.iter())
             .filter(|a| !matches!(a.0, Action::Palette | Action::GoToTab(_) | Action::LastTab))
+            // Only Windows has a window menu to open.
+            .filter(|a| cfg!(windows) || a.0 != Action::SystemMenu)
             .filter(|a| !self.hidden.contains(&a.0));
         for &(a, name, label) in actions {
             if hit(format!("{label} {name}")) {
@@ -3366,21 +3368,6 @@ impl App {
     fn winit_key(&mut self, ev: &winit::event::KeyEvent) {
         let mut text = String::new();
         let input = keymap::winit_key(&keymap::WinitKey::of(ev), mods_now(), &mut text);
-        let modifier = matches!(
-            input.key,
-            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
-        );
-        // A Cmd chord blitz has no use for does nothing, as in other Mac
-        // apps, rather than type its letter.
-        let cmd = input.mods.lsuper || input.mods.rsuper;
-        if cfg!(target_os = "macos")
-            && cmd
-            && input.down
-            && !modifier
-            && keymap::action(&input, &self.config.keys).is_none()
-        {
-            return;
-        }
         let queued = Input::Key(owned(&input), text.clone(), ev.repeat);
         self.keys.borrow_mut().queue.push(queued);
     }
@@ -3562,6 +3549,13 @@ impl App {
         // Nor do jumps already on their way when it closed.
         let since = self.game_ended.map(|t| t.elapsed());
         if k.down && late_jump(k.vk, since) {
+            self.eaten.press(k.vk);
+            return;
+        }
+        // A Cmd chord is the Mac's, as in other Mac apps: one that did
+        // nothing, as Cmd+C with nothing selected, does not type its letter,
+        // and its release goes nowhere either.
+        if k.down && !modifier && cmd_stays(k) {
             self.eaten.press(k.vk);
             return;
         }
@@ -5633,7 +5627,11 @@ impl App {
                     });
                 }
                 g.r.chrome(&chrome);
-                let rtv = g.chain.rtv(&g.r.gpu)?;
+                // No frame to draw while the window is hidden: winit says
+                // when it shows again.
+                let Some(rtv) = g.chain.rtv(&g.r.gpu)? else {
+                    return Ok(false);
+                };
                 if !g.r.draw(&rtv, size.width, size.height, pal.bg)? {
                     break;
                 }
@@ -7108,6 +7106,11 @@ fn first_line(text: &str) -> String {
 /// not, when there is one, or else the text of one output rewrote
 /// (`orphan`), which shows nowhere. Plain Ctrl+C is the interrupt too, so
 /// it copies only what the user can see; the other copy keys always copy.
+/// Whether `k` is a Cmd chord, which on a Mac never reaches the program.
+fn cmd_stays(k: &KeyInput) -> bool {
+    cfg!(target_os = "macos") && (k.mods.lsuper || k.mods.rsuper)
+}
+
 fn copy_key_copies(k: &KeyInput, shown: Option<bool>, orphan: bool) -> bool {
     shown.or(orphan.then_some(false)) != Some(false) || !vt::keys::is_interrupt(k)
 }
@@ -7524,6 +7527,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             WindowEvent::Moved(_) => self.note_place(),
+            // A frame skipped while the window was hidden is drawn now.
+            WindowEvent::Occluded(false) => self.request_redraw(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;
                 // The cursor's cell stays, but its pixels move.
@@ -10583,7 +10588,9 @@ mod tests {
     fn palette_matches_every_word_of_the_label_or_name() {
         let mut c = Commands::default();
         let run = |a| (Pick::Run(a), keymap::label(a).to_string());
-        assert_eq!(c.matches().len(), keymap::ACTIONS.len() - 10, "not itself");
+        // Not itself, and the window menu only on Windows.
+        let listed = keymap::ACTIONS.len() - if cfg!(windows) { 10 } else { 11 };
+        assert_eq!(c.matches().len(), listed, "not itself");
         c.filter = "tab".into();
         assert!(c.matches().iter().all(|m| m.1 != "Go to the last tab"));
         c.filter = "Split R".into();
@@ -10672,11 +10679,8 @@ mod tests {
         );
         assert_eq!(c.matches(), [search]);
         c.filter = "  ".into();
-        assert_eq!(
-            c.matches().len(),
-            keymap::ACTIONS.len() - 10,
-            "nothing typed"
-        );
+        let listed = keymap::ACTIONS.len() - if cfg!(windows) { 10 } else { 11 };
+        assert_eq!(c.matches().len(), listed, "nothing typed");
     }
 
     #[test]
@@ -10832,6 +10836,16 @@ mod tests {
             assert!(copy_key_copies(&k, Some(false), false));
             assert!(copy_key_copies(&k, None, true));
         }
+        // Cmd+C with nothing to copy types no `c` on a Mac.
+        let cmd_c = KeyInput {
+            mods: vt::Mods {
+                lsuper: true,
+                ..Default::default()
+            },
+            ..ctrl_c
+        };
+        assert_eq!(cmd_stays(&cmd_c), cfg!(target_os = "macos"));
+        assert!(!cmd_stays(&ctrl_c));
     }
 
     #[test]
