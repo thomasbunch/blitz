@@ -678,6 +678,12 @@ mod tests {
         wait_for(&rx, "ready");
         pty.close();
         let _ = finish(&rx);
+        // A Mac ends the pane when the shell ends, as the terminal goes
+        // with its session, so the job may still be cleaning up.
+        let started = Instant::now();
+        while !marker.exists() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let cleaned = marker.exists();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(cleaned, "the job was killed before it cleaned up");
