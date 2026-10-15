@@ -505,8 +505,8 @@ that, or typing, goes back to the bottom.
 | Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
 On Linux the keys are the same, but for Alt+Space, which goes to the program.
-On macOS shortcuts take Cmd, as in Terminal, and every Ctrl key goes to
-the program:
+On macOS shortcuts take Cmd, as in Terminal, and Ctrl keys go to the
+program, but for the few in the table:
 
 | Keys | Action |
 |---|---|

@@ -3,7 +3,8 @@
 
 /// Width and height of the glyph atlas texture: room for a 4K screen of
 /// distinct wide glyphs, so a full one never clears it every frame.
-/// Direct3D feature level 10_0 and wgpu's default limits allow 8192.
+/// Direct3D feature level 10_0 allows 8192; under wgpu the adapter's
+/// own limit decides, and every GPU blitz runs on reports at least 4096.
 pub const ATLAS_SIZE: u32 = 4096;
 
 /// The four alpha-correction constants the shader needs for a text
@@ -60,6 +61,9 @@ pub struct Quad {
     pub color: [u8; 4],
     pub flags: u32,
 }
+
+// The shaders read a quad as 20 bytes.
+const _: () = assert!(std::mem::size_of::<Quad>() == 20);
 
 /// `0xRRGGBB` to opaque [`Quad::color`].
 pub fn rgba(rgb: u32) -> [u8; 4] {

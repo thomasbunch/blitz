@@ -281,9 +281,31 @@ jobs:
               "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
           done
 
-          # The icon, from the Windows one's largest image.
+          # The icon, drawn from the SVG at 1024 px so the Retina sizes are
+          # sharp. AppKit reads SVG on macOS 13 and later; the Windows
+          # icon's 256 px image stands in should it fail.
           png="$RUNNER_TEMP/icon.png"
-          sips -s format png crates/blitz/icon/blitz.ico --out "$png"
+          cat > "$RUNNER_TEMP/svg2png.swift" <<'SWIFT'
+          import AppKit
+          let a = CommandLine.arguments
+          let n = 1024
+          guard let img = NSImage(contentsOfFile: a[1]),
+                let rep = NSBitmapImageRep(
+                  bitmapDataPlanes: nil, pixelsWide: n, pixelsHigh: n, bitsPerSample: 8,
+                  samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                  colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+          else { exit(1) }
+          NSGraphicsContext.saveGraphicsState()
+          NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+          img.draw(in: NSRect(x: 0, y: 0, width: n, height: n))
+          NSGraphicsContext.restoreGraphicsState()
+          guard let data = rep.representation(using: .png, properties: [:]) else { exit(1) }
+          do { try data.write(to: URL(fileURLWithPath: a[2])) } catch { exit(1) }
+          SWIFT
+          if ! swift "$RUNNER_TEMP/svg2png.swift" crates/blitz/icon/blitz.svg "$png"; then
+            echo "::warning::could not draw the icon from blitz.svg; using blitz.ico"
+            sips -s format png crates/blitz/icon/blitz.ico --out "$png"
+          fi
           set="$RUNNER_TEMP/blitz.iconset"
           mkdir "$set"
           for n in 16 32 128 256 512; do
@@ -343,6 +365,13 @@ jobs:
           lipo "$(dirname "$exe")/blitz-hook" -verify_arch arm64 x86_64
           v="$("$exe" --version)"
           [ "$v" = "blitz $VERSION" ] || { echo "::error::the app says $v"; exit 1; }
+          # The Intel half too, through Rosetta where the runner has it.
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            v="$(arch -x86_64 "$exe" --version)"
+            [ "$v" = "blitz $VERSION" ] || { echo "::error::the Intel app says $v"; exit 1; }
+          else
+            echo "::warning::no Rosetta on this runner; the Intel half was not started"
+          fi
           printf 'waitfor 20000 42-smoke\nwaitexit 20000\n' > "$t/script.txt"
           "$exe" debug run --cmd 'echo $((6 * 7))-smoke' --script "$t/script.txt" --timeout 60000
 

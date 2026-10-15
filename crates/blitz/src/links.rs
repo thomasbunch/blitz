@@ -471,12 +471,15 @@ fn bundle(path: &Path) -> bool {
     cfg!(target_os = "macos") && path.extension().is_some() && path.is_dir()
 }
 
-/// Whether `path` is a file anyone may run. The Finder runs one with no
-/// type in Terminal, and some Linux desktops run or offer to run it.
+/// Whether `path` is a file with no type and an execute bit. The Finder
+/// runs one in Terminal, and some Linux desktops run or offer to run it.
+/// A file with a type opens by it: a share or a FAT drive marks every
+/// file as one to run, notes and source included.
 #[cfg(unix)]
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    path.extension().is_none()
+        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Windows judges a file by its type alone.
@@ -1231,17 +1234,22 @@ mod tests {
         let dir = std::fs::canonicalize(&dir).expect("real");
         let tool = dir.join("README");
         let text = dir.join("NOTES");
+        let notes = dir.join("notes.md");
         std::fs::write(&tool, "#!/bin/sh\n").expect("write");
         std::fs::write(&text, "x").expect("write");
+        std::fs::write(&notes, "x").expect("write");
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let uri = |p: &Path| Target::Uri(format!("file://{}", p.display()));
         let run = plan(&uri(&tool), "");
         let read = plan(&uri(&text), "");
+        let marked = plan(&uri(&notes), "");
         let typed = plan(&Target::Path(tool.clone(), None), "");
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(run, Some(Open::Reveal(_))), "{run:?}");
         assert!(matches!(typed, Some(Open::Reveal(_))), "{typed:?}");
         assert!(matches!(read, Some(Open::File(_))), "{read:?}");
+        assert!(matches!(marked, Some(Open::File(_))), "{marked:?}");
     }
 
     #[cfg(unix)]
