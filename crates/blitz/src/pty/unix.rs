@@ -386,10 +386,15 @@ impl Pty {
                 let group = foreground();
                 hang_up(group, libc::SIGHUP);
                 signal(&child, libc::SIGHUP);
-                let ended = wait(&child, CLOSE_GRACE).is_some();
-                // An emptied group just gives ESRCH.
-                hang_up(group, libc::SIGKILL);
-                if !ended {
+                if wait(&child, CLOSE_GRACE).is_some() {
+                    // The shell died of the hangup just now; its job's
+                    // group, if the job lives on, still has that id. An
+                    // emptied one just gives ESRCH.
+                    hang_up(group, libc::SIGKILL);
+                } else {
+                    // The session still exists, so its group now is current:
+                    // an id read seconds ago could name another's by now.
+                    hang_up(foreground(), libc::SIGKILL);
                     signal(&child, libc::SIGKILL);
                     // Reaped, so it does not stay a zombie until blitz exits.
                     let _ = wait(&child, CLOSE_GRACE);
