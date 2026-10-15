@@ -1,8 +1,9 @@
 name: release
 
-# A v* tag builds the Windows zip and installer and attaches them to a draft
-# release, once CI has passed on the tagged commit. Running the workflow by
-# hand builds the same files as an artifact.
+# A v* tag builds the Windows zip and installer, the macOS app and the
+# experimental Linux build, and attaches them to a draft release, once CI
+# has passed on the tagged commit. Running the workflow by hand builds the
+# same files as artifacts.
 # Publishing the draft ships it: blitz offers the latest full release as an
 # update, so the draft is not marked as a prerelease.
 on:
@@ -53,6 +54,11 @@ jobs:
           fi
           if [ "$GITHUB_REF_TYPE" = tag ] && ! git merge-base --is-ancestor HEAD origin/main; then
             echo "::error::tag $GITHUB_REF_NAME is not on main"
+            exit 1
+          fi
+          # The release notes come from this section; publish takes it.
+          if [ "$GITHUB_REF_TYPE" = tag ] && ! grep -qxE "## \[${version//./\\.}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no dated section for $version, such as \"## [$version] - $(date -u +%F)\""
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -231,9 +237,219 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  # One app for Apple silicon and Intel Macs. Signed ad hoc, not by a
+  # developer ID, so the first start needs Open Anyway in System Settings.
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      # Both slices claim what Info.plist does.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+
+      - name: Version
+        id: v
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "blitz") | .version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          cargo build --release --locked -p blitz --target aarch64-apple-darwin
+          cargo build --release --locked -p blitz --target x86_64-apple-darwin
+
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-about@0.9.2
+
+      - name: Bundle
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          d="dist/blitz-$VERSION-macos"
+          app="$d/blitz.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" out
+          for b in blitz blitz-hook; do
+            lipo -create -output "$app/Contents/MacOS/$b" \
+              "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
+          done
+
+          # The icon, drawn from the SVG at 1024 px so the Retina sizes are
+          # sharp. AppKit reads SVG on macOS 13 and later; the Windows
+          # icon's 256 px image stands in should it fail.
+          png="$RUNNER_TEMP/icon.png"
+          cat > "$RUNNER_TEMP/svg2png.swift" <<'SWIFT'
+          import AppKit
+          let a = CommandLine.arguments
+          let n = 1024
+          guard let img = NSImage(contentsOfFile: a[1]),
+                let rep = NSBitmapImageRep(
+                  bitmapDataPlanes: nil, pixelsWide: n, pixelsHigh: n, bitsPerSample: 8,
+                  samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                  colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+          else { exit(1) }
+          NSGraphicsContext.saveGraphicsState()
+          NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+          img.draw(in: NSRect(x: 0, y: 0, width: n, height: n))
+          NSGraphicsContext.restoreGraphicsState()
+          guard let data = rep.representation(using: .png, properties: [:]) else { exit(1) }
+          do { try data.write(to: URL(fileURLWithPath: a[2])) } catch { exit(1) }
+          SWIFT
+          if ! swift "$RUNNER_TEMP/svg2png.swift" crates/blitz/icon/blitz.svg "$png"; then
+            echo "::warning::could not draw the icon from blitz.svg; using blitz.ico"
+            sips -s format png crates/blitz/icon/blitz.ico --out "$png"
+          fi
+          set="$RUNNER_TEMP/blitz.iconset"
+          mkdir "$set"
+          for n in 16 32 128 256 512; do
+            sips -z "$n" "$n" "$png" --out "$set/icon_${n}x${n}.png"
+            sips -z "$((n * 2))" "$((n * 2))" "$png" --out "$set/icon_${n}x${n}@2x.png"
+          done
+          iconutil -c icns "$set" -o "$app/Contents/Resources/blitz.icns"
+
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>blitz</string>
+            <key>CFBundleDisplayName</key><string>blitz</string>
+            <key>CFBundleIdentifier</key><string>io.github.thomasbunch.blitz</string>
+            <key>CFBundleExecutable</key><string>blitz</string>
+            <key>CFBundleIconFile</key><string>blitz</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$app/Contents/Info.plist"
+
+          cp LICENSE "$d/LICENSE.txt"
+          {
+            echo "blitz includes the following third-party software."
+            echo
+            echo "================================================================================"
+            echo "Character width tables derived from the Unicode Character Database"
+            echo
+            curl -fsSL https://www.unicode.org/license.txt
+            echo
+            cargo about generate --locked --fail --config .github/about.toml .github/about.hbs
+          } > "$d/THIRD-PARTY-NOTICES.txt"
+
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          ditto -c -k --keepParent "$d" "out/blitz-$VERSION-macos.zip"
+
+      # The app as unzipped: both architectures, and a session through
+      # `blitz debug run`. The text to wait for is not in the command line.
+      - name: Smoke test
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          t="$RUNNER_TEMP/smoke"
+          mkdir "$t"
+          ditto -x -k "out/blitz-$VERSION-macos.zip" "$t"
+          exe="$t/blitz-$VERSION-macos/blitz.app/Contents/MacOS/blitz"
+          lipo "$exe" -verify_arch arm64 x86_64
+          lipo "$(dirname "$exe")/blitz-hook" -verify_arch arm64 x86_64
+          v="$("$exe" --version)"
+          [ "$v" = "blitz $VERSION" ] || { echo "::error::the app says $v"; exit 1; }
+          # The Intel half too, through Rosetta where the runner has it.
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            v="$(arch -x86_64 "$exe" --version)"
+            [ "$v" = "blitz $VERSION" ] || { echo "::error::the Intel app says $v"; exit 1; }
+          else
+            echo "::warning::no Rosetta on this runner; the Intel half was not started"
+          fi
+          printf 'waitfor 20000 42-smoke\nwaitexit 20000\n' > "$t/script.txt"
+          "$exe" debug run --cmd 'echo $((6 * 7))-smoke' --script "$t/script.txt" --timeout 60000
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blitz-macos
+          path: out/*
+          if-no-files-found: error
+
+  # Built and smoke tested, but nobody has used it on a desktop yet.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+
+      - name: Version
+        id: v
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "blitz") | .version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked -p blitz
+
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-about@0.9.2
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          name="blitz-$VERSION-linux-x64-experimental"
+          d="dist/$name"
+          mkdir -p "$d" out
+          cp target/release/blitz target/release/blitz-hook "$d/"
+          cp LICENSE "$d/LICENSE.txt"
+          {
+            echo "blitz includes the following third-party software."
+            echo
+            echo "================================================================================"
+            echo "Character width tables derived from the Unicode Character Database"
+            echo
+            curl -fsSL https://www.unicode.org/license.txt
+            echo
+            cargo about generate --locked --fail --config .github/about.toml .github/about.hbs
+          } > "$d/THIRD-PARTY-NOTICES.txt"
+          tar -C dist -czf "out/$name.tar.gz" "$name"
+
+      - name: Smoke test
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          t="$RUNNER_TEMP/smoke"
+          mkdir "$t"
+          tar -C "$t" -xzf "out/blitz-$VERSION-linux-x64-experimental.tar.gz"
+          exe="$t/blitz-$VERSION-linux-x64-experimental/blitz"
+          v="$("$exe" --version)"
+          [ "$v" = "blitz $VERSION" ] || { echo "::error::blitz says $v"; exit 1; }
+          printf 'waitfor 20000 42-smoke\nwaitexit 20000\n' > "$t/script.txt"
+          "$exe" debug run --cmd 'echo $((6 * 7))-smoke' --script "$t/script.txt" --timeout 60000
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blitz-linux
+          path: out/*
+          if-no-files-found: error
+
   publish:
     if: github.ref_type == 'tag'
-    needs: [ci, windows]
+    needs: [ci, windows, macos, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -241,19 +457,40 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: blitz-windows
+          pattern: blitz-*
           path: out
+          merge-multiple: true
+      # One list for every system's files; the Windows updater finds its
+      # installer's sum by name.
+      - name: Checksums
+        working-directory: out
+        run: rm -f SHA256SUMS.txt && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt
       # Signed provenance tying each file to this workflow and commit, which
       # a checksum in the same release cannot do. Check a download with
       # `gh attestation verify FILE --repo thomasbunch/blitz`.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: out/*
+      # The notes are the version's section of CHANGELOG.md, up to the next
+      # section or the links at the end. The draft can still be edited before
+      # it is published.
       - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v h="## [$v] - " '
+            index($0, h) == 1 { on = 1; next }
+            on && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md" || { echo "::error::CHANGELOG.md has no notes for $v"; exit 1; }
           gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
-            --draft --title "blitz ${GITHUB_REF_NAME#v}" --notes ""
+            --draft --title "blitz $v" --notes-file "$RUNNER_TEMP/notes.md"

@@ -2,7 +2,7 @@
 
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Component, Path, Prefix};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -325,7 +325,9 @@ pub fn program_name(cmdline: &str) -> String {
 /// Blocks on the drive, so the app calls it off the UI thread.
 pub fn git_branch(dir: &Path) -> Option<String> {
     for d in dir.ancestors() {
-        let git = d.join(".git");
+        // A link from a download can point anywhere, and looking through
+        // it is looking at where it points.
+        let git = local(d, &d.join(".git"))?;
         let head = if git.is_dir() {
             git.join("HEAD")
         } else if git.is_file() {
@@ -333,12 +335,7 @@ pub fn git_branch(dir: &Path) -> Option<String> {
             // A folder from a download can name a share there, and just
             // reading it makes Windows sign in to that host.
             let link = read_start(&git)?;
-            let gitdir = d.join(link.strip_prefix("gitdir:")?.trim());
-            match gitdir.components().next() {
-                Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_)) => {}
-                _ => return None,
-            }
-            gitdir.join("HEAD")
+            local(d, &d.join(link.strip_prefix("gitdir:")?.trim()))?.join("HEAD")
         } else {
             continue;
         };
@@ -352,10 +349,109 @@ pub fn git_branch(dir: &Path) -> Option<String> {
     None
 }
 
-/// The first 4 KiB of a file that should hold one short line.
+/// `path`, named by a file blitz did not write in folder `d`, when it is
+/// surely on this machine: on Windows a path on a drive. Something right
+/// in `d`, which blitz is already looking at, is as local as `d`.
+#[cfg(windows)]
+fn local(d: &Path, path: &Path) -> Option<PathBuf> {
+    if path.parent() == Some(d) {
+        return Some(path.into());
+    }
+    match path.components().next() {
+        Some(Component::Prefix(p)) if matches!(p.kind(), std::path::Prefix::Disk(_)) => {
+            Some(path.into())
+        }
+        _ => None,
+    }
+}
+
+/// Whether looking at `p` mounts a share or drive that `d`, as written or
+/// as it really is (`real`), is not on already.
+#[cfg(unix)]
+fn reaches_another(p: &Path, d: &Path, real: &Path) -> bool {
+    let mut parts = p.components();
+    let (Some(_), Some(root), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let mounts = ["net", "Network", "Volumes"]
+        .iter()
+        .any(|r| root.as_os_str() == *r);
+    let r = Path::new("/").join(root).join(name);
+    mounts && !d.starts_with(&r) && !real.starts_with(&r)
+}
+
+/// `path`, named by a file blitz did not write in folder `d`, with its
+/// links and `..` followed one step at a time, when it never steps into a
+/// folder that mounts another machine's on first look: the automounter's
+/// `/net/<host>` and `/Network/<host>`, and the Mac's `/Volumes/<share>`.
+/// One `d` is already in is fine, `d` being taken as it really is, as a
+/// shell reports a folder through a link as the link.
+#[cfg(unix)]
+fn local(d: &Path, path: &Path) -> Option<PathBuf> {
+    // `d` is being looked at already, so following its links reaches
+    // nothing new.
+    let real = std::fs::canonicalize(d).unwrap_or_else(|_| d.into());
+    // The parts still to follow, last first, owned as links add their own.
+    let parts = |p: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = p
+            .components()
+            .map(|c| PathBuf::from(c.as_os_str()))
+            .collect();
+        v.reverse();
+        v
+    };
+    let mut out = PathBuf::from("/");
+    let mut rest = parts(path);
+    let (mut hops, mut gone) = (0, false);
+    while let Some(part) = rest.pop() {
+        match part.components().next() {
+            Some(Component::RootDir) => out = PathBuf::from("/"),
+            Some(Component::ParentDir) => {
+                out.pop();
+            }
+            Some(Component::Normal(name)) => {
+                out.push(name);
+                if reaches_another(&out, d, &real) {
+                    return None;
+                }
+                // Past a part that is not there, nothing is there to
+                // look at, but `..` and the folder checks still apply.
+                if gone {
+                    continue;
+                }
+                let Ok(m) = out.symlink_metadata() else {
+                    gone = true;
+                    continue;
+                };
+                if m.file_type().is_symlink() {
+                    hops += 1;
+                    if hops > 40 {
+                        return None;
+                    }
+                    let target = std::fs::read_link(&out).ok()?;
+                    out.pop();
+                    rest.extend(parts(&target));
+                }
+            }
+            _ => {}
+        }
+    }
+    path.is_absolute().then_some(out)
+}
+
+/// The first 4 KiB of a file that should hold one short line. Anything but
+/// a plain file, as a pipe that never ends, gives nothing.
 fn read_start(path: &Path) -> Option<String> {
     let mut s = String::new();
-    let file = std::fs::File::open(path).ok()?;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    // Opening a pipe waits for a writer otherwise.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let file = open.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     file.take(4096).read_to_string(&mut s).ok()?;
     Some(s)
 }
@@ -366,11 +462,69 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 
+    #[cfg(unix)]
+    #[test]
+    fn pane_branch_never_reads_a_pipe_or_a_share() {
+        let dir = std::env::temp_dir().join(format!("blitz-git-{}", std::process::id()));
+        let repo = dir.join("repo");
+        let share = dir.join("share");
+        std::fs::create_dir_all(repo.join(".git")).expect("dir");
+        std::fs::create_dir_all(&share).expect("dir");
+        let fifo =
+            std::ffi::CString::new(repo.join(".git").join("HEAD").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::fs::write(share.join(".git"), "gitdir: /net/somehost/x\n").expect("write");
+        let (up, down, linked) = (dir.join("up"), dir.join("down"), dir.join("linked"));
+        for d in [&up, &down, &linked] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        std::fs::write(up.join(".git"), "gitdir: /tmp/../net/somehost/x\n").expect("write");
+        std::fs::write(down.join(".git"), "gitdir: ../../../../net/somehost/x\n").expect("write");
+        std::os::unix::fs::symlink("/net/somehost/r/.git", linked.join(".git")).expect("link");
+        let (piped, shared) = (git_branch(&repo), git_branch(&share));
+        // Each is refused before anything under /net is looked at.
+        let tricks = [
+            local(&up, Path::new("/usr/../net/somehost/x")),
+            local(&down, &down.join("../../../../../../../../net/somehost/x")),
+            local(&linked, &linked.join(".git")),
+        ];
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((piped, shared), (None, None));
+        assert_eq!(tricks, [None, None, None]);
+        // A repo reached through a link to a drive is on that drive.
+        let (ssd, link) = (
+            Path::new("/Volumes/SSD/code/proj"),
+            Path::new("/Users/me/code/proj"),
+        );
+        assert!(!reaches_another(Path::new("/Volumes/SSD"), link, ssd));
+        assert!(reaches_another(Path::new("/Volumes/SSD"), link, link));
+        assert!(reaches_another(Path::new("/net/host"), link, ssd));
+        assert!(!reaches_another(Path::new("/Volumes"), link, link));
+        let here = Path::new("/home/me");
+        // Not /tmp, which is a link on a Mac.
+        assert_eq!(local(here, Path::new("/usr/../net/x")), None);
+        assert_eq!(local(here, Path::new("/Volumes/x/.git")), None);
+        let drive = Path::new("/Volumes/usb/repo");
+        let sub = Path::new("/Volumes/usb/repo/../repo/.git/modules/a");
+        assert_eq!(
+            local(drive, sub),
+            Some("/Volumes/usb/repo/.git/modules/a".into())
+        );
+        let wt = Path::new("/nowhere/src/.git/worktrees/a");
+        assert_eq!(local(here, wt), Some(wt.into()));
+    }
+
     #[test]
     fn pane_program_names() {
-        let pwsh = r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit"#;
-        assert_eq!(program_name(pwsh), "pwsh");
-        assert_eq!(program_name(r"C:\Windows\system32\cmd.exe /d"), "cmd");
+        #[cfg(windows)]
+        {
+            let pwsh = r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoExit"#;
+            assert_eq!(program_name(pwsh), "pwsh");
+            assert_eq!(program_name(r"C:\Windows\system32\cmd.exe /d"), "cmd");
+        }
+        #[cfg(unix)]
+        assert_eq!(program_name("/opt/homebrew/bin/fish -l"), "fish");
         assert_eq!(program_name("claude"), "claude");
         assert_eq!(program_name(""), "");
     }
@@ -437,11 +591,13 @@ mod tests {
         assert_eq!(git_branch(&wt).as_deref(), Some("side"));
 
         // Only a git dir on a drive is read, not a share or device path.
+        #[cfg(windows)]
         std::fs::write(
             wt.join(".git"),
             format!("gitdir: \\\\?\\{}\n", root.join("meta").display()),
         )
         .expect("link");
+        #[cfg(windows)]
         assert_eq!(git_branch(&wt), None);
 
         // A huge HEAD is not read whole.
@@ -463,7 +619,11 @@ mod tests {
         let pane = Pane::spawn(
             PaneId(7),
             &Spawn {
-                cmdline: "cmd.exe /d /c echo pane-%BLITZ_PANE_ID%",
+                cmdline: if cfg!(windows) {
+                    "cmd.exe /d /c echo pane-%BLITZ_PANE_ID%"
+                } else {
+                    "echo pane-$BLITZ_PANE_ID"
+                },
                 env: &[],
                 cwd: None,
                 cols: 40,
@@ -547,7 +707,11 @@ mod tests {
     /// and output after it shows on a fresh one.
     #[test]
     fn pane_starts_its_screen_over_after_a_panic() {
-        let cmd = "cmd.exe /d /c echo pane-one& ping -n 2 127.0.0.1 >nul& echo pane-two";
+        let cmd = if cfg!(windows) {
+            "cmd.exe /d /c echo pane-one& ping -n 2 127.0.0.1 >nul& echo pane-two"
+        } else {
+            "echo pane-one; sleep 1; echo pane-two"
+        };
         let (pane, notes) = panicking(cmd, 1);
         assert!(notes.contains(&Note::Reset), "{notes:?}");
         assert!(!notes.contains(&Note::Dead), "{notes:?}");
@@ -565,7 +729,13 @@ mod tests {
         let pane = Pane::spawn(
             PaneId(9),
             &Spawn {
-                cmdline: "cmd.exe /d /k echo pane-one",
+                cmdline: if cfg!(windows) {
+                    "cmd.exe /d /k echo pane-one"
+                } else {
+                    // The terminal echoes what is typed after the prompt,
+                    // as a shell's line editor would.
+                    "echo pane-one; printf 'pane-two>'; read x"
+                },
                 env: &[("PROMPT".into(), "pane-two$G".into())],
                 cwd: None,
                 cols: 40,
@@ -616,8 +786,12 @@ mod tests {
     /// comes through, so the pane can close.
     #[test]
     fn pane_gives_up_on_the_third_panic_and_still_reports_its_exit() {
-        let pause = "ping -n 2 127.0.0.1 >nul";
-        let cmd = format!("cmd.exe /d /c echo pane-a& {pause}& echo pane-b& {pause}& echo pane-c");
+        let cmd = if cfg!(windows) {
+            let pause = "ping -n 2 127.0.0.1 >nul";
+            format!("cmd.exe /d /c echo pane-a& {pause}& echo pane-b& {pause}& echo pane-c")
+        } else {
+            "echo pane-a; sleep 1; echo pane-b; sleep 1; echo pane-c".into()
+        };
         let (pane, notes) = panicking(&cmd, usize::MAX);
         assert_eq!(notes, [Note::Reset, Note::Reset, Note::Dead, Note::Exit(0)]);
         let text = lock(&pane.term).screen_text();
@@ -687,5 +861,41 @@ mod tests {
         // The first is more than a minute old by now.
         assert!(!gives_up(&mut times, at(61)));
         assert!(gives_up(&mut times, at(62)));
+    }
+
+    /// A whole session outside Windows: the shell's output reaches the
+    /// screen, and its exit reaches the UI thread.
+    #[cfg(unix)]
+    #[test]
+    fn pane_runs_a_session_on_a_pseudo_terminal() {
+        let (tx, rx) = mpsc::channel();
+        let pane = Pane::spawn(
+            PaneId(1),
+            &Spawn {
+                cmdline: "printf '\\033[1mbold\\033[0m\\r\\n%s' \"$BLITZ_PANE_TOKEN\"",
+                env: &[],
+                cwd: None,
+                cols: 30,
+                rows: 4,
+                scrollback: 100,
+                dark: true,
+                pal: crate::theme::dark(),
+                parent: None,
+                token: "0123abcd",
+                restored: &[],
+            },
+            move |_, note| {
+                let _ = tx.send(note);
+            },
+        )
+        .expect("spawn");
+        let exit = std::iter::from_fn(|| rx.recv_timeout(Duration::from_secs(20)).ok())
+            .find(|n| matches!(n, Note::Exit(_)));
+        assert_eq!(exit, Some(Note::Exit(0)));
+        let text = lock(&pane.term).screen_text();
+        assert_eq!(
+            text.lines().take(2).collect::<Vec<_>>(),
+            ["bold", "0123abcd"]
+        );
     }
 }

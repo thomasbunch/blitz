@@ -56,10 +56,10 @@ jobs:
       # crates/ or .github/ gets past the check above.
       - name: Only expected kinds of files are tracked
         run: |
-          ok='\.gitignore|\.gitattributes|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|LICENSE|README\.md'
+          ok='\.gitignore|\.gitattributes|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|LICENSE|README\.md|CHANGELOG\.md'
           ok="$ok|\.cargo/config\.toml|\.github/workflows/[a-z0-9-]+\.yml|\.github/(blitz\.iss|about\.toml|about\.hbs|dependabot\.yml)"
           ok="$ok|crates/[a-z0-9-]+/(Cargo\.toml|build\.rs)|crates/[a-z0-9-]+/(src|tests|examples)/.+\.rs"
-          ok="$ok|crates/[a-z0-9-]+/tests/.+\.vt|crates/blitz/src/render/[a-z0-9_]+\.hlsl"
+          ok="$ok|crates/[a-z0-9-]+/tests/.+\.vt|crates/blitz/src/render/[a-z0-9_]+\.(hlsl|wgsl)"
           ok="$ok|crates/blitz/icon/blitz\.(ico|svg)|crates/blitz/themes/[a-z0-9-]+"
           bad="$(git ls-files | grep -vxE "$ok" || true)"
           [ -z "$bad" ] || { echo "::error::files of a kind this repo does not track:"; echo "$bad"; exit 1; }
@@ -102,14 +102,22 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/deny.toml" <<'EOF'
           [licenses]
-          allow = ["MIT", "Apache-2.0", "Zlib", "Unicode-3.0"]
+          allow = ["MIT", "Apache-2.0", "Zlib", "Unicode-3.0", "ISC", "BSD-2-Clause", "BSD-3-Clause"]
 
           [sources]
           unknown-registry = "deny"
           unknown-git = "deny"
           EOF
-          # Licenses cover what ships: Windows, no dev dependencies.
-          cargo deny --config "$RUNNER_TEMP/deny.toml" --locked --target x86_64-pc-windows-msvc --exclude-dev check licenses
+          # Licenses cover what ships, on each system, without dev
+          # dependencies. cargo-deny takes one --target, so the systems are
+          # listed in a config of their own.
+          cat "$RUNNER_TEMP/deny.toml" - > "$RUNNER_TEMP/deny-ship.toml" <<'EOF'
+
+          [graph]
+          targets = ["x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+          exclude-dev = true
+          EOF
+          cargo deny --config "$RUNNER_TEMP/deny-ship.toml" --locked check licenses
           # Sources cover every crate CI builds, on every target.
           cargo deny --config "$RUNNER_TEMP/deny.toml" --locked check sources
 
@@ -133,6 +141,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         timeout-minutes: 15
+      # The renderer's tests draw on the GPU; Linux runners have none, so
+      # they draw through Mesa's software Vulkan driver.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       # On Windows this runs on the system's console host.
       - run: cargo test --workspace --locked
         timeout-minutes: 15

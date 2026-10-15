@@ -1,32 +1,23 @@
 //! The blitz terminal application.
 
+pub mod app;
 pub mod arcade;
 pub mod attention;
+pub mod clipboard;
 pub mod config;
+pub mod debug;
+pub mod desktop;
+pub mod handoff;
 pub mod hook;
 pub mod keymap;
 pub mod layout;
+pub mod links;
+pub mod notify;
+pub mod pane;
+pub mod pty;
 pub mod render;
 pub mod session;
 pub mod settings;
 pub mod shell;
 pub mod theme;
-
-#[cfg(windows)]
-pub mod app;
-#[cfg(windows)]
-pub mod clipboard;
-#[cfg(windows)]
-pub mod debug;
-#[cfg(windows)]
-pub mod handoff;
-#[cfg(windows)]
-pub mod links;
-#[cfg(windows)]
-pub mod notify;
-#[cfg(windows)]
-pub mod pane;
-#[cfg(windows)]
-pub mod pty;
-#[cfg(windows)]
 pub mod update;

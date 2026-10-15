@@ -25,6 +25,11 @@ pub const ITALIC: u8 = 2;
 /// What [`Font::raster`] fails with when it has no fallback lookups left.
 pub const E_PENDING: HRESULT = HRESULT(0x8000_000A_u32 as i32);
 
+/// Whether `e` is [`Font::raster`] out of fallback lookups for the frame.
+pub fn is_pending(e: &windows::core::Error) -> bool {
+    e.code() == E_PENDING
+}
+
 /// Families tried in order; Consolas ships with every Windows.
 pub const DEFAULT_FAMILIES: &[&str] = crate::config::FALLBACK_FONTS;
 

@@ -3,8 +3,8 @@
 A fast terminal for running several Claude Code sessions, or any other
 shells, side by side, and seeing at a glance which one is waiting for you.
 
-> **Early alpha. Windows only for now.** Expect rough edges and missing
-> features.
+> **Early alpha.** Windows and macOS; Linux builds are experimental and
+> untested. Expect rough edges and missing features.
 
 - Tabs and splits; every pane is its own shell.
 - With two or more sessions, a sidebar lists them with their directory,
@@ -34,9 +34,12 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   file paths.
 - Files dropped on a pane paste as their paths, and Ctrl+V pastes a
   screenshot into Claude Code.
-- Direct3D 11 and DirectWrite rendering, with a software fallback.
+- Direct3D 11 and DirectWrite rendering on Windows, with a software
+  fallback; Metal on macOS and Vulkan or OpenGL on Linux, through wgpu.
 
 ## Install
+
+### Windows
 
 Windows 10 1809 or later, x64. From
 [Releases](https://github.com/thomasbunch/blitz/releases), run the
@@ -78,6 +81,33 @@ installer's log. With nothing shown, Ctrl+Shift+U asks GitHub right away
 and says what it found. The settings panel, under **Check for updates**,
 says why the last look or update failed.
 
+### macOS
+
+macOS 11 or later, Apple silicon or Intel. From
+[Releases](https://github.com/thomasbunch/blitz/releases), unzip
+`-macos.zip` and drag `blitz.app` to Applications. The app is not
+notarized yet, so macOS stops it the first time. On macOS 15 or later,
+open System Settings, Privacy & Security, and choose **Open Anyway** under
+the note about blitz; on older versions, right-click the app and choose
+**Open**, then **Open** again. Either way, after that it starts like any
+other app. Or, from a terminal, run
+`xattr -d com.apple.quarantine /Applications/blitz.app` before the first
+start.
+
+The shell is your login shell (`$SHELL`, usually zsh). Shortcuts use Cmd
+where Windows uses Ctrl or Ctrl+Shift; see [Default keys](#default-keys).
+Settings are in `~/.config/blitz`. blitz tells you about a newer release
+but does not install it: the notice opens the release page.
+
+### Linux (experimental)
+
+x64, built on Ubuntu but not tested beyond CI. Unpack
+`-linux-x64-experimental.tar.gz` and run `blitz` from it, keeping
+`blitz-hook` beside it. It needs a Vulkan or OpenGL driver; copy and
+paste use `wl-copy` and `wl-paste`, `xclip` or `xsel`, and notifications
+use `notify-send`. Settings are in `~/.config/blitz`. Reports of what
+works and what does not are welcome as issues.
+
 ## Build
 
 Needs [Rust](https://rustup.rs); `rust-toolchain.toml` pins the toolchain.
@@ -86,8 +116,9 @@ Needs [Rust](https://rustup.rs); `rust-toolchain.toml` pins the toolchain.
 cargo build --release
 ```
 
-This produces `target\release\blitz.exe` and `blitz-hook.exe`; keep them
-together. Releases also ship Microsoft's `conpty.dll` and `OpenConsole.exe`
+This produces `target\release\blitz.exe` and `blitz-hook.exe` on Windows,
+or `target/release/blitz` and `blitz-hook` elsewhere; keep them together.
+The rest of this section is about Windows. Releases also ship Microsoft's `conpty.dll` and `OpenConsole.exe`
 (NuGet `Microsoft.Windows.Console.ConPTY` 1.25 or later, from
 `runtimes\win-x64` and `build\native\runtimes\x64`). Put them next to
 `blitz.exe` or set `BLITZ_CONPTY_DIR` to the full path of their folder.
@@ -473,6 +504,45 @@ that, or typing, goes back to the bottom.
 | Ctrl+Shift+Space | Quick select a link, path or hash to copy or open |
 | Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
+On Linux the keys are the same, but for Alt+Space, which goes to the program.
+On macOS shortcuts take Cmd, as in Terminal, and Ctrl keys go to the
+program, but for the few in the table:
+
+| Keys | Action |
+|---|---|
+| Cmd+T | New tab |
+| Cmd+W, Shift+Cmd+W | Close pane, close tab |
+| Shift+Cmd+T | Reopen the last closed pane |
+| Shift+Cmd+], Shift+Cmd+[, Ctrl+Tab, Ctrl+Shift+Tab | Next, previous tab |
+| Shift+Cmd+PgUp, Shift+Cmd+PgDn | Move the tab left, right |
+| Cmd+1 to Cmd+8, Cmd+9 | Go to that tab, to the last tab |
+| Cmd+D, Shift+Cmd+D | Split right, split down |
+| Opt+Cmd+Arrows | Move focus between panes |
+| Ctrl+Cmd+Arrows | Resize the focused pane |
+| Opt+Shift+Cmd+Arrows | Swap the focused pane with its neighbour |
+| Shift+Cmd+Enter | Zoom the focused pane |
+| Shift+Cmd+J | Jump to the next session that needs you |
+| Shift+Cmd+O | Go to a session |
+| Shift+Cmd+B | Expand or collapse the sidebar |
+| Shift+Cmd+U | Look for a newer release |
+| Shift+Cmd+K | Pick a theme |
+| Cmd+, | Settings |
+| Shift+Cmd+P | Command palette |
+| Cmd+=, Shift+Cmd+=, Cmd+-, Cmd+0 | Font size up, down, and back to the setting |
+| Ctrl+Cmd+F | Full screen |
+| Cmd+C, Cmd+V, Cmd+A | Copy, paste, select all |
+| Cmd+K | Clear the scrollback |
+| Shift+PgUp, Shift+PgDn, Cmd+PgUp, Cmd+PgDn | Scroll |
+| Cmd+Home, Cmd+End | Scroll to the top, to the bottom |
+| Cmd+F | Find in the scrollback |
+| Shift+Cmd+Space | Quick select a link, path or hash |
+| Cmd+Up, Cmd+Down | Previous, next prompt |
+
+Option types the character it makes on your layout, as Option+E does
+for an accent; on a key where it makes none, such as an arrow, it is
+Meta, or Alt, for the shell. Cmd+click opens links, where other systems
+take Ctrl+click.
+
 A zoomed pane stays zoomed until you zoom again, move focus to another
 pane, split or resize. With `global_jump` on, Ctrl+Alt+J jumps from any
 program: it brings blitz to the front on the session that needs you.
@@ -509,7 +579,8 @@ keybind = ctrl+shift+r=none
 keybind = alt+f11=command_palette
 ```
 
-A chord is any of `ctrl`, `shift` and `alt` and one key, joined by `+`:
+A chord is any of `ctrl`, `shift`, `alt` (or `opt`) and `cmd` (or
+`super`, the Windows key) and one key, joined by `+`:
 a letter, a digit, `f1` to `f24`, `left`, `right`, `up`, `down`, `home`,
 `end`, `pageup`, `pagedown`, `insert`, `delete`, `tab`, `enter`, `esc`,
 `space`, `backspace`, or a punctuation key by its character or its name,

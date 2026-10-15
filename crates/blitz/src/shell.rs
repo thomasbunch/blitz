@@ -2,12 +2,22 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(any(windows, test))]
 use std::sync::{Mutex, PoisonError};
 
 /// Finds the shell to start when none is configured: `pwsh.exe` on PATH,
 /// then the newest `%ProgramFiles%\PowerShell\<n>\pwsh.exe`, then Windows
 /// PowerShell, then `%ComSpec%`. Looked up again when a new pane's PATH
 /// changed, so one installed while blitz runs is found.
+///
+/// Outside Windows it is the login shell, which a pane starts for an empty
+/// command line.
+#[cfg(not(windows))]
+pub fn detect() -> PathBuf {
+    crate::pty::user_shell()
+}
+
+#[cfg(windows)]
 pub fn detect() -> PathBuf {
     static LAST: Memo<Option<OsString>, PathBuf> = Mutex::new(None);
     memo(&LAST, pane_var("PATH"), |path| {
@@ -16,12 +26,14 @@ pub fn detect() -> PathBuf {
 }
 
 /// The last value [`memo`] made, and its key.
+#[cfg(any(windows, test))]
 type Memo<K, T> = Mutex<Option<(K, T)>>;
 
 /// `make(key)`, kept in `last` and made again only once `key` changed.
 /// Looking for a program stats a file in each PATH folder, which takes
 /// seconds on a network drive that is not there; the PATH changes when a
 /// program is installed.
+#[cfg(any(windows, test))]
 fn memo<K: PartialEq, T: Clone>(last: &Memo<K, T>, key: K, make: impl FnOnce(&K) -> T) -> T {
     let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((k, v)) = &*last
@@ -251,11 +263,6 @@ fn subkey_strings(
     names
 }
 
-#[cfg(not(windows))]
-fn wsl_distros() -> Vec<String> {
-    Vec::new()
-}
-
 /// [`detect`] with the environment supplied by the caller.
 pub fn detect_with(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     let root = system_root(&var);
@@ -327,6 +334,37 @@ fn pwsh(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 
 /// The shells the settings panel offers, as (name, `shell` setting): first
 /// the automatic choice, whose setting is empty, then each one installed.
+#[cfg(not(windows))]
+pub fn choices() -> Vec<(String, String)> {
+    let shells = std::fs::read_to_string("/etc/shells").unwrap_or_default();
+    let auto = detect();
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let mut out = vec![(
+        format!("Automatic ({})", name(&auto).unwrap_or_default()),
+        String::new(),
+    )];
+    out.extend(unix_shells(&shells, |p| Path::new(p).is_file()));
+    out
+}
+
+/// The shells `/etc/shells` lists that `exists`, once each by name, as
+/// (name, `shell` setting). A login shell reads the user's profile.
+#[cfg(any(not(windows), test))]
+fn unix_shells(list: &str, exists: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in list.lines().map(str::trim) {
+        if !line.starts_with('/') || !exists(line) {
+            continue;
+        }
+        let name = line.rsplit('/').next().unwrap_or(line).to_string();
+        if !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, format!("{line} -l")));
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
 pub fn choices() -> Vec<(String, String)> {
     type Found = Vec<(String, String)>;
     static LAST: Memo<(Option<OsString>, Vec<String>), Found> = Mutex::new(None);
@@ -347,6 +385,7 @@ pub fn choices() -> Vec<(String, String)> {
 /// each of the WSL distributions `distros`, as (name, `shell` setting).
 /// Docker and Rancher Desktop's own distributions are no shells, and
 /// Windows Terminal leaves them out too.
+#[cfg(any(windows, test))]
 fn installed_with(
     var: impl Fn(&str) -> Option<OsString>,
     mut distros: Vec<String>,
@@ -387,6 +426,7 @@ fn installed_with(
 
 /// Git's `bin\bash.exe`: of the Git whose `git.exe` is on PATH, as one
 /// installed for this user only is, else of `%ProgramFiles%\Git`.
+#[cfg(any(windows, test))]
 fn git_bash(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let path = var("PATH").unwrap_or_default();
     // Git puts its `cmd` folder on PATH, and may put `mingw64\bin`.
@@ -730,6 +770,11 @@ pub struct Launch {
 /// and the like.
 fn parts(shell: &str) -> (&str, &str) {
     let shell = shell.trim();
+    // Outside Windows the shell reads the line, and a program path has no
+    // extension to find its end by.
+    if cfg!(not(windows)) {
+        return split_program(shell);
+    }
     let spaces = shell.rmatch_indices([' ', '\t']).map(|m| m.0);
     // `\Program Files\...`, with no drive, is a path too, and so is
     // `tools\nu.exe`, from the current folder as `CreateProcessW` reads it.
@@ -765,6 +810,14 @@ pub fn label(shell: &str) -> String {
 /// variables the settings add, whose PROMPT cmd's marks wrap rather than
 /// blitz's own.
 pub fn launch(shell: &str, integrate: bool, token: &str, env: &[(String, String)]) -> Launch {
+    // `/bin/sh -c` runs the line as typed, and the pseudo terminal starts
+    // the login shell for an empty one.
+    if cfg!(not(windows)) {
+        return Launch {
+            cmdline: shell.trim().to_owned(),
+            env: Vec::new(),
+        };
+    }
     let (program, args) = match parts(shell) {
         ("", args) => (detect(), args),
         (program, args) => (PathBuf::from(program), args),
@@ -807,6 +860,36 @@ pub fn launch(shell: &str, integrate: bool, token: &str, env: &[(String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn etc_shells_lists_each_installed_shell_once_as_a_login_shell() {
+        let list = "# comment\n/bin/bash\n/bin/zsh\n/usr/bin/zsh\n/usr/local/bin/fish\n/bin/gone\nrelative\n";
+        let shells = unix_shells(list, |p| p != "/bin/gone");
+        assert_eq!(
+            shells,
+            [
+                ("bash".to_string(), "/bin/bash -l".to_string()),
+                ("zsh".into(), "/bin/zsh -l".into()),
+                ("fish".into(), "/usr/local/bin/fish -l".into()),
+            ]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn no_shell_setting_starts_the_login_shell_outside_windows() {
+        let l = launch("", true, "5eed", &[]);
+        assert_eq!(l.cmdline, "");
+        assert!(l.env.is_empty());
+        let l = launch(" /bin/zsh -l ", true, "5eed", &[]);
+        assert_eq!(l.cmdline, "/bin/zsh -l");
+        assert_eq!(label("/bin/zsh -l"), "zsh -l");
+        assert!(detect().is_absolute(), "{}", detect().display());
+        let auto = &choices()[0];
+        assert!(auto.0.starts_with("Automatic ("), "{auto:?}");
+        assert!(!auto.0.contains(".exe"), "{auto:?}");
+        assert_eq!(auto.1, "");
+    }
 
     #[test]
     fn prompts_leave_the_alternate_screen() {
@@ -973,6 +1056,7 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
         assert!(!is_blitz_prompt(OsStr::new(r"$e]133;A$e\$P$G")));
     }
 
+    #[cfg(windows)]
     #[test]
     fn cmd_keeps_the_users_own_prompt() {
         let mine = r"$T $e]9;9;$P$e\$P$_$+$G";
@@ -988,6 +1072,7 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
         assert_eq!(env, [("PROMPT".into(), cmd_prompt("5eed", "$T$G"))]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn other_shells_run_as_configured() {
         let bash = r#""C:\Program Files\Git\bin\bash.exe" --login -i"#;
@@ -1081,6 +1166,7 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
         assert!(subkey_strings(HKEY_CURRENT_USER, none, w!("x")).is_empty());
     }
 
+    #[cfg(windows)]
     /// The setting once took only a path, written without quotes.
     #[test]
     fn a_path_with_spaces_is_one_program() {
@@ -1110,6 +1196,7 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
         assert_eq!(got, (program.as_str(), " -l"));
     }
 
+    #[cfg(windows)]
     /// Cut at its first space, a missing program would run as the first
     /// word of its path, which another user may have put there.
     #[test]
@@ -1126,6 +1213,7 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
         }
     }
 
+    #[cfg(windows)]
     /// A file put where a missing program's path is cut is not run.
     #[test]
     fn a_file_at_the_start_of_a_missing_path_is_not_the_program() {
@@ -1138,6 +1226,7 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
         assert_eq!(got, quote(&shell));
     }
 
+    #[cfg(windows)]
     #[test]
     fn powershell_arguments_stay_and_integration_follows_them() {
         let ps = |s: &str| launch(s, true, "t", &[]).cmdline;
@@ -1244,6 +1333,7 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
         assert_eq!(kind(Path::new("bash.exe")), Kind::Other);
     }
 
+    #[cfg(windows)]
     #[test]
     fn launch_integration() {
         let ps = launch(

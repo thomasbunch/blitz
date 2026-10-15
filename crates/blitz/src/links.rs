@@ -4,11 +4,18 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
 use windows::Win32::UI::Shell::{
     ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_FRIENDLYAPPNAME, AssocQueryStringW, ShellExecuteW,
 };
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+#[cfg(windows)]
 use windows::core::{HSTRING, PCWSTR, w};
+
+/// Bytes of a local path that name its root, which is trusted: `C:\`, or
+/// `/` outside Windows.
+const ROOT: usize = if cfg!(windows) { 3 } else { 1 };
 
 /// What Ctrl+click on a link opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,7 +46,8 @@ pub enum Open {
     Uri(String),
     /// Open the file or folder with its program.
     File(PathBuf),
-    /// Show the file selected in Explorer: opening it would run it.
+    /// Show the file selected in Explorer or the Finder: opening it would
+    /// run it.
     Reveal(PathBuf),
 }
 
@@ -290,7 +298,7 @@ fn trim_end(s: &str) -> usize {
 /// Only a path that exists counts, and one that would reach another
 /// machine is never looked at, nor is one through a link; see [`plain`].
 pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE").ok();
+    let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok();
     let (full, from) = full_path(word, cwd, home.as_deref())?;
     plain(&full, from).then_some(full)
 }
@@ -300,7 +308,7 @@ pub fn resolve(word: &str, cwd: &str) -> Option<PathBuf> {
 fn full_path(word: &str, cwd: &str, home: Option<&str>) -> Option<(PathBuf, usize)> {
     let (base, rest) = match word.strip_prefix('~') {
         Some(r) if r.starts_with(['/', '\\']) => (home?, &r[1..]),
-        _ if vt::osc::local_dir(word) => return Some((PathBuf::from(word), 3)),
+        _ if vt::osc::local_dir(word) => return Some((PathBuf::from(word), ROOT)),
         _ => (cwd, word),
     };
     // A rest that is itself absolute, such as `\\host\share`, replaces
@@ -310,7 +318,7 @@ fn full_path(word: &str, cwd: &str, home: Option<&str>) -> Option<(PathBuf, usiz
     let from = if full.starts_with(base) {
         base.len()
     } else {
-        3
+        ROOT
     };
     (vt::osc::local_dir(base) && vt::osc::local_dir(&full.to_string_lossy()))
         .then_some((full, from))
@@ -358,7 +366,11 @@ pub fn plan_uri(uri: &str, pathext: &str) -> Option<Open> {
 pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
     let s = path.to_str()?;
     // No `:` stream after the drive, and nothing a name cannot hold.
-    if !vt::osc::local_dir(s) || s[2..].contains([':', '"', '*', '?', '<', '>', '|']) {
+    // The root is ASCII: `C:\` here starts the check at its `\`, and `/`
+    // takes it from the start, as a path can be `/` alone or go on with
+    // any character.
+    let rest = s.get(ROOT - 1..).unwrap_or_default();
+    if !vt::osc::local_dir(s) || rest.contains([':', '"', '*', '?', '<', '>', '|']) {
         return None;
     }
     // Windows drops dots and spaces at the end of a name: `x.exe.` is `x.exe`.
@@ -368,7 +380,8 @@ pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
     let runs = name.rsplit_once('.').is_some_and(|(_, ext)| {
         let is = |t: &str| !t.is_empty() && t.eq_ignore_ascii_case(ext);
         !OPENS.iter().any(|t| is(t)) || pathext.split(';').any(|t| is(t.trim_start_matches('.')))
-    });
+    }) || bundle(path)
+        || executable(path);
     Some(if runs {
         Open::Reveal(path.into())
     } else {
@@ -387,7 +400,7 @@ pub fn plan(t: &Target, pathext: &str) -> Option<Open> {
         Open::Uri(_) => Some(p),
         Open::File(p) | Open::Reveal(p) => {
             // A path from the text passed [`resolve`] already.
-            if matches!(t, Target::Uri(_)) && !plain(&p, 3) {
+            if matches!(t, Target::Uri(_)) && !plain(&p, ROOT) {
                 return None;
             }
             let real = std::fs::canonicalize(p).ok()?;
@@ -451,7 +464,43 @@ pub fn editor_uri(template: &str, path: &Path, (line, col): (u32, u32)) -> Optio
     )
 }
 
+/// Whether `path` has no type, as the Finder sees it: `setup.` and
+/// `setup. ` have none either.
+#[cfg(unix)]
+fn untyped(path: &Path) -> bool {
+    path.extension()
+        .is_none_or(|e| e.to_str().is_some_and(|e| e.trim().is_empty()))
+}
+
+/// Whether a folder at `path` is a macOS bundle, such as `x.app`: the
+/// Finder starts what it holds rather than showing it, so it is shown
+/// selected instead. A plain folder has no type.
+fn bundle(path: &Path) -> bool {
+    cfg!(target_os = "macos") && path.extension().is_some() && path.is_dir()
+}
+
+/// Whether `path` is a file with an execute bit and no type in [`OPENS`].
+/// The Finder runs one with no type in Terminal, and reads `setup.` as
+/// having none, and some Linux desktops run or offer to run it. A known
+/// type opens by it: a share or a FAT drive marks every file as one to
+/// run, notes and source included.
+#[cfg(unix)]
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let typed = (path.extension().and_then(|e| e.to_str()))
+        .is_some_and(|e| OPENS.iter().any(|t| t.eq_ignore_ascii_case(e)));
+    !typed
+        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Windows judges a file by its type alone.
+#[cfg(windows)]
+fn executable(_path: &Path) -> bool {
+    false
+}
+
 /// Whether Windows has a program to open files of `path`'s type.
+#[cfg(windows)]
 fn has_program(path: &Path) -> bool {
     let Some(ext) = path.extension() else {
         return false;
@@ -473,7 +522,15 @@ fn has_program(path: &Path) -> bool {
     found.is_ok()
 }
 
+/// Whether there is a program to open files of `path`'s type. The
+/// desktop picks one for any type, and asks when it has none.
+#[cfg(unix)]
+fn has_program(_path: &Path) -> bool {
+    true
+}
+
 /// Opens `t` as [`plan`] and [`with_editor`] allow.
+#[cfg(windows)]
 pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
     let pathext = std::env::var("PATHEXT").unwrap_or_default();
     let how = plan(t, &pathext).ok_or("blitz opens only web links and files on this computer")?;
@@ -497,6 +554,29 @@ pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
     shell_open(&file, &args).ok_or("Windows could not open the link")
 }
 
+/// Opens `t` as [`plan`] and [`with_editor`] allow.
+#[cfg(unix)]
+pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
+    let how = plan(t, "").ok_or("blitz opens only web links and files on this computer")?;
+    let place = match t {
+        Target::Path(_, place) => *place,
+        Target::Uri(_) => None,
+    };
+    let done = match with_editor(how, editor, place, has_program)? {
+        Open::Uri(u) => desktop_open(&[], u.as_ref()),
+        // A file with no type goes to the text editor: what the Finder
+        // picks for one might run it.
+        Open::File(p) if cfg!(target_os = "macos") && p.is_file() && untyped(&p) => {
+            desktop_open(&["-t"], p.as_os_str())
+        }
+        Open::File(p) => desktop_open(&[], p.as_os_str()),
+        Open::Reveal(p) if cfg!(target_os = "macos") => desktop_open(&["-R"], p.as_os_str()),
+        // xdg-open has no way to select a file, so its folder opens.
+        Open::Reveal(p) => desktop_open(&[], p.parent().unwrap_or(&p).as_os_str()),
+    };
+    done.ok_or("the link could not be opened")
+}
+
 /// What opens the text file `path` for editing, as (file, arguments) for
 /// `ShellExecuteW`: the file itself when Windows has a program for its
 /// type (`associated`), else Notepad from Windows folder `root`, as for
@@ -511,6 +591,7 @@ pub fn edit_plan(path: &Path, associated: bool, root: &Path) -> (String, String)
 }
 
 /// Opens the text file `path` for editing, as [`edit_plan`] says.
+#[cfg(windows)]
 pub fn edit(path: &Path) -> Result<(), &'static str> {
     // A relative SystemRoot would run a planted notepad.exe.
     let root = crate::shell::system_root(|k| std::env::var_os(k));
@@ -518,8 +599,21 @@ pub fn edit(path: &Path) -> Result<(), &'static str> {
     shell_open(&file, &args).ok_or("Windows could not open the file")
 }
 
+/// Opens the text file `path` for editing: in the default text editor on
+/// macOS, whatever its type, and with the desktop's program elsewhere.
+#[cfg(unix)]
+pub fn edit(path: &Path) -> Result<(), &'static str> {
+    let flags: &[&str] = if cfg!(target_os = "macos") {
+        &["-t"]
+    } else {
+        &[]
+    };
+    desktop_open(flags, path.as_os_str()).ok_or("the file could not be opened")
+}
+
 /// Whether Windows has a program that opens files of `path`'s type. The
 /// "Unknown" type, which offers the Open with dialog, is none.
+#[cfg(windows)]
 fn opens(path: &Path) -> bool {
     use windows::Win32::UI::Shell::{
         ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_COMMAND, AssocQueryStringW,
@@ -541,12 +635,41 @@ fn opens(path: &Path) -> bool {
     .is_ok()
 }
 
-/// Shows the folder `dir` in Explorer.
+/// Shows the folder `dir` in Explorer or the Finder.
 pub fn show_folder(dir: &Path) -> Result<(), &'static str> {
-    shell_open(&dir.display().to_string(), "").ok_or("Windows could not open the folder")
+    #[cfg(windows)]
+    return shell_open(&dir.display().to_string(), "").ok_or("Windows could not open the folder");
+    #[cfg(unix)]
+    return desktop_open(&[], dir.as_os_str()).ok_or("the folder could not be opened");
+}
+
+/// Hands `what`, a URL or an absolute path, to the desktop: `open` on
+/// macOS, `xdg-open` elsewhere, with `flags` before it. `None` if it did
+/// not start. It is waited for on a thread of its own, so it leaves no
+/// zombie and the window does not wait.
+#[cfg(unix)]
+fn desktop_open(flags: &[&str], what: &std::ffi::OsStr) -> Option<()> {
+    // A URL or an absolute path, never an option to the opener.
+    if what.as_encoded_bytes().first() == Some(&b'-') {
+        return None;
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "/usr/bin/open".into()
+    } else {
+        crate::desktop::tool("xdg-open")?
+    };
+    let mut child = (std::process::Command::new(opener).args(flags).arg(what))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    std::thread::spawn(move || child.wait());
+    Some(())
 }
 
 /// `ShellExecuteW`'s open of `file` with `args`; `None` if it failed.
+#[cfg(windows)]
 fn shell_open(file: &str, args: &str) -> Option<()> {
     // SAFETY: NUL-terminated strings that outlive the call, and no window.
     let done = unsafe {
@@ -583,6 +706,7 @@ mod tests {
         Link::Path(s.into(), Some((line, col)))
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_file_with_no_program_for_its_type_opens_in_notepad() {
         let (cfg, win) = (
@@ -825,6 +949,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn links_find_home_and_relative_paths() {
         let home = Some(r"C:\Users\me");
@@ -853,6 +978,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn links_open_only_what_is_safe() {
         let pathext = ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.PY";
@@ -951,6 +1077,7 @@ mod tests {
         assert_eq!(plan_path(Path::new("x.txt"), pathext), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn links_judge_the_real_file() {
         let dir = std::env::temp_dir().join(format!("blitz-links-{}", std::process::id()));
@@ -1040,6 +1167,7 @@ mod tests {
         assert_eq!(line_one, one);
     }
 
+    #[cfg(windows)]
     #[test]
     fn links_know_which_types_have_a_program() {
         // Which known types have one depends on the machine: Windows
@@ -1048,6 +1176,7 @@ mod tests {
         assert!(!has_program(Path::new(r"C:\x\Makefile")));
     }
 
+    #[cfg(windows)]
     #[test]
     fn links_never_look_through_a_link() {
         let dir = std::env::temp_dir().join(format!("blitz-links-j-{}", std::process::id()));
@@ -1070,5 +1199,112 @@ mod tests {
         assert!(made, "mklink");
         assert!(real.is_some());
         assert_eq!((through, link, opened), (None, None, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_open_only_what_is_safe_on_unix() {
+        let file = |p: &str| Some(Open::File(p.into()));
+        let reveal = |p: &str| Some(Open::Reveal(p.into()));
+        assert_eq!(
+            plan_uri("file:///home/me/a%20b.txt", ""),
+            file("/home/me/a b.txt")
+        );
+        assert_eq!(
+            plan_uri("file:///home/me/run.sh", ""),
+            reveal("/home/me/run.sh")
+        );
+        for t in [
+            "command", "sh", "app", "pkg", "dmg", "terminal", "workflow", "py",
+        ] {
+            let p = format!("/x/a.{t}");
+            assert_eq!(plan_path(Path::new(&p), ""), reveal(&p), "{t}");
+        }
+        for t in ["a.txt", "a.rs", "a.png", "Makefile", "dir"] {
+            let p = format!("/x/{t}");
+            assert_eq!(plan_path(Path::new(&p), ""), file(&p), "{t}");
+        }
+        for bad in ["x.txt", "//host/x.txt", "relative/x.txt"] {
+            assert_eq!(plan_path(Path::new(bad), ""), None, "{bad}");
+        }
+        assert_eq!(desktop_open(&[], "-a".as_ref()), None);
+        // Short or non-ASCII paths right after the root.
+        assert_eq!(plan_uri("file:///", ""), file("/"));
+        assert_eq!(plan_uri("file:///%C3%A9", ""), file("/é"));
+        assert_eq!(plan_path(Path::new("/é:x"), ""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_reveal_a_file_anyone_may_run_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("blitz-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // macOS's temporary folder is under a link, which a URI may not go
+        // through.
+        let dir = std::fs::canonicalize(&dir).expect("real");
+        let tool = dir.join("README");
+        let text = dir.join("NOTES");
+        let notes = dir.join("notes.md");
+        let dotted =
+            ["setup.", "setup..", "setup. ", "notes.md.", "notes.md "].map(|n| dir.join(n));
+        std::fs::write(&tool, "#!/bin/sh\n").expect("write");
+        std::fs::write(&text, "x").expect("write");
+        std::fs::write(&notes, "x").expect("write");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        for d in &dotted {
+            std::fs::write(d, "#!/bin/sh\n").expect("write");
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let uri = |p: &Path| Target::Uri(format!("file://{}", p.display()));
+        let run = plan(&uri(&tool), "");
+        let read = plan(&uri(&text), "");
+        let marked = plan(&uri(&notes), "");
+        let dots = dotted
+            .clone()
+            .map(|d| [plan(&uri(&d), ""), plan(&Target::Path(d, None), "")]);
+        let typed = plan(&Target::Path(tool.clone(), None), "");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(run, Some(Open::Reveal(_))), "{run:?}");
+        assert!(matches!(typed, Some(Open::Reveal(_))), "{typed:?}");
+        assert!(matches!(read, Some(Open::File(_))), "{read:?}");
+        assert!(matches!(marked, Some(Open::File(_))), "{marked:?}");
+        // A name ending in a dot has no type, so its execute bit counts.
+        for p in dots.iter().flatten() {
+            assert!(matches!(p, None | Some(Open::Reveal(_))), "{p:?}");
+        }
+        assert!(untyped(Path::new("/a/setup.")) && untyped(Path::new("/a/setup. ")));
+        assert!(!untyped(Path::new("/a/notes.md")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_judge_the_real_file_on_unix() {
+        let dir = std::env::temp_dir().join(format!("blitz-links-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real")).expect("dir");
+        std::fs::create_dir_all(dir.join("Notes.md")).expect("dir");
+        std::fs::write(dir.join("real").join("a.txt"), "x").expect("write");
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("j")).expect("symlink");
+        let cwd = dir.display().to_string();
+        let real = resolve("real/a.txt", &cwd);
+        let through = resolve("j/a.txt", &cwd);
+        let uri = format!("file://{}", dir.join("j").join("a.txt").display());
+        let opened = plan(&Target::Uri(uri), "");
+        let app = plan(&Target::Path(dir.join("Notes.md"), None), "");
+        let home = full_path("~/x/y.rs", "/work", Some("/home/me"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(real.is_some());
+        assert_eq!((through, opened), (None, None));
+        let bundle = cfg!(target_os = "macos");
+        assert_eq!(matches!(app, Some(Open::Reveal(_))), bundle, "{app:?}");
+        assert_eq!(
+            home,
+            Some((PathBuf::from("/home/me/x/y.rs"), "/home/me".len()))
+        );
+        assert_eq!(
+            full_path("/etc/x", "/work", None),
+            Some(("/etc/x".into(), 1))
+        );
     }
 }

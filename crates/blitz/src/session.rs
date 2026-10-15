@@ -187,16 +187,24 @@ pub fn numbers(saved: &[u32]) -> (Vec<u32>, u32) {
     (nums, next)
 }
 
-/// `%LOCALAPPDATA%\blitz`. It is created on the first save. Debug builds
-/// use their own, so `cargo run` never restores, resumes or deletes the
-/// installed blitz's sessions.
+/// `%LOCALAPPDATA%\blitz`; on macOS `~/Library/Application Support/blitz`,
+/// and on Linux `~/.local/state/blitz` or under `XDG_STATE_HOME`. It is
+/// created on the first save. Debug builds use their own, so `cargo run`
+/// never restores, resumes or deletes the installed blitz's sessions.
 pub fn dir() -> Option<PathBuf> {
     let name = if cfg!(debug_assertions) {
         "blitz.dev"
     } else {
         "blitz"
     };
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(name))
+    let root = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        crate::config::xdg(None, "Library/Application Support")
+    } else {
+        crate::config::xdg(Some("XDG_STATE_HOME"), ".local/state")
+    };
+    root.map(|d| d.join(name))
 }
 
 fn file() -> Option<PathBuf> {
@@ -212,7 +220,7 @@ pub fn first_time_in(dir: &Path, name: &str) -> bool {
     if shown.lines().any(|l| l == name) {
         return false;
     }
-    let noted = std::fs::create_dir_all(dir).and_then(|()| {
+    let noted = private_dir(dir).and_then(|()| {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -235,7 +243,7 @@ pub fn load() -> Option<State> {
 /// other's half-written one.
 pub fn save(s: &State) -> io::Result<()> {
     let dir = dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
-    std::fs::create_dir_all(&dir)?;
+    private_dir(&dir)?;
     // A crash between the write and the swap leaves a temporary file named
     // for a process that is gone; one this old is no live window's. Once a
     // run is enough: a held resize key saves every half second.
@@ -253,7 +261,7 @@ pub fn save(s: &State) -> io::Result<()> {
         }
     });
     let tmp = dir.join(format!("session.json.{}.tmp", std::process::id()));
-    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+    let written = private_file(&tmp).and_then(|mut f| {
         f.write_all(to_json(s).as_bytes())?;
         f.sync_all()
     });
@@ -268,8 +276,35 @@ pub fn save(s: &State) -> io::Result<()> {
 /// see [`take_crash`].
 pub fn write_crash(text: &str) -> io::Result<()> {
     let dir = dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("crash.txt"), text)
+    private_dir(&dir)?;
+    private_file(&dir.join("crash.txt"))?.write_all(text.as_bytes())
+}
+
+/// Creates `dir` for this user alone. What blitz keeps there, folders,
+/// conversations and output, is no one else's to read: on Windows the
+/// profile is this user's alone, while a Unix home is often open to all.
+fn private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        // One an older blitz made is open to all.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+/// Creates or empties `path`, readable by this user alone.
+fn private_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)
 }
 
 /// Where the last run wrote down its crash, if it did and no start has
@@ -331,9 +366,9 @@ pub fn save_output(panes: &[(String, String)]) -> io::Result<()> {
     if panes.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(&dir)?;
+    private_dir(&dir)?;
     for (key, text) in panes.iter().filter(|p| is_key(&p.0)) {
-        std::fs::write(dir.join(format!("{key}.txt")), text)?;
+        private_file(&dir.join(format!("{key}.txt")))?.write_all(text.as_bytes())?;
     }
     Ok(())
 }

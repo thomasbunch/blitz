@@ -1,6 +1,5 @@
-//! Bringing the user back to a session while blitz is in the background:
-//! the taskbar button's flash and badge, Windows notifications, and a key
-//! that works from any program.
+//! The taskbar button's flash and badge, Windows notifications, and a
+//! key that works from any program.
 
 use std::ffi::c_void;
 use std::sync::Once;
@@ -23,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, w};
 use winit::event_loop::EventLoopProxy;
 
+use super::TOAST_LINE;
 use crate::app::UserEvent;
 use crate::layout::PaneId;
 
@@ -103,33 +103,9 @@ pub fn flash(hwnd: isize, count: u32) {
     let _ = unsafe { FlashWindowEx(&info) };
 }
 
-/// A round badge `size` pixels wide for the taskbar button, drawn like the
-/// sidebar's dots: a dot of `fg`, or a ring of it, on a disc of `bg` that
-/// sets it apart from the icon under it. Pixels are `0xAARRGGBB`, top row
-/// first, with straight alpha as icons take it.
-pub fn badge_pixels(size: u32, fg: u32, bg: u32, ring: bool) -> Vec<u32> {
-    let r = size as f32 / 2.0;
-    let inner = r - (size as f32 / 10.0).max(1.0);
-    let stroke = (size as f32 / 8.0).max(1.5);
-    // How much of a pixel `d` from the centre a circle of radius `rad` covers.
-    let cover = |rad: f32, d: f32| (rad - d + 0.5).clamp(0.0, 1.0);
-    (0..size * size)
-        .map(|i| {
-            let (x, y) = ((i % size) as f32 + 0.5 - r, (i / size) as f32 + 0.5 - r);
-            let d = (x * x + y * y).sqrt();
-            let mut k = cover(inner, d);
-            if ring {
-                k -= cover(inner - stroke, d);
-            }
-            let alpha = (cover(r, d) * 255.0).round() as u32;
-            alpha << 24 | crate::theme::mix(bg, fg, k)
-        })
-        .collect()
-}
-
 /// An icon from [`badge_pixels`]; the caller destroys it.
 pub fn badge_icon(size: u32, fg: u32, bg: u32, ring: bool) -> Option<HICON> {
-    let px = badge_pixels(size, fg, bg, ring);
+    let px = super::badge_pixels(size, fg, bg, ring);
     // Ignored where the colour has alpha, which is everywhere; one byte a
     // pixel is more than its one bit.
     let mask = vec![0u8; px.len()];
@@ -187,7 +163,7 @@ const AUMID: &str = if cfg!(debug_assertions) {
 };
 
 /// Notifications take their icon from a file.
-const ICON: &[u8] = include_bytes!("../icon/blitz.ico");
+const ICON: &[u8] = include_bytes!("../../icon/blitz.ico");
 
 /// Done before the first notification, which is how [`untoast_all`] knows
 /// there may be some.
@@ -256,9 +232,6 @@ pub fn toast_xml(lines: &[&str], silent: bool) -> String {
     xml
 }
 
-/// The most characters a notification line keeps.
-const TOAST_LINE: usize = 200;
-
 /// Tells apart the notifications of two blitz processes, whose panes may
 /// have the same ids.
 fn group() -> HSTRING {
@@ -297,6 +270,20 @@ pub fn toast(
     notifier.Show(&t)?;
     Ok(Some(t))
 }
+
+/// A notification about pane `id` saying `lines`, as [`toast`] shows it,
+/// with Windows' sound unless `silent`. Why it failed, if it did.
+pub fn show(
+    id: PaneId,
+    lines: &[&str],
+    silent: bool,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> Result<Option<Toast>, String> {
+    toast(id, &toast_xml(lines, silent), proxy).map_err(|e| e.to_string())
+}
+
+/// What keeps a notification's click answered while it is up.
+pub type Toast = ToastNotification;
 
 /// Takes the notification about pane `id` off the screen and out of the
 /// notification centre.
@@ -392,34 +379,6 @@ mod tests {
             DestroyWindow(second).expect("destroy");
             DestroyWindow(own).expect("destroy");
         }
-    }
-
-    #[test]
-    fn badges_are_round_dots_or_rings() {
-        let (fg, bg) = (0x11_22_33, 0xee_dd_cc);
-        let n = 16;
-        let dot = badge_pixels(n, fg, bg, false);
-        let ring = badge_pixels(n, fg, bg, true);
-        let at = |px: &[u32], x: u32, y: u32| px[(y * n + x) as usize];
-        for px in [&dot, &ring] {
-            assert_eq!(px.len(), 256);
-            // Corners are clear; the edge is the background disc.
-            assert_eq!(at(px, 0, 0) >> 24, 0);
-            assert_eq!(at(px, 15, 15) >> 24, 0);
-            let edge = at(px, 0, 8);
-            assert_eq!(edge & 0xff_ffff, bg);
-            assert!(edge >> 24 > 0x80, "mostly covered");
-            // Round: the same across both axes and both diagonals.
-            for y in 0..n {
-                for x in 0..n {
-                    assert_eq!(at(px, x, y), at(px, n - 1 - x, y));
-                    assert_eq!(at(px, x, y), at(px, y, x));
-                }
-            }
-        }
-        assert_eq!(at(&dot, 8, 8), 0xff << 24 | fg, "a full dot");
-        assert_eq!(at(&ring, 8, 8), 0xff << 24 | bg, "an open ring");
-        assert_eq!(at(&ring, 8, 2), 0xff << 24 | fg, "the ring itself");
     }
 
     #[test]
