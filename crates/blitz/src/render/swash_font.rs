@@ -183,6 +183,19 @@ fn covering(c: char, style: u8) -> Option<Face> {
     (face.font().is_some() && face.glyph(c) != 0).then_some(face)
 }
 
+/// What asking fontconfig takes from [`Font::lookups`]: a renderer's 256
+/// a frame allow two asks.
+const ASK_COST: u32 = 100;
+
+/// Whether fontconfig might find a font for `c` that the lists lack: not on
+/// a Mac, and not for a private character, which only a Nerd Font draws,
+/// nor a noncharacter, which none does.
+fn worth_asking(c: char) -> bool {
+    let n = u32::from(c);
+    let nonchar = (0xFDD0..=0xFDEF).contains(&n) || n & 0xFFFE == 0xFFFE;
+    cfg!(not(target_os = "macos")) && !is_private(c) && !nonchar
+}
+
 /// The Mac's fallback list covers what it ships with.
 #[cfg(target_os = "macos")]
 fn covering(_c: char, _style: u8) -> Option<Face> {
@@ -459,10 +472,23 @@ impl Font {
         }
         self.lookups -= 1;
         let nerd = is_private(c).then(nerd_family).flatten();
-        let face = (nerd.into_iter().chain(FALLBACK_FAMILIES.iter().copied()))
+        let listed = (nerd.into_iter().chain(FALLBACK_FAMILIES.iter().copied()))
             .filter_map(|f| face_of(f, style))
-            .find(|f| f.glyph(c) != 0)
-            .or_else(|| covering(c, style));
+            .find(|f| f.glyph(c) != 0);
+        let face = match listed {
+            Some(face) => Some(face),
+            // Asking fontconfig starts a process, so output full of
+            // characters no font has could stall every frame: a few asks
+            // a frame, and none for a character no font is likely to have.
+            None if worth_asking(c) => {
+                if self.lookups < ASK_COST {
+                    return Err(Pending.into());
+                }
+                self.lookups -= ASK_COST;
+                covering(c, style)
+            }
+            None => None,
+        };
         self.fallbacks.insert((c, style), face.clone());
         Ok(face)
     }
@@ -497,7 +523,7 @@ mod tests {
                 println!("SKIPPED: no font has {c}");
                 continue;
             }
-            f.lookups = 8;
+            f.lookups = 1 + ASK_COST;
             let r = f.raster(c, 0, 2).expect("raster");
             assert!(r.is_some_and(|r| r.alpha.iter().any(|&a| a > 200)), "{c}");
         }
@@ -544,6 +570,25 @@ mod tests {
         assert!(is_pending(&e));
         f.lookups = 1;
         assert!(f.raster("\u{10FFFD}", 0, 1).is_ok());
+    }
+
+    #[test]
+    fn fontconfig_is_asked_a_few_times_a_frame_and_never_for_hopeless_characters() {
+        assert!(!worth_asking('\u{F0001}') && !worth_asking('\u{FDD0}'));
+        assert!(!worth_asking('\u{1FFFF}') && !worth_asking('\u{10FFFE}'));
+        assert_eq!(worth_asking('中'), cfg!(not(target_os = "macos")));
+        let Some(mut f) = font() else { return };
+        // Unassigned, so nothing has it, but worth one ask.
+        let unknown = ['\u{2FFF0}', '\u{2FFF1}', '\u{2FFF2}'];
+        if !worth_asking(unknown[0]) {
+            return;
+        }
+        f.lookups = 256;
+        let pending = (unknown.iter())
+            .map(|c| f.raster(&c.to_string(), 0, 1))
+            .filter(|r| r.as_ref().is_err_and(is_pending))
+            .count();
+        assert_eq!(pending, 1, "two asks fit in a frame");
     }
 
     #[test]
