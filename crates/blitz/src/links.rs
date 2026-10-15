@@ -1246,7 +1246,8 @@ mod tests {
         let tool = dir.join("README");
         let text = dir.join("NOTES");
         let notes = dir.join("notes.md");
-        let dotted = ["setup.", "setup..", "setup. "].map(|n| dir.join(n));
+        let dotted =
+            ["setup.", "setup..", "setup. ", "notes.md.", "notes.md "].map(|n| dir.join(n));
         std::fs::write(&tool, "#!/bin/sh\n").expect("write");
         std::fs::write(&text, "x").expect("write");
         std::fs::write(&notes, "x").expect("write");

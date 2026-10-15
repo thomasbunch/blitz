@@ -198,12 +198,13 @@ const ASK_COST: u32 = 100;
 const MAX_ASKS: u32 = 256;
 
 /// Whether fontconfig might find a font for `c` that the lists lack: not on
-/// a Mac, and not for a private character, which only a Nerd Font draws,
-/// nor a noncharacter, which none does.
+/// a Mac, and not for a noncharacter, which no font draws. A private one
+/// is asked about, as a patched font such as `MesloLGS NF` has icons there
+/// under a name no Nerd Font search finds.
 fn worth_asking(c: char) -> bool {
     let n = u32::from(c);
     let nonchar = (0xFDD0..=0xFDEF).contains(&n) || n & 0xFFFE == 0xFFFE;
-    cfg!(not(target_os = "macos")) && !is_private(c) && !nonchar
+    cfg!(not(target_os = "macos")) && !nonchar
 }
 
 /// The Mac's fallback list covers what it ships with.
@@ -594,13 +595,15 @@ mod tests {
         // A character no monospace font has, so a fallback is looked for.
         let e = f.raster("\u{10FFFD}", 0, 1).err().expect("pending");
         assert!(is_pending(&e));
-        f.lookups = 1;
+        // One lookup, and one ask of fontconfig on Linux.
+        f.lookups = 1 + ASK_COST;
         assert!(f.raster("\u{10FFFD}", 0, 1).is_ok());
     }
 
     #[test]
     fn fontconfig_is_asked_a_few_times_a_frame_and_never_for_hopeless_characters() {
-        assert!(!worth_asking('\u{F0001}') && !worth_asking('\u{FDD0}'));
+        assert!(!worth_asking('\u{FDD0}'));
+        assert_eq!(worth_asking('\u{E0A0}'), cfg!(not(target_os = "macos")));
         assert!(!worth_asking('\u{1FFFF}') && !worth_asking('\u{10FFFE}'));
         assert_eq!(worth_asking('中'), cfg!(not(target_os = "macos")));
         let Some(mut f) = font() else { return };

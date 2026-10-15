@@ -369,9 +369,13 @@ fn local(d: &Path, path: &Path) -> Option<PathBuf> {
 /// links and `..` followed one step at a time, when it never steps into a
 /// folder that mounts another machine's on first look: the automounter's
 /// `/net/<host>` and `/Network/<host>`, and the Mac's `/Volumes/<share>`.
-/// One `d` is already in is fine.
+/// One `d` is already in is fine, `d` being taken as it really is, as a
+/// shell reports a folder through a link as the link.
 #[cfg(unix)]
 fn local(d: &Path, path: &Path) -> Option<PathBuf> {
+    // `d` is being looked at already, so following its links reaches
+    // nothing new.
+    let real = std::fs::canonicalize(d).unwrap_or_else(|_| d.into());
     let remote = |p: &Path| {
         let mut parts = p.components();
         let root = parts.nth(1)?.as_os_str();
@@ -401,7 +405,7 @@ fn local(d: &Path, path: &Path) -> Option<PathBuf> {
             }
             Some(Component::Normal(name)) => {
                 out.push(name);
-                if remote(&out).is_some_and(|r| !d.starts_with(r)) {
+                if remote(&out).is_some_and(|r| !real.starts_with(&r) && !d.starts_with(&r)) {
                     return None;
                 }
                 // Past a part that is not there, nothing is there to
@@ -473,12 +477,24 @@ mod tests {
         std::fs::write(down.join(".git"), "gitdir: ../../../../net/somehost/x\n").expect("write");
         std::os::unix::fs::symlink("/net/somehost/r/.git", linked.join(".git")).expect("link");
         let (piped, shared) = (git_branch(&repo), git_branch(&share));
-        let tricks = [&up, &down, &linked].map(|d| git_branch(d));
+        // Each is refused before anything under /net is looked at.
+        let tricks = [
+            local(&up, Path::new("/usr/../net/somehost/x")),
+            local(&down, &down.join("../../../../../../../../net/somehost/x")),
+            local(&linked, &linked.join(".git")),
+        ];
+        // A repo reached through a link to a drive is on that drive.
+        let drive = dir.join("Volumes-like");
+        std::fs::create_dir_all(drive.join("proj")).expect("dir");
+        std::os::unix::fs::symlink(&drive, dir.join("code")).expect("link");
+        let through = local(&dir.join("code/proj"), &dir.join("code/proj/.git"));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!((piped, shared), (None, None));
         assert_eq!(tricks, [None, None, None]);
+        assert!(through.is_some());
         let here = Path::new("/home/me");
-        assert_eq!(local(here, Path::new("/tmp/../net/x")), None);
+        // Not /tmp, which is a link on a Mac.
+        assert_eq!(local(here, Path::new("/usr/../net/x")), None);
         assert_eq!(local(here, Path::new("/Volumes/x/.git")), None);
         let drive = Path::new("/Volumes/usb/repo");
         let sub = Path::new("/Volumes/usb/repo/../repo/.git/modules/a");

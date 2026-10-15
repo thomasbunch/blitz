@@ -292,7 +292,9 @@ pub struct Awake {
 }
 
 impl Awake {
-    /// Turns it `on` or off; false when the system refused.
+    /// Turns it `on` or off; false when the system refused. On Linux that
+    /// is only when `systemd-inhibit` could not start: one that starts but
+    /// finds no logind ends at once, unseen.
     pub fn set(&mut self, on: bool) -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -319,11 +321,6 @@ impl Awake {
                     let _ = c.wait();
                 }
                 return true;
-            }
-            // One that ended already, as without logind, holds nothing.
-            if (self.inhibit.as_mut()).is_some_and(|c| !matches!(c.try_wait(), Ok(None))) {
-                self.inhibit = None;
-                return false;
             }
             if self.inhibit.is_none() {
                 self.inhibit = inhibit();

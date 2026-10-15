@@ -364,25 +364,32 @@ impl Pty {
         let master = self.master.try_clone().ok();
         // A job the shell started runs in a group of its own, which a signal
         // to the child's misses: the terminal's foreground group gets it too.
-        let foreground = move |sig| {
-            if let Some(m) = &master {
-                // SAFETY: plain calls on an open terminal; a group of this
-                // session, or none.
-                unsafe {
-                    let group = libc::tcgetpgrp(m.as_raw_fd());
-                    if group > 0 {
-                        libc::kill(-group, sig);
-                    }
-                }
+        let foreground = move || {
+            // SAFETY: a plain call on an open terminal.
+            let group = master
+                .as_ref()
+                .map(|m| unsafe { libc::tcgetpgrp(m.as_raw_fd()) });
+            group.filter(|&g| g > 0)
+        };
+        let hang_up = |group: Option<libc::pid_t>, sig| {
+            if let Some(g) = group {
+                // SAFETY: a signal to a group of this terminal's session.
+                unsafe { libc::kill(-g, sig) };
             }
         };
         let _ = std::thread::Builder::new()
             .name("pty-close".into())
             .spawn(move || {
-                foreground(libc::SIGHUP);
+                // The group as it is now: once the shell dies of the hangup
+                // the terminal has none, but a job that ignores it lives on
+                // and keeps the pane open.
+                let group = foreground();
+                hang_up(group, libc::SIGHUP);
                 signal(&child, libc::SIGHUP);
-                if wait(&child, CLOSE_GRACE).is_none() {
-                    foreground(libc::SIGKILL);
+                let ended = wait(&child, CLOSE_GRACE).is_some();
+                // An emptied group just gives ESRCH.
+                hang_up(group, libc::SIGKILL);
+                if !ended {
                     signal(&child, libc::SIGKILL);
                     // Reaped, so it does not stay a zombie until blitz exits.
                     let _ = wait(&child, CLOSE_GRACE);
@@ -631,6 +638,24 @@ mod tests {
         pty.writer().send(b"\x03".to_vec());
         let (_, code) = finish(&rx);
         assert_eq!(code, 5);
+    }
+
+    #[test]
+    fn closing_ends_a_job_that_outlives_its_shell() {
+        // The shell dies of the hangup; its job ignores it.
+        let script = "sh -c \"trap '' HUP; echo ready; exec sleep 123\"; :";
+        let env = [("S".to_string(), script.to_string())];
+        let (pty, rx) = spawn(&SpawnOpts {
+            cmdline: "/bin/sh -i -c \"$S\"",
+            env: &env,
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        });
+        wait_for(&rx, "ready");
+        pty.close();
+        // Ends at all: the job no longer holds the terminal open.
+        let _ = finish(&rx);
     }
 
     #[test]
