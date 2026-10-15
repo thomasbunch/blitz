@@ -5689,6 +5689,7 @@ impl App {
             }
             Err(e) => {
                 eprintln!("blitz: render: {e}");
+                self.skipped_at = None;
                 // The atlas is only a cache: build everything again, at once
                 // for a lost device. Other errors wait, so one that persists
                 // cannot spin; either way the frame is drawn again.
@@ -5884,7 +5885,9 @@ impl App {
             find,
             self.save_after,
             gfx,
-            self.skipped_at.filter(|_| shown),
+            // Only with a renderer to draw: without one a redraw does
+            // nothing, and the past deadline would spin.
+            self.skipped_at.filter(|_| shown && self.gfx.is_some()),
             anim,
             self.mouse.scroll_at,
             self.hidden_until,
