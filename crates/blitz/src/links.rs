@@ -464,6 +464,14 @@ pub fn editor_uri(template: &str, path: &Path, (line, col): (u32, u32)) -> Optio
     )
 }
 
+/// Whether `path` has no type, as the Finder sees it: `setup.` and
+/// `setup. ` have none either.
+#[cfg(unix)]
+fn untyped(path: &Path) -> bool {
+    path.extension()
+        .is_none_or(|e| e.to_str().is_some_and(|e| e.trim().is_empty()))
+}
+
 /// Whether a folder at `path` is a macOS bundle, such as `x.app`: the
 /// Finder starts what it holds rather than showing it, so it is shown
 /// selected instead. A plain folder has no type.
@@ -471,14 +479,17 @@ fn bundle(path: &Path) -> bool {
     cfg!(target_os = "macos") && path.extension().is_some() && path.is_dir()
 }
 
-/// Whether `path` is a file with no type and an execute bit. The Finder
-/// runs one in Terminal, and some Linux desktops run or offer to run it.
-/// A file with a type opens by it: a share or a FAT drive marks every
-/// file as one to run, notes and source included.
+/// Whether `path` is a file with an execute bit and no type in [`OPENS`].
+/// The Finder runs one with no type in Terminal, and reads `setup.` as
+/// having none, and some Linux desktops run or offer to run it. A known
+/// type opens by it: a share or a FAT drive marks every file as one to
+/// run, notes and source included.
 #[cfg(unix)]
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    path.extension().is_none()
+    let typed = (path.extension().and_then(|e| e.to_str()))
+        .is_some_and(|e| OPENS.iter().any(|t| t.eq_ignore_ascii_case(e)));
+    !typed
         && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
@@ -555,7 +566,7 @@ pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
         Open::Uri(u) => desktop_open(&[], u.as_ref()),
         // A file with no type goes to the text editor: what the Finder
         // picks for one might run it.
-        Open::File(p) if cfg!(target_os = "macos") && p.is_file() && p.extension().is_none() => {
+        Open::File(p) if cfg!(target_os = "macos") && p.is_file() && untyped(&p) => {
             desktop_open(&["-t"], p.as_os_str())
         }
         Open::File(p) => desktop_open(&[], p.as_os_str()),
@@ -1235,21 +1246,35 @@ mod tests {
         let tool = dir.join("README");
         let text = dir.join("NOTES");
         let notes = dir.join("notes.md");
+        let dotted = ["setup.", "setup..", "setup. "].map(|n| dir.join(n));
         std::fs::write(&tool, "#!/bin/sh\n").expect("write");
         std::fs::write(&text, "x").expect("write");
         std::fs::write(&notes, "x").expect("write");
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        for d in &dotted {
+            std::fs::write(d, "#!/bin/sh\n").expect("write");
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
         let uri = |p: &Path| Target::Uri(format!("file://{}", p.display()));
         let run = plan(&uri(&tool), "");
         let read = plan(&uri(&text), "");
         let marked = plan(&uri(&notes), "");
+        let dots = dotted
+            .clone()
+            .map(|d| [plan(&uri(&d), ""), plan(&Target::Path(d, None), "")]);
         let typed = plan(&Target::Path(tool.clone(), None), "");
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(run, Some(Open::Reveal(_))), "{run:?}");
         assert!(matches!(typed, Some(Open::Reveal(_))), "{typed:?}");
         assert!(matches!(read, Some(Open::File(_))), "{read:?}");
         assert!(matches!(marked, Some(Open::File(_))), "{marked:?}");
+        // A name ending in a dot has no type, so its execute bit counts.
+        for p in dots.iter().flatten() {
+            assert!(matches!(p, None | Some(Open::Reveal(_))), "{p:?}");
+        }
+        assert!(untyped(Path::new("/a/setup.")) && untyped(Path::new("/a/setup. ")));
+        assert!(!untyped(Path::new("/a/notes.md")));
     }
 
     #[cfg(unix)]

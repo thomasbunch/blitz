@@ -166,7 +166,9 @@ fn sh_line(cmdline: &str) -> String {
         "!", "{", "}", "[[", "case", "do", "done", "elif", "else", "esac", "fi", "for", "function",
         "if", "in", "select", "then", "time", "until", "while", "exec", ".", "alias", "cd", "eval",
         "exit", "export", "local", "read", "readonly", "return", "set", "shift", "source", "trap",
-        "ulimit", "umask", "unset", "wait",
+        "ulimit", "umask", "unset", "wait", ":", "command", "type", "hash", "jobs", "getopts",
+        "break", "continue", "times", "fg", "bg", "builtin", "declare", "typeset", "let", "shopt",
+        "pushd", "popd", "dirs",
     ];
     let line = cmdline.trim();
     let first = line.split([' ', '\t']).next().unwrap_or_default();
@@ -605,6 +607,8 @@ mod tests {
             "if true; then a; fi",
             "exec sleep 1",
             "read x",
+            ":",
+            "command -v sh",
         ] {
             assert_eq!(sh_line(kept), kept);
         }
@@ -632,8 +636,9 @@ mod tests {
     #[test]
     fn closing_ends_a_job_in_a_group_of_its_own() {
         // An interactive shell runs its job in a group of its own, and
-        // neither hears the hangup.
-        let script = "trap '' HUP; echo ready; sleep 123";
+        // neither hears the hangup. The job says it is ready itself, so
+        // its group exists by then.
+        let script = "trap '' HUP; sh -c 'echo ready; exec sleep 123'";
         let env = [("S".to_string(), script.to_string())];
         let (pty, rx) = spawn(&SpawnOpts {
             cmdline: "/bin/sh -i -c \"$S\"",
@@ -643,7 +648,6 @@ mod tests {
             ..Default::default()
         });
         wait_for(&rx, "ready");
-        std::thread::sleep(Duration::from_millis(200));
         pty.close();
         let (_, code) = finish(&rx);
         assert_eq!(code, 128 + libc::SIGKILL as u32);

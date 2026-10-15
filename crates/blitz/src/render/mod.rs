@@ -1354,9 +1354,6 @@ mod tests {
         u32::from_be_bytes([0, px[i + 2], px[i + 1], px[i]])
     }
 
-    /// A terminal not yet resized to its smaller pane draws only inside the
-    /// pane, never over its neighbour.
-    #[cfg(any(windows, unix))]
     /// Too large a target is an error to report, not a panic.
     #[cfg(not(windows))]
     #[test]
@@ -1367,6 +1364,9 @@ mod tests {
         assert!(r.gpu.offscreen(4, 4).is_ok());
     }
 
+    /// A terminal not yet resized to its smaller pane draws only inside the
+    /// pane, never over its neighbour.
+    #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_clipped_keeps_a_grid_inside_its_pane() {
         let mut r = Renderer::new(true, 16.0).expect("renderer");

@@ -121,6 +121,13 @@ struct Face {
 }
 
 impl Face {
+    /// Whether `o` is this face drawn the same way. Files are loaded once,
+    /// so the same file is the same data.
+    fn same_as(&self, o: &Face) -> bool {
+        Arc::ptr_eq(&self.data, &o.data)
+            && (self.index, self.embolden, self.slant) == (o.index, o.embolden, o.slant)
+    }
+
     fn font(&self) -> Option<FontRef<'_>> {
         FontRef::from_index(&self.data, self.index)
     }
@@ -186,6 +193,9 @@ fn covering(c: char, style: u8) -> Option<Face> {
 /// What asking fontconfig takes from [`Font::lookups`]: a renderer's 256
 /// a frame allow two asks.
 const ASK_COST: u32 = 100;
+
+/// How many times one font asks fontconfig in all.
+const MAX_ASKS: u32 = 256;
 
 /// Whether fontconfig might find a font for `c` that the lists lack: not on
 /// a Mac, and not for a private character, which only a Nerd Font draws,
@@ -254,6 +264,10 @@ pub struct Font {
     pub gamma: f32,
     pub contrast: f32,
     fallbacks: HashMap<(char, u8), Option<Face>>,
+    /// Faces fontconfig found, tried before asking it again.
+    found: Vec<Face>,
+    /// Times fontconfig was asked, up to [`MAX_ASKS`].
+    asked: u32,
     scaler: ScaleContext,
     /// Fallback lookups [`Font::raster`] may still make before it fails
     /// as pending; a renderer allows a few per frame.
@@ -300,6 +314,8 @@ impl Font {
             gamma: 1.8,
             contrast: 1.0,
             fallbacks: HashMap::new(),
+            found: Vec::new(),
+            asked: 0,
             scaler: ScaleContext::new(),
             lookups: u32::MAX,
         })
@@ -474,18 +490,28 @@ impl Font {
         let nerd = is_private(c).then(nerd_family).flatten();
         let listed = (nerd.into_iter().chain(FALLBACK_FAMILIES.iter().copied()))
             .filter_map(|f| face_of(f, style))
+            .chain(self.found.iter().cloned())
             .find(|f| f.glyph(c) != 0);
         let face = match listed {
             Some(face) => Some(face),
             // Asking fontconfig starts a process, so output full of
             // characters no font has could stall every frame: a few asks
-            // a frame, and none for a character no font is likely to have.
-            None if worth_asking(c) => {
+            // a frame and a few hundred in all, none for a character no
+            // font is likely to have, and each face it finds is tried
+            // before asking again.
+            None if worth_asking(c) && self.asked < MAX_ASKS => {
                 if self.lookups < ASK_COST {
                     return Err(Pending.into());
                 }
                 self.lookups -= ASK_COST;
-                covering(c, style)
+                self.asked += 1;
+                let face = covering(c, style);
+                if let Some(f) = &face
+                    && !self.found.iter().any(|g| g.same_as(f))
+                {
+                    self.found.push(f.clone());
+                }
+                face
             }
             None => None,
         };
@@ -589,6 +615,11 @@ mod tests {
             .filter(|r| r.as_ref().is_err_and(is_pending))
             .count();
         assert_eq!(pending, 1, "two asks fit in a frame");
+        // Past the cap, a miss is drawn as missing without asking, so a
+        // single lookup is enough.
+        f.asked = MAX_ASKS;
+        f.lookups = 1;
+        assert!(f.raster("\u{2FFF3}", 0, 1).is_ok());
     }
 
     #[test]

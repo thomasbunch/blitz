@@ -67,34 +67,48 @@ fn decode(bytes: &[u8]) -> Option<Ask> {
 /// [`install`] to listen on once the window is up.
 static CLAIMED: std::sync::Mutex<Option<UnixListener>> = std::sync::Mutex::new(None);
 
+/// The lock beside the socket, held by the main window for as long as it
+/// runs.
+static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
 /// A connection to the blitz listening at `path`, or `None` when there is
-/// none, after this launch took the socket. Taking it first means two
-/// launches at once, as a double click starts, cannot both become the
-/// main window: the second finds the first's socket.
+/// none, after this launch took the socket. The main window holds a lock
+/// beside the socket for as long as it runs, so two launches at once, as a
+/// double click starts, cannot both become it, and only the holder ever
+/// removes a socket a blitz that is gone left.
 fn connect_or_claim(path: &Path) -> Option<UnixStream> {
-    for _ in 0..2 {
-        match UnixListener::bind(path) {
-            Ok(l) => {
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-                *CLAIMED
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l);
-                return None;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                match UnixStream::connect(path) {
-                    Ok(s) => return Some(s),
-                    // Left by a blitz that is gone.
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                        let _ = std::fs::remove_file(path);
-                    }
-                    Err(_) => return None,
-                }
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path.with_extension("lock"))
+        .ok()?;
+    // SAFETY: a file this function owns, open for the call.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let _ = std::fs::remove_file(path);
+        let l = UnixListener::bind(path).ok()?;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        let _ = HELD.set(lock);
+        *CLAIMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l);
+        return None;
+    }
+    // A blitz runs: it may still be about to listen.
+    let start = std::time::Instant::now();
+    loop {
+        match UnixStream::connect(path) {
+            Ok(s) => return Some(s),
+            Err(_) if start.elapsed() < TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(20));
             }
             Err(_) => return None,
         }
     }
-    None
 }
 
 /// Sends this launch, and `dir` when it names one, to the running blitz.
@@ -193,7 +207,14 @@ mod tests {
         // A socket left by a blitz that is gone is taken over.
         drop(UnixListener::bind(&path).expect("stale"));
         assert!(connect_or_claim(&path).is_none(), "the first takes it");
-        assert!(connect_or_claim(&path).is_some(), "the second finds it");
+        // The lock is per open file, so this process is a second launch
+        // now, and a second at once.
+        let both = std::thread::scope(|s| {
+            let a = s.spawn(|| connect_or_claim(&path).is_some());
+            let b = s.spawn(|| connect_or_claim(&path).is_some());
+            (a.join().expect("a"), b.join().expect("b"))
+        });
+        assert_eq!(both, (true, true), "the others find it");
         let held = CLAIMED.lock().expect("lock").take();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(held.is_some());

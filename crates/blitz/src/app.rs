@@ -126,6 +126,9 @@ const SAVE_DELAY: Duration = Duration::from_millis(500);
 const SAVE_WARN: u32 = 3;
 /// How long to wait before building the renderer again after it failed.
 const GFX_RETRY: Duration = Duration::from_secs(1);
+/// How long to wait before drawing again after a frame had nothing to draw
+/// into, so a stuck compositor cannot spin blitz.
+const SKIPPED_FRAME: Duration = Duration::from_millis(250);
 /// Time between the steps a drag scrolls while the pointer is held above
 /// or below its pane.
 const AUTOSCROLL: Duration = Duration::from_millis(50);
@@ -1236,6 +1239,8 @@ struct App {
     toasts_failed: bool,
     /// No renderer could be built; the next try is not before this.
     gfx_retry: Option<Instant>,
+    /// The last frame had nothing to draw into; the next try is then.
+    skipped_at: Option<Instant>,
     /// Where the window last was while not minimized, maximized or full
     /// screen.
     placed: Geometry,
@@ -1705,6 +1710,7 @@ impl App {
             save_fails: 0,
             toasts_failed: false,
             gfx_retry: None,
+            skipped_at: None,
             placed: Geometry::default(),
             watched: None,
             started: Instant::now(),
@@ -1771,7 +1777,7 @@ impl App {
         {
             self.hwnd = h.hwnd.get();
         }
-        crate::handoff::install(self.hwnd, self.proxy.clone(), !self.args.separate());
+        crate::handoff::install(self.hwnd, self.proxy.clone(), self.args.main());
         crate::notify::install(self.hwnd, self.proxy.clone());
         watch_settings(self.proxy.clone());
         self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
@@ -5630,7 +5636,7 @@ impl App {
                 // No frame to draw while the window is hidden: winit says
                 // when it shows again.
                 let Some(rtv) = g.chain.rtv(&g.r.gpu)? else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 if !g.r.draw(&rtv, size.width, size.height, pal.bg)? {
                     break;
@@ -5649,11 +5655,16 @@ impl App {
             let t = Instant::now();
             let shown = g.chain.present(&g.r.gpu);
             waited += t.elapsed();
-            shown
+            shown.map(Some)
         })();
         self.counters.frame_cpu_ms += (started.elapsed() - waited).as_secs_f64() * 1000.0;
         match result {
-            Ok(shown) => {
+            // No frame to draw into. winit says when a hidden window shows
+            // again, but not when a frame stops timing out, so it is tried
+            // again a little later.
+            Ok(None) => self.skipped_at = Some(Instant::now() + SKIPPED_FRAME),
+            Ok(Some(shown)) => {
+                self.skipped_at = None;
                 self.reveal(true);
                 self.counters.frames += 1;
                 if shown {
@@ -5868,6 +5879,7 @@ impl App {
             find,
             self.save_after,
             gfx,
+            self.skipped_at.filter(|_| shown),
             anim,
             self.mouse.scroll_at,
             self.hidden_until,
@@ -7102,15 +7114,15 @@ fn first_line(text: &str) -> String {
         .collect()
 }
 
-/// Whether copy key `k` copies a selection that `shown` says is in view or
-/// not, when there is one, or else the text of one output rewrote
-/// (`orphan`), which shows nowhere. Plain Ctrl+C is the interrupt too, so
-/// it copies only what the user can see; the other copy keys always copy.
 /// Whether `k` is a Cmd chord, which on a Mac never reaches the program.
 fn cmd_stays(k: &KeyInput) -> bool {
     cfg!(target_os = "macos") && (k.mods.lsuper || k.mods.rsuper)
 }
 
+/// Whether copy key `k` copies a selection that `shown` says is in view or
+/// not, when there is one, or else the text of one output rewrote
+/// (`orphan`), which shows nowhere. Plain Ctrl+C is the interrupt too, so
+/// it copies only what the user can see; the other copy keys always copy.
 fn copy_key_copies(k: &KeyInput, shown: Option<bool>, orphan: bool) -> bool {
     shown.or(orphan.then_some(false)) != Some(false) || !vt::keys::is_interrupt(k)
 }

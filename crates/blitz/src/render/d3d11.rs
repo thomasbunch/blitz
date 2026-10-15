@@ -439,9 +439,8 @@ impl Swapchain {
         }
     }
 
-    /// The current back buffer's render target view.
-    /// The back buffer to draw to. Always one: a hidden window still has
-    /// its back buffer here.
+    /// The current back buffer's render target view. Always one: a hidden
+    /// window still has its back buffer here.
     pub fn rtv(&mut self, gpu: &Gpu) -> Result<Option<ID3D11RenderTargetView>> {
         if let Some(rtv) = &self.rtv {
             return Ok(Some(rtv.clone()));
