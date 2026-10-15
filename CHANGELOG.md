@@ -4,7 +4,7 @@ What changes in each blitz release. The newest release comes first. A
 release's section here becomes its notes on GitHub, so write it for the
 people who use blitz.
 
-## [0.0.5] - Unreleased
+## [0.0.5] - 2026-10-15
 
 The biggest release yet: a command palette, your own key bindings, find,
 notifications, Claude Code marks that need no setup, and the first builds
@@ -154,7 +154,7 @@ for macOS. Linux builds are experimental.
   *done* marks for Claude Code, Direct3D 11 and DirectWrite rendering, and
   Microsoft's ConPTY bundled for low input latency.
 
-[0.0.5]: https://github.com/thomasbunch/blitz/compare/v0.0.4...main
+[0.0.5]: https://github.com/thomasbunch/blitz/releases/tag/v0.0.5
 [0.0.4]: https://github.com/thomasbunch/blitz/releases/tag/v0.0.4
 [0.0.3]: https://github.com/thomasbunch/blitz/releases/tag/v0.0.3
 [0.0.2]: https://github.com/thomasbunch/blitz/releases/tag/v0.0.2
