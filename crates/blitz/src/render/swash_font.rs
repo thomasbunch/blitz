@@ -194,8 +194,11 @@ fn covering(c: char, style: u8) -> Option<Face> {
 /// a frame allow two asks.
 const ASK_COST: u32 = 100;
 
-/// How many times one font asks fontconfig in all.
+/// How many times one font asks fontconfig in all, and how many of those
+/// may be about private characters, so icons with no font cannot use up
+/// what text needs.
 const MAX_ASKS: u32 = 256;
+const MAX_PRIVATE_ASKS: u32 = 32;
 
 /// Whether fontconfig might find a font for `c` that the lists lack: not on
 /// a Mac, and not for a noncharacter, which no font draws. A private one
@@ -267,8 +270,10 @@ pub struct Font {
     fallbacks: HashMap<(char, u8), Option<Face>>,
     /// Faces fontconfig found, tried before asking it again.
     found: Vec<Face>,
-    /// Times fontconfig was asked, up to [`MAX_ASKS`].
+    /// Times fontconfig was asked about text, up to [`MAX_ASKS`], and
+    /// about private characters, up to [`MAX_PRIVATE_ASKS`].
     asked: u32,
+    asked_private: u32,
     scaler: ScaleContext,
     /// Fallback lookups [`Font::raster`] may still make before it fails
     /// as pending; a renderer allows a few per frame.
@@ -317,6 +322,7 @@ impl Font {
             fallbacks: HashMap::new(),
             found: Vec::new(),
             asked: 0,
+            asked_private: 0,
             scaler: ScaleContext::new(),
             lookups: u32::MAX,
         })
@@ -478,6 +484,15 @@ impl Font {
         }))
     }
 
+    /// Whether fontconfig may still be asked about `c`.
+    fn may_ask(&self, c: char) -> bool {
+        if is_private(c) {
+            self.asked_private < MAX_PRIVATE_ASKS
+        } else {
+            self.asked < MAX_ASKS
+        }
+    }
+
     /// The face for `c` when the font lacks it, cached: an installed Nerd
     /// Font for an icon, else the first fallback family that has it.
     fn fallback_face(&mut self, c: char, style: u8) -> Result<Option<Face>> {
@@ -505,12 +520,16 @@ impl Font {
             // a frame and a few hundred in all, none for a character no
             // font is likely to have, and each face it finds is tried
             // before asking again.
-            None if worth_asking(c) && self.asked < MAX_ASKS => {
+            None if worth_asking(c) && self.may_ask(c) => {
                 if self.lookups < ASK_COST {
                     return Err(Pending.into());
                 }
                 self.lookups -= ASK_COST;
-                self.asked += 1;
+                if is_private(c) {
+                    self.asked_private += 1;
+                } else {
+                    self.asked += 1;
+                }
                 let face = covering(c, style);
                 let plain = (face.clone()).map(|f| Face {
                     embolden: false,
@@ -633,6 +652,10 @@ mod tests {
         f.asked = MAX_ASKS;
         f.lookups = 1;
         assert!(f.raster("\u{2FFF3}", 0, 1).is_ok());
+        // Icons have a budget of their own, and text keeps its own.
+        f.asked = 0;
+        f.asked_private = MAX_PRIVATE_ASKS;
+        assert!(!f.may_ask('\u{F0001}') && f.may_ask('\u{2FFF4}'));
     }
 
     #[test]
