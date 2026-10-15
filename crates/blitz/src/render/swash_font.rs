@@ -194,10 +194,10 @@ fn covering(c: char, style: u8) -> Option<Face> {
 /// a frame allow two asks.
 const ASK_COST: u32 = 100;
 
-/// How many times one font asks fontconfig in all, and how many of those
-/// may be about private characters, so icons with no font cannot use up
-/// what text needs.
+/// How many times one font asks fontconfig in all about text.
 const MAX_ASKS: u32 = 256;
+/// And about private characters, apart, so icons with no font cannot use
+/// up what text needs.
 const MAX_PRIVATE_ASKS: u32 = 32;
 
 /// Whether fontconfig might find a font for `c` that the lists lack: not on
@@ -270,9 +270,10 @@ pub struct Font {
     fallbacks: HashMap<(char, u8), Option<Face>>,
     /// Faces fontconfig found, tried before asking it again.
     found: Vec<Face>,
-    /// Times fontconfig was asked about text, up to [`MAX_ASKS`], and
-    /// about private characters, up to [`MAX_PRIVATE_ASKS`].
+    /// Times fontconfig was asked about text, up to [`MAX_ASKS`].
     asked: u32,
+    /// Times it was asked about private characters, up to
+    /// [`MAX_PRIVATE_ASKS`].
     asked_private: u32,
     scaler: ScaleContext,
     /// Fallback lookups [`Font::raster`] may still make before it fails

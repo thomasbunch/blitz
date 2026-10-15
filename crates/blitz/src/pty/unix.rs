@@ -354,8 +354,9 @@ impl Pty {
     }
 
     /// Hangs up on the child and the terminal's foreground job (SIGHUP to
-    /// their process groups) and kills what is still running 6 s later. Returns at once; output keeps flowing
-    /// to the reader until the end. Also called on drop.
+    /// their process groups) and kills what is still running 6 s later.
+    /// Returns at once; output keeps flowing to the reader until the end.
+    /// Also called on drop.
     pub fn close(&self) {
         if self.closing.swap(true, Ordering::Relaxed) {
             return;
