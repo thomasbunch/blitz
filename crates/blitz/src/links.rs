@@ -366,7 +366,11 @@ pub fn plan_uri(uri: &str, pathext: &str) -> Option<Open> {
 pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
     let s = path.to_str()?;
     // No `:` stream after the drive, and nothing a name cannot hold.
-    if !vt::osc::local_dir(s) || s[2..].contains([':', '"', '*', '?', '<', '>', '|']) {
+    // The root is ASCII: `C:\` here starts the check at its `\`, and `/`
+    // takes it from the start, as a path can be `/` alone or go on with
+    // any character.
+    let rest = s.get(ROOT - 1..).unwrap_or_default();
+    if !vt::osc::local_dir(s) || rest.contains([':', '"', '*', '?', '<', '>', '|']) {
         return None;
     }
     // Windows drops dots and spaces at the end of a name: `x.exe.` is `x.exe`.
@@ -376,7 +380,8 @@ pub fn plan_path(path: &Path, pathext: &str) -> Option<Open> {
     let runs = name.rsplit_once('.').is_some_and(|(_, ext)| {
         let is = |t: &str| !t.is_empty() && t.eq_ignore_ascii_case(ext);
         !OPENS.iter().any(|t| is(t)) || pathext.split(';').any(|t| is(t.trim_start_matches('.')))
-    }) || bundle(path);
+    }) || bundle(path)
+        || executable(path);
     Some(if runs {
         Open::Reveal(path.into())
     } else {
@@ -466,6 +471,20 @@ fn bundle(path: &Path) -> bool {
     cfg!(target_os = "macos") && path.extension().is_some() && path.is_dir()
 }
 
+/// Whether `path` is a file anyone may run. The Finder runs one with no
+/// type in Terminal, and some Linux desktops run or offer to run it.
+#[cfg(unix)]
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Windows judges a file by its type alone.
+#[cfg(windows)]
+fn executable(_path: &Path) -> bool {
+    false
+}
+
 /// Whether Windows has a program to open files of `path`'s type.
 #[cfg(windows)]
 fn has_program(path: &Path) -> bool {
@@ -531,6 +550,11 @@ pub fn open(t: &Target, editor: &str) -> Result<(), &'static str> {
     };
     let done = match with_editor(how, editor, place, has_program)? {
         Open::Uri(u) => desktop_open(&[], u.as_ref()),
+        // A file with no type goes to the text editor: what the Finder
+        // picks for one might run it.
+        Open::File(p) if cfg!(target_os = "macos") && p.is_file() && p.extension().is_none() => {
+            desktop_open(&["-t"], p.as_os_str())
+        }
         Open::File(p) => desktop_open(&[], p.as_os_str()),
         Open::Reveal(p) if cfg!(target_os = "macos") => desktop_open(&["-R"], p.as_os_str()),
         // xdg-open has no way to select a file, so its folder opens.
@@ -616,9 +640,9 @@ fn desktop_open(flags: &[&str], what: &std::ffi::OsStr) -> Option<()> {
         return None;
     }
     let opener = if cfg!(target_os = "macos") {
-        "/usr/bin/open"
+        "/usr/bin/open".into()
     } else {
-        "xdg-open"
+        crate::desktop::tool("xdg-open")?
     };
     let mut child = (std::process::Command::new(opener).args(flags).arg(what))
         .stdin(std::process::Stdio::null())
@@ -1190,6 +1214,34 @@ mod tests {
             assert_eq!(plan_path(Path::new(bad), ""), None, "{bad}");
         }
         assert_eq!(desktop_open(&[], "-a".as_ref()), None);
+        // Short or non-ASCII paths right after the root.
+        assert_eq!(plan_uri("file:///", ""), file("/"));
+        assert_eq!(plan_uri("file:///%C3%A9", ""), file("/é"));
+        assert_eq!(plan_path(Path::new("/é:x"), ""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_reveal_a_file_anyone_may_run_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("blitz-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // macOS's temporary folder is under a link, which a URI may not go
+        // through.
+        let dir = std::fs::canonicalize(&dir).expect("real");
+        let tool = dir.join("README");
+        let text = dir.join("NOTES");
+        std::fs::write(&tool, "#!/bin/sh\n").expect("write");
+        std::fs::write(&text, "x").expect("write");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let uri = |p: &Path| Target::Uri(format!("file://{}", p.display()));
+        let run = plan(&uri(&tool), "");
+        let read = plan(&uri(&text), "");
+        let typed = plan(&Target::Path(tool.clone(), None), "");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(run, Some(Open::Reveal(_))), "{run:?}");
+        assert!(matches!(typed, Some(Open::Reveal(_))), "{typed:?}");
+        assert!(matches!(read, Some(Open::File(_))), "{read:?}");
     }
 
     #[cfg(unix)]

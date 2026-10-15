@@ -92,6 +92,19 @@ fn session_files_round_trip() {
     out(&[(A, "c")]);
     assert_eq!(session::load_output(A).as_deref(), Some("c"));
     assert_eq!(session::load_output(B), None);
+    // Only this user reads what is kept, wherever HOME is open to all.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("session.json")), 0o600);
+        assert_eq!(mode(&dir.join("scrollback")), 0o700);
+        assert_eq!(
+            mode(&dir.join("scrollback").join(format!("{A}.txt"))),
+            0o600
+        );
+    }
 
     // Output is filed by its pane's own key, so saving another layout keeps
     // it: it can only come back into the pane it came from, so a start after

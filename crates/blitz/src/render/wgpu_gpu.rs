@@ -34,6 +34,10 @@ pub struct Gpu {
     /// Grayscale contrast boost and [`gamma_ratios`] for glyphs.
     contrast: f32,
     gamma: [f32; 4],
+    /// An error wgpu reported on its own since the last frame. wgpu panics
+    /// on one unless told where it goes; here it ends the frame, and the
+    /// device is made again.
+    failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// A render target that lives only on the GPU, for headless rendering.
@@ -83,6 +87,12 @@ impl Gpu {
                     wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
                 ..Default::default()
             }))?;
+        let failed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let to = failed.clone();
+        device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
+            let mut first = to.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            first.get_or_insert_with(|| e.to_string());
+        }));
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
@@ -166,7 +176,24 @@ impl Gpu {
             quad_cap: 0,
             contrast: 1.0,
             gamma: gamma_ratios(1.8),
+            failed,
         })
+    }
+
+    /// The error wgpu reported since the last call, if it did.
+    fn failure(&self) -> Option<String> {
+        (self
+            .failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .take()
+    }
+
+    /// `(w, h)`, at least a pixel and at most the largest texture the
+    /// device takes: a window across several screens can be wider.
+    fn fit(&self, w: u32, h: u32) -> (u32, u32) {
+        let max = self.device.limits().max_texture_dimension_2d.max(1);
+        (w.clamp(1, max), h.clamp(1, max))
     }
 
     /// The pipeline that draws to targets of `format`, made at first use.
@@ -370,6 +397,9 @@ impl Gpu {
         });
         self.device.poll(wgpu::PollType::wait_indefinitely())?;
         rx.recv()??;
+        if let Some(e) = self.failure() {
+            return Err(format!("the GPU reported an error: {e}").into());
+        }
         let data = slice.get_mapped_range()?;
         let mut out = vec![0u8; row * t.h as usize];
         for (dst, src) in out.chunks_exact_mut(row).zip(data.chunks(pitch)) {
@@ -426,7 +456,7 @@ impl Swapchain {
         w: u32,
         h: u32,
     ) -> Result<Self> {
-        let (w, h) = (w.max(1), h.max(1));
+        let (w, h) = gpu.fit(w, h);
         let surface = (gpu.instance)
             .create_surface(wgpu::SurfaceTarget::DisplayAndWindow(Box::new(window)))?;
         let caps = surface.get_capabilities(&gpu.adapter);
@@ -486,7 +516,7 @@ impl Swapchain {
     }
 
     pub fn resize(&mut self, gpu: &Gpu, w: u32, h: u32) -> Result<()> {
-        let (w, h) = (w.max(1), h.max(1));
+        let (w, h) = gpu.fit(w, h);
         if (w, h) == (self.w, self.h) {
             return Ok(());
         }
@@ -510,6 +540,10 @@ impl Swapchain {
             return Ok(false);
         };
         gpu.queue.present(texture);
+        // Made again, the renderer starts from what it knows is sound.
+        if gpu.failure().is_some() {
+            return Err(Lost.into());
+        }
         Ok(true)
     }
 }

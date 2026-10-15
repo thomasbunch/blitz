@@ -34,13 +34,17 @@ fn writers() -> Vec<&'static [&'static str]> {
 /// clipboard holds nothing of that type.
 fn read(mime: &str) -> Option<Vec<u8>> {
     readers(mime).into_iter().find_map(|tool| {
-        let out = (Command::new(&tool[0]).args(&tool[1..]))
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        out.status.success().then_some(out.stdout)
+        let mut cmd = Command::new(crate::desktop::tool(&tool[0])?);
+        output_within(cmd.args(&tool[1..]), MAX_CLIP)
     })
+}
+
+/// The most blitz reads from the clipboard, enough for a screenshot. The
+/// program that owns it decides what comes back, and when.
+const MAX_CLIP: u64 = 64 << 20;
+
+fn output_within(cmd: &mut Command, cap: u64) -> Option<Vec<u8>> {
+    crate::desktop::output_within(cmd, std::time::Duration::from_secs(2), cap)
 }
 
 /// The types the clipboard holds.
@@ -53,16 +57,13 @@ fn types() -> Vec<String> {
     (listers.iter())
         .filter(|l| wayland || l[0] != "wl-paste")
         .find_map(|l| {
-            let out = (Command::new(l[0]).args(&l[1..]))
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .ok()?;
-            out.status.success().then(|| {
-                (String::from_utf8_lossy(&out.stdout).lines())
+            let mut cmd = Command::new(crate::desktop::tool(l[0])?);
+            let out = output_within(cmd.args(&l[1..]), 1 << 16)?;
+            Some(
+                (String::from_utf8_lossy(&out).lines())
                     .map(str::to_owned)
-                    .collect()
-            })
+                    .collect(),
+            )
         })
         .unwrap_or_default()
 }
@@ -94,7 +95,10 @@ pub fn get_files() -> Option<Vec<PathBuf>> {
 /// owner window is for Windows.
 pub fn set_text(_owner: Option<isize>, text: &str) -> bool {
     writers().into_iter().any(|tool| {
-        let Ok(mut child) = (Command::new(tool[0]).args(&tool[1..]))
+        let Some(exe) = crate::desktop::tool(tool[0]) else {
+            return false;
+        };
+        let Ok(mut child) = (Command::new(exe).args(&tool[1..]))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

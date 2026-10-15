@@ -60,35 +60,68 @@ fn winsize(cols: u16, rows: u16) -> libc::winsize {
 }
 
 /// Opens a pseudo terminal of `cols` by `rows`, as (master, slave). Neither
-/// end leaks into other children: the slave is handed to this one as its
-/// standard streams only.
+/// end leaks into other children: both are opened close-on-exec, at once,
+/// so a program another thread starts meanwhile cannot take them along;
+/// the slave is handed to this one as its standard streams only.
 fn open(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
-    let (mut m, mut s) = (-1, -1);
-    let ws = winsize(cols, rows);
-    // SAFETY: valid out pointers, no name buffer, default terminal settings
-    // and a valid size, which openpty only reads; both descriptors are
-    // owned right away.
-    let r = unsafe {
-        libc::openpty(
-            &mut m,
-            &mut s,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::from_ref(&ws).cast_mut(),
-        )
-    };
-    if r < 0 {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    let m = open_fd(c"/dev/ptmx", flags)?;
+    // SAFETY: an open pseudo terminal master; neither call forks here, as
+    // the kernel's devpts or ioctl does the work.
+    if unsafe { libc::grantpt(m.as_raw_fd()) } < 0 || unsafe { libc::unlockpt(m.as_raw_fd()) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: openpty returned two open descriptors nothing else owns.
-    let (m, s) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
-    for fd in [&m, &s] {
-        // SAFETY: an open descriptor; the flag only affects exec.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+    let s = open_fd(&slave_name(&m)?, flags)?;
+    let ws = winsize(cols, rows);
+    // SAFETY: an open terminal and a valid size, which the call only reads.
+    if unsafe { libc::ioctl(m.as_raw_fd(), libc::TIOCSWINSZ, &ws) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((m, s))
+}
+
+fn open_fd(path: &std::ffi::CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: a NUL-terminated path; the descriptor is owned right away.
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: open returned a descriptor nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The path of `master`'s slave, read into a buffer of blitz's own, as
+/// `ptsname` shares one between threads.
+fn slave_name(master: &OwnedFd) -> io::Result<std::ffi::CString> {
+    let mut buf = [0 as libc::c_char; 128];
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: an open master and a buffer of the 128 bytes the call
+        // fills.
+        let r = unsafe {
+            libc::ioctl(
+                master.as_raw_fd(),
+                libc::TIOCPTYGNAME.into(),
+                buf.as_mut_ptr(),
+            )
+        };
+        if r < 0 {
             return Err(io::Error::last_os_error());
         }
     }
-    Ok((m, s))
+    #[cfg(not(target_os = "macos"))]
+    {
+        // SAFETY: an open master, and the buffer's real length.
+        let r = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+        // It returns the error rather than setting errno.
+        if r != 0 {
+            return Err(io::Error::from_raw_os_error(r));
+        }
+    }
+    // The last byte stays NUL whatever the call wrote.
+    buf[buf.len() - 1] = 0;
+    // SAFETY: a NUL-terminated name in a buffer that outlives the borrow.
+    Ok(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_owned())
 }
 
 /// The shell to start when a pane names no command: `SHELL` when it is an

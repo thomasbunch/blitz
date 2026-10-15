@@ -1,10 +1,60 @@
 //! macOS and Linux. Most of what Windows reports, as the pointer hiding
 //! while typing, has no setting to read here, so these give the usual.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "macos"))]
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
+
+/// The program `name` from a folder on PATH, by its full path. A bare
+/// name would also be looked for in an empty or relative PATH entry, that
+/// is, in whatever folder blitz was started in, where a planted program
+/// would run.
+pub fn tool(name: &str) -> Option<PathBuf> {
+    tool_in(std::env::var_os("PATH").as_deref(), name)
+}
+
+fn tool_in(path: Option<&std::ffi::OsStr>, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".as_ref());
+    (std::env::split_paths(path))
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// What `cmd` prints, when it ends well within `deadline` having printed
+/// at most `cap` bytes. One that hangs or never stops is killed: what
+/// another program serves, such as the clipboard, is not to freeze or
+/// fill blitz.
+pub fn output_within(cmd: &mut Command, deadline: Duration, cap: u64) -> Option<Vec<u8>> {
+    let mut child = (cmd.stdin(Stdio::null()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = out.take(cap + 1).read_to_end(&mut bytes);
+        let _ = tx.send(read.map(|_| bytes));
+    });
+    let got = rx.recv_timeout(deadline);
+    let fits = matches!(&got, Ok(Ok(b)) if b.len() as u64 <= cap);
+    if !fits {
+        let _ = child.kill();
+    }
+    let ok = child.wait().is_ok_and(|s| s.success());
+    match got {
+        Ok(Ok(bytes)) if fits && ok => Some(bytes),
+        _ => None,
+    }
+}
 
 /// What the OS is called in an issue report.
 #[cfg(target_os = "macos")]
@@ -277,19 +327,28 @@ impl Awake {
     }
 }
 
-/// A `systemd-inhibit` that holds off idle sleep until it is killed.
+impl Drop for Awake {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
+/// A `systemd-inhibit` that holds off idle sleep until it is killed or
+/// blitz exits.
 #[cfg(not(target_os = "macos"))]
 fn inhibit() -> Option<Child> {
-    Command::new("systemd-inhibit")
+    // `cat` waits on a pipe only blitz holds, so the lock ends with blitz
+    // however it ends.
+    let cat = tool("cat")?;
+    Command::new(tool("systemd-inhibit")?)
         .args([
             "--what=idle:sleep",
             "--who=blitz",
             "--why=A session is working",
             "--mode=block",
-            "sleep",
-            "infinity",
         ])
-        .stdin(Stdio::null())
+        .arg(cat)
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -306,6 +365,36 @@ mod tests {
         assert_eq!(os_name(release).as_deref(), Some("Ubuntu 24.04.1 LTS"));
         assert_eq!(os_name("ID=arch\n"), None);
         assert_eq!(os_name("PRETTY_NAME=\n"), None);
+    }
+
+    #[test]
+    fn tools_come_only_from_absolute_folders() {
+        assert_eq!(tool_in(Some("".as_ref()), "sh"), None);
+        assert_eq!(tool_in(Some(".:bin".as_ref()), "sh"), None);
+        assert_eq!(
+            tool_in(Some(":/bin".as_ref()), "sh"),
+            Some("/bin/sh".into())
+        );
+        assert_eq!(tool_in(Some("/bin".as_ref()), "no-such-tool"), None);
+    }
+
+    #[test]
+    fn output_within_stops_a_tool_that_hangs_or_floods() {
+        let sh = |script: &str| {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", script]);
+            c
+        };
+        let second = Duration::from_secs(1);
+        assert_eq!(
+            output_within(&mut sh("printf hi"), second, 2),
+            Some(b"hi".to_vec())
+        );
+        assert_eq!(output_within(&mut sh("printf hi; exit 1"), second, 9), None);
+        assert_eq!(output_within(&mut sh("yes"), second * 5, 1 << 16), None);
+        let start = std::time::Instant::now();
+        assert_eq!(output_within(&mut sh("exec sleep 30"), second, 9), None);
+        assert!(start.elapsed() < second * 10);
     }
 
     #[test]

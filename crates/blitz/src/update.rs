@@ -193,22 +193,24 @@ pub fn notes(v: &str) -> String {
 #[cfg(not(windows))]
 pub fn open(url: &str) -> bool {
     let opener = if cfg!(target_os = "macos") {
-        "/usr/bin/open"
+        Some("/usr/bin/open".into())
     } else {
-        "xdg-open"
+        crate::desktop::tool("xdg-open")
     };
     // Only web pages: `open` and xdg-open would take anything.
-    url.starts_with("https://")
-        && Command::new(opener)
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map(|mut c| {
-                std::thread::spawn(move || c.wait());
-            })
-            .is_ok()
+    let Some(opener) = opener.filter(|_| url.starts_with("https://")) else {
+        return false;
+    };
+    Command::new(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|mut c| {
+            std::thread::spawn(move || c.wait());
+        })
+        .is_ok()
 }
 
 /// Opens a web page in the browser; false if it could not.
@@ -513,9 +515,9 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     // The system's own, by its full path on macOS. curl reads the proxy
     // from the environment itself.
     let exe = if cfg!(target_os = "macos") {
-        "/usr/bin/curl"
+        "/usr/bin/curl".into()
     } else {
-        "curl"
+        crate::desktop::tool("curl").ok_or("could not find curl")?
     };
     // A slow line still finishes the download; one that stalls gives up.
     let out = Command::new(exe)

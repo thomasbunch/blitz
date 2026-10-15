@@ -24,8 +24,28 @@ fn args(lines: &[String], silent: bool) -> Vec<String> {
     // Nothing after this is an option, whatever the text starts with.
     a.push("--".into());
     a.extend(lines.first().cloned());
-    a.push(lines.get(1..).unwrap_or_default().join("\n"));
+    let body: Vec<String> = (lines.get(1..).unwrap_or_default().iter())
+        .map(|l| markup_text(l))
+        .collect();
+    a.push(body.join("\n"));
     a
+}
+
+/// `line` as body text: notify-send turns `\NNN` back into any byte after
+/// blitz cleaned the line, and the desktop reads the body as markup, where
+/// a program's `<a href>` would become a link.
+fn markup_text(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Shows a notification saying `lines` about pane `id`. `None` when there
@@ -40,7 +60,10 @@ pub fn show(
     if lines.is_empty() {
         return Ok(None);
     }
-    let Ok(mut child) = (Command::new("notify-send").args(args(&lines, silent)))
+    let Some(exe) = crate::desktop::tool("notify-send") else {
+        return Ok(None);
+    };
+    let Ok(mut child) = (Command::new(exe).args(args(&lines, silent)))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -75,6 +98,24 @@ mod tests {
                 "--",
                 "--help",
                 "-u critical\nx"
+            ]
+        );
+    }
+
+    #[test]
+    fn notify_send_body_stays_text() {
+        let lines = [
+            "<b>title</b>".to_owned(),
+            r"ok \342\200\256gpj.exe \033[31m".into(),
+            r#"<a href="https://evil.example">Approve</a> & more"#.into(),
+        ];
+        assert_eq!(
+            args(&lines, false)[1..],
+            [
+                "--",
+                "<b>title</b>",
+                "ok \\\\342\\\\200\\\\256gpj.exe \\\\033[31m\n\
+                 &lt;a href=\"https://evil.example\"&gt;Approve&lt;/a&gt; &amp; more"
             ]
         );
     }
