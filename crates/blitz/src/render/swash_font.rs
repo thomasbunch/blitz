@@ -491,7 +491,12 @@ impl Font {
         let nerd = is_private(c).then(nerd_family).flatten();
         let listed = (nerd.into_iter().chain(FALLBACK_FAMILIES.iter().copied()))
             .filter_map(|f| face_of(f, style))
-            .chain(self.found.iter().cloned())
+            // Drawn in this style, whichever style first found them.
+            .chain(self.found.iter().map(|f| Face {
+                embolden: style & BOLD != 0,
+                slant: style & ITALIC != 0,
+                ..f.clone()
+            }))
             .find(|f| f.glyph(c) != 0);
         let face = match listed {
             Some(face) => Some(face),
@@ -507,10 +512,15 @@ impl Font {
                 self.lookups -= ASK_COST;
                 self.asked += 1;
                 let face = covering(c, style);
-                if let Some(f) = &face
-                    && !self.found.iter().any(|g| g.same_as(f))
+                let plain = (face.clone()).map(|f| Face {
+                    embolden: false,
+                    slant: false,
+                    ..f
+                });
+                if let Some(f) = plain
+                    && !self.found.iter().any(|g| g.same_as(&f))
                 {
-                    self.found.push(f.clone());
+                    self.found.push(f);
                 }
                 face
             }

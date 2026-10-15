@@ -204,17 +204,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blitz-handoff-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("t.sock");
-        // A socket left by a blitz that is gone is taken over.
+        // A socket left by a blitz that is gone, and two launches at once:
+        // one takes it over and the other finds that one.
         drop(UnixListener::bind(&path).expect("stale"));
-        assert!(connect_or_claim(&path).is_none(), "the first takes it");
-        // The lock is per open file, so this process is a second launch
-        // now, and a second at once.
+        let barrier = std::sync::Barrier::new(2);
         let both = std::thread::scope(|s| {
-            let a = s.spawn(|| connect_or_claim(&path).is_some());
-            let b = s.spawn(|| connect_or_claim(&path).is_some());
+            let go = || {
+                barrier.wait();
+                connect_or_claim(&path).is_some()
+            };
+            let a = s.spawn(go);
+            let b = s.spawn(go);
             (a.join().expect("a"), b.join().expect("b"))
         });
-        assert_eq!(both, (true, true), "the others find it");
+        assert!(both == (true, false) || both == (false, true), "{both:?}");
+        // The lock is per open file, so a later launch finds it too.
+        assert!(connect_or_claim(&path).is_some(), "a later one finds it");
         let held = CLAIMED.lock().expect("lock").take();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(held.is_some());
