@@ -1241,6 +1241,8 @@ struct App {
     gfx_retry: Option<Instant>,
     /// The last frame had nothing to draw into; the next try is then.
     skipped_at: Option<Instant>,
+    /// winit said the window is out of sight.
+    occluded: bool,
     /// Where the window last was while not minimized, maximized or full
     /// screen.
     placed: Geometry,
@@ -1711,6 +1713,7 @@ impl App {
             toasts_failed: false,
             gfx_retry: None,
             skipped_at: None,
+            occluded: false,
             placed: Geometry::default(),
             watched: None,
             started: Instant::now(),
@@ -5659,10 +5662,12 @@ impl App {
         })();
         self.counters.frame_cpu_ms += (started.elapsed() - waited).as_secs_f64() * 1000.0;
         match result {
-            // No frame to draw into. winit says when a hidden window shows
-            // again, but not when a frame stops timing out, so it is tried
-            // again a little later.
-            Ok(None) => self.skipped_at = Some(Instant::now() + SKIPPED_FRAME),
+            // No frame to draw into. A hidden window, as a Mac's is until
+            // its first frame, is shown now.
+            Ok(None) => {
+                self.reveal(true);
+                self.skipped_at = retry_skipped(self.occluded, Instant::now());
+            }
             Ok(Some(shown)) => {
                 self.skipped_at = None;
                 self.reveal(true);
@@ -7114,6 +7119,13 @@ fn first_line(text: &str) -> String {
         .collect()
 }
 
+/// When to draw again after a frame that had nothing to draw into. winit
+/// says when a window out of sight shows again, but not when a frame stops
+/// timing out, so that is tried again a little later.
+fn retry_skipped(occluded: bool, now: Instant) -> Option<Instant> {
+    (!occluded).then_some(now + SKIPPED_FRAME)
+}
+
 /// Whether `k` is a Cmd chord, which on a Mac never reaches the program.
 fn cmd_stays(k: &KeyInput) -> bool {
     cfg!(target_os = "macos") && (k.mods.lsuper || k.mods.rsuper)
@@ -7540,7 +7552,12 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Moved(_) => self.note_place(),
             // A frame skipped while the window was hidden is drawn now.
-            WindowEvent::Occluded(false) => self.request_redraw(),
+            WindowEvent::Occluded(o) => {
+                self.occluded = o;
+                if !o {
+                    self.request_redraw();
+                }
+            }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;
                 // The cursor's cell stays, but its pixels move.
@@ -10858,6 +10875,13 @@ mod tests {
         };
         assert_eq!(cmd_stays(&cmd_c), cfg!(target_os = "macos"));
         assert!(!cmd_stays(&ctrl_c));
+    }
+
+    #[test]
+    fn a_frame_out_of_sight_waits_for_winit_and_one_that_timed_out_is_retried() {
+        let now = Instant::now();
+        assert_eq!(retry_skipped(true, now), None);
+        assert_eq!(retry_skipped(false, now), Some(now + SKIPPED_FRAME));
     }
 
     #[test]
