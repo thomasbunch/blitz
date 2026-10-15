@@ -194,10 +194,10 @@ fn covering(c: char, style: u8) -> Option<Face> {
 /// a frame allow two asks.
 const ASK_COST: u32 = 100;
 
-/// How many times one font asks fontconfig in all about text.
+/// The most times one font asks fontconfig about text.
 const MAX_ASKS: u32 = 256;
-/// And about private characters, apart, so icons with no font cannot use
-/// up what text needs.
+/// The most times it asks about private characters, counted apart so
+/// icons with no font cannot use up what text needs.
 const MAX_PRIVATE_ASKS: u32 = 32;
 
 /// Whether fontconfig might find a font for `c` that the lists lack: not on
