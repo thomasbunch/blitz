@@ -353,8 +353,8 @@ impl Pty {
         false
     }
 
-    /// Hangs up on the child (SIGHUP to its process group) and kills it if
-    /// it is still running 6 s later. Returns at once; output keeps flowing
+    /// Hangs up on the child and the terminal's foreground job (SIGHUP to
+    /// their process groups) and kills what is still running 6 s later. Returns at once; output keeps flowing
     /// to the reader until the end. Also called on drop.
     pub fn close(&self) {
         if self.closing.swap(true, Ordering::Relaxed) {
@@ -386,11 +386,22 @@ impl Pty {
                 let group = foreground();
                 hang_up(group, libc::SIGHUP);
                 signal(&child, libc::SIGHUP);
+                let end = Instant::now() + CLOSE_GRACE;
                 if wait(&child, CLOSE_GRACE).is_some() {
-                    // The shell died of the hangup just now; its job's
-                    // group, if the job lives on, still has that id. An
-                    // emptied one just gives ESRCH.
-                    hang_up(group, libc::SIGKILL);
+                    // The shell died of the hangup at once, as one does; its
+                    // job gets the rest of the grace to clean up. While the
+                    // group has members its id cannot name another's.
+                    if let Some(g) = group {
+                        // SAFETY: signal 0 only asks whether the group has
+                        // members.
+                        while unsafe { libc::kill(-g, 0) } == 0 {
+                            if Instant::now() >= end {
+                                hang_up(group, libc::SIGKILL);
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
                 } else {
                     // The session still exists, so its group now is current:
                     // an id read seconds ago could name another's by now.
@@ -643,6 +654,33 @@ mod tests {
         pty.writer().send(b"\x03".to_vec());
         let (_, code) = finish(&rx);
         assert_eq!(code, 5);
+    }
+
+    #[test]
+    fn closing_gives_a_job_its_grace_after_the_shell_ends() {
+        let dir = std::env::temp_dir().join(format!("blitz-grace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let marker = dir.join("cleaned");
+        // The job cleans up for a second when hung up on.
+        let script = "sh -c \"trap 'sleep 1; touch \\\"$M\\\"; exit 0' HUP; echo ready; \
+                      while :; do sleep 0.1; done\"; :";
+        let env = [
+            ("S".to_string(), script.to_string()),
+            ("M".to_string(), marker.display().to_string()),
+        ];
+        let (pty, rx) = spawn(&SpawnOpts {
+            cmdline: "/bin/sh -i -c \"$S\"",
+            env: &env,
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        });
+        wait_for(&rx, "ready");
+        pty.close();
+        let _ = finish(&rx);
+        let cleaned = marker.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(cleaned, "the job was killed before it cleaned up");
     }
 
     #[test]

@@ -365,6 +365,21 @@ fn local(d: &Path, path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether looking at `p` mounts a share or drive that `d`, as written or
+/// as it really is (`real`), is not on already.
+#[cfg(unix)]
+fn reaches_another(p: &Path, d: &Path, real: &Path) -> bool {
+    let mut parts = p.components();
+    let (Some(_), Some(root), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let mounts = ["net", "Network", "Volumes"]
+        .iter()
+        .any(|r| root.as_os_str() == *r);
+    let r = Path::new("/").join(root).join(name);
+    mounts && !d.starts_with(&r) && !real.starts_with(&r)
+}
+
 /// `path`, named by a file blitz did not write in folder `d`, with its
 /// links and `..` followed one step at a time, when it never steps into a
 /// folder that mounts another machine's on first look: the automounter's
@@ -376,15 +391,6 @@ fn local(d: &Path, path: &Path) -> Option<PathBuf> {
     // `d` is being looked at already, so following its links reaches
     // nothing new.
     let real = std::fs::canonicalize(d).unwrap_or_else(|_| d.into());
-    let remote = |p: &Path| {
-        let mut parts = p.components();
-        let root = parts.nth(1)?.as_os_str();
-        let name = parts.next()?;
-        ["net", "Network", "Volumes"]
-            .iter()
-            .any(|r| root == *r)
-            .then(|| Path::new("/").join(root).join(name))
-    };
     // The parts still to follow, last first, owned as links add their own.
     let parts = |p: &Path| -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = p
@@ -405,7 +411,7 @@ fn local(d: &Path, path: &Path) -> Option<PathBuf> {
             }
             Some(Component::Normal(name)) => {
                 out.push(name);
-                if remote(&out).is_some_and(|r| !real.starts_with(&r) && !d.starts_with(&r)) {
+                if reaches_another(&out, d, &real) {
                     return None;
                 }
                 // Past a part that is not there, nothing is there to
@@ -483,15 +489,18 @@ mod tests {
             local(&down, &down.join("../../../../../../../../net/somehost/x")),
             local(&linked, &linked.join(".git")),
         ];
-        // A repo reached through a link to a drive is on that drive.
-        let drive = dir.join("Volumes-like");
-        std::fs::create_dir_all(drive.join("proj")).expect("dir");
-        std::os::unix::fs::symlink(&drive, dir.join("code")).expect("link");
-        let through = local(&dir.join("code/proj"), &dir.join("code/proj/.git"));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!((piped, shared), (None, None));
         assert_eq!(tricks, [None, None, None]);
-        assert!(through.is_some());
+        // A repo reached through a link to a drive is on that drive.
+        let (ssd, link) = (
+            Path::new("/Volumes/SSD/code/proj"),
+            Path::new("/Users/me/code/proj"),
+        );
+        assert!(!reaches_another(Path::new("/Volumes/SSD"), link, ssd));
+        assert!(reaches_another(Path::new("/Volumes/SSD"), link, link));
+        assert!(reaches_another(Path::new("/net/host"), link, ssd));
+        assert!(!reaches_another(Path::new("/Volumes"), link, link));
         let here = Path::new("/home/me");
         // Not /tmp, which is a link on a Mac.
         assert_eq!(local(here, Path::new("/usr/../net/x")), None);
