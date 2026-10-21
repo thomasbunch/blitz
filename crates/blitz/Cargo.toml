@@ -34,7 +34,7 @@ objc2 = "=0.5.2"
 block2 = "=0.5.1"
 objc2-user-notifications = { version = "=0.2.2", default-features = false, features = ["std", "block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 objc2-foundation = { version = "=0.2.2", features = ["NSArray", "NSData", "NSDictionary", "NSString", "NSURL", "NSBundle", "NSProcessInfo", "NSThread", "NSValue"] }
-objc2-app-kit = { version = "=0.2.2", features = ["NSAccessibility", "NSApplication", "NSDockTile", "NSGraphics", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSWorkspace", "NSWindow", "NSView", "NSColor", "NSAppearance", "NSEvent", "NSImage"] }
+objc2-app-kit = { version = "=0.3.2", features = ["NSAccessibility", "NSApplication", "NSDockTile", "NSGraphics", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSWorkspace", "NSWindow", "NSView", "NSColor", "NSAppearance", "NSEvent", "NSImage"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "=0.62.2"
