@@ -18,6 +18,11 @@ people who use blitz.
   `open_files_in_blitz` off, or set an editor in `editor_uri`, to open it
   elsewhere as before.
 
+### Sidebar
+
+- Double-clicking a session's row collapses the sidebar to the rail, and
+  double-clicking one on the rail expands it again.
+
 ## [0.0.5] - 2026-10-15
 
 The biggest release yet: a command palette, your own key bindings, find,
