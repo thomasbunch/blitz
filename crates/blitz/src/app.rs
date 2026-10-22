@@ -660,6 +660,9 @@ struct Mouse {
     click: Option<(Instant, Pos, u8)>,
     /// The same for the last press on a divider, by its index.
     divider_click: Option<(Instant, Pos, u8)>,
+    /// The same for the last press on a session's row in the sidebar or
+    /// rail, by its id.
+    row_click: Option<(Instant, Pos, u8)>,
     /// The cell of the left press a program was sent, and whether a drag
     /// from it may still show the Shift+drag hint.
     program_press: Option<((u16, u16), bool)>,
@@ -719,9 +722,9 @@ fn clicks(last: Option<(Instant, Pos, u8)>, at: Pos, now: Instant, within: Durat
     }
 }
 
-/// Whether a press on divider `i` double-clicks it, which gives the panes
-/// equal space. `last` holds the last press on a divider and takes this
-/// one.
+/// Whether a press on divider or row `i` double-clicks it: a divider gives
+/// the panes equal space, a session's row expands or collapses the sidebar.
+/// `last` holds the last press of that kind and takes this one.
 fn evens(last: &mut Option<(Instant, Pos, u8)>, i: usize, now: Instant, within: Duration) -> bool {
     let n = clicks(*last, (i, 0), now, within);
     *last = Some((now, (i, 0), n));
@@ -4960,7 +4963,14 @@ impl App {
         // A click in the sidebar goes to what it is on.
         if pressed && x < self.tab_area().x {
             match self.side.at(x, y) {
-                Some(Side::Session(id)) => self.show(id),
+                Some(Side::Session(id)) => {
+                    self.show(id);
+                    let within = crate::desktop::double_click();
+                    let i = id.0 as usize;
+                    if evens(&mut self.mouse.row_click, i, Instant::now(), within) {
+                        self.toggle_sidebar();
+                    }
+                }
                 Some(Side::Tab(i)) => {
                     if let Some(id) = self.win.tabs.get(i).map(|t| t.focus) {
                         self.show(id);
