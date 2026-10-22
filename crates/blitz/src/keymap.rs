@@ -87,6 +87,8 @@ pub enum Action {
     JumpToPrompt(i8),
     /// Open the find bar on the focused pane, or close it.
     Find,
+    /// Show the files in the focused pane's folder over it, or close them.
+    Files,
     /// Name the focused session on the command palette's line; an empty
     /// name gives back the one blitz picks.
     RenameSession,
@@ -168,6 +170,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::JumpToPrompt(1), "previous_prompt", "Scroll to the previous prompt"),
     (Action::JumpToPrompt(-1), "next_prompt", "Scroll to the next prompt"),
     (Action::Find, "find", "Find in the scrollback"),
+    (Action::Files, "files", "Browse the files in this folder"),
     (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
     (Action::SystemMenu, "system_menu", "Window menu"),
     (Action::QuickSelect, "quick_select", "Quick select a link, path or hash"),
@@ -254,6 +257,7 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, 0x26, Action::JumpToPrompt(1)),
     (CTRL | SHIFT, 0x28, Action::JumpToPrompt(-1)),
     (CTRL | SHIFT, b'F' as u16, Action::Find),
+    (CTRL | SHIFT, b'E' as u16, Action::Files),
     // Only Windows has a window menu; elsewhere Alt+Space is Meta+Space.
     #[cfg(windows)]
     (ALT, 0x20, Action::SystemMenu),
@@ -315,6 +319,7 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CMD, 0x26, Action::JumpToPrompt(1)),
     (CMD, 0x28, Action::JumpToPrompt(-1)),
     (CMD, b'F' as u16, Action::Find),
+    (CMD | SHIFT, b'E' as u16, Action::Files),
     (CMD | SHIFT, 0x20, Action::QuickSelect),
 ];
 

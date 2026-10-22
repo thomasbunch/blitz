@@ -4,6 +4,20 @@ What changes in each blitz release. The newest release comes first. A
 release's section here becomes its notes on GitHub, so write it for the
 people who use blitz.
 
+## [Unreleased]
+
+### Files
+
+- **Ctrl+Shift+E** (**Shift+Cmd+E** on macOS) shows the files in the
+  pane's folder over the pane, with the highlighted file beside them.
+  Typing narrows the list, Enter opens a folder, Backspace goes up, Tab
+  moves to the file and Esc closes it. The program underneath keeps
+  running.
+- Ctrl+click on a text file's path, as in Claude Code's
+  `Update(src/app.rs)`, opens it there at its line. Turn
+  `open_files_in_blitz` off, or set an editor in `editor_uri`, to open it
+  elsewhere as before.
+
 ## [0.0.5] - 2026-10-15
 
 The biggest release yet: a command palette, your own key bindings, find,

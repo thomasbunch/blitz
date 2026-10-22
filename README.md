@@ -300,6 +300,7 @@ there shows in the panel with what blitz uses instead.
 | `bell_attention` | `true` | Treat a bell or a notification in a background pane as needing you |
 | `right_click_paste` | `true` | A right click copies the selection, or pastes when nothing is selected |
 | `editor_uri` | `""` | Ctrl+click on a file path opens it at its line through this URI, such as `"vscode://file/{path}:{line}:{col}"`. Empty opens the file with its program, or shows it in Explorer when it has none |
+| `open_files_in_blitz` | `true` | Ctrl+click on a text file shows it at its line in the [Files view](#files), unless `editor_uri` names an editor |
 | `scenery` | `"off"` | Pixel scenery behind the panes: `"off"`, `"stars"`, `"hills"` or `"snow"` |
 | `mascot` | `false` | Show the spark, a critter at the foot of the sidebar that follows your sessions |
 | `keybind` | | Binds a key to an action; one line per key. See [Key bindings](#key-bindings) |
@@ -403,8 +404,10 @@ Folders, text, source code, images and PDFs open with their program;
 any other file, such as a program, script, shortcut or installer, is
 shown selected in Explorer instead, and so is one no program opens.
 
-With an editor set in `editor_uri`, Ctrl+click opens a file there at
-the line and column after its path, as in `src/app.rs:12:5` or
+A text file, such as source code, opens in the [Files view](#files) at
+its line unless you turn `open_files_in_blitz` off. With an editor set
+in `editor_uri`, Ctrl+click opens a file there instead, at the line and
+column after its path, as in `src/app.rs:12:5` or
 `src/app.ts(12,5)`. This works in Claude Code's fullscreen too, where
 other clicks go to Claude Code.
 
@@ -469,6 +472,35 @@ go to the program.
 A pane scrolled back says how many lines are below the view; a click on
 that, or typing, goes back to the bottom.
 
+## Files
+
+Ctrl+Shift+E (Shift+Cmd+E on macOS) shows the files in the focused
+pane's folder over the pane: the folder's files and folders on the
+left, folders first, and the highlighted file on the right with its
+line numbers. The program in the pane keeps running underneath, other
+panes stay as they were, and each pane keeps its own view until you
+close it. The folder is the one the shell last reported, so with shell
+integration it follows `cd`; in Claude Code it is where Claude started.
+
+| Keys | Action |
+|---|---|
+| Up, Down, PgUp, PgDn, Home, End | Move in the list, or scroll the file once Tab or Right moved there |
+| Enter, Right | Open the folder, or move to the file |
+| Backspace, Left | Go up to the parent folder |
+| Typing | Narrow the list to names holding what you type; Esc clears it |
+| Tab | Move between the list and the file |
+| Ctrl+H | Show hidden files and folders, or hide them again |
+| Ctrl+Enter (Cmd+Enter) | Open the file at the line in view with `editor_uri`, or with its program |
+| Esc | Back to the list, then close |
+| Ctrl+Shift+E | Close |
+
+A click picks a row, a double click opens it, and the wheel scrolls the
+side under the pointer. A binary file, or one that cannot be read, says
+so instead; past its first megabyte, a file says the rest is not shown.
+With `open_files_in_blitz` on, as it is unless you turn it off, Ctrl+click on a
+text file's path, or Shift and its quick select letter, opens it here at
+its line, marked, unless `editor_uri` names an editor.
+
 ## Default keys
 
 | Keys | Action |
@@ -501,6 +533,7 @@ that, or typing, goes back to the bottom.
 | Shift+PgUp, Shift+PgDn | Scroll |
 | Ctrl+Shift+Home, Ctrl+Shift+End | Scroll to the top, to the bottom |
 | Ctrl+Shift+F | Find in the scrollback |
+| Ctrl+Shift+E | Browse the files in the pane's folder |
 | Ctrl+Shift+Space | Quick select a link, path or hash to copy or open |
 | Ctrl+Shift+Up, Ctrl+Shift+Down | Previous, next prompt |
 
@@ -535,6 +568,7 @@ program, but for the few in the table:
 | Shift+PgUp, Shift+PgDn, Cmd+PgUp, Cmd+PgDn | Scroll |
 | Cmd+Home, Cmd+End | Scroll to the top, to the bottom |
 | Cmd+F | Find in the scrollback |
+| Shift+Cmd+E | Browse the files in the pane's folder |
 | Shift+Cmd+Space | Quick select a link, path or hash |
 | Cmd+Up, Cmd+Down | Previous, next prompt |
 
@@ -574,7 +608,7 @@ or folder names.
 an action, or with `none` gives a chord back to the program:
 
 ```
-keybind = ctrl+shift+e=split_right
+keybind = ctrl+shift+y=split_right
 keybind = ctrl+shift+r=none
 keybind = alt+f11=command_palette
 ```
@@ -606,7 +640,7 @@ The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
 `open_themes`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
 `resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
 `equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
-`fullscreen`, `command_palette`, `find`, `quick_select`,
+`fullscreen`, `command_palette`, `find`, `files`, `quick_select`,
 `previous_prompt`, `next_prompt`, `system_menu`, `claude_setup`,
 `report_issue`, `go_to_tab_1` to `go_to_tab_8` and `last_tab`. Typing a
 name in the command palette finds its action.
