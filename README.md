@@ -10,7 +10,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 - With two or more sessions, a sidebar lists them with their directory,
   git branch and state: *needs you*, *working*, *done*, *error*.
   Ctrl+Shift+B collapses it to a narrow rail of status dots, and a click
-  on the rail expands it again; a window under 800 pixels wide (at 100%
+  on the rail expands it again; double-clicking a session's row in
+  either does both. A window under 800 pixels wide (at 100%
   scaling) shows the rail. Click a session or a tab's heading to go
   there. Sessions that do not fit are counted at the foot, in the accent
   colour when one of them needs you, and a click there goes to it.
