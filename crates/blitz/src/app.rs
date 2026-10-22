@@ -47,6 +47,7 @@ use crate::desktop::{
     animations_on, elevated, idle_for, local_stamp, mouse_vanish, not_a_start, place_caret,
     restart_after_reboot, scroll_lines, starts_at_sign_in,
 };
+use crate::files::{self, FileView};
 use crate::keymap::{self, Action};
 use crate::layout::{self, Axis, Dir, PaneId, Rect, Tab};
 use crate::links::{Link, Target};
@@ -174,6 +175,8 @@ pub enum UserEvent {
     ShowPane(PaneId),
     /// The user pressed the key that brings them to blitz from anywhere.
     GlobalJump,
+    /// A folder or file read for a pane's Files view.
+    Files(PaneId, files::Loaded),
 }
 
 /// Command-line options of the GUI.
@@ -1098,6 +1101,10 @@ struct View {
     hooks_seen: bool,
     /// Selected text, kept while another pane has focus.
     selection: Option<Selection>,
+    /// The Files view drawn over the terminal, while it is open, and what
+    /// it drew in the last frame.
+    files: Option<Box<FileView>>,
+    files_snap: Snapshot,
 }
 
 impl View {
@@ -2166,6 +2173,8 @@ impl App {
             claude_working: None,
             hooks_seen: false,
             selection: None,
+            files: None,
+            files_snap: Snapshot::default(),
         });
         if let Some(text) = fell_back {
             // It covers the pane's last row, so it stays only until the
@@ -2999,10 +3008,104 @@ impl App {
             self.find_go(true, 0);
         } else if self.quick.take().is_some() {
             self.request_redraw();
+        } else if let Some(v) = self.current_mut()
+            && let Some(f) = v.files.as_mut()
+        {
+            f.type_text(t);
+            let id = v.pane.id;
+            self.files_act(Some(id), files::Act::Redraw);
         } else {
             return false;
         }
         true
+    }
+
+    /// Opens the Files view on pane `id` in its shell's folder, or closes
+    /// it.
+    fn toggle_files(&mut self, id: PaneId) {
+        let Some(v) = self.view_mut(id) else {
+            return;
+        };
+        if v.files.take().is_some() {
+            self.request_redraw();
+            return;
+        }
+        let dir = start_dir(&v.pane.cwd).unwrap_or_else(|| PathBuf::from(&v.pane.cwd));
+        self.show_files(id, FileView::new(dir));
+    }
+
+    /// Shows `f` over pane `id`, in place of its find bar or quick select.
+    fn show_files(&mut self, id: PaneId, f: FileView) {
+        let Some(v) = self.view_mut(id) else {
+            return;
+        };
+        v.files = Some(Box::new(f));
+        if self.find.as_ref().is_some_and(|f| f.pane == id) {
+            self.find = None;
+        }
+        if self.quick.as_ref().is_some_and(|q| q.pane == id) {
+            self.quick = None;
+        }
+        self.files_act(Some(id), files::Act::Redraw);
+    }
+
+    /// Reads, on other threads, what pane `id`'s Files view needs.
+    fn files_load(&mut self, id: PaneId) {
+        let Some(f) = self.view_mut(id).and_then(|v| v.files.as_mut()) else {
+            return;
+        };
+        let needs = f.needs();
+        if let Some(dir) = needs.list {
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let l = files::listing::read(&dir);
+                let _ = proxy.send_event(UserEvent::Files(id, files::Loaded::Listing(dir, l)));
+            });
+        }
+        if let Some(path) = needs.preview {
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let p = files::load::read(&path);
+                let _ = proxy.send_event(UserEvent::Files(id, files::Loaded::Preview(path, p)));
+            });
+        }
+    }
+
+    /// A key for the focused pane's Files view.
+    fn files_key(&mut self, k: &KeyInput) {
+        let Some(v) = self.current_mut() else {
+            return;
+        };
+        let id = v.pane.id;
+        if let Some(f) = v.files.as_mut() {
+            let act = f.key(k);
+            self.files_act(Some(id), act);
+        }
+    }
+
+    /// Does what pane `id`'s Files view asked.
+    fn files_act(&mut self, id: Option<PaneId>, act: files::Act) {
+        let Some(id) = id else {
+            return;
+        };
+        match act {
+            files::Act::None => {}
+            files::Act::Redraw => {
+                self.files_load(id);
+                self.request_redraw();
+            }
+            files::Act::Close => {
+                if let Some(v) = self.view_mut(id) {
+                    v.files = None;
+                }
+                self.request_redraw();
+            }
+            files::Act::Open(path, line) => {
+                let t = Target::Path(path, Some((line, 1)));
+                let opened = crate::links::open(&t, &self.config.editor_uri);
+                self.tell(opened.map_err(String::from));
+            }
+        }
     }
 
     /// The size in cells of each pane of `win` in the window as it is now.
@@ -3093,6 +3196,13 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// The focused pane, while its Files view is open.
+    fn files_focus(&self) -> Option<PaneId> {
+        (self.current())
+            .filter(|v| v.files.is_some())
+            .map(|v| v.pane.id)
     }
 
     fn modes(&self) -> InputModes {
@@ -3420,7 +3530,8 @@ impl App {
             || self.picker.is_some()
             || self.settings.is_some()
             || self.find.is_some()
-            || self.game.is_some();
+            || self.game.is_some()
+            || self.current().is_some_and(|v| v.files.is_some());
         let taken = self.eaten.0.contains(&k.vk);
         if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
             return;
@@ -3522,6 +3633,20 @@ impl App {
                     }
                 }
                 None => self.find_key(k),
+            }
+            return;
+        }
+        // And for the focused pane's Files view: shortcuts that work on the
+        // terminal's text have none to work on, and the rest run.
+        if k.down && self.current().is_some_and(|v| v.files.is_some()) {
+            self.eaten.press(k.vk);
+            match keymap::action(k, &self.config.keys) {
+                Some(Action::Files) => self.files_act(self.focus_id(), files::Act::Close),
+                Some(a) if files_runs(a) => {
+                    self.act(el, a);
+                }
+                Some(_) => {}
+                None => self.files_key(k),
             }
             return;
         }
@@ -4170,6 +4295,12 @@ impl App {
                     return false;
                 };
                 self.open_find(id);
+            }
+            Action::Files => {
+                let Some(id) = before else {
+                    return false;
+                };
+                self.toggle_files(id);
             }
             // The palette's line takes the name, starting from the one the
             // user gave before.
@@ -4849,6 +4980,9 @@ impl App {
 
     /// Whether mouse events go to the program rather than to selection.
     fn mouse_to_program(&self, mods: &Mods) -> Option<InputModes> {
+        if self.files_focus().is_some() {
+            return None;
+        }
         let m = self.modes();
         (m.mouse != MouseMode::Off && !(mods.lshift || mods.rshift)).then_some(m)
     }
@@ -4992,6 +5126,23 @@ impl App {
             if !on_grid {
                 return;
             }
+        }
+        // The Files view takes every button over the focused pane, so
+        // nothing reaches the program or starts a selection under it.
+        if let Some(id) = self.files_focus() {
+            if pressed
+                && b == 0
+                && let Some((col, row)) = self.grid_cell(id, self.mouse.pos)
+            {
+                let now = Instant::now();
+                let at = (usize::from(row), col);
+                let n = clicks(self.mouse.click, at, now, crate::desktop::double_click());
+                self.mouse.click = Some((now, at, n));
+                let act = (self.view_mut(id).and_then(|v| v.files.as_mut()))
+                    .map_or(files::Act::None, |f| f.click(col, row, n == 2));
+                self.files_act(Some(id), act);
+            }
+            return;
         }
         if pressed
             && b == 0
@@ -5156,7 +5307,7 @@ impl App {
     fn link_under(&self, pos: PhysicalPosition<f64>) -> Option<(Target, (Pos, Pos))> {
         let v = self
             .current()
-            .filter(|v| self.hit(pos) == (Some(v.pane.id), false))?;
+            .filter(|v| v.files.is_none() && self.hit(pos) == (Some(v.pane.id), false))?;
         let (col, row) = self.cell_at(pos);
         let t = lock(&v.pane.term);
         let at = (t.view_top() + usize::from(row), col);
@@ -5250,6 +5401,9 @@ impl App {
         let grid = (!panel).then(|| self.hit(pos)).and_then(|(id, side)| {
             let v = self.view(id.filter(|_| !side)?)?;
             v.rect.filter(inside)?;
+            if v.files.is_some() {
+                return Some(false);
+            }
             let mouse = lock(&v.pane.term).input_modes().mouse;
             Some(mouse != MouseMode::Off && !(mods.lshift || mods.rshift))
         });
@@ -5275,6 +5429,16 @@ impl App {
 
     /// Opens a link, or says in the pane why not.
     fn open_link(&mut self, target: &Target) {
+        if let Target::Path(path, place) = target
+            && self.config.open_files_in_blitz
+            && self.config.editor_uri.is_empty()
+            && crate::links::is_text(path)
+            && let Some(id) = self.focus_id()
+        {
+            let line = place.map(|p| p.0);
+            self.show_files(id, FileView::at(path, line));
+            return;
+        }
         self.tell(crate::links::open(target, &self.config.editor_uri).map_err(String::from));
     }
 
@@ -5388,6 +5552,16 @@ impl App {
             return;
         };
         let id = v.pane.id;
+        if v.files.is_some() {
+            if !side {
+                let (col, _) = self.cell_in(id, self.mouse.pos);
+                let lines = steps as isize * 3;
+                let act = (self.view_mut(id).and_then(|v| v.files.as_mut()))
+                    .map_or(files::Act::None, |f| f.wheel(col, lines));
+                self.files_act(Some(id), act);
+            }
+            return;
+        }
         let focused = Some(id) == self.focus_id();
         let m = lock(&v.pane.term).input_modes();
         let lines = steps as isize * wheel_lines(scroll_lines(), v.grid.1);
@@ -5465,6 +5639,11 @@ impl App {
         // Where the cursor is drawn, as of the last frame, else where it
         // is: a program may hide it, or the view may be scrolled.
         let cursor = self.current().map(|v| match v.snap.cursor {
+            // The Files view's last frame: typing goes to its filter.
+            _ if v.files.is_some() => match v.files_snap.cursor {
+                Some((col, row, _)) => (col, row),
+                None => (1, v.grid.1.saturating_sub(1)),
+            },
             Some((col, row, _)) => (col, row),
             None => {
                 let (col, row, _) = lock(&v.pane.term).cursor();
@@ -5555,6 +5734,10 @@ impl App {
             if Some(id) != focus && chrome::dims(split, v.pane.attn.state) {
                 dimmed.push(id);
             }
+            drop(term);
+            if let Some(f) = &mut v.files {
+                f.draw(&mut v.files_snap, v.grid.0, v.grid.1, &self.theme.pal);
+            }
         }
 
         // Output that numbered the lines anew leaves the labels on nothing.
@@ -5627,8 +5810,13 @@ impl App {
                     // A terminal still at its old size until it is resized
                     // shows only what fits its pane.
                     let rows = v.grid.1.min((at.h / ch as i32) as u16);
+                    let snap = if v.files.is_some() {
+                        &v.files_snap
+                    } else {
+                        &v.snap
+                    };
                     g.r.clipped(at, |r| {
-                        r.grid(&v.snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
+                        r.grid(snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
                         if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code)
                         {
                             draw_notice(r, &pal, at, (v.grid.0, rows), &text, dim);
@@ -6102,6 +6290,27 @@ fn ime_area(
 /// closes the bar. Paste is left to the bar.
 fn find_runs(a: Action) -> bool {
     a != Action::Paste
+}
+
+/// Whether shortcut `a` runs while the Files view covers the focused
+/// pane: those that work on the terminal's text have none to work on.
+fn files_runs(a: Action) -> bool {
+    !matches!(
+        a,
+        Action::Copy
+            | Action::CopyUnindented
+            | Action::Paste
+            | Action::SelectAll
+            | Action::SelectOutput
+            | Action::ScrollPage(_)
+            | Action::ScrollEnd(_)
+            | Action::ClearScrollback
+            | Action::Reset
+            | Action::JumpToPrompt(_)
+            | Action::Find
+            | Action::SendText(_)
+            | Action::QuickSelect
+    )
 }
 
 /// Whether the find bar stays open after shortcut `a` ran: scrolling
@@ -7658,6 +7867,13 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Pane(id, note) => self.on_pane(el, id, note),
             UserEvent::Branch(id, dir, branch) => self.on_branch(id, dir, branch),
+            UserEvent::Files(id, loaded) => {
+                if let Some(f) = self.view_mut(id).and_then(|v| v.files.as_mut()) {
+                    f.accept(loaded);
+                    self.files_load(id);
+                    self.request_redraw();
+                }
+            }
             UserEvent::Finish(code) => {
                 self.code = code;
                 if self.args.capture.is_some() {
@@ -9282,6 +9498,30 @@ mod tests {
             Some(field)
         );
         assert_eq!(ime_area(None, None, Some((2, 1)), cell), None);
+    }
+
+    #[test]
+    fn only_shortcuts_with_no_terminal_text_to_work_on_run_over_files() {
+        for a in [
+            Action::Files,
+            Action::Palette,
+            Action::SplitRight,
+            Action::Focus(Dir::Left),
+            Action::NewTab,
+        ] {
+            assert!(files_runs(a), "{a:?}");
+        }
+        for a in [
+            Action::Copy,
+            Action::Paste,
+            Action::SelectAll,
+            Action::ScrollPage(1),
+            Action::Find,
+            Action::QuickSelect,
+            Action::SendText(0),
+        ] {
+            assert!(!files_runs(a), "{a:?}");
+        }
     }
 
     #[test]
