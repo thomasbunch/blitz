@@ -56,6 +56,9 @@ pub struct Config {
     /// `vscode://file/{path}:{line}:{col}`. Empty opens files with their
     /// program.
     pub editor_uri: String,
+    /// Ctrl+click on a text file shows it in the Files view, unless
+    /// `editor_uri` names an editor.
+    pub open_files_in_blitz: bool,
     /// Key bindings from `keybind` lines, one per chord, which take the
     /// place of the default for that chord; see [`keymap::binding`].
     pub keys: Vec<keymap::Binding>,
@@ -94,6 +97,7 @@ impl Default for Config {
             mascot: false,
             right_click_paste: true,
             editor_uri: String::new(),
+            open_files_in_blitz: true,
             keys: Vec::new(),
             texts: Vec::new(),
             env: Vec::new(),
@@ -250,6 +254,16 @@ pub const SETTINGS: &[Setting] = &[
                Without one, a file opens with its program, or shows in \
                Explorer when it has none.",
         kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
+        key: "open_files_in_blitz",
+        group: "Mouse",
+        label: "Open text files in blitz",
+        help: "Ctrl+click on a text file path shows it at its line in the \
+               Files view, beside the other files in its folder. An editor \
+               set above takes it instead.",
+        kind: Kind::Toggle,
         applies: NOW,
     },
     Setting {
@@ -412,6 +426,7 @@ impl Config {
             "mascot" => flag(self.mascot),
             "right_click_paste" => flag(self.right_click_paste),
             "editor_uri" => quote(&self.editor_uri),
+            "open_files_in_blitz" => flag(self.open_files_in_blitz),
             _ => String::new(),
         }
     }
@@ -500,6 +515,7 @@ impl Config {
             "check_updates" => &mut self.check_updates,
             "mascot" => &mut self.mascot,
             "right_click_paste" => &mut self.right_click_paste,
+            "open_files_in_blitz" => &mut self.open_files_in_blitz,
             _ => return None,
         })
     }
@@ -1196,6 +1212,7 @@ scenery = stars
             ("mascot", "true"),
             ("right_click_paste", "false"),
             ("editor_uri", "\"cursor://file/{path}:{line}:{col}\""),
+            ("open_files_in_blitz", "false"),
         ] {
             assert!(c.set(k, v), "{k} = {v}");
         }

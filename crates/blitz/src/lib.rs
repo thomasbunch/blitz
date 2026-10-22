@@ -7,6 +7,7 @@ pub mod clipboard;
 pub mod config;
 pub mod debug;
 pub mod desktop;
+pub mod files;
 pub mod handoff;
 pub mod hook;
 pub mod keymap;

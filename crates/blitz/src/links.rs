@@ -61,6 +61,23 @@ const OPENS: &[&str] = &[
     "css", "scss", "html", "htm", "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "svg", "pdf",
 ];
 
+/// The types in [`OPENS`] that are not text.
+const MEDIA: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "svg", "pdf",
+];
+
+/// Whether `path` is a text file blitz's Files view can show: one of the
+/// text types in [`OPENS`], or a file with no type that is not a program,
+/// such as a `Makefile` or a `LICENSE`.
+pub fn is_text(path: &Path) -> bool {
+    let is = |list: &[&str], e: &str| list.iter().any(|t| t.eq_ignore_ascii_case(e));
+    let typed = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => is(OPENS, e) && !is(MEDIA, e),
+        None => !executable(path),
+    };
+    typed && path.is_file()
+}
+
 /// Every URL and path-like word in `text`, the logical line under the
 /// pointer, with where each is.
 ///
@@ -1104,6 +1121,29 @@ mod tests {
     }
 
     const VSCODE: &str = "vscode://file/{path}:{line}:{col}";
+
+    #[test]
+    fn only_text_files_show_in_the_files_view() {
+        let d = std::env::temp_dir().join(format!("blitz-is-text-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("src.rs")).unwrap();
+        for f in [
+            "main.RS",
+            "notes.md",
+            "Makefile",
+            "logo.png",
+            "setup.exe",
+            "doc.pdf",
+        ] {
+            std::fs::write(d.join(f), "x").unwrap();
+        }
+        let text: Vec<bool> = ["main.RS", "notes.md", "Makefile", "logo.png", "setup.exe"]
+            .iter()
+            .chain(&["doc.pdf", "src.rs", "missing.txt"])
+            .map(|f| is_text(&d.join(f)))
+            .collect();
+        assert_eq!(text, [true, true, true, false, false, false, false, false]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 
     #[test]
     fn links_fill_in_the_editor_uri() {
