@@ -660,8 +660,8 @@ struct Mouse {
     click: Option<(Instant, Pos, u8)>,
     /// The same for the last press on a divider, by its index.
     divider_click: Option<(Instant, Pos, u8)>,
-    /// The same for the last press on a session's row in the sidebar or
-    /// rail, by its id.
+    /// The same for the last left press on a session's row in the sidebar
+    /// or rail, by its id. Any other press clears it.
     row_click: Option<(Instant, Pos, u8)>,
     /// The cell of the left press a program was sent, and whether a drag
     /// from it may still show the Shift+drag hint.
@@ -722,13 +722,26 @@ fn clicks(last: Option<(Instant, Pos, u8)>, at: Pos, now: Instant, within: Durat
     }
 }
 
-/// Whether a press on divider or row `i` double-clicks it: a divider gives
-/// the panes equal space, a session's row expands or collapses the sidebar.
-/// `last` holds the last press of that kind and takes this one.
+/// Whether a press on divider `i` double-clicks it, which gives the panes
+/// equal space. `last` holds the last press on a divider and takes this
+/// one.
 fn evens(last: &mut Option<(Instant, Pos, u8)>, i: usize, now: Instant, within: Duration) -> bool {
     let n = clicks(*last, (i, 0), now, within);
     *last = Some((now, (i, 0), n));
     n == 2
+}
+
+/// Whether press `b` on session `id`'s row double-clicks it, which expands
+/// or collapses the sidebar. Only left presses count. `last` holds the last
+/// left press on a row and takes this one.
+fn row_toggles(
+    last: &mut Option<(Instant, Pos, u8)>,
+    id: PaneId,
+    b: usize,
+    now: Instant,
+    within: Duration,
+) -> bool {
+    b == 0 && evens(last, id.0 as usize, now, within)
 }
 
 /// Selected cells in a pane.
@@ -4888,6 +4901,13 @@ impl App {
             MouseButton::Right => 2,
             _ => return,
         };
+        // Only two presses in a row on a session's row double-click it, so
+        // every press takes the last one.
+        let mut row_click = if pressed {
+            self.mouse.row_click.take()
+        } else {
+            None
+        };
         // The click that brings blitz to the front only moves focus. Sent
         // on, it could pick an option of a Claude Code prompt the user has
         // not read yet.
@@ -4966,10 +4986,10 @@ impl App {
                 Some(Side::Session(id)) => {
                     self.show(id);
                     let within = crate::desktop::double_click();
-                    let i = id.0 as usize;
-                    if evens(&mut self.mouse.row_click, i, Instant::now(), within) {
+                    if row_toggles(&mut row_click, id, b, Instant::now(), within) {
                         self.toggle_sidebar();
                     }
+                    self.mouse.row_click = row_click;
                 }
                 Some(Side::Tab(i)) => {
                     if let Some(id) = self.win.tabs.get(i).map(|t| t.focus) {
@@ -9515,6 +9535,47 @@ mod tests {
             "another divider"
         );
         assert!(!evens(&mut last, 2, t0 + ms(1100), within), "too late");
+    }
+
+    /// A second left press on the same session's row in time expands or
+    /// collapses the sidebar; one on another row or with another button
+    /// does not.
+    #[test]
+    fn app_a_double_click_on_a_row_toggles_the_sidebar() {
+        let (t0, ms, within) = (
+            Instant::now(),
+            Duration::from_millis,
+            Duration::from_millis(500),
+        );
+        let (a, b) = (PaneId(1), PaneId(2));
+        let mut last = None;
+        assert!(!row_toggles(&mut last, a, 0, t0, within), "one shows it");
+        assert!(
+            row_toggles(&mut last, a, 0, t0 + ms(200), within),
+            "the second"
+        );
+        assert!(
+            !row_toggles(&mut last, a, 0, t0 + ms(400), within),
+            "a third"
+        );
+        assert!(
+            !row_toggles(&mut last, b, 0, t0 + ms(500), within),
+            "another row"
+        );
+        assert!(
+            !row_toggles(&mut last, b, 2, t0 + ms(600), within),
+            "a right press"
+        );
+        let mut last = None;
+        assert!(!row_toggles(&mut last, a, 2, t0, within));
+        assert!(
+            !row_toggles(&mut last, a, 2, t0 + ms(200), within),
+            "two right presses"
+        );
+        assert!(
+            !row_toggles(&mut last, a, 1, t0 + ms(400), within),
+            "middle presses"
+        );
     }
 
     /// A new tab has room even when the pane focused before it, now in a
