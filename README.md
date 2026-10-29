@@ -26,8 +26,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   *done*, or *error* with its exit code.
 - Progress a program reports (OSC 9;4) shows in the sidebar and on the
   taskbar button.
-- Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
-  format.
+- Themes: 31 built in, from radiant to high contrast; Ctrl+Shift+K
+  previews them live; bring your own in Ghostty's format.
 - A settings panel on Ctrl+, for the font, shell, sessions and more.
 - A command palette on Ctrl+Shift+P lists every action with its keys,
   and `config.toml` can bind any of them to other keys.
@@ -329,9 +329,11 @@ Built in, in the picker's order:
   green and amber screens of old terminals; **blitz paper light**, ink
   on warm paper; and **blitz contrast** dark and light, whose text meets
   WCAG AAA.
-- For developers, as their authors made them: Catppuccin Mocha and
-  Latte, Gruvbox Dark and Light, Rose Pine and Rose Pine Dawn, Solarized
-  Dark and Light, and Tokyo Night and Tokyo Night Day.
+- For developers, as their authors made them: Ayu Light, Catppuccin
+  Mocha and Latte, Dracula, Everforest Light, Gruvbox Dark and Light,
+  Kanagawa Wave, Night Owl, Nord, One Dark and One Light, Rose Pine and
+  Rose Pine Dawn, Solarized Dark and Light, and Tokyo Night and Tokyo
+  Night Day.
 
 Typing `blitz` in the picker leaves only blitz's own.
 

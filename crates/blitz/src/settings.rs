@@ -411,8 +411,8 @@ mod tests {
             let shown = format!("{gone} (not found, using {took})");
             assert_eq!(p.shown(theme, &c), shown);
         }
-        c.theme = "Nord".into();
-        let missing = format!("Nord (not found, using {blitz})");
+        c.theme = "Iris".into();
+        let missing = format!("Iris (not found, using {blitz})");
         assert_eq!(p.shown(theme, &c), missing);
         assert_eq!(p.rows(&c, None)[0].value, missing);
         // Installed, though not fixed-width: blitz uses it.
@@ -424,7 +424,7 @@ mod tests {
         assert_eq!(p.shown(font, &c), "Fira Code (not found, using Consolas)");
         // When nothing is known, nothing is said.
         let p = Panel::default();
-        assert_eq!(p.shown(theme, &c), "Nord");
+        assert_eq!(p.shown(theme, &c), "Iris");
         assert_eq!(p.shown(font, &c), "Fira Code");
     }
 

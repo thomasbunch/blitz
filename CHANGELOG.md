@@ -25,10 +25,11 @@ people who use blitz.
 
 ### Themes
 
-- Seven new built-in themes. Radiant: **blitz neon** and **blitz volt**.
-  Retro: **blitz phosphor** and **blitz phosphor amber**. Plain: **blitz
-  paper light**, and **blitz contrast** dark and light, whose text meets
-  WCAG AAA.
+- Fifteen new built-in themes. Radiant: **blitz neon** and **blitz
+  volt**. Retro: **blitz phosphor** and **blitz phosphor amber**. Plain:
+  **blitz paper light**, and **blitz contrast** dark and light, whose
+  text meets WCAG AAA. And Dracula, Nord, One Dark, One Light, Night
+  Owl, Kanagawa Wave, Ayu Light and Everforest Light.
 - **blitz ember** and **blitz tide** no longer look like blitz dark and
   light with a tint: ember glows orange on dark brown, tide aqua on deep
   sea.

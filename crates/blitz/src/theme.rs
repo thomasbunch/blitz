@@ -52,6 +52,7 @@ const BUILTIN: &[(&str, &str)] = &[
         "blitz contrast light",
         include_str!("../themes/blitz-contrast-light"),
     ),
+    ("Ayu Light", include_str!("../themes/ayu-light")),
     (
         "Catppuccin Mocha",
         include_str!("../themes/catppuccin-mocha"),
@@ -60,8 +61,18 @@ const BUILTIN: &[(&str, &str)] = &[
         "Catppuccin Latte",
         include_str!("../themes/catppuccin-latte"),
     ),
+    ("Dracula", include_str!("../themes/dracula")),
+    (
+        "Everforest Light",
+        include_str!("../themes/everforest-light"),
+    ),
     ("Gruvbox Dark", include_str!("../themes/gruvbox-dark")),
     ("Gruvbox Light", include_str!("../themes/gruvbox-light")),
+    ("Kanagawa Wave", include_str!("../themes/kanagawa-wave")),
+    ("Night Owl", include_str!("../themes/night-owl")),
+    ("Nord", include_str!("../themes/nord")),
+    ("One Dark", include_str!("../themes/one-dark")),
+    ("One Light", include_str!("../themes/one-light")),
     ("Rose Pine", include_str!("../themes/rose-pine")),
     ("Rose Pine Dawn", include_str!("../themes/rose-pine-dawn")),
     ("Solarized Dark", include_str!("../themes/solarized-dark")),
@@ -1032,8 +1043,8 @@ mod tests {
                 ("Latin", b"# Th\xe8me\nbackground = #000006\n"),
                 ("README.md", b"# Themes\n\nGhostty themes go here.\n"),
                 ("logo.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
-                ("Nord", b"notes = for Nord\n"),
-                ("nord.conf", b"palette = 0=#000007\n"),
+                ("Iris", b"notes = for Iris\n"),
+                ("iris.conf", b"palette = 0=#000007\n"),
             ],
         );
         std::fs::create_dir(f.0.join("folder")).unwrap();
@@ -1044,15 +1055,15 @@ mod tests {
             .map(|t| (t.name.as_str(), t.pal.bg))
             .collect();
         // `Alpha` and `alpha.CONF` are one theme; backups, hidden files,
-        // folders and files that set no colour are none, so `nord.conf`
-        // is the only Nord; a file that is not UTF-8 still reads.
-        let nord = dark().bg;
+        // folders and files that set no colour are none, so `iris.conf`
+        // is the only Iris; a file that is not UTF-8 still reads.
+        let iris = dark().bg;
         assert_eq!(
             extra,
             [
                 ("Alpha", 3),
+                ("iris", iris),
                 ("Latin", 6),
-                ("nord", nord),
                 ("Zed", 0xffffff)
             ]
         );
