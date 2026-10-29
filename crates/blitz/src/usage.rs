@@ -909,7 +909,10 @@ fn cost(r: &Row, (i, o, cr): Price, long: bool) -> Spend {
 /// included; `off` gives the clock's offset at a Unix time.
 fn utc(local: i64, off: &dyn Fn(i64) -> i64) -> i64 {
     let guess = local - off(local);
-    local - off(guess)
+    let t = local - off(guess);
+    // In the hour the clock skips `local` never shows: take the moment it
+    // jumps past it.
+    if t + off(t) == local { t } else { t.max(guess) }
 }
 
 /// When the week holding `now` began: the last time the clock read the
@@ -1284,6 +1287,59 @@ mod tests {
             let start = week_start(now, (6, 1), off);
             assert!(start <= now && now - start < WEEK, "{now}");
             assert_eq!(clock(start, off), "Sun 1 am");
+        }
+        // A reset at 2 am on the Sunday the clock skips from 2 to 3 am
+        // comes as it jumps, not an hour before.
+        let jump = at("2026-03-08T08:00:00Z");
+        assert_eq!(week_start(jump - 1, (6, 2), off), jump - WEEK);
+        assert_eq!(week_start(jump, (6, 2), off), jump);
+        assert_eq!(week_start(jump + DAY, (6, 2), off), jump, "the next reset");
+        assert_eq!(clock(jump, off), "Sun 3 am");
+    }
+
+    /// Central Europe in 2026: summer time from 29 March to 25 October.
+    fn berlin(t: i64) -> i64 {
+        if (1_774_746_000..1_792_890_000).contains(&t) {
+            2 * 3600
+        } else {
+            3600
+        }
+    }
+
+    #[test]
+    fn every_reset_starts_a_week_across_daylight_saving() {
+        let clocks: [(fn(i64) -> i64, [&str; 2]); 2] = [
+            (central, ["2026-03-08T08:00:00Z", "2026-11-01T07:00:00Z"]),
+            (berlin, ["2026-03-29T01:00:00Z", "2026-10-25T01:00:00Z"]),
+        ];
+        for (off, changes) in clocks {
+            for change in changes.map(at) {
+                for now in (change - 8 * DAY..change + 8 * DAY).step_by(900) {
+                    for reset in (0..7).flat_map(|d| (0..24).map(move |h| (d, h))) {
+                        let this = week_start(now, reset, &off);
+                        let last = week_start(this - 1, reset, &off);
+                        let next = week_start(this + 8 * DAY, reset, &off);
+                        assert!(
+                            last < this && this <= now && now < next,
+                            "{reset:?} at {now}: {last} {this} {next}"
+                        );
+                        assert!((next - this - WEEK).abs() <= 3600, "{reset:?} at {now}");
+                        // The clock reads the reset as the week starts, or
+                        // jumps past it then.
+                        let want = i64::from(reset.0) * DAY + i64::from(reset.1) * 3600;
+                        let into = |t: i64| {
+                            let l = t + off(t);
+                            ((l.div_euclid(DAY) + 3) * DAY + l.rem_euclid(DAY) - want)
+                                .rem_euclid(WEEK)
+                        };
+                        let (starts, before) = (into(this), into(this - 1));
+                        assert!(
+                            starts == 0 || (starts <= 3600 && before == WEEK - 1),
+                            "{reset:?} at {now}: starts {starts}s past it"
+                        );
+                    }
+                }
+            }
         }
     }
 
