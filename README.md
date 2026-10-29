@@ -299,6 +299,9 @@ there shows in the panel with what blitz uses instead.
 | `sound` | `false` | Play a sound when a session wants you while blitz is in the background: the notification's, or the default beep without one |
 | `global_jump` | `false` | Let Ctrl+Alt+J bring blitz to the front from any program, on the session that needs you |
 | `bell_attention` | `true` | Treat a bell or a notification in a background pane as needing you |
+| `usage_tracking` | `false` | Read Claude Code's logs to show what your sessions would cost at API prices. Off by default. See [Usage](#usage) |
+| `usage_reset_day` | `"mon"` | The day your Claude plan's weekly limit resets, `"mon"` to `"sun"` |
+| `usage_reset_hour` | `0` | The hour of that reset, 0 to 23, by the PC's clock |
 | `right_click_paste` | `true` | A right click copies the selection, or pastes when nothing is selected |
 | `editor_uri` | `""` | Ctrl+click on a file path opens it at its line through this URI, such as `"vscode://file/{path}:{line}:{col}"`. Empty opens the file with its program, or shows it in Explorer when it has none |
 | `open_files_in_blitz` | `true` | Ctrl+click on a text file shows it at its line in the [Files view](#files), unless `editor_uri` names an editor |

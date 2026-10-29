@@ -10,10 +10,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::config::{Config, DAYS};
 use crate::hook::Json;
 
 /// The weekly reset: the day, 0 for Monday, and the hour, local time.
 pub type Reset = (u8, u8);
+
+/// The weekly reset the settings give.
+pub fn reset(c: &Config) -> Reset {
+    let day = DAYS.iter().position(|d| *d == c.usage_reset_day);
+    (day.unwrap_or(0) as u8, c.usage_reset_hour)
+}
 
 /// The time now in Unix seconds; 0 if the clock is before 1970.
 pub fn now() -> i64 {
