@@ -930,8 +930,9 @@ mod gpu {
     /// one tab, for checking the chrome. With `--demo`, `--cols` and
     /// `--rows` give the window size in pixels, `--picker` opens the
     /// theme picker filtered to `--picker`'s value, `--settings N` opens
-    /// the settings panel with row N highlighted, `--keys N` the keyboard
-    /// shortcuts so, and `--find TEXT` finds TEXT in the focused pane.
+    /// the settings panel with row N highlighted, `--keys N` draws the
+    /// keyboard shortcuts with row N highlighted (over `--settings`), and
+    /// `--find TEXT` finds TEXT in the focused pane.
     fn render_demo(
         r: &mut Renderer,
         theme: &crate::theme::Theme,
