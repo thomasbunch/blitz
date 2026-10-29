@@ -26,8 +26,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   *done*, or *error* with its exit code.
 - Progress a program reports (OSC 9;4) shows in the sidebar and on the
   taskbar button.
-- Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
-  format.
+- Themes: 31 built in, from radiant to high contrast; Ctrl+Shift+K
+  previews them live; bring your own in Ghostty's format.
 - A settings panel on Ctrl+, for the font, shell, sessions and more.
 - A command palette on Ctrl+Shift+P lists every action with its keys,
   and `config.toml` can bind any of them to other keys.
@@ -314,6 +314,9 @@ blitz run, the last row of the panel, is a game rather than a setting:
 Enter starts it, and it keeps its best score in
 `%LOCALAPPDATA%\blitz\run-best`.
 
+**Keyboard shortcuts**, under Keys, opens the list of every key; see
+[Key bindings](#key-bindings).
+
 ## Themes
 
 Ctrl+Shift+K opens the theme picker. The arrow keys show each theme on
@@ -322,10 +325,24 @@ theme (it writes `theme = "..."` to `config.toml`) and Esc puts the old
 one back. With a light and a dark theme set, Enter changes the one for
 the mode Windows is in now.
 
-Built in: **blitz** dark and light (the default), **blitz ember** and
-**blitz tide**, each dark and light, and Catppuccin Mocha and Latte,
-GitHub Dark and Light, Gruvbox Dark and Light, Rose Pine and Rose Pine
-Dawn, Solarized Dark and Light, and Tokyo Night and Tokyo Night Day.
+Built in, in the picker's order:
+
+- **blitz** dark and light, the default.
+- Radiant: **blitz neon**, pink and cyan on deep violet; **blitz volt**,
+  electric lime on black; and **blitz ember** and **blitz tide**, each
+  dark and light: orange on dark brown or peach, and aqua on deep sea or
+  pale surf.
+- Retro and plain: **blitz phosphor** and **blitz phosphor amber**, the
+  green and amber screens of old terminals; **blitz paper light**, ink
+  on warm paper; and **blitz contrast** dark and light, whose text meets
+  WCAG AAA.
+- For developers, as their authors made them: Ayu Light, Catppuccin
+  Mocha and Latte, Dracula, Everforest Light, Gruvbox Dark and Light,
+  Kanagawa Wave, Night Owl, Nord, One Dark and One Light, Rose Pine and
+  Rose Pine Dawn, Solarized Dark and Light, and Tokyo Night and Tokyo
+  Night Day.
+
+Typing `blitz` in the picker leaves only blitz's own.
 
 To make your own, put a file in `%APPDATA%\blitz\themes`, which **Open
 themes folder** in the command palette opens; its file name, without a
@@ -552,6 +569,7 @@ newer than the release is priced as the newest of its family and marked
 | Ctrl+Shift+U | Update, or look for a newer release now |
 | Ctrl+Shift+K | Pick a theme |
 | Ctrl+, | Settings |
+| Ctrl+Shift+/ | Keyboard shortcuts: every key, and changing them |
 | Ctrl+Shift+P | Command palette |
 | Ctrl+=, Ctrl+-, Ctrl+0 | Font size up, down, and back to the setting, until blitz restarts |
 | Ctrl+Shift+=, Ctrl+NumpadAdd, Ctrl+NumpadSubtract, Ctrl+Numpad0 | The same, with + typed with Shift and on the keypad |
@@ -590,6 +608,7 @@ program, but for the few in the table:
 | Shift+Cmd+U | Look for a newer release |
 | Shift+Cmd+K | Pick a theme |
 | Cmd+, | Settings |
+| Cmd+/ | Keyboard shortcuts |
 | Shift+Cmd+P | Command palette |
 | Cmd+=, Shift+Cmd+=, Cmd+-, Cmd+0 | Font size up, down, and back to the setting |
 | Ctrl+Cmd+F | Full screen |
@@ -634,8 +653,22 @@ or folder names.
 
 ## Key bindings
 
-`keybind` lines in `config.toml` change the keys. Each binds a chord to
-an action, or with `none` gives a chord back to the program:
+Ctrl+Shift+/ (Cmd+/ on macOS), or **Keyboard shortcuts** in the command
+palette or the settings panel, lists every action with the keys that run
+it now, grouped by what they do; a dot marks those you changed. Typing
+narrows the list by name or by keys. Enter on an action waits for new
+keys: press them and Enter adds them, or click the row. When they run
+something else it says what, and Enter moves them over. A key alone
+stays the program's, but for F1 to F24, and so does a key with only
+Shift, but for those and the arrows, Home, End, PgUp, PgDn, Insert and
+Delete. While it waits, Backspace takes back the keys pressed, Del (on
+macOS, Delete) gives the action's keys back to the program and Esc
+stops. Del on an action puts its default keys back. Changes apply at
+once, as `keybind` lines in `config.toml`, which you can also edit
+yourself.
+
+Each line binds a chord to an action, or with `none` gives a chord back
+to the program:
 
 ```
 keybind = ctrl+shift+y=split_right
@@ -666,7 +699,7 @@ The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
 `move_tab_left`, `move_tab_right`, `move_pane_to_new_tab`,
 `split_right`, `split_down`, `new_claude`, `focus_left`, `focus_right`,
 `focus_up`, `focus_down`, `jump_to_attention`, `go_to_session`,
-`toggle_sidebar`, `update`, `theme_picker`, `settings`, `open_config`,
+`toggle_sidebar`, `update`, `theme_picker`, `settings`, `keys`, `open_config`,
 `open_themes`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
 `resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
 `equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
@@ -698,6 +731,8 @@ and swap repeat; the others act once, so a held key never answers its own
   effects are off. `flash = false` stops the taskbar button flashing.
 - With a Windows contrast theme on and the `theme` setting at its
   default, blitz takes the contrast theme's colours.
+- **blitz contrast** dark and light keep text at 7:1 or more (WCAG AAA)
+  and program colours 1 to 15 at 4.5:1, without a Windows contrast theme.
 - blitz keeps the system caret, hidden, on the cursor, so Magnifier and
   other tools that follow the text cursor follow it. Claude Code draws a
   cursor of its own instead; set `CLAUDE_CODE_ACCESSIBILITY=1` in your

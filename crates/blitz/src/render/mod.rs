@@ -930,15 +930,22 @@ mod gpu {
     /// one tab, for checking the chrome. With `--demo`, `--cols` and
     /// `--rows` give the window size in pixels, `--picker` opens the
     /// theme picker filtered to `--picker`'s value, `--settings N` opens
-    /// the settings panel with row N highlighted, `--find TEXT` finds
-    /// TEXT in the focused pane, and `--usage` opens the usage panel on a
-    /// made-up week.
+    /// the settings panel with row N highlighted, `--keys N` draws the
+    /// keyboard shortcuts with row N highlighted (over `--settings`),
+    /// `--find TEXT` finds TEXT in the focused pane, and `--usage` opens
+    /// the usage panel on a made-up week.
     fn render_demo(
         r: &mut Renderer,
         theme: &crate::theme::Theme,
         collapsed: bool,
         banner: Option<&str>,
-        (picker, settings, find, usage): (Option<&str>, Option<usize>, Option<&str>, bool),
+        (picker, settings, keys, find, usage): (
+            Option<&str>,
+            Option<usize>,
+            Option<usize>,
+            Option<&str>,
+            bool,
+        ),
         (w, h): (u32, u32),
         scale: f32,
     ) -> Result<Vec<u8>> {
@@ -1123,19 +1130,36 @@ mod gpu {
             usage: None,
             usage_line: None,
         };
-        // One setting changed, to show its mark and a switch that is off.
-        let config = crate::config::Config {
+        // One setting changed, to show its mark and a switch that is off,
+        // and one action given more keys.
+        let mut config = crate::config::Config {
             flash: false,
             ..Default::default()
         };
+        config.set("keybind", "ctrl+alt+y=split_right");
         let themes = crate::theme::all().into_iter().map(|t| t.name).collect();
         let fonts = super::font::families().to_vec();
         let mut panel = crate::settings::Panel::new(fonts, crate::shell::choices(), themes);
         if let Some(sel) = settings {
             panel.sel = sel;
             model.settings = Some(chrome::Settings {
+                page: chrome::Page::Settings,
                 filter: "",
                 rows: panel.rows(&config, None),
+                sel,
+                top: 0,
+                error: None,
+            });
+        }
+        if let Some(sel) = keys {
+            let panel = crate::shortcuts::Panel {
+                sel,
+                ..Default::default()
+            };
+            model.settings = Some(chrome::Settings {
+                page: chrome::Page::Keys(false),
+                filter: "",
+                rows: panel.rows(&config.keys),
                 sel,
                 top: 0,
                 error: None,
@@ -1267,7 +1291,7 @@ mod gpu {
         let (mut warp, mut light, mut demo, mut collapsed) = (false, false, false, false);
         let mut usage = false;
         let (mut banner, mut theme, mut picker, mut settings) = (None, None, None, None);
-        let mut find = None;
+        let (mut keys, mut find) = (None, None);
         let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
         let mut px = DEFAULT_PX;
         let mut it = args.iter();
@@ -1289,6 +1313,7 @@ mod gpu {
                 "--theme" => theme = Some(val()?.clone()),
                 "--picker" => picker = Some(val()?.clone()),
                 "--settings" => settings = Some(usize::from(num(val()?)?)),
+                "--keys" => keys = Some(usize::from(num(val()?)?)),
                 "--find" => find = Some(val()?.clone()),
                 "--usage" => usage = true,
                 "--script" => {
@@ -1318,7 +1343,7 @@ mod gpu {
                 &theme,
                 collapsed,
                 banner.as_deref(),
-                (picker.as_deref(), settings, find.as_deref(), usage),
+                (picker.as_deref(), settings, keys, find.as_deref(), usage),
                 (w, h),
                 scale,
             )
@@ -1402,6 +1427,12 @@ mod tests {
         assert_eq!(toward(0x123456, 0x123456), 0x123456);
     }
 
+    /// The tests that draw take turns. Linux's Vulkan loader can crash
+    /// naming an object while another thread destroys a device, and wgpu
+    /// names everything it makes in a debug build.
+    #[cfg(any(windows, unix))]
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The colour of the pixel at (`x`, `y`) of `w`-wide BGRA pixels.
     #[cfg(any(windows, unix))]
     fn pixel(px: &[u8], w: u32, x: u32, y: u32) -> u32 {
@@ -1413,6 +1444,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn render_too_large_a_target_is_an_error() {
+        let _turn = TURN.lock();
         let r = Renderer::new(true, 16.0).expect("renderer");
         let max = r.gpu.device.limits().max_texture_dimension_2d;
         assert!(r.gpu.offscreen(max + 1, 4).is_err());
@@ -1424,6 +1456,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_clipped_keeps_a_grid_inside_its_pane() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let snap = text_snapshot("\u{2588}\u{2588}\u{2588}", 3, 1, &p);
@@ -1451,6 +1484,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_unfocused_pane_hollows_cursor_and_hides_selection() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}  ", 3, 1, &p);
@@ -1484,6 +1518,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_glyph_under_a_block_cursor_takes_the_background() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}\u{2588}", 2, 1, &p);
@@ -1517,6 +1552,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_strike_and_overline_cross_the_cell() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         // Through the terminal, so the attributes come from SGR.
@@ -1553,6 +1589,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_set_font_draws_at_the_new_size() {
+        let _turn = TURN.lock();
         let p = pal();
         let snap = text_snapshot("\u{2588}", 1, 1, &p);
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1617,6 +1654,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_snapshot_draws_glyphs_and_cursor() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("A\u{2588}", 3, 1, &p);
@@ -1644,6 +1682,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_dim_text_is_halfway_to_its_background() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}\u{2588}", 2, 1, &p);
@@ -1667,6 +1706,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_text_close_to_its_background_shows_but_shapes_keep_their_colour() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         // Black text on the dark background, underlined so its colour
@@ -1693,6 +1733,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_underline_selection_and_bar_cursor() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("_中x", 4, 2, &p);
@@ -1724,6 +1765,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_program_cursor_colour_and_hollow_cursor() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let (cw, ch) = r.cell();
@@ -1760,6 +1802,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_bar_and_underline_cursors_show_over_text_at_any_scale() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let (cw, ch) = r.cell();
@@ -1799,6 +1842,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_lines_and_underline_colours() {
+        let _turn = TURN.lock();
         use vt::snapshot::attr;
 
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1847,6 +1891,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_selection_shows_text_close_to_its_background() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}", 1, 1, &p);
@@ -1862,6 +1907,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_theme_colours_for_selected_text_and_text_on_the_cursor() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = Palette {
             selection_fg: 0x00ff00,
@@ -1889,6 +1935,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_search_matches_and_the_current_one() {
+        let _turn = TURN.lock();
         use vt::snapshot::Highlight;
 
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1931,6 +1978,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_block_selection_takes_the_same_columns_of_each_row() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("", 3, 2, &p);
@@ -1950,6 +1998,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_link_under_the_pointer_is_underlined() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("", 3, 2, &p);
@@ -1970,6 +2019,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_chrome_shapes_and_text() {
+        let _turn = TURN.lock();
         use crate::layout::Rect;
         use chrome::{Chrome, Prim};
 
@@ -2030,6 +2080,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_italic_text_draws_another_face() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("ll", 2, 1, &p);
@@ -2049,6 +2100,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_full_atlas_leaves_earlier_glyphs_alone() {
+        let _turn = TURN.lock();
         let p = pal();
         let snap = text_snapshot("HELLO\nabcdefghijklmnopqrstuvwxyz0123456789", 36, 2, &p);
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -2063,6 +2115,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_glyph_too_big_for_the_atlas_is_left_out() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         r.set_atlas_size(8, 8);
@@ -2079,6 +2132,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_wide_clusters_stay_inside_their_grid() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let mut snap = text_snapshot("ab", 4, 1, &p);
@@ -2108,6 +2162,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_combining_marks_stay_on_their_character() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         // Ink in the first and second cell of `text` on a 2x1 screen.
@@ -2142,6 +2197,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_spreads_font_lookups_over_frames() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         // More new fallback characters than one frame looks up.

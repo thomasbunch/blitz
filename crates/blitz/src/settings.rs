@@ -2,6 +2,7 @@
 //! shows, and the value the arrow keys move it to.
 
 use crate::config::{Config, DAYS, FALLBACK_FONTS, Kind, SETTINGS, Setting, TOASTS, quote};
+use crate::keymap::{self, Action};
 use crate::render::chrome::SettingRow;
 
 /// Font sizes offered, in points.
@@ -154,10 +155,13 @@ impl Panel {
             }
             Kind::Theme => {
                 let light = crate::theme::system_is_light();
-                let used = crate::theme::choose(crate::theme::DEFAULT, light);
-                found_or(crate::theme::choose(&c.theme, light), &self.themes, used)
+                let name = crate::theme::choose(&c.theme, light);
+                let used = crate::theme::successor(name)
+                    .unwrap_or_else(|| crate::theme::choose(crate::theme::DEFAULT, light));
+                found_or(name, &self.themes, used)
             }
             Kind::Game => "play".into(),
+            Kind::Keys => keymap::keys_for(Action::Keys, &c.keys).unwrap_or_default(),
             Kind::Choice => {
                 let now = c.get(s.key);
                 (self.choices(s, c).into_iter())
@@ -177,7 +181,7 @@ impl Panel {
         let next = match s.kind {
             Kind::Toggle if wrap => (now != "true").to_string(),
             Kind::Toggle => (by > 0).to_string(),
-            Kind::Theme | Kind::Game => return None,
+            Kind::Theme | Kind::Game | Kind::Keys => return None,
             Kind::Choice => {
                 let list = self.choices(s, c);
                 let i = list
@@ -206,7 +210,7 @@ impl Panel {
                     .map(Into::into),
                 group: s.group,
                 label: s.label,
-                help: s.help,
+                help: s.help.into(),
                 applies: s.applies,
                 on: (s.kind == Kind::Toggle).then(|| c.get(s.key) == "true"),
                 value: self.shown(s, c),
@@ -404,8 +408,17 @@ mod tests {
         assert_eq!(p.shown(theme, &c), blitz);
         c.theme = "rose pine".into();
         assert_eq!(p.shown(theme, &c), "rose pine");
-        c.theme = "Nord".into();
-        let missing = format!("Nord (not found, using {blitz})");
+        // A built-in since dropped names the one that took its place.
+        for (gone, took) in [
+            ("github dark", "blitz dark"),
+            ("GitHub Light", "blitz light"),
+        ] {
+            c.theme = gone.into();
+            let shown = format!("{gone} (not found, using {took})");
+            assert_eq!(p.shown(theme, &c), shown);
+        }
+        c.theme = "Iris".into();
+        let missing = format!("Iris (not found, using {blitz})");
         assert_eq!(p.shown(theme, &c), missing);
         assert_eq!(p.rows(&c, None)[0].value, missing);
         // Installed, though not fixed-width: blitz uses it.
@@ -417,7 +430,7 @@ mod tests {
         assert_eq!(p.shown(font, &c), "Fira Code (not found, using Consolas)");
         // When nothing is known, nothing is said.
         let p = Panel::default();
-        assert_eq!(p.shown(theme, &c), "Nord");
+        assert_eq!(p.shown(theme, &c), "Iris");
         assert_eq!(p.shown(font, &c), "Fira Code");
     }
 
@@ -446,6 +459,20 @@ mod tests {
         let game = setting("game");
         assert_eq!(p.shown(game, &c), "play");
         assert_eq!(p.step(game, &c, 1, true), None);
+    }
+
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_keys_row_shows_their_keys_and_opens_them() {
+        let (mut p, mut c) = (panel(), Config::default());
+        p.filter = "shortcut".into();
+        let keys = p.selected().expect("a match");
+        assert_eq!(keys.key, "keys");
+        assert_eq!(p.shown(keys, &c), "Ctrl+Shift+/");
+        assert_eq!(p.step(keys, &c, 1, true), None);
+        assert!(c.set("keybind", "alt+k=keys"));
+        assert_eq!(p.shown(keys, &c), "Alt+K");
     }
 
     #[test]
