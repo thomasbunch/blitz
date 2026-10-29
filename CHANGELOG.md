@@ -25,6 +25,9 @@ people who use blitz.
 
 ### Themes
 
+- **blitz ember** and **blitz tide** no longer look like blitz dark and
+  light with a tint: ember glows orange on dark brown, tide aqua on deep
+  sea.
 - GitHub Dark and Light are gone, as blitz dark and light are near
   copies of them. A `theme` that names one gets blitz dark or light in
   its place; to keep the original, put its file from
