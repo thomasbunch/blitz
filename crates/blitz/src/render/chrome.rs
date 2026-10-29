@@ -36,6 +36,8 @@ pub struct Session {
     pub exit_code: Option<u32>,
     /// Lines of output below the view, when it is scrolled back.
     pub below: usize,
+    /// The session whose program opened this one, while it is open.
+    pub parent: Option<PaneId>,
 }
 
 /// A program's progress, as OSC 9;4 reports it.
@@ -415,9 +417,27 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let area = area(m.win, m.size, m.scale, m.banner, tw);
     let (side, bh) = (area.x, h - area.bottom());
     let session = |id: PaneId| m.sessions.iter().find(|x| x.id == id);
-    // A tab's sessions in reading order, as its panes sit.
-    let members =
-        |t: &Tab| -> Vec<&Session> { t.panes().into_iter().filter_map(session).collect() };
+    // A tab's sessions in reading order, as its panes sit, each followed
+    // by the ones it opened, depth first. One opened from another tab
+    // takes its place in reading order.
+    let members = |t: &Tab| -> Vec<&Session> {
+        let list: Vec<&Session> = t.panes().into_iter().filter_map(session).collect();
+        let top = |x: &Session| x.parent.is_none_or(|p| list.iter().all(|y| y.id != p));
+        let mut stack: Vec<&Session> = list.iter().rev().filter(|x| top(x)).copied().collect();
+        let mut out = Vec::new();
+        while let Some(x) = stack.pop() {
+            out.push(x);
+            stack.extend(list.iter().rev().filter(|y| y.parent == Some(x.id)));
+        }
+        out
+    };
+    // How far in a session's row sits: a step for the session that
+    // opened it, and another when a session opened that one.
+    let depth = |x: &Session| {
+        std::iter::successors(x.parent, |&p| session(p)?.parent)
+            .take(2)
+            .count() as i32
+    };
     let p = &mut out.prims;
     let text = |p: &mut Vec<Prim>, x, y, t: &str, color, bold| {
         if t.is_empty() {
@@ -762,10 +782,11 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 }
                 let focused = ti == m.win.active && x.id == t.focus;
                 let bar = x.state == Attn::Working || x.progress.is_some();
+                let indent = depth(x) * s(12.0);
                 let row = Rect {
-                    x: s(8.0),
+                    x: s(8.0) + indent,
                     y,
-                    w: (side - s(18.0)).max(0),
+                    w: (side - s(18.0) - indent).max(0),
                     h: rh,
                 };
                 out.side.rows.push((x.id, row));
@@ -2202,6 +2223,7 @@ mod tests {
             progress: None,
             exit_code: None,
             below: 0,
+            parent: None,
         }
     }
 
@@ -2502,6 +2524,53 @@ mod tests {
             let rows: Vec<_> = c.side.rows.iter().map(|(id, _)| id.0).collect();
             assert_eq!(rows, [2, 1, 3]);
         }
+    }
+
+    /// The sessions a session's program opened follow its row, depth
+    /// first and indented, in their own tab's group.
+    #[test]
+    fn opened_sessions_sit_under_their_opener() {
+        let now = Instant::now();
+        let mut a = Tab::new("shop".into(), PaneId(1));
+        for id in 2..=4 {
+            assert!(a.split(Dir::Right, PaneId(id), AREA, (1, 1)));
+        }
+        let mut b = Tab::new("team".into(), PaneId(5));
+        assert!(b.split(Dir::Down, PaneId(6), AREA, (1, 1)));
+        let mut win = Window {
+            tabs: vec![a, b],
+            active: 0,
+            sidebar_expanded: true,
+            narrow: None,
+        };
+        let mut sessions: Vec<_> = (1..=6)
+            .map(|i| session(i, &format!("s{i}"), Attn::Idle, now))
+            .collect();
+        // 1 opened 2, 3 and 5 in the other tab; 2 opened 4, which opened 6.
+        for (child, parent) in [(2, 1), (3, 1), (4, 2), (5, 1), (6, 4)] {
+            sessions[child - 1].parent = Some(PaneId(parent));
+        }
+        let c = build(&model(&win, &sessions, now));
+        let rows: Vec<_> = c.side.rows.iter().map(|(id, r)| (id.0, r.x)).collect();
+        // Two steps in at most.
+        let want = [(1, 8), (2, 20), (4, 32), (3, 20), (5, 20), (6, 32)];
+        assert_eq!(rows, want);
+        assert!(c.side.rows.iter().all(|(_, r)| r.right() == 230));
+        // Each tab keeps its heading, and the focused pane, 4, its tint.
+        assert_eq!(c.side.heads.iter().map(|h| h.0).collect::<Vec<_>>(), [0, 1]);
+        let ui = crate::theme::blitz(false).ui;
+        let lit: Vec<Rect> = (c.prims.iter())
+            .filter_map(|p| match p {
+                Prim::Shape { r, color, .. } if *color == ui.row_focus => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lit, [c.side.rows[2].1]);
+        // The rail lists them alike, at its edge.
+        win.sidebar_expanded = false;
+        let c = build(&model(&win, &sessions, now));
+        let rows: Vec<_> = c.side.rows.iter().map(|(id, r)| (id.0, r.x)).collect();
+        assert_eq!(rows, want.map(|(id, _)| (id, 0)));
     }
 
     #[test]
