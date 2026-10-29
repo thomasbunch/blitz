@@ -29,3 +29,11 @@ updates:
       default-days: 7
     commit-message:
       prefix: deps
+    # winit 0.30 links objc2 0.5 and the 0.2 frameworks, and blitz pins the
+    # same versions so AppKit is linked once (crates/blitz/Cargo.toml). A
+    # 0.x minor bump breaks their API, so they move only with winit.
+    ignore:
+      - dependency-name: "objc2*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "block2"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
