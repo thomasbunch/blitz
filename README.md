@@ -311,6 +311,9 @@ blitz run, the last row of the panel, is a game rather than a setting:
 Enter starts it, and it keeps its best score in
 `%LOCALAPPDATA%\blitz\run-best`.
 
+**Keyboard shortcuts**, under Keys, opens the list of every key; see
+[Key bindings](#key-bindings).
+
 ## Themes
 
 Ctrl+Shift+K opens the theme picker. The arrow keys show each theme on

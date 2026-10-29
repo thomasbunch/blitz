@@ -2,6 +2,7 @@
 //! shows, and the value the arrow keys move it to.
 
 use crate::config::{Config, FALLBACK_FONTS, Kind, SETTINGS, Setting, TOASTS, quote};
+use crate::keymap::{self, Action};
 use crate::render::chrome::SettingRow;
 
 /// Font sizes offered, in points.
@@ -154,6 +155,7 @@ impl Panel {
                 found_or(crate::theme::choose(&c.theme, light), &self.themes, used)
             }
             Kind::Game => "play".into(),
+            Kind::Keys => keymap::keys_for(Action::Keys, &c.keys).unwrap_or_default(),
             Kind::Choice => {
                 let now = c.get(s.key);
                 (self.choices(s, c).into_iter())
@@ -173,7 +175,7 @@ impl Panel {
         let next = match s.kind {
             Kind::Toggle if wrap => (now != "true").to_string(),
             Kind::Toggle => (by > 0).to_string(),
-            Kind::Theme | Kind::Game => return None,
+            Kind::Theme | Kind::Game | Kind::Keys => return None,
             Kind::Choice => {
                 let list = self.choices(s, c);
                 let i = list
@@ -442,6 +444,20 @@ mod tests {
         let game = setting("game");
         assert_eq!(p.shown(game, &c), "play");
         assert_eq!(p.step(game, &c, 1, true), None);
+    }
+
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_keys_row_shows_their_keys_and_opens_them() {
+        let (mut p, mut c) = (panel(), Config::default());
+        p.filter = "shortcut".into();
+        let keys = p.selected().expect("a match");
+        assert_eq!(keys.key, "keys");
+        assert_eq!(p.shown(keys, &c), "Ctrl+Shift+/");
+        assert_eq!(p.step(keys, &c, 1, true), None);
+        assert!(c.set("keybind", "alt+k=keys"));
+        assert_eq!(p.shown(keys, &c), "Alt+K");
     }
 
     #[test]

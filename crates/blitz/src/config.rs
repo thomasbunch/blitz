@@ -117,6 +117,8 @@ pub enum Kind {
     Theme,
     /// Starts blitz run; not a value in `config.toml`.
     Game,
+    /// Opens the keyboard shortcuts; not a value in `config.toml`.
+    Keys,
 }
 
 /// A setting the settings panel shows. `key` is its name in `config.toml`.
@@ -264,6 +266,14 @@ pub const SETTINGS: &[Setting] = &[
                Files view, beside the other files in its folder. An editor \
                set above takes it instead.",
         kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
+        key: "keys",
+        group: "Keys",
+        label: "Keyboard shortcuts",
+        help: "Every action and the keys that run it. Enter shows them, to change any.",
+        kind: Kind::Keys,
         applies: NOW,
     },
     Setting {
@@ -1106,7 +1116,10 @@ keybind = ctrl+shift+n=text:
     #[test]
     fn every_setting_reads_back_what_it_writes() {
         let mut c = Config::default();
-        for s in SETTINGS.iter().filter(|s| s.kind != Kind::Game) {
+        for s in SETTINGS
+            .iter()
+            .filter(|s| !matches!(s.kind, Kind::Game | Kind::Keys))
+        {
             let v = c.get(s.key);
             assert!(!v.is_empty(), "{} has no value", s.key);
             assert!(c.set(s.key, &v), "{} = {v} does not read back", s.key);
@@ -1276,9 +1289,12 @@ scenery = stars
         assert_eq!(Config::read(&folder), Config::default());
     }
 
-    /// The panel's rows that are settings in the file, not blitz run.
+    /// The panel's rows that are settings in the file, not blitz run or the
+    /// keyboard shortcuts.
     fn values() -> impl Iterator<Item = &'static Setting> {
-        SETTINGS.iter().filter(|s| s.kind != Kind::Game)
+        SETTINGS
+            .iter()
+            .filter(|s| !matches!(s.kind, Kind::Game | Kind::Keys))
     }
 
     #[test]

@@ -2698,6 +2698,7 @@ impl App {
             Some(Kind::Toggle) => self.change_setting(1, true),
             Some(Kind::Theme) => self.open_picker(),
             Some(Kind::Game) => self.open_game(),
+            Some(Kind::Keys) => self.open_shortcuts(),
             Some(Kind::Choice) if inside(&control) => {
                 let by = if x < control.x + control.w / 2 { -1 } else { 1 };
                 self.change_setting(by, false);
@@ -2719,6 +2720,7 @@ impl App {
         match s.kind {
             Kind::Theme => return self.open_picker(),
             Kind::Game => return self.open_game(),
+            Kind::Keys => return self.open_shortcuts(),
             _ => {}
         }
         if let Some(v) = p.step(s, &self.config, by, wrap) {
