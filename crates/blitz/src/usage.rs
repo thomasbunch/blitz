@@ -252,7 +252,11 @@ pub fn panel(on: bool, r: Option<&Report>, now: i64, top: usize) -> chrome::Usag
             return u;
         }
         Some(r) if !r.found => {
-            u.note = format!("No Claude Code logs in {}", r.folder);
+            // No folder without a home folder or `CLAUDE_CONFIG_DIR`.
+            u.note = match r.folder.as_str() {
+                "" => "No Claude Code folder found".into(),
+                f => format!("No Claude Code logs in {f}"),
+            };
             return u;
         }
         Some(r) => r,
@@ -1526,6 +1530,8 @@ mod tests {
         let u = panel(true, Some(&missing), 0, 0);
         assert_eq!(u.note, "No Claude Code logs in /home/me/.claude/projects");
         assert!(u.lines.is_empty());
+        let nowhere = panel(true, Some(&Report::default()), 0, 0);
+        assert_eq!(nowhere.note, "No Claude Code folder found");
         // Off, a report is not shown.
         let found = Report {
             found: true,
