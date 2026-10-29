@@ -735,8 +735,9 @@ fn evens(last: &mut Option<(Instant, Pos, u8)>, i: usize, now: Instant, within: 
 }
 
 /// Whether press `b` on session `id`'s row double-clicks it, which expands
-/// or collapses the sidebar. Only left presses count. `last` holds the last
-/// left press on a row and takes this one.
+/// or collapses the sidebar. Only left presses count, and any other press
+/// clears `last`. `last` holds the last left press on a row and takes this
+/// one.
 fn row_toggles(
     last: &mut Option<(Instant, Pos, u8)>,
     id: PaneId,
@@ -744,7 +745,11 @@ fn row_toggles(
     now: Instant,
     within: Duration,
 ) -> bool {
-    b == 0 && evens(last, id.0 as usize, now, within)
+    if b != 0 {
+        *last = None;
+        return false;
+    }
+    evens(last, id.0 as usize, now, within)
 }
 
 /// Selected cells in a pane.
@@ -9815,6 +9820,13 @@ mod tests {
         assert!(
             !row_toggles(&mut last, a, 1, t0 + ms(400), within),
             "middle presses"
+        );
+        let mut last = None;
+        assert!(!row_toggles(&mut last, a, 0, t0, within));
+        assert!(!row_toggles(&mut last, a, 2, t0 + ms(100), within));
+        assert!(
+            !row_toggles(&mut last, a, 0, t0 + ms(200), within),
+            "a right press between two left ones"
         );
     }
 
