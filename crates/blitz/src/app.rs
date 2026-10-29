@@ -238,10 +238,12 @@ impl Args {
 
     /// A scripted or test run, which nobody watches.
     fn scripted(&self) -> bool {
-        self.cmd.is_some()
-            || self.selftest.is_some()
-            || self.exit_after.is_some()
-            || self.capture.is_some()
+        self.cmd.is_some() || self.test()
+    }
+
+    /// A test run: a self-test, a capture or one set to exit.
+    fn test(&self) -> bool {
+        self.selftest.is_some() || self.exit_after.is_some() || self.capture.is_some()
     }
 
     /// A window of its own, which takes no launches. Run as administrator,
@@ -2474,11 +2476,11 @@ impl App {
     }
 
     /// Starts or stops reading Claude Code's logs as the settings say, and
-    /// reads them again for a week that starts at another time. Scripted
-    /// and test runs never read the user's logs.
+    /// reads them again for a week that starts at another time. Test runs
+    /// never read the user's logs; a `--cmd` run, `claude` say, does.
     fn track_usage(&mut self) {
         let reset = crate::usage::reset(&self.config);
-        if !self.config.usage_tracking || self.args.scripted() {
+        if !self.config.usage_tracking || self.args.test() {
             // Its thread ends with it.
             self.usage = None;
         } else if let Some(t) = &mut self.usage {
@@ -10696,6 +10698,9 @@ mod tests {
         };
         assert!(parse(&["--capture", "f.bmp"]).scripted());
         assert!(!parse(&["--cwd", "C:\\", "--new-window"]).scripted());
+        // A command of the user's own is no test run, and reads their logs.
+        assert!(a.test() && parse(&["--capture", "f.bmp"]).test());
+        assert!(!parse(&["--cmd", "claude"]).test());
     }
 
     #[cfg(windows)]
