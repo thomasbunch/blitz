@@ -367,7 +367,7 @@ fn dollars(x: f64) -> String {
     let cents = (x * 100.0).round() as u64;
     match cents {
         0..100_000 => format!("${}.{:02}", cents / 100, cents % 100),
-        _ => format!("${}", thousands(((cents + 50) / 100) as usize)),
+        _ => format!("${}", thousands((cents.saturating_add(50) / 100) as usize)),
     }
 }
 
@@ -1561,6 +1561,10 @@ mod tests {
         assert_eq!(dollars(999.99), "$999.99");
         assert_eq!(dollars(1234.5), "$1,235");
         assert_eq!(dollars(-1e-12), "$0.00");
+        // A figure past what cents can count stops at the most they can.
+        for huge in [1.9e17, f64::MAX, f64::INFINITY] {
+            assert_eq!(dollars(huge), "$184,467,440,737,095,516");
+        }
         assert_eq!(tokens(980), "980");
         assert_eq!(tokens(4200), "4.2k");
         assert_eq!(tokens(45_000), "45k");
