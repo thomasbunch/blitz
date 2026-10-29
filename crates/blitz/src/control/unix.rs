@@ -160,6 +160,8 @@ mod tests {
         let _watch = shut_after(&server, Duration::from_millis(200));
         let _ = client.write_all(b"{");
         let mut got = Vec::new();
+        // So a missed shut fails the assert below instead of hanging.
+        let _ = server.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = server.read_to_end(&mut got);
         let took = start.elapsed();
         assert!(took >= Duration::from_millis(200), "it waited: {took:?}");
