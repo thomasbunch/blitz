@@ -5,11 +5,9 @@ use std::net::Shutdown;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
-
-/// How many callers are served now.
-static CALLS: AtomicUsize = AtomicUsize::new(0);
+use std::time::Duration;
 
 /// Listens on a new socket of this process's own and answers each request
 /// with `answer`, on a thread per connection. Returns the socket's path,
@@ -38,8 +36,8 @@ pub fn listen(answer: impl Fn(String) -> String + Clone + Send + 'static) -> io:
                 let Ok(mut s) = s else {
                     continue;
                 };
-                if CALLS.fetch_add(1, Ordering::SeqCst) >= super::MAX_CALLS {
-                    CALLS.fetch_sub(1, Ordering::SeqCst);
+                if super::CALLS.fetch_add(1, Ordering::SeqCst) >= super::MAX_CALLS {
+                    super::CALLS.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }
                 let answer = answer.clone();
@@ -48,30 +46,34 @@ pub fn listen(answer: impl Fn(String) -> String + Clone + Send + 'static) -> io:
                     .spawn(move || {
                         let _ = s.set_read_timeout(Some(super::ANSWER));
                         let _ = s.set_write_timeout(Some(super::ANSWER));
-                        // The timeouts are per wait; past the deadline the
-                        // socket is shut, which ends a caller that sends a
-                        // byte now and then.
-                        let (done, ended) = mpsc::channel::<()>();
-                        if let Ok(watch) = s.try_clone() {
-                            let _ = std::thread::Builder::new()
-                                .name("pane-control-watch".into())
-                                .spawn(move || {
-                                    let late = ended.recv_timeout(super::DEADLINE);
-                                    if late == Err(RecvTimeoutError::Timeout) {
-                                        let _ = watch.shutdown(Shutdown::Both);
-                                    }
-                                });
-                        }
+                        let done = shut_after(&s, super::DEADLINE);
                         super::serve(&mut s, answer);
                         drop(done);
-                        CALLS.fetch_sub(1, Ordering::SeqCst);
+                        super::CALLS.fetch_sub(1, Ordering::SeqCst);
                     });
                 if call.is_err() {
-                    CALLS.fetch_sub(1, Ordering::SeqCst);
+                    super::CALLS.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         })?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Shuts `s` past `deadline`, unless what this returns is dropped first.
+/// Its timeouts are per wait, so a caller that sends a byte now and then
+/// would otherwise hold it for good.
+fn shut_after(s: &UnixStream, deadline: Duration) -> mpsc::Sender<()> {
+    let (done, ended) = mpsc::channel::<()>();
+    if let Ok(watch) = s.try_clone() {
+        let _ = std::thread::Builder::new()
+            .name("pane-control-watch".into())
+            .spawn(move || {
+                if ended.recv_timeout(deadline) == Err(RecvTimeoutError::Timeout) {
+                    let _ = watch.shutdown(Shutdown::Both);
+                }
+            });
+    }
+    done
 }
 
 /// Where in `dir` a new socket goes, through no link: [`valid`] takes
@@ -146,6 +148,61 @@ mod tests {
         let ok = valid(&path.to_string_lossy());
         let _ = (std::fs::remove_file(&link), std::fs::remove_dir(&real));
         assert!(ok, "{path:?}");
+    }
+
+    /// A caller that sends a byte now and then is shut at the deadline,
+    /// and one whose call ended in time is not.
+    #[test]
+    fn control_a_slow_caller_is_cut_off() {
+        use std::io::{Read, Write};
+        let (mut server, mut client) = UnixStream::pair().expect("a pair");
+        let start = std::time::Instant::now();
+        let _watch = shut_after(&server, Duration::from_millis(200));
+        let _ = client.write_all(b"{");
+        let mut got = Vec::new();
+        let _ = server.read_to_end(&mut got);
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(200), "it waited: {took:?}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let (mut server, mut client) = UnixStream::pair().expect("a pair");
+        drop(shut_after(&server, Duration::from_millis(50)));
+        std::thread::sleep(Duration::from_millis(150));
+        let _ = client.write_all(b"x");
+        let mut one = [0; 1];
+        assert_eq!(server.read(&mut one).ok(), Some(1));
+    }
+
+    /// Callers past the cap are dropped at once, and blitz goes on
+    /// listening.
+    #[test]
+    fn control_callers_past_the_cap_are_dropped() {
+        use std::io::{Read, Write};
+        let path = listen(|_| r#"{"ok":true}"#.into()).expect("listen");
+        let calls = || crate::control::CALLS.load(Ordering::SeqCst);
+        let wait_for = |done: &dyn Fn() -> bool| {
+            let start = std::time::Instant::now();
+            while !done() {
+                assert!(start.elapsed() < Duration::from_secs(10), "{}", calls());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let idle: Vec<UnixStream> = (0..crate::control::MAX_CALLS)
+            .map(|_| connect(&path).expect("connect"))
+            .collect();
+        wait_for(&|| calls() >= crate::control::MAX_CALLS);
+        let mut over = connect(&path).expect("connect");
+        let _ = over.write_all(b"{}\n");
+        let mut got = Vec::new();
+        let _ = over.read_to_end(&mut got);
+        assert!(got.is_empty(), "{got:?}");
+        drop(idle);
+        wait_for(&|| calls() == 0);
+        let mut again = connect(&path).expect("connect");
+        let _ = again.write_all(b"{}\n");
+        let mut got = String::new();
+        let _ = again.read_to_string(&mut got);
+        let _ = std::fs::remove_file(&path);
+        assert!(got.contains("ok"), "{got:?}");
     }
 
     /// The socket of a blitz that stopped without removing it goes when

@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -31,8 +31,6 @@ const PREFIX: &str = r"\\.\pipe\blitz-";
 /// How long a caller waits for blitz to open the pipe again while it
 /// answers others.
 const BUSY: Duration = Duration::from_secs(2);
-/// How many callers are served now.
-static CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Listens on a new pipe of this process's own and answers each request
 /// with `answer`, on a thread per connection. Returns the pipe's name.
@@ -71,8 +69,8 @@ pub fn listen(answer: impl Fn(String) -> String + Clone + Send + 'static) -> io:
                 }
                 // Past the cap a caller is dropped at once, so a flood
                 // cannot use up the instances blitz listens with.
-                if CALLS.fetch_add(1, Ordering::SeqCst) >= super::MAX_CALLS {
-                    CALLS.fetch_sub(1, Ordering::SeqCst);
+                if super::CALLS.fetch_add(1, Ordering::SeqCst) >= super::MAX_CALLS {
+                    super::CALLS.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }
                 let answer = answer.clone();
@@ -91,10 +89,10 @@ pub fn listen(answer: impl Fn(String) -> String + Clone + Send + 'static) -> io:
                     .name("pane-control-call".into())
                     .spawn(move || {
                         within(super::DEADLINE, call);
-                        CALLS.fetch_sub(1, Ordering::SeqCst);
+                        super::CALLS.fetch_sub(1, Ordering::SeqCst);
                     });
                 if watched.is_err() {
-                    CALLS.fetch_sub(1, Ordering::SeqCst);
+                    super::CALLS.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         })?;
@@ -249,7 +247,7 @@ mod tests {
     #[test]
     fn control_callers_past_the_cap_are_dropped() {
         let pipe = listen(|_| r#"{"ok":true}"#.into()).expect("listen");
-        let calls = || CALLS.load(Ordering::SeqCst);
+        let calls = || crate::control::CALLS.load(Ordering::SeqCst);
         let wait_for = |done: &dyn Fn() -> bool| {
             let start = Instant::now();
             while !done() {

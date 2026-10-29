@@ -12,6 +12,7 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use crate::attention::Attn;
@@ -49,6 +50,8 @@ const DEADLINE: Duration = ANSWER.saturating_add(Duration::from_secs(5));
 /// The most callers served at once: past it a caller is dropped at once,
 /// so a flood cannot pile up threads.
 const MAX_CALLS: usize = 64;
+/// How many callers are served now.
+static CALLS: AtomicUsize = AtomicUsize::new(0);
 
 const NOT_IN_PANE: &str =
     "not in a blitz pane, or CLAUDE_CODE_SUBPROCESS_ENV_SCRUB removed BLITZ_PANE_TOKEN";
