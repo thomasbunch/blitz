@@ -14,11 +14,14 @@ const DIVIDER_CONTRAST: f64 = 1.3;
 /// The `theme` setting when there is none: follow the Windows app theme.
 pub const DEFAULT: &str = "light:blitz light,dark:blitz dark";
 
-/// Built-in themes as (name, file), the plain blitz pair first. A user
-/// file with the same name wins.
+/// Built-in themes as (name, file): the plain blitz pair first, then
+/// the other blitz originals, then the ones from elsewhere by name. A
+/// user file with the same name wins.
 const BUILTIN: &[(&str, &str)] = &[
     ("blitz dark", include_str!("../themes/blitz-dark")),
     ("blitz light", include_str!("../themes/blitz-light")),
+    ("blitz neon", include_str!("../themes/blitz-neon")),
+    ("blitz volt", include_str!("../themes/blitz-volt")),
     (
         "blitz ember dark",
         include_str!("../themes/blitz-ember-dark"),

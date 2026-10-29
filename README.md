@@ -319,10 +319,17 @@ theme (it writes `theme = "..."` to `config.toml`) and Esc puts the old
 one back. With a light and a dark theme set, Enter changes the one for
 the mode Windows is in now.
 
-Built in: **blitz** dark and light (the default), **blitz ember** and
-**blitz tide**, each dark and light, and Catppuccin Mocha and Latte,
-Gruvbox Dark and Light, Rose Pine and Rose Pine Dawn, Solarized Dark and
-Light, and Tokyo Night and Tokyo Night Day.
+Built in, in the picker's order:
+
+- **blitz** dark and light, the default.
+- Radiant: **blitz neon**, pink and cyan on deep violet; **blitz volt**,
+  electric lime on black; and **blitz ember** and **blitz tide**, each
+  dark and light, glowing orange on dark brown and aqua on deep sea.
+- For developers, as their authors made them: Catppuccin Mocha and
+  Latte, Gruvbox Dark and Light, Rose Pine and Rose Pine Dawn, Solarized
+  Dark and Light, and Tokyo Night and Tokyo Night Day.
+
+Typing `blitz` in the picker leaves only blitz's own.
 
 To make your own, put a file in `%APPDATA%\blitz\themes`, which **Open
 themes folder** in the command palette opens; its file name, without a
