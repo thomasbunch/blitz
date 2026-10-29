@@ -915,6 +915,55 @@ mod tests {
         }
     }
 
+    /// `0xRRGGBB` in OKLab, where the distance between two colours follows
+    /// how different they look.
+    fn oklab(rgb: u32) -> [f64; 3] {
+        let [_, r, g, b] = rgb.to_be_bytes();
+        let lin = linear();
+        let (r, g, b) = (
+            lin[usize::from(r)],
+            lin[usize::from(g)],
+            lin[usize::from(b)],
+        );
+        let l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
+        let m = (0.2119034982 * r + 0.6806995747 * g + 0.1073969271 * b).cbrt();
+        let s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).cbrt();
+        [
+            0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+        ]
+    }
+
+    fn distance(a: u32, b: u32) -> f64 {
+        let (a, b) = (oklab(a), oklab(b));
+        (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt()
+    }
+
+    #[test]
+    fn no_two_builtin_themes_look_alike() {
+        // Two themes of the same lightness may share a background or a
+        // palette, not both. Background is most of the window, and Claude
+        // Code draws in colours of its own, so a theme that only nudges
+        // another's is one more name for the same look.
+        let all = all_in(None);
+        for (i, a) in all.iter().enumerate() {
+            for b in all[i + 1..].iter().filter(|b| b.light == a.light) {
+                let bg = distance(a.pal.bg, b.pal.bg);
+                let pal = (1..7)
+                    .map(|k| distance(a.pal.ansi[k], b.pal.ansi[k]))
+                    .sum::<f64>()
+                    / 6.0;
+                assert!(
+                    bg >= 0.03 || pal >= 0.08,
+                    "{} and {} look alike: background {bg:.3}, palette {pal:.3}",
+                    a.name,
+                    b.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_contrast_themes_meet_wcag_aaa() {
         for t in all_in(None)
