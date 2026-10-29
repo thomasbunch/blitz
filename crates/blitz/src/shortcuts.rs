@@ -177,6 +177,16 @@ impl Panel {
                 } else {
                     keys(&now)
                 };
+                // Off a Mac, Ctrl and a digit go to a tab only where the key
+                // types the digit, which the chord alone cannot tell.
+                let tab = matches!(a, Action::GoToTab(_) | Action::LastTab);
+                let only = match default.iter().find(|d| now.contains(d)) {
+                    Some(d) if tab && !cfg!(target_os = "macos") => format!(
+                        " {} goes there only where its key types the digit.",
+                        keymap::chord_label(d.0, d.1)
+                    ),
+                    _ => String::new(),
+                };
                 SettingRow {
                     group: GROUPS[group(a)],
                     label: keymap::label(a),
@@ -186,7 +196,7 @@ impl Panel {
                              program; Esc stops.",
                             keymap::label(a)
                         ),
-                        None => format!("{shown}. In config.toml it is {}.", keymap::name(a)),
+                        None => format!("{shown}.{only} In config.toml it is {}.", keymap::name(a)),
                     },
                     applies: config::NOW,
                     on: None,
@@ -394,6 +404,12 @@ mod tests {
         assert_eq!(rows[0].value, "Ctrl+C \u{b7} Ctrl+Insert");
         assert!(rows[0].changed && !rows[1].changed);
         assert_eq!(rows[0].default, all);
+        let tab = |user: &[Binding]| panel("go_to_tab_3").rows(user).remove(0).help;
+        let digit = "Ctrl+3. Ctrl+3 goes there only where its key types the digit. \
+                     In config.toml it is go_to_tab_3.";
+        assert_eq!(tab(&[]), digit);
+        let user = config::Config::parse("keybind = ctrl+3=none").keys;
+        assert_eq!(tab(&user), "No keys. In config.toml it is go_to_tab_3.");
     }
 
     // Windows' and Linux's chords.
