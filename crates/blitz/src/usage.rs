@@ -1312,36 +1312,36 @@ mod tests {
 
     #[test]
     fn every_reset_starts_a_week_across_daylight_saving() {
-        let clocks: [(fn(i64) -> i64, [&str; 2]); 2] = [
-            (central, ["2026-03-08T08:00:00Z", "2026-11-01T07:00:00Z"]),
-            (berlin, ["2026-03-29T01:00:00Z", "2026-10-25T01:00:00Z"]),
-        ];
-        for (off, changes) in clocks {
-            for change in changes.map(at) {
-                for now in (change - 8 * DAY..change + 8 * DAY).step_by(900) {
-                    for reset in (0..7).flat_map(|d| (0..24).map(move |h| (d, h))) {
-                        let this = week_start(now, reset, &off);
-                        let last = week_start(this - 1, reset, &off);
-                        let next = week_start(this + 8 * DAY, reset, &off);
-                        assert!(
-                            last < this && this <= now && now < next,
-                            "{reset:?} at {now}: {last} {this} {next}"
-                        );
-                        assert!((next - this - WEEK).abs() <= 3600, "{reset:?} at {now}");
-                        // The clock reads the reset as the week starts, or
-                        // jumps past it then.
-                        let want = i64::from(reset.0) * DAY + i64::from(reset.1) * 3600;
-                        let into = |t: i64| {
-                            let l = t + off(t);
-                            ((l.div_euclid(DAY) + 3) * DAY + l.rem_euclid(DAY) - want)
-                                .rem_euclid(WEEK)
-                        };
-                        let (starts, before) = (into(this), into(this - 1));
-                        assert!(
-                            starts == 0 || (starts <= 3600 && before == WEEK - 1),
-                            "{reset:?} at {now}: starts {starts}s past it"
-                        );
-                    }
+        every_reset(&central, ["2026-03-08T08:00:00Z", "2026-11-01T07:00:00Z"]);
+        every_reset(&berlin, ["2026-03-29T01:00:00Z", "2026-10-25T01:00:00Z"]);
+    }
+
+    /// Checks the week of every reset each quarter hour from 8 days before
+    /// to 8 days after each of the `changes` of clock `off`.
+    fn every_reset(off: &dyn Fn(i64) -> i64, changes: [&str; 2]) {
+        for change in changes.map(at) {
+            for now in (change - 8 * DAY..change + 8 * DAY).step_by(900) {
+                for reset in (0..7).flat_map(|d| (0..24).map(move |h| (d, h))) {
+                    let this = week_start(now, reset, off);
+                    let last = week_start(this - 1, reset, off);
+                    let next = week_start(this + 8 * DAY, reset, off);
+                    assert!(
+                        last < this && this <= now && now < next,
+                        "{reset:?} at {now}: {last} {this} {next}"
+                    );
+                    assert!((next - this - WEEK).abs() <= 3600, "{reset:?} at {now}");
+                    // The clock reads the reset as the week starts, or jumps
+                    // past it then.
+                    let want = i64::from(reset.0) * DAY + i64::from(reset.1) * 3600;
+                    let into = |t: i64| {
+                        let l = t + off(t);
+                        ((l.div_euclid(DAY) + 3) * DAY + l.rem_euclid(DAY) - want).rem_euclid(WEEK)
+                    };
+                    let (starts, before) = (into(this), into(this - 1));
+                    assert!(
+                        starts == 0 || (starts <= 3600 && before == WEEK - 1),
+                        "{reset:?} at {now}: starts {starts}s past it"
+                    );
                 }
             }
         }
