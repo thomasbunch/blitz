@@ -930,14 +930,14 @@ mod gpu {
     /// one tab, for checking the chrome. With `--demo`, `--cols` and
     /// `--rows` give the window size in pixels, `--picker` opens the
     /// theme picker filtered to `--picker`'s value, `--settings N` opens
-    /// the settings panel with row N highlighted, and `--find TEXT` finds
-    /// TEXT in the focused pane.
+    /// the settings panel with row N highlighted, `--keys N` the keyboard
+    /// shortcuts so, and `--find TEXT` finds TEXT in the focused pane.
     fn render_demo(
         r: &mut Renderer,
         theme: &crate::theme::Theme,
         collapsed: bool,
         banner: Option<&str>,
-        (picker, settings, find): (Option<&str>, Option<usize>, Option<&str>),
+        (picker, settings, keys, find): (Option<&str>, Option<usize>, Option<usize>, Option<&str>),
         (w, h): (u32, u32),
         scale: f32,
     ) -> Result<Vec<u8>> {
@@ -1120,11 +1120,13 @@ mod gpu {
             commands: None,
             find: None,
         };
-        // One setting changed, to show its mark and a switch that is off.
-        let config = crate::config::Config {
+        // One setting changed, to show its mark and a switch that is off,
+        // and one action given more keys.
+        let mut config = crate::config::Config {
             flash: false,
             ..Default::default()
         };
+        config.set("keybind", "ctrl+alt+y=split_right");
         let themes = crate::theme::all().into_iter().map(|t| t.name).collect();
         let fonts = super::font::families().to_vec();
         let mut panel = crate::settings::Panel::new(fonts, crate::shell::choices(), themes);
@@ -1134,6 +1136,20 @@ mod gpu {
                 page: chrome::Page::Settings,
                 filter: "",
                 rows: panel.rows(&config, None),
+                sel,
+                top: 0,
+                error: None,
+            });
+        }
+        if let Some(sel) = keys {
+            let panel = crate::shortcuts::Panel {
+                sel,
+                ..Default::default()
+            };
+            model.settings = Some(chrome::Settings {
+                page: chrome::Page::Keys(false),
+                filter: "",
+                rows: panel.rows(&config.keys),
                 sel,
                 top: 0,
                 error: None,
@@ -1214,7 +1230,7 @@ mod gpu {
         let mut bmp = None;
         let (mut warp, mut light, mut demo, mut collapsed) = (false, false, false, false);
         let (mut banner, mut theme, mut picker, mut settings) = (None, None, None, None);
-        let mut find = None;
+        let (mut keys, mut find) = (None, None);
         let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
         let mut px = DEFAULT_PX;
         let mut it = args.iter();
@@ -1236,6 +1252,7 @@ mod gpu {
                 "--theme" => theme = Some(val()?.clone()),
                 "--picker" => picker = Some(val()?.clone()),
                 "--settings" => settings = Some(usize::from(num(val()?)?)),
+                "--keys" => keys = Some(usize::from(num(val()?)?)),
                 "--find" => find = Some(val()?.clone()),
                 "--script" => {
                     return Err("--script is not supported yet; pass --vt FILE".into());
@@ -1264,7 +1281,7 @@ mod gpu {
                 &theme,
                 collapsed,
                 banner.as_deref(),
-                (picker.as_deref(), settings, find.as_deref()),
+                (picker.as_deref(), settings, keys, find.as_deref()),
                 (w, h),
                 scale,
             )
