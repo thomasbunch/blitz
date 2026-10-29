@@ -86,6 +86,7 @@ pub struct ChromeModel<'a> {
     /// one's field instead.
     pub preedit: Option<(u16, u16, &'a str)>,
     pub picker: Option<Picker<'a>>,
+    /// The settings panel, or the keyboard shortcuts drawn in its place.
     pub settings: Option<Settings<'a>>,
     /// The spark at the foot of the sidebar, when it is on: seconds into
     /// its animation.
@@ -137,11 +138,13 @@ pub struct Commands<'a> {
 /// Rows the theme picker and the command palette show at once.
 pub const PICKER_ROWS: usize = 12;
 
-/// The settings panel, drawn over everything but the theme picker.
+/// The settings panel, or the keyboard shortcuts in its frame, drawn over
+/// everything but the theme picker.
 pub struct Settings<'a> {
+    pub page: Page,
     /// What was typed to narrow the list.
     pub filter: &'a str,
-    /// The settings that match it.
+    /// The settings, or actions, that match it.
     pub rows: Vec<SettingRow>,
     /// The highlighted row.
     pub sel: usize,
@@ -151,15 +154,24 @@ pub struct Settings<'a> {
     pub error: Option<&'a str>,
 }
 
+/// Which list the settings panel shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    Settings,
+    /// The keyboard shortcuts; true while they wait for new keys.
+    Keys(bool),
+}
+
 /// One setting as the panel shows it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SettingRow {
     pub group: &'static str,
     pub label: &'static str,
-    pub help: &'static str,
+    pub help: String,
     /// When a change takes effect.
     pub applies: &'static str,
-    /// A switch's state; `None` shows `value` between arrows instead.
+    /// A switch's state; `None` shows `value` instead, between arrows in
+    /// the settings.
     pub on: Option<bool>,
     pub value: String,
     /// Whether a step left or right would change the value.
@@ -168,7 +180,7 @@ pub struct SettingRow {
     /// The default value, as shown.
     pub default: String,
     /// Said in place of when a change applies: why the last look for an
-    /// update failed.
+    /// update failed, or what the keys pressed for an action run now.
     pub note: Option<String>,
     /// The value is not the default.
     pub changed: bool,
@@ -1445,7 +1457,8 @@ fn inset(r: Rect, by: i32) -> Rect {
 /// The settings panel: a search line, the settings under group headings,
 /// each with a switch or a value between arrows, help for the highlighted
 /// one and a key hint. The list scrolls only as far as it must to show the
-/// highlighted row and its heading.
+/// highlighted row and its heading. The keyboard shortcuts show the same
+/// way, with their keys as plain values.
 fn settings(
     p: &mut Vec<Prim>,
     st: &Settings,
@@ -1540,10 +1553,28 @@ fn settings(
         p.push(Prim::Rect(r, c.rule));
     };
 
+    let (title, empty, hint) = match st.page {
+        Page::Settings => (
+            "Settings",
+            "No setting matches",
+            "\u{2191}\u{2193} choose  \u{b7}  \u{2190}\u{2192} change  \u{b7}  Del default  \u{b7}  Esc close",
+        ),
+        Page::Keys(false) => (
+            "Keyboard shortcuts",
+            "No shortcut matches",
+            "\u{2191}\u{2193} choose  \u{b7}  Enter add keys  \u{b7}  Del default  \u{b7}  Esc close",
+        ),
+        Page::Keys(true) => (
+            "Keyboard shortcuts",
+            "No shortcut matches",
+            "Press the new keys  \u{b7}  Enter add  \u{b7}  Del remove  \u{b7}  Esc cancel",
+        ),
+    };
     let mut y = inner.y;
-    text(p, left, mid(y, head_h), "Settings".into(), c.name, true);
-    let fx = left + 10 * tw;
-    let caret = caret.then_some(one);
+    text(p, left, mid(y, head_h), title.into(), c.name, true);
+    let fx = left + text_w(title, tw) + 2 * tw;
+    // Nothing types into the search while the shortcuts wait for keys.
+    let caret = (caret && st.page != Page::Keys(true)).then_some(one);
     let at = (fx, mid(y, head_h), right);
     hits.field = field(p, c, at, (st.filter, "type to search"), caret, (tw, th));
     y += head_h;
@@ -1552,14 +1583,7 @@ fn settings(
     let list_y = y;
 
     if lines.is_empty() {
-        text(
-            p,
-            left,
-            mid(y, line_h),
-            "No setting matches".into(),
-            c.dim,
-            false,
-        );
+        text(p, left, mid(y, line_h), empty.into(), c.dim, false);
     }
     for line in lines.iter().skip(first).take(shown) {
         match *line {
@@ -1618,6 +1642,17 @@ fn settings(
                         dot(p, k, if on { c.side_bg } else { c.dim });
                         track
                     }
+                    None if st.page != Page::Settings => {
+                        let value = fit(&r.value, pw / 2 - pad, tw);
+                        let vx = right - text_w(&value, tw);
+                        text(p, vx, ty, value, lc, false);
+                        Rect {
+                            x: vx,
+                            y,
+                            w: right - vx,
+                            h: line_h,
+                        }
+                    }
                     None => {
                         let value = fit(&r.value, pw / 2 - pad, tw);
                         let sp = s(8.0);
@@ -1646,7 +1681,7 @@ fn settings(
     y += one + s(10.0);
     let meta_y = y + 2 * help_line;
     if let Some(r) = st.rows.get(st.sel) {
-        for (k, l) in wrap(r.help, right - left, tw, 2).into_iter().enumerate() {
+        for (k, l) in wrap(&r.help, right - left, tw, 2).into_iter().enumerate() {
             text(p, left, y + k as i32 * help_line, l, c.msg, false);
         }
         if st.error.is_none() {
@@ -1660,7 +1695,6 @@ fn settings(
     if let Some(e) = st.error {
         text(p, left, meta_y, fit(e, right - left, tw), c.error, false);
     }
-    let hint = "\u{2191}\u{2193} choose  \u{b7}  \u{2190}\u{2192} change  \u{b7}  Del default  \u{b7}  Esc close";
     let hy = inner.bottom() - line_h;
     text(
         p,
@@ -2619,6 +2653,7 @@ mod tests {
         let mut rows = setting_rows();
         rows[2].changed = true;
         m.settings = Some(Settings {
+            page: Page::Settings,
             filter: "",
             rows,
             sel: 2,
@@ -3004,7 +3039,7 @@ mod tests {
         let row = |group, label, on: Option<bool>| SettingRow {
             group,
             label,
-            help: "Help for this setting.",
+            help: "Help for this setting.".into(),
             applies: "Applies now",
             on,
             value: if on.is_none() {
@@ -3032,6 +3067,7 @@ mod tests {
         let (win, sessions, now) = fleet(true);
         let mut m = model(&win, &sessions, now);
         m.settings = Some(Settings {
+            page: Page::Settings,
             filter: "",
             rows: setting_rows(),
             sel: 1,
@@ -3063,6 +3099,7 @@ mod tests {
         let mut rows = setting_rows();
         rows[1].note = Some("Could not look for an update: offline".into());
         m.settings = Some(Settings {
+            page: Page::Settings,
             filter: "",
             rows,
             sel: 1,
@@ -3077,10 +3114,61 @@ mod tests {
     }
 
     #[test]
+    fn keys_page_shows_keys_plainly_with_its_own_hints() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let (name, th) = (m.ui.name, m.text_cell.1 as i32);
+        let keys = "Ctrl+C \u{b7} Ctrl+Insert";
+        let rows: Vec<SettingRow> = (setting_rows().into_iter())
+            .map(|r| SettingRow {
+                on: None,
+                value: keys.into(),
+                ..r
+            })
+            .collect();
+        let page = |waiting, rows| Settings {
+            page: Page::Keys(waiting),
+            filter: "",
+            rows,
+            sel: 1,
+            top: 0,
+            error: None,
+        };
+        let caret = |c: &Chrome| {
+            (c.prims.iter()).any(
+                |p| matches!(p, Prim::Rect(r, color) if *color == name && r.w == 1 && r.h == th),
+            )
+        };
+        m.settings = Some(page(false, rows.clone()));
+        let c = build(&m);
+        let t = texts(&c);
+        let hint = "\u{2191}\u{2193} choose  \u{b7}  Enter add keys  \u{b7}  Del default  \u{b7}  Esc close";
+        for want in ["Keyboard shortcuts", hint, keys] {
+            assert!(t.contains(&want), "missing {want:?} in {t:?}");
+        }
+        assert!(!t.contains(&"\u{2039}"), "no arrows");
+        assert!(caret(&c));
+        let hits = c.settings.expect("settings hits");
+        assert!(
+            (hits.rows.iter())
+                .all(|&(_, row, ctl)| ctl.w > 0 && ctl.x >= row.x && ctl.right() <= row.right())
+        );
+        // While it waits for keys, nothing types into the search.
+        m.settings = Some(page(true, rows));
+        let c = build(&m);
+        let hint = "Press the new keys  \u{b7}  Enter add  \u{b7}  Del remove  \u{b7}  Esc cancel";
+        assert!(texts(&c).contains(&hint));
+        assert!(!caret(&c));
+        m.settings = Some(page(false, Vec::new()));
+        assert!(texts(&build(&m)).contains(&"No shortcut matches"));
+    }
+
+    #[test]
     fn panels_sit_over_the_panes_not_the_sidebar() {
         let (win, sessions, now) = fleet(true);
         let mut m = model(&win, &sessions, now);
         m.settings = Some(Settings {
+            page: Page::Settings,
             filter: "",
             rows: setting_rows(),
             sel: 0,
@@ -3116,6 +3204,7 @@ mod tests {
         m.size = (900, 330);
         let mut show = |sel, top| {
             m.settings = Some(Settings {
+                page: Page::Settings,
                 filter: "",
                 rows: setting_rows(),
                 sel,

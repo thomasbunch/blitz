@@ -67,6 +67,8 @@ pub enum Action {
     ThemePicker,
     /// Open or close the settings panel.
     Settings,
+    /// Open or close the keyboard shortcuts.
+    Keys,
     /// Open `config.toml` in an editor.
     OpenConfig,
     /// Open the themes folder in Explorer.
@@ -150,6 +152,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Update, "update", "Update blitz"),
     (Action::ThemePicker, "theme_picker", "Pick a theme"),
     (Action::Settings, "settings", "Settings"),
+    (Action::Keys, "keys", "Keyboard shortcuts"),
     (Action::OpenConfig, "open_config", "Open config.toml"),
     (Action::OpenThemes, "open_themes", "Open themes folder"),
     (Action::Zoom, "zoom", "Zoom the pane, or show every pane"),
@@ -189,6 +192,14 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
 /// A key binding: modifiers, virtual key, and the action, or `None` where
 /// the key goes to the program.
 pub type Binding = (u8, u16, Option<Action>);
+
+/// A chord: modifiers and virtual key.
+pub type Chord = (u8, u16);
+
+/// A change to the key bindings: the `keybind` line for a chord, as
+/// config.toml writes it after `keybind = `, or `None` to drop the
+/// chord's lines so its default applies.
+pub type Rebind = (Chord, Option<String>);
 
 const CTRL: u8 = 1;
 const SHIFT: u8 = 2;
@@ -240,6 +251,10 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, b'K' as u16, Action::ThemePicker),
     // VK_OEM_COMMA: the comma key on every layout.
     (CTRL, 0xbc, Action::Settings),
+    // VK_OEM_2, the / key: Ctrl+? on a US layout, which would reach the
+    // program as ^?, a second Backspace. Not Ctrl+/: that is ^_, Claude
+    // Code's undo.
+    (CTRL | SHIFT, 0xbf, Action::Keys),
     (CTRL | SHIFT, b'Z' as u16, Action::Zoom),
     // VK_OEM_PLUS and VK_OEM_MINUS, with Shift too where + needs it, and
     // the keypad's. Ctrl+Shift+- still goes to the program: it is Claude
@@ -309,6 +324,8 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CMD | SHIFT, b'U' as u16, Action::Update),
     (CMD | SHIFT, b'K' as u16, Action::ThemePicker),
     (CMD, 0xbc, Action::Settings),
+    // Not Cmd+?: that is the Help menu's.
+    (CMD, 0xbf, Action::Keys),
     (CMD | SHIFT, 0x0d, Action::Zoom),
     (CMD, 0xbb, Action::FontSize(1)),
     (CMD | SHIFT, 0xbb, Action::FontSize(1)),
@@ -444,8 +461,17 @@ pub fn unesc(s: &str) -> Vec<u8> {
     out
 }
 
+/// The chord of a `keybind` value, whether it runs an action or types
+/// text.
+pub fn chord_of(line: &str) -> Option<Chord> {
+    match text_binding(line) {
+        Some((mods, vk, _)) => Some((mods, vk)),
+        None => binding(line).map(|(mods, vk, _)| (mods, vk)),
+    }
+}
+
 /// A chord's modifiers and virtual key.
-fn parse_chord(chord: &str) -> Option<(u8, u16)> {
+fn parse_chord(chord: &str) -> Option<Chord> {
     let chord = chord.trim();
     // A + key ends the chord, after the + that joins it on, if any.
     let (mods, key) = match chord.strip_suffix('+').map(str::trim_end) {
@@ -489,7 +515,7 @@ fn key_code(name: &str) -> Option<u16> {
 }
 
 /// A chord as the command palette shows it, such as `Ctrl+Shift+R`.
-fn chord_label(mods: u8, vk: u16) -> String {
+pub fn chord_label(mods: u8, vk: u16) -> String {
     let mut s = String::new();
     let cmd = if cfg!(target_os = "macos") {
         "Cmd+"
@@ -517,6 +543,38 @@ fn chord_label(mods: u8, vk: u16) -> String {
     s
 }
 
+/// A chord as `config.toml` writes it, such as `ctrl+shift+/`, `win+x` or
+/// `opt+cmd+left`, which [`binding`] reads back.
+pub fn chord_text(c: Chord) -> String {
+    chord_label(c.0, c.1).to_lowercase()
+}
+
+/// Why chord `c` cannot be a shortcut: a key alone, or with only Shift,
+/// is the program's, and a key blitz has no name for cannot be written
+/// in config.toml. F1 to F24 may go alone; arrows, Home, End, PgUp,
+/// PgDn, Insert and Delete with Shift alone.
+pub fn refused(c: Chord) -> Option<&'static str> {
+    let (mods, vk) = c;
+    let f = (0x70..=0x87).contains(&vk);
+    if parse_chord(&chord_text(c)) != Some(c) {
+        Some("blitz has no name for this key")
+    } else if mods == 0 && !f {
+        Some(if cfg!(target_os = "macos") {
+            "A key alone goes to the program; hold Cmd or Ctrl with it"
+        } else {
+            "A key alone goes to the program; hold Ctrl or Alt with it"
+        })
+    } else if mods == SHIFT && !f && !matches!(vk, 0x21..=0x28 | 0x2d | 0x2e) {
+        Some(if cfg!(target_os = "macos") {
+            "Shift and this key go to the program; hold Cmd or Ctrl too"
+        } else {
+            "Shift and this key go to the program; hold Ctrl or Alt too"
+        })
+    } else {
+        None
+    }
+}
+
 /// Every binding in effect: the user's, then the defaults whose chords
 /// they leave alone.
 fn bindings(user: &[Binding]) -> impl Iterator<Item = Binding> + '_ {
@@ -538,16 +596,68 @@ pub fn label(a: Action) -> &'static str {
     ACTIONS.iter().find(|x| x.0 == a).map_or("", |x| x.2)
 }
 
+/// The name of `a` in `config.toml`.
+pub fn name(a: Action) -> &'static str {
+    ACTIONS.iter().find(|x| x.0 == a).map_or("", |x| x.1)
+}
+
+/// The digit key that goes to tab `a` with no binding for it.
+fn tab_digit(a: Action) -> Option<Chord> {
+    match a {
+        Action::GoToTab(i @ 0..8) => Some((TAB_DIGIT, 0x31 + u16::from(i))),
+        Action::LastTab => Some((TAB_DIGIT, 0x39)),
+        _ => None,
+    }
+}
+
+/// What chord `c` runs with no binding for it.
+pub fn default_for(c: Chord) -> Option<Action> {
+    match DEFAULT_KEYS.iter().find(|d| (d.0, d.1) == c) {
+        Some(d) => Some(d.2),
+        None => (c.0 == TAB_DIGIT && (0x31..=0x39).contains(&c.1)).then(|| match c.1 {
+            0x39 => Action::LastTab,
+            vk => Action::GoToTab((vk - 0x31) as u8),
+        }),
+    }
+}
+
+/// The chords that run `a` with no bindings.
+pub fn defaults(a: Action) -> Vec<Chord> {
+    (DEFAULT_KEYS.iter())
+        .filter(|d| d.2 == a)
+        .map(|d| (d.0, d.1))
+        .chain(tab_digit(a))
+        .collect()
+}
+
+/// Every chord that runs `a`, the `user` bindings' first.
+pub fn chords(a: Action, user: &[Binding]) -> Vec<Chord> {
+    let digit = tab_digit(a).filter(|&d| !user.iter().any(|u| (u.0, u.1) == d));
+    (bindings(user))
+        .filter(|b| b.2 == Some(a))
+        .map(|b| (b.0, b.1))
+        .chain(digit)
+        .collect()
+}
+
+/// What chord `c` runs: its `user` binding's action, or `None` where that
+/// gives it to the program, else its default.
+pub fn bound_to(c: Chord, user: &[Binding]) -> Option<Action> {
+    match user.iter().find(|u| (u.0, u.1) == c) {
+        Some(u) => u.2,
+        None => default_for(c),
+    }
+}
+
 /// What a notice tells the user to press for `a`: its first chord, or
 /// with none its name in the command palette.
 pub fn press_for(a: Action, user: &[Binding]) -> String {
     keys_for(a, user).unwrap_or_else(|| format!("\"{}\"", label(a)))
 }
 
-/// The shortcut a key press triggers, if any, with the `user` bindings
-/// from `config.toml` over the defaults. Modifiers must match exactly, so
-/// AltGr (Ctrl+Alt) and Win never trigger Ctrl shortcuts.
-pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
+/// The chord a key press makes: the modifiers held and the virtual key.
+/// `None` for a release, and for a key AltGr (Ctrl+Alt) types with.
+pub fn pressed(k: &KeyInput) -> Option<Chord> {
     if !k.down {
         return None;
     }
@@ -565,7 +675,15 @@ pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
     if mods & (CTRL | ALT) == CTRL | ALT && typed {
         return None;
     }
-    if let Some(b) = bindings(user).find(|b| (b.0, b.1) == (mods, k.vk)) {
+    Some((mods, k.vk))
+}
+
+/// The shortcut a key press triggers, if any, with the `user` bindings
+/// from `config.toml` over the defaults. Modifiers must match exactly, so
+/// AltGr (Ctrl+Alt) and Win never trigger Ctrl shortcuts.
+pub fn action(k: &KeyInput, user: &[Binding]) -> Option<Action> {
+    let (mods, vk) = pressed(k)?;
+    if let Some(b) = bindings(user).find(|b| (b.0, b.1) == (mods, vk)) {
         return b.2;
     }
     // Ctrl and a digit go to a tab, 9 to the last, where the key types
@@ -1680,6 +1798,8 @@ mod msg_to_key_tests {
         assert_eq!(press(0x25, &[LCTRL, LSHIFT]), None, "selects a word");
         assert_eq!(press(0xbd, &[LCTRL]), Some(Action::FontSize(-1)));
         assert_eq!(press(0xbd, &[LCTRL, LSHIFT]), None, "Claude Code's undo");
+        assert_eq!(press(0xbf, &[LCTRL, LSHIFT]), Some(Action::Keys));
+        assert_eq!(press(0xbf, &[LCTRL]), None, "Claude Code's undo too");
         // Ctrl and + with Shift, as on a US layout, and on the keypad.
         assert_eq!(press(0xbb, &[LCTRL, LSHIFT]), Some(Action::FontSize(1)));
         assert_eq!(press(0x6b, &[LCTRL]), Some(Action::FontSize(1)));
@@ -1957,6 +2077,91 @@ mod msg_to_key_tests {
             }
             let tab = a.0 == TAB_DIGIT && (0x31..=0x39).contains(&a.1);
             assert!(!tab, "{a:?} is a Go to tab key");
+        }
+    }
+
+    #[test]
+    fn keymap_chord_text_reads_back() {
+        for m in 0..16 {
+            for vk in 0..=0xff {
+                if chord_label(m, vk).contains('?') {
+                    continue;
+                }
+                let text = chord_text((m, vk));
+                let read = |name| binding(&format!("{text}={name}"));
+                assert_eq!(read("copy"), Some((m, vk, Some(Action::Copy))), "{text}");
+                assert_eq!(read("none"), Some((m, vk, None)), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn keymap_pressed_is_the_chord_of_a_key() {
+        let chord = |vk, down, rows, held: &[usize]| {
+            let mut t = String::new();
+            let lp = lp(0, false, down, 1);
+            let k = msg_to_key(vk, lp, &state(held, &[]), layout(rows), &mut t);
+            pressed(&k)
+        };
+        let cs = [0xa2, 0xa0];
+        assert_eq!(chord(0x52, true, US, &cs), Some((CTRL | SHIFT, 0x52)));
+        assert_eq!(chord(0x52, false, US, &cs), None, "a release");
+        let altgr = [0xa2, 0xa5];
+        assert_eq!(chord(0x51, true, DE, &altgr), None, "AltGr+Q types @");
+        assert_eq!(chord(0x25, true, DE, &altgr), Some((CTRL | ALT, 0x25)));
+    }
+
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn keymap_chords_list_every_key_of_an_action() {
+        let user =
+            |lines: &[&str]| -> Vec<Binding> { lines.iter().filter_map(|l| binding(l)).collect() };
+        let copy = [(CTRL, 0x43), (CTRL | SHIFT, 0x43), (CTRL, 0x2d)];
+        assert_eq!(chords(Action::Copy, &[]), copy);
+        assert_eq!(chords(Action::GoToTab(2), &[]), [(CTRL, 0x33)]);
+        assert!(chords(Action::GoToTab(2), &user(&["ctrl+3=none"])).is_empty());
+        assert!(chords(Action::CopyUnindented, &[]).is_empty());
+        // The user's come first.
+        assert_eq!(chords(Action::Copy, &user(&["alt+c=copy"]))[0], (ALT, 0x43));
+        assert_eq!(defaults(Action::LastTab), [(CTRL, 0x39)]);
+        assert_eq!(defaults(Action::Copy), copy);
+        let u = user(&["ctrl+shift+t=split_right", "ctrl+shift+w=none"]);
+        assert!(chords(Action::NewTab, &u).is_empty());
+        assert_eq!(bound_to((CTRL | SHIFT, 0x54), &u), Some(Action::SplitRight));
+        assert_eq!(bound_to((CTRL | SHIFT, 0x57), &u), None, "given back");
+        assert_eq!(bound_to((CTRL, 0x43), &u), Some(Action::Copy));
+        assert_eq!(bound_to((CTRL, 0x31), &u), Some(Action::GoToTab(0)));
+        assert_eq!(bound_to((CTRL, 0x52), &u), None, "never bound");
+        assert_eq!(default_for((CTRL, 0x39)), Some(Action::LastTab));
+        // The chord of a line, whatever it binds.
+        assert_eq!(
+            chord_of(r"ctrl+shift+g=text:git status\r"),
+            Some((CTRL | SHIFT, 0x47))
+        );
+        assert_eq!(chord_of("ctrl+shift+r=none"), Some((CTRL | SHIFT, 0x52)));
+        assert_eq!(chord_of("ctrl+shift+r=quit"), None);
+        assert_eq!(name(Action::SplitRight), "split_right");
+    }
+
+    #[test]
+    fn keymap_refuses_keys_that_are_typing() {
+        for c in [
+            (0, 0x41),
+            (SHIFT, 0x41),
+            (SHIFT, 0x0d),
+            (SHIFT, 0x09),
+            (0, 0x1b),
+        ] {
+            assert!(refused(c).is_some(), "{c:?}");
+        }
+        let unnamed = refused((CTRL, 0x10));
+        assert_eq!(unnamed, Some("blitz has no name for this key"));
+        for c in [(SHIFT, 0x21), (0, 0x7a), (CTRL, 0x41), (ALT, 0x20)] {
+            assert_eq!(refused(c), None, "{c:?}");
+        }
+        for &(m, vk, a) in DEFAULT_KEYS {
+            assert_eq!(refused((m, vk)), None, "{a:?}");
         }
     }
 
@@ -2325,6 +2530,9 @@ mod winit_key_tests {
         assert_eq!(action(&k, &[]), Some(Action::Copy));
         let k = winit_key(&press(KeyCode::Digit3, "3", Some("3")), cmd, &mut text);
         assert_eq!(action(&k, &[]), Some(Action::GoToTab(2)));
+        let k = winit_key(&press(KeyCode::Slash, "/", Some("/")), cmd, &mut text);
+        assert_eq!(action(&k, &[]), Some(Action::Keys));
+        assert_eq!(keys_for(Action::Keys, &[]).as_deref(), Some("Cmd+/"));
         // Ctrl+C is the program's.
         let ctrl = mods(|m| m.lctrl = true);
         let k = winit_key(&press(KeyCode::KeyC, "c", Some("c")), ctrl, &mut text);
@@ -2342,6 +2550,8 @@ mod winit_key_tests {
         let both = mods(|m| (m.lctrl, m.lshift) = (true, true));
         let k = winit_key(&press(KeyCode::KeyT, "t", Some("T")), both, &mut text);
         assert_eq!(action(&k, &[]), Some(Action::NewTab));
+        let k = winit_key(&press(KeyCode::Slash, "/", Some("?")), both, &mut text);
+        assert_eq!(action(&k, &[]), Some(Action::Keys));
         let sup = mods(|m| m.lsuper = true);
         let k = winit_key(&press(KeyCode::KeyC, "c", Some("c")), sup, &mut text);
         assert_eq!(action(&k, &[]), None);

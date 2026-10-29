@@ -117,6 +117,8 @@ pub enum Kind {
     Theme,
     /// Starts blitz run; not a value in `config.toml`.
     Game,
+    /// Opens the keyboard shortcuts; not a value in `config.toml`.
+    Keys,
 }
 
 /// A setting the settings panel shows. `key` is its name in `config.toml`.
@@ -135,7 +137,7 @@ pub struct Setting {
 /// and finished ones too.
 pub const TOASTS: &[&str] = &["off", "needs-you", "all"];
 
-const NOW: &str = "Applies now";
+pub const NOW: &str = "Applies now";
 const NEW_PANES: &str = "Applies to new panes";
 const RESTART: &str = "Applies when blitz restarts";
 
@@ -264,6 +266,14 @@ pub const SETTINGS: &[Setting] = &[
                Files view, beside the other files in its folder. An editor \
                set above takes it instead.",
         kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
+        key: "keys",
+        group: "Keys",
+        label: "Keyboard shortcuts",
+        help: "Every action and the keys that run it. Enter shows them, to change any.",
+        kind: Kind::Keys,
         applies: NOW,
     },
     Setting {
@@ -499,6 +509,17 @@ impl Config {
             },
         }
         true
+    }
+
+    /// The bindings with `rebinds` made, as reading what [`save_keys`]
+    /// writes gives them.
+    pub fn set_keys(&mut self, rebinds: &[keymap::Rebind]) {
+        for (chord, line) in rebinds {
+            self.keys.retain(|k| (k.0, k.1) != *chord);
+            if let Some(l) = line {
+                self.set("keybind", l);
+            }
+        }
     }
 
     fn flag(&mut self, key: &str) -> Option<&mut bool> {
@@ -773,6 +794,21 @@ fn save_in(dir: &Path, key: &str, value: Option<&str>) -> std::io::Result<()> {
             "a setting cannot hold a control character",
         ));
     }
+    write_in(dir, |old| with_value(old, key, value))
+}
+
+/// Sets the `keybind` lines of each chord in `rebinds` in `config.toml`,
+/// keeping the rest of the file, as [`save`] does a setting: the last
+/// line for the chord takes the new binding, keeping its comment, or
+/// with none every line for it goes, so its default applies.
+pub fn save_keys(rebinds: &[keymap::Rebind]) -> std::io::Result<()> {
+    let dir = dir().ok_or_else(|| std::io::Error::other("no APPDATA"))?;
+    // Chord and action names only, so no control character to refuse.
+    write_in(&dir, |old| with_keys(old, rebinds))
+}
+
+/// Writes `config.toml` in `dir` as `edit` makes it from the file there.
+fn write_in(dir: &Path, edit: impl FnOnce(&str) -> String) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut path = dir.join(FILE);
     // A config.toml linked from elsewhere, as from a dotfiles folder, is
@@ -815,8 +851,7 @@ fn save_in(dir: &Path, key: &str, value: Option<&str>) -> std::io::Result<()> {
             let _ = std::fs::remove_file(e.path());
         }
     }
-    let saved = std::fs::write(&tmp, with_value(&old, key, value))
-        .and_then(|()| std::fs::rename(&tmp, &path));
+    let saved = std::fs::write(&tmp, edit(&old)).and_then(|()| std::fs::rename(&tmp, &path));
     if saved.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -828,6 +863,21 @@ fn save_in(dir: &Path, key: &str, value: Option<&str>) -> std::io::Result<()> {
 /// `[table]` (or at the end). With no value, every `key` line goes. The
 /// file keeps its line endings.
 fn with_value(text: &str, key: &str, value: Option<&str>) -> String {
+    with_line(text, key, |_| true, value)
+}
+
+/// `text` with the `keybind` lines of each chord in `rebinds` set as
+/// [`save_keys`] says.
+fn with_keys(text: &str, rebinds: &[keymap::Rebind]) -> String {
+    (rebinds.iter()).fold(text.to_string(), |text, (chord, line)| {
+        let of = |v: &str| keymap::chord_of(&unquote(v).unwrap_or_else(|| v.into()));
+        with_line(&text, "keybind", |v| of(v) == Some(*chord), line.as_deref())
+    })
+}
+
+/// [`with_value`] for only the `key` lines whose value is one `which`
+/// takes.
+fn with_line(text: &str, key: &str, which: impl Fn(&str) -> bool, value: Option<&str>) -> String {
     let bom = if text.starts_with('\u{feff}') {
         "\u{feff}"
     } else {
@@ -835,7 +885,7 @@ fn with_value(text: &str, key: &str, value: Option<&str>) -> String {
     };
     let (lines, nl) = split_lines(text.trim_start_matches('\u{feff}'));
     let mut lines: Vec<String> = lines.into_iter().map(str::to_string).collect();
-    let is_key = |l: &String| entry(l).is_some_and(|(k, _, _)| k == key);
+    let is_key = |l: &String| entry(l).is_some_and(|(k, v, _)| k == key && which(v));
     match value {
         Some(v) => match lines.iter().rposition(is_key) {
             Some(i) => {
@@ -1066,7 +1116,10 @@ keybind = ctrl+shift+n=text:
     #[test]
     fn every_setting_reads_back_what_it_writes() {
         let mut c = Config::default();
-        for s in SETTINGS.iter().filter(|s| s.kind != Kind::Game) {
+        for s in SETTINGS
+            .iter()
+            .filter(|s| !matches!(s.kind, Kind::Game | Kind::Keys))
+        {
             let v = c.get(s.key);
             assert!(!v.is_empty(), "{} has no value", s.key);
             assert!(c.set(s.key, &v), "{} = {v} does not read back", s.key);
@@ -1114,6 +1167,60 @@ keybind = ctrl+shift+n=text:
             with_value("\u{feff}flash = false", "flash", None),
             "\u{feff}"
         );
+    }
+
+    /// A file with key bindings of every kind, and changes to some of
+    /// them.
+    fn bound() -> (&'static str, Vec<keymap::Rebind>) {
+        let text = "# mine\n\
+                    keybind = ctrl+shift+y=split_down # left hand\n\
+                    keybind = \"ctrl+shift+w=none\"\n\
+                    keybind = ctrl+shift+g=text:git status\\r\n\
+                    flash = false\n\
+                    keybind = Ctrl + Shift + R = new_tab\n\
+                    [colors]\n";
+        let chord = |line| keymap::chord_of(line).expect(line);
+        let rebinds = vec![
+            (
+                chord("ctrl+shift+y=none"),
+                Some("ctrl+shift+y=split_right".into()),
+            ),
+            (chord("ctrl+shift+w=none"), None),
+            (chord("ctrl+shift+r=none"), Some("ctrl+shift+r=none".into())),
+            (chord("ctrl+alt+y=none"), Some("ctrl+alt+y=copy".into())),
+        ];
+        (text, rebinds)
+    }
+
+    #[test]
+    fn saving_keys_changes_only_the_lines_of_their_chords() {
+        let (text, rebinds) = bound();
+        // The text binding and the other settings stay; a spaced chord is
+        // the same chord, and a new one goes before the first table.
+        assert_eq!(
+            with_keys(text, &rebinds),
+            "# mine\n\
+             keybind = ctrl+shift+y=split_right # left hand\n\
+             keybind = ctrl+shift+g=text:git status\\r\n\
+             flash = false\n\
+             keybind = ctrl+shift+r=none\n\
+             keybind = ctrl+alt+y=copy\n\
+             [colors]\n"
+        );
+        assert_eq!(with_keys(text, &[]), text);
+    }
+
+    #[test]
+    fn keys_set_in_memory_match_the_saved_file() {
+        let (text, rebinds) = bound();
+        let mut saved = Config::parse(&with_keys(text, &rebinds));
+        let mut set = Config::parse(text);
+        set.set_keys(&rebinds);
+        for c in [&mut saved, &mut set] {
+            c.keys.sort_by_key(|k| (k.0, k.1));
+        }
+        assert_eq!(saved.keys, set.keys);
+        assert_eq!(saved.texts, set.texts);
     }
 
     /// A folder for one test, gone when the test ends, even if it fails.
@@ -1182,9 +1289,12 @@ scenery = stars
         assert_eq!(Config::read(&folder), Config::default());
     }
 
-    /// The panel's rows that are settings in the file, not blitz run.
+    /// The panel's rows that are settings in the file, not blitz run or the
+    /// keyboard shortcuts.
     fn values() -> impl Iterator<Item = &'static Setting> {
-        SETTINGS.iter().filter(|s| s.kind != Kind::Game)
+        SETTINGS
+            .iter()
+            .filter(|s| !matches!(s.kind, Kind::Game | Kind::Keys))
     }
 
     #[test]
@@ -1476,6 +1586,23 @@ scenery = stars
             std::fs::read_to_string(dir.join(FILE)).unwrap(),
             "# Réglages\nflash = false\ntheme = \"B\"\n"
         );
+    }
+
+    #[test]
+    fn keys_are_saved_as_settings_are() {
+        let t = Temp::new("keys");
+        save_in(&t.0, "flash", Some("false")).unwrap();
+        let (_, rebinds) = bound();
+        let add = &rebinds[3..];
+        write_in(&t.0, |old| with_keys(old, add)).unwrap();
+        let read = || std::fs::read_to_string(t.0.join(FILE)).unwrap();
+        assert_eq!(read(), "flash = false\nkeybind = ctrl+alt+y=copy\n");
+        write_in(&t.0, |old| with_keys(old, &[(add[0].0, None)])).unwrap();
+        assert_eq!(read(), "flash = false\n");
+        let names: Vec<_> = (std::fs::read_dir(&t.0).unwrap().flatten())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, [FILE]);
     }
 
     #[test]

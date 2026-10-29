@@ -311,6 +311,9 @@ blitz run, the last row of the panel, is a game rather than a setting:
 Enter starts it, and it keeps its best score in
 `%LOCALAPPDATA%\blitz\run-best`.
 
+**Keyboard shortcuts**, under Keys, opens the list of every key; see
+[Key bindings](#key-bindings).
+
 ## Themes
 
 Ctrl+Shift+K opens the theme picker. The arrow keys show each theme on
@@ -537,6 +540,7 @@ its line, marked, unless `editor_uri` names an editor.
 | Ctrl+Shift+U | Update, or look for a newer release now |
 | Ctrl+Shift+K | Pick a theme |
 | Ctrl+, | Settings |
+| Ctrl+Shift+/ | Keyboard shortcuts: every key, and changing them |
 | Ctrl+Shift+P | Command palette |
 | Ctrl+=, Ctrl+-, Ctrl+0 | Font size up, down, and back to the setting, until blitz restarts |
 | Ctrl+Shift+=, Ctrl+NumpadAdd, Ctrl+NumpadSubtract, Ctrl+Numpad0 | The same, with + typed with Shift and on the keypad |
@@ -575,6 +579,7 @@ program, but for the few in the table:
 | Shift+Cmd+U | Look for a newer release |
 | Shift+Cmd+K | Pick a theme |
 | Cmd+, | Settings |
+| Cmd+/ | Keyboard shortcuts |
 | Shift+Cmd+P | Command palette |
 | Cmd+=, Shift+Cmd+=, Cmd+-, Cmd+0 | Font size up, down, and back to the setting |
 | Ctrl+Cmd+F | Full screen |
@@ -619,8 +624,22 @@ or folder names.
 
 ## Key bindings
 
-`keybind` lines in `config.toml` change the keys. Each binds a chord to
-an action, or with `none` gives a chord back to the program:
+Ctrl+Shift+/ (Cmd+/ on macOS), or **Keyboard shortcuts** in the command
+palette or the settings panel, lists every action with the keys that run
+it now, grouped by what they do; a dot marks those you changed. Typing
+narrows the list by name or by keys. Enter on an action waits for new
+keys: press them and Enter adds them, or click the row. When they run
+something else it says what, and Enter moves them over. A key alone
+stays the program's, but for F1 to F24, and so does a key with only
+Shift, but for those and the arrows, Home, End, PgUp, PgDn, Insert and
+Delete. While it waits, Backspace takes back the keys pressed, Del (on
+macOS, Delete) gives the action's keys back to the program and Esc
+stops. Del on an action puts its default keys back. Changes apply at
+once, as `keybind` lines in `config.toml`, which you can also edit
+yourself.
+
+Each line binds a chord to an action, or with `none` gives a chord back
+to the program:
 
 ```
 keybind = ctrl+shift+y=split_right
@@ -651,7 +670,7 @@ The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
 `move_tab_left`, `move_tab_right`, `move_pane_to_new_tab`,
 `split_right`, `split_down`, `new_claude`, `focus_left`, `focus_right`,
 `focus_up`, `focus_down`, `jump_to_attention`, `go_to_session`,
-`toggle_sidebar`, `update`, `theme_picker`, `settings`, `open_config`,
+`toggle_sidebar`, `update`, `theme_picker`, `settings`, `keys`, `open_config`,
 `open_themes`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
 `resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
 `equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
