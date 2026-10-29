@@ -3772,10 +3772,13 @@ impl App {
         }
         // The same for the keyboard shortcuts, but while they wait for new
         // keys every key is the new keys, a shortcut's too.
-        if let Some(p) = &self.shortcuts
+        if let Some(p) = &mut self.shortcuts
             && k.down
         {
             self.eaten.press(k.vk);
+            if p.repeats_stop(k.vk, held) {
+                return;
+            }
             match keymap::action(k, &self.config.keys).filter(|_| p.capture.is_none()) {
                 Some(Action::Keys) => {
                     self.shortcuts = None;

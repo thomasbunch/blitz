@@ -85,6 +85,8 @@ pub struct Panel {
     pub top: usize,
     /// The action waiting for new keys, while one does.
     pub capture: Option<Capture>,
+    /// The key that stopped the last wait, until another is pressed.
+    pub stopped_by: Option<u16>,
     /// Why the last change was not saved.
     pub error: Option<String>,
 }
@@ -135,6 +137,16 @@ impl Panel {
             action,
             pressed: None,
         });
+    }
+
+    /// Whether a key pressed is the auto-repeat (`held`) of the key that
+    /// stopped the last wait, which does nothing more: a held Backspace
+    /// that gave keys back would go on to erase the search.
+    pub fn repeats_stop(&mut self, vk: u16, held: bool) -> bool {
+        if !held {
+            self.stopped_by = None;
+        }
+        held && self.stopped_by == Some(vk)
     }
 
     /// The rows the chrome draws: each matching action with its keys.
@@ -217,6 +229,7 @@ impl Panel {
             }
         };
         self.capture = None;
+        self.stopped_by = key.map(|(_, vk)| vk);
         changes
     }
 }
@@ -476,6 +489,23 @@ mod tests {
         p.wait(&user);
         p.press(Some(chord("alt+c")), &user);
         assert_eq!(p.press(Some(chord("del")), &user), [(chord("alt+c"), None)]);
+    }
+
+    #[test]
+    fn a_held_key_that_stops_waiting_does_nothing_more() {
+        let mut p = panel("");
+        p.wait(&[]);
+        assert!(!p.repeats_stop(0x08, false));
+        p.press(Some(chord("backspace")), &[]);
+        assert!(p.capture.is_none());
+        assert!(p.repeats_stop(0x08, true) && p.repeats_stop(0x08, true));
+        // Pressed again, it erases the search, and so do its repeats.
+        assert!(!p.repeats_stop(0x08, false));
+        assert!(!p.repeats_stop(0x08, true));
+        // Keys pressed while waiting are not held back.
+        p.wait(&[]);
+        p.press(Some(chord("ctrl+alt+y")), &[]);
+        assert!(!p.repeats_stop(0x59, true));
     }
 
     // Windows' and Linux's chords.
