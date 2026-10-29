@@ -3707,13 +3707,20 @@ impl App {
             return;
         }
         // The usage panel takes keys too, but another shortcut closes it
-        // and runs; its own closes it.
+        // and runs; its own closes it. One that would reach the pane only
+        // closes it.
         if self.usage_panel.is_some() && k.down {
             match keymap::action(k, &self.config.keys) {
                 Some(Action::Usage) => {}
-                Some(_) => {
+                Some(a) if usage_runs(a) => {
                     self.usage_panel = None;
                     self.request_redraw();
+                }
+                Some(_) => {
+                    self.eaten.press(k.vk);
+                    self.usage_panel = None;
+                    self.request_redraw();
+                    return;
                 }
                 None => {
                     self.eaten.press(k.vk);
@@ -6448,6 +6455,16 @@ fn ime_area(
 /// closes the bar. Paste is left to the bar.
 fn find_runs(a: Action) -> bool {
     a != Action::Paste
+}
+
+/// Whether a shortcut pressed while the usage panel is open runs once it
+/// closes the panel. Those that type into the pane, or hand it a copy key
+/// with nothing to copy, would reach a program the panel was covering.
+fn usage_runs(a: Action) -> bool {
+    !matches!(
+        a,
+        Action::Copy | Action::CopyUnindented | Action::Paste | Action::SendText(_)
+    )
 }
 
 /// Whether shortcut `a` runs while the Files view covers the focused
@@ -9687,6 +9704,26 @@ mod tests {
             Action::SendText(0),
         ] {
             assert!(!files_runs(a), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn only_shortcuts_that_leave_the_pane_alone_run_over_usage() {
+        for a in [
+            Action::Palette,
+            Action::SplitRight,
+            Action::ScrollPage(1),
+            Action::Settings,
+        ] {
+            assert!(usage_runs(a), "{a:?}");
+        }
+        for a in [
+            Action::Copy,
+            Action::CopyUnindented,
+            Action::Paste,
+            Action::SendText(0),
+        ] {
+            assert!(!usage_runs(a), "{a:?}");
         }
     }
 
