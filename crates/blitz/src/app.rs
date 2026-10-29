@@ -1907,9 +1907,9 @@ impl App {
         if !self.args.scripted()
             && let Some(id) = self.focus_id()
             && !self.holds_notice(id)
-            && session::dir().is_some_and(|d| session::first_time_in(&d, "keys"))
+            && let Some(d) = session::dir()
+            && let Some(text) = start_hint(|n| session::first_time_in(&d, n), &self.config.keys)
         {
-            let text = first_hint(&self.config.keys);
             self.set_notice(id, text, Some(Instant::now() + HINT), true);
         }
         if !self.args.scripted() && !cfg!(debug_assertions) {
@@ -7308,6 +7308,21 @@ fn first_hint(user: &[keymap::Binding]) -> String {
     parts.join(" \u{b7} ")
 }
 
+/// The hint a start shows, if any: [`first_hint`] the first time, then
+/// once the keys of the keyboard shortcuts, for those who saw the first
+/// hint before there were any. `first_time` says whether a hint shows for
+/// the first time, noting that it has.
+fn start_hint(
+    mut first_time: impl FnMut(&str) -> bool,
+    user: &[keymap::Binding],
+) -> Option<String> {
+    if first_time("keys") {
+        return Some(first_hint(user));
+    }
+    let keys = keymap::keys_for(Action::Keys, user)?;
+    first_time("shortcuts").then(|| format!("{keys} shows every shortcut and lets you change them"))
+}
+
 /// An update left for when blitz closes: its release, and its installer
 /// once downloaded.
 type AtClose = (String, Option<crate::update::Installer>);
@@ -10786,6 +10801,30 @@ mod tests {
             first_hint(&user),
             "Alt+P every action \u{b7} Ctrl+, settings"
         );
+    }
+
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_shortcuts_hint_shows_once_after_the_first() {
+        let mut seen: Vec<String> = Vec::new();
+        let mut start = |user: &[keymap::Binding]| {
+            let first_time = |name: &str| {
+                let first = !seen.iter().any(|s| s == name);
+                if first {
+                    seen.push(name.into());
+                }
+                first
+            };
+            start_hint(first_time, user)
+        };
+        assert_eq!(start(&[]), Some(first_hint(&[])));
+        // Without keys it waits until there are some.
+        let none = [keymap::binding("ctrl+shift+/=none").expect("a binding")];
+        assert_eq!(start(&none), None);
+        let keys = "Ctrl+Shift+/ shows every shortcut and lets you change them";
+        assert_eq!(start(&[]).as_deref(), Some(keys));
+        assert_eq!(start(&[]), None);
     }
 
     #[cfg(windows)]
