@@ -31,10 +31,7 @@ const PREFIX: &str = r"\\.\pipe\blitz-";
 /// How long a caller waits for blitz to open the pipe again while it
 /// answers others.
 const BUSY: Duration = Duration::from_secs(2);
-/// How long a caller may take in all, the window's answer included.
-const DEADLINE: Duration = super::ANSWER.saturating_add(Duration::from_secs(5));
-/// The most callers served at once, and how many are now.
-const MAX_CALLS: usize = 64;
+/// How many callers are served now.
 static CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Listens on a new pipe of this process's own and answers each request
@@ -74,7 +71,7 @@ pub fn listen(answer: impl Fn(String) -> String + Clone + Send + 'static) -> io:
                 }
                 // Past the cap a caller is dropped at once, so a flood
                 // cannot use up the instances blitz listens with.
-                if CALLS.fetch_add(1, Ordering::SeqCst) >= MAX_CALLS {
+                if CALLS.fetch_add(1, Ordering::SeqCst) >= super::MAX_CALLS {
                     CALLS.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }
@@ -93,7 +90,7 @@ pub fn listen(answer: impl Fn(String) -> String + Clone + Send + 'static) -> io:
                 let watched = std::thread::Builder::new()
                     .name("pane-control-call".into())
                     .spawn(move || {
-                        within(DEADLINE, call);
+                        within(super::DEADLINE, call);
                         CALLS.fetch_sub(1, Ordering::SeqCst);
                     });
                 if watched.is_err() {
@@ -260,10 +257,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
-        let idle: Vec<File> = (0..MAX_CALLS)
+        let idle: Vec<File> = (0..crate::control::MAX_CALLS)
             .map(|_| connect(&pipe).expect("connect"))
             .collect();
-        wait_for(&|| calls() == MAX_CALLS);
+        wait_for(&|| calls() == crate::control::MAX_CALLS);
         let mut over = connect(&pipe).expect("connect");
         let _ = over.write_all(b"{}\n");
         let mut got = Vec::new();

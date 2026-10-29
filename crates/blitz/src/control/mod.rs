@@ -44,6 +44,11 @@ pub const MAX_LINES: usize = 2000;
 pub const MAX_READ: usize = 40 * 1024;
 /// How long blitz takes to answer before the caller is told it did not.
 pub const ANSWER: Duration = Duration::from_secs(10);
+/// How long a caller may take in all, the window's answer included.
+const DEADLINE: Duration = ANSWER.saturating_add(Duration::from_secs(5));
+/// The most callers served at once: past it a caller is dropped at once,
+/// so a flood cannot pile up threads.
+const MAX_CALLS: usize = 64;
 
 const NOT_IN_PANE: &str =
     "not in a blitz pane, or CLAUDE_CODE_SUBPROCESS_ENV_SCRUB removed BLITZ_PANE_TOKEN";

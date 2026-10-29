@@ -71,7 +71,7 @@ people who use blitz.
   script or an agent in a pane open panes of its own, type into them and
   read what they show. A program reaches only the panes it opened, never
   types into one waiting for you, and its panes are not saved with the
-  window.
+  window while it is open.
 
 ## [0.0.5] - 2026-10-15
 

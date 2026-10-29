@@ -1,9 +1,15 @@
 //! The channel as a Unix socket in a folder only this user can reach.
 
 use std::io;
+use std::net::Shutdown;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+
+/// How many callers are served now.
+static CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Listens on a new socket of this process's own and answers each request
 /// with `answer`, on a thread per connection. Returns the socket's path,
@@ -22,10 +28,7 @@ pub fn listen(answer: impl Fn(String) -> String + Clone + Send + 'static) -> io:
             let _ = std::fs::remove_file(e.path());
         }
     }
-    let path = dir.join(format!(
-        "blitz-ctl-{}.sock",
-        &crate::pty::pane_token()?[..16]
-    ));
+    let path = socket_in(&dir)?;
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     std::thread::Builder::new()
@@ -35,17 +38,47 @@ pub fn listen(answer: impl Fn(String) -> String + Clone + Send + 'static) -> io:
                 let Ok(mut s) = s else {
                     continue;
                 };
+                if CALLS.fetch_add(1, Ordering::SeqCst) >= super::MAX_CALLS {
+                    CALLS.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
                 let answer = answer.clone();
-                let _ = std::thread::Builder::new()
+                let call = std::thread::Builder::new()
                     .name("pane-control-call".into())
                     .spawn(move || {
                         let _ = s.set_read_timeout(Some(super::ANSWER));
                         let _ = s.set_write_timeout(Some(super::ANSWER));
+                        // The timeouts are per wait; past the deadline the
+                        // socket is shut, which ends a caller that sends a
+                        // byte now and then.
+                        let (done, ended) = mpsc::channel::<()>();
+                        if let Ok(watch) = s.try_clone() {
+                            let _ = std::thread::Builder::new()
+                                .name("pane-control-watch".into())
+                                .spawn(move || {
+                                    let late = ended.recv_timeout(super::DEADLINE);
+                                    if late == Err(RecvTimeoutError::Timeout) {
+                                        let _ = watch.shutdown(Shutdown::Both);
+                                    }
+                                });
+                        }
                         super::serve(&mut s, answer);
+                        drop(done);
+                        CALLS.fetch_sub(1, Ordering::SeqCst);
                     });
+                if call.is_err() {
+                    CALLS.fetch_sub(1, Ordering::SeqCst);
+                }
             }
         })?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Where in `dir` a new socket goes, through no link: [`valid`] takes
+/// none, and TMPDIR on macOS is one.
+fn socket_in(dir: &Path) -> io::Result<PathBuf> {
+    let name = format!("blitz-ctl-{}.sock", &crate::pty::pane_token()?[..16]);
+    Ok(std::fs::canonicalize(dir)?.join(name))
 }
 
 /// Whether `name` is a file name [`listen`] gives a socket.
@@ -82,6 +115,7 @@ mod tests {
     #[test]
     fn control_socket_names() {
         let dir = crate::handoff::private_dir().expect("a folder of this user's own");
+        let dir = std::fs::canonicalize(dir).expect("canonical");
         let at = |name: &str| dir.join(name).to_string_lossy().into_owned();
         assert!(valid(&at("blitz-ctl-0123456789abcdef.sock")));
         for bad in [
@@ -96,6 +130,22 @@ mod tests {
         ] {
             assert!(!valid(&bad), "{bad}");
         }
+    }
+
+    /// A folder reached through a link, as XDG_RUNTIME_DIR or TMPDIR may
+    /// be, still gives a socket path [`valid`] takes.
+    #[test]
+    fn control_socket_through_a_link() {
+        let real = std::env::temp_dir().join(format!("blitz-ctl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&real).expect("folder");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        let link = real.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let path = socket_in(&link).expect("path");
+        let ok = valid(&path.to_string_lossy());
+        let _ = (std::fs::remove_file(&link), std::fs::remove_dir(&real));
+        assert!(ok, "{path:?}");
     }
 
     /// The socket of a blitz that stopped without removing it goes when

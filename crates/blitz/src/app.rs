@@ -2420,7 +2420,6 @@ impl App {
                     Ok(v) => &v.pane,
                     Err(e) => return e,
                 };
-                let lines = lines.min(crate::control::MAX_LINES);
                 // Only the rows asked for, not all of the scrollback.
                 let text = read_text(&lock(&p.term).last_text(lines), lines);
                 let mut out = String::from("{\"ok\":true,\"text\":\"");
