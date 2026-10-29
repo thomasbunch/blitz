@@ -321,8 +321,8 @@ the mode Windows is in now.
 
 Built in: **blitz** dark and light (the default), **blitz ember** and
 **blitz tide**, each dark and light, and Catppuccin Mocha and Latte,
-GitHub Dark and Light, Gruvbox Dark and Light, Rose Pine and Rose Pine
-Dawn, Solarized Dark and Light, and Tokyo Night and Tokyo Night Day.
+Gruvbox Dark and Light, Rose Pine and Rose Pine Dawn, Solarized Dark and
+Light, and Tokyo Night and Tokyo Night Day.
 
 To make your own, put a file in `%APPDATA%\blitz\themes`, which **Open
 themes folder** in the command palette opens; its file name, without a

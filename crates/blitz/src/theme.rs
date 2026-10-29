@@ -40,8 +40,6 @@ const BUILTIN: &[(&str, &str)] = &[
         "Catppuccin Latte",
         include_str!("../themes/catppuccin-latte"),
     ),
-    ("GitHub Dark", include_str!("../themes/github-dark")),
-    ("GitHub Light", include_str!("../themes/github-light")),
     ("Gruvbox Dark", include_str!("../themes/gruvbox-dark")),
     ("Gruvbox Light", include_str!("../themes/gruvbox-light")),
     ("Rose Pine", include_str!("../themes/rose-pine")),
@@ -520,9 +518,22 @@ fn current_of(mut all: Vec<Theme>, setting: &str, light: bool) -> Theme {
         let i = all.iter().position(|t| t.name.eq_ignore_ascii_case(name))?;
         Some(all.swap_remove(i))
     };
-    take(choose(setting, light))
+    let name = choose(setting, light);
+    take(name)
+        .or_else(|| take(successor(name)?))
         .or_else(|| take(choose(DEFAULT, light)))
         .unwrap_or_else(|| blitz(light))
+}
+
+/// The built-in that took the place of `name`, one blitz no longer has:
+/// GitHub Dark and Light, of which blitz dark and light are near copies.
+/// A file of that name in the themes folder still wins.
+pub fn successor(name: &str) -> Option<&'static str> {
+    match name.to_lowercase().as_str() {
+        "github dark" => Some("blitz dark"),
+        "github light" => Some("blitz light"),
+        _ => None,
+    }
 }
 
 /// The built-in blitz theme of this lightness.
@@ -1020,6 +1031,24 @@ mod tests {
             assert_eq!(current_of(all(), "light:x,dark:y", light).name, want);
             assert_eq!(current_of(Vec::new(), "nope", light).name, want);
         }
+    }
+
+    #[test]
+    fn a_dropped_builtin_gives_the_theme_that_took_its_place() {
+        for light in [false, true] {
+            let t = |setting| current_of(all_in(None), setting, light).name;
+            assert_eq!(t("GitHub Dark"), "blitz dark");
+            assert_eq!(t("github light"), "blitz light");
+            assert_eq!(
+                t("light:GitHub Light,dark:GitHub Dark"),
+                choose(DEFAULT, light)
+            );
+        }
+        assert!(all_in(None).iter().all(|t| successor(&t.name).is_none()));
+        // Its own file in the themes folder brings it back.
+        let f = Folder::new("dropped", &[("GitHub Dark", b"background = #0d1117\n")]);
+        let t = current_of(all_in(Some(&f.0)), "github dark", true);
+        assert_eq!((t.name.as_str(), t.pal.bg), ("GitHub Dark", 0x0d1117));
     }
 
     /// Windows 11's contrast themes as (window, text, highlight): Aquatic,

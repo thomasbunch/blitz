@@ -150,8 +150,10 @@ impl Panel {
             }
             Kind::Theme => {
                 let light = crate::theme::system_is_light();
-                let used = crate::theme::choose(crate::theme::DEFAULT, light);
-                found_or(crate::theme::choose(&c.theme, light), &self.themes, used)
+                let name = crate::theme::choose(&c.theme, light);
+                let used = crate::theme::successor(name)
+                    .unwrap_or_else(|| crate::theme::choose(crate::theme::DEFAULT, light));
+                found_or(name, &self.themes, used)
             }
             Kind::Game => "play".into(),
             Kind::Choice => {
@@ -400,6 +402,15 @@ mod tests {
         assert_eq!(p.shown(theme, &c), blitz);
         c.theme = "rose pine".into();
         assert_eq!(p.shown(theme, &c), "rose pine");
+        // A built-in since dropped names the one that took its place.
+        for (gone, took) in [
+            ("github dark", "blitz dark"),
+            ("GitHub Light", "blitz light"),
+        ] {
+            c.theme = gone.into();
+            let shown = format!("{gone} (not found, using {took})");
+            assert_eq!(p.shown(theme, &c), shown);
+        }
         c.theme = "Nord".into();
         let missing = format!("Nord (not found, using {blitz})");
         assert_eq!(p.shown(theme, &c), missing);

@@ -23,6 +23,14 @@ people who use blitz.
 - Double-clicking a session's row collapses the sidebar to the rail, and
   double-clicking one on the rail expands it again.
 
+### Themes
+
+- GitHub Dark and Light are gone, as blitz dark and light are near
+  copies of them. A `theme` that names one gets blitz dark or light in
+  its place; to keep the original, put its file from
+  [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/ghostty)
+  in the themes folder.
+
 ## [0.0.5] - 2026-10-15
 
 The biggest release yet: a command palette, your own key bindings, find,
