@@ -26,8 +26,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   *done*, or *error* with its exit code.
 - Progress a program reports (OSC 9;4) shows in the sidebar and on the
   taskbar button.
-- Themes: Ctrl+Shift+K previews them live; bring your own in Ghostty's
-  format.
+- Themes: 31 built in, from radiant to high contrast; Ctrl+Shift+K
+  previews them live; bring your own in Ghostty's format.
 - A settings panel on Ctrl+, for the font, shell, sessions and more.
 - A command palette on Ctrl+Shift+P lists every action with its keys,
   and `config.toml` can bind any of them to other keys.
@@ -322,10 +322,24 @@ theme (it writes `theme = "..."` to `config.toml`) and Esc puts the old
 one back. With a light and a dark theme set, Enter changes the one for
 the mode Windows is in now.
 
-Built in: **blitz** dark and light (the default), **blitz ember** and
-**blitz tide**, each dark and light, and Catppuccin Mocha and Latte,
-GitHub Dark and Light, Gruvbox Dark and Light, Rose Pine and Rose Pine
-Dawn, Solarized Dark and Light, and Tokyo Night and Tokyo Night Day.
+Built in, in the picker's order:
+
+- **blitz** dark and light, the default.
+- Radiant: **blitz neon**, pink and cyan on deep violet; **blitz volt**,
+  electric lime on black; and **blitz ember** and **blitz tide**, each
+  dark and light: orange on dark brown or peach, and aqua on deep sea or
+  pale surf.
+- Retro and plain: **blitz phosphor** and **blitz phosphor amber**, the
+  green and amber screens of old terminals; **blitz paper light**, ink
+  on warm paper; and **blitz contrast** dark and light, whose text meets
+  WCAG AAA.
+- For developers, as their authors made them: Ayu Light, Catppuccin
+  Mocha and Latte, Dracula, Everforest Light, Gruvbox Dark and Light,
+  Kanagawa Wave, Night Owl, Nord, One Dark and One Light, Rose Pine and
+  Rose Pine Dawn, Solarized Dark and Light, and Tokyo Night and Tokyo
+  Night Day.
+
+Typing `blitz` in the picker leaves only blitz's own.
 
 To make your own, put a file in `%APPDATA%\blitz\themes`, which **Open
 themes folder** in the command palette opens; its file name, without a
@@ -688,6 +702,8 @@ and swap repeat; the others act once, so a held key never answers its own
   effects are off. `flash = false` stops the taskbar button flashing.
 - With a Windows contrast theme on and the `theme` setting at its
   default, blitz takes the contrast theme's colours.
+- **blitz contrast** dark and light keep text at 7:1 or more (WCAG AAA)
+  and program colours 1 to 15 at 4.5:1, without a Windows contrast theme.
 - blitz keeps the system caret, hidden, on the cursor, so Magnifier and
   other tools that follow the text cursor follow it. Claude Code draws a
   cursor of its own instead; set `CLAUDE_CODE_ACCESSIBILITY=1` in your

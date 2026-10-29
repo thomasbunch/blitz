@@ -14,11 +14,14 @@ const DIVIDER_CONTRAST: f64 = 1.3;
 /// The `theme` setting when there is none: follow the Windows app theme.
 pub const DEFAULT: &str = "light:blitz light,dark:blitz dark";
 
-/// Built-in themes as (name, file), the plain blitz pair first. A user
-/// file with the same name wins.
+/// Built-in themes as (name, file): the plain blitz pair first, then
+/// the other blitz originals, then the ones from elsewhere by name. A
+/// user file with the same name wins.
 const BUILTIN: &[(&str, &str)] = &[
     ("blitz dark", include_str!("../themes/blitz-dark")),
     ("blitz light", include_str!("../themes/blitz-light")),
+    ("blitz neon", include_str!("../themes/blitz-neon")),
+    ("blitz volt", include_str!("../themes/blitz-volt")),
     (
         "blitz ember dark",
         include_str!("../themes/blitz-ember-dark"),
@@ -32,6 +35,24 @@ const BUILTIN: &[(&str, &str)] = &[
         "blitz tide light",
         include_str!("../themes/blitz-tide-light"),
     ),
+    ("blitz phosphor", include_str!("../themes/blitz-phosphor")),
+    (
+        "blitz phosphor amber",
+        include_str!("../themes/blitz-phosphor-amber"),
+    ),
+    (
+        "blitz paper light",
+        include_str!("../themes/blitz-paper-light"),
+    ),
+    (
+        "blitz contrast dark",
+        include_str!("../themes/blitz-contrast-dark"),
+    ),
+    (
+        "blitz contrast light",
+        include_str!("../themes/blitz-contrast-light"),
+    ),
+    ("Ayu Light", include_str!("../themes/ayu-light")),
     (
         "Catppuccin Mocha",
         include_str!("../themes/catppuccin-mocha"),
@@ -40,10 +61,18 @@ const BUILTIN: &[(&str, &str)] = &[
         "Catppuccin Latte",
         include_str!("../themes/catppuccin-latte"),
     ),
-    ("GitHub Dark", include_str!("../themes/github-dark")),
-    ("GitHub Light", include_str!("../themes/github-light")),
+    ("Dracula", include_str!("../themes/dracula")),
+    (
+        "Everforest Light",
+        include_str!("../themes/everforest-light"),
+    ),
     ("Gruvbox Dark", include_str!("../themes/gruvbox-dark")),
     ("Gruvbox Light", include_str!("../themes/gruvbox-light")),
+    ("Kanagawa Wave", include_str!("../themes/kanagawa-wave")),
+    ("Night Owl", include_str!("../themes/night-owl")),
+    ("Nord", include_str!("../themes/nord")),
+    ("One Dark", include_str!("../themes/one-dark")),
+    ("One Light", include_str!("../themes/one-light")),
     ("Rose Pine", include_str!("../themes/rose-pine")),
     ("Rose Pine Dawn", include_str!("../themes/rose-pine-dawn")),
     ("Solarized Dark", include_str!("../themes/solarized-dark")),
@@ -520,9 +549,22 @@ fn current_of(mut all: Vec<Theme>, setting: &str, light: bool) -> Theme {
         let i = all.iter().position(|t| t.name.eq_ignore_ascii_case(name))?;
         Some(all.swap_remove(i))
     };
-    take(choose(setting, light))
+    let name = choose(setting, light);
+    take(name)
+        .or_else(|| take(successor(name)?))
         .or_else(|| take(choose(DEFAULT, light)))
         .unwrap_or_else(|| blitz(light))
+}
+
+/// The built-in that took the place of `name`, one blitz no longer has:
+/// GitHub Dark and Light, of which blitz dark and light are near copies.
+/// A file of that name in the themes folder still wins.
+pub fn successor(name: &str) -> Option<&'static str> {
+    match name.to_lowercase().as_str() {
+        "github dark" => Some("blitz dark"),
+        "github light" => Some("blitz light"),
+        _ => None,
+    }
 }
 
 /// The built-in blitz theme of this lightness.
@@ -650,7 +692,7 @@ mod tests {
             let p = parse(name, text).pal;
             let text = contrast(p.fg, p.bg);
             assert!(text >= 4.5, "{name}: text contrast {text:.2}");
-            let sel = contrast(p.fg, p.selection_bg);
+            let sel = contrast(p.selection_fg, p.selection_bg);
             assert!(sel >= 4.5, "{name}: selected text contrast {sel:.2}");
             let cursor = contrast(p.cursor, p.bg);
             assert!(cursor >= 3.0, "{name}: cursor contrast {cursor:.2}");
@@ -873,6 +915,82 @@ mod tests {
         }
     }
 
+    /// `0xRRGGBB` in OKLab, where the distance between two colours follows
+    /// how different they look.
+    fn oklab(rgb: u32) -> [f64; 3] {
+        let [_, r, g, b] = rgb.to_be_bytes();
+        let lin = linear();
+        let (r, g, b) = (
+            lin[usize::from(r)],
+            lin[usize::from(g)],
+            lin[usize::from(b)],
+        );
+        let l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
+        let m = (0.2119034982 * r + 0.6806995747 * g + 0.1073969271 * b).cbrt();
+        let s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).cbrt();
+        [
+            0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+        ]
+    }
+
+    fn distance(a: u32, b: u32) -> f64 {
+        let (a, b) = (oklab(a), oklab(b));
+        (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt()
+    }
+
+    #[test]
+    fn no_two_builtin_themes_look_alike() {
+        // Two themes of the same lightness may share a background or a
+        // palette, not both. Background is most of the window, and Claude
+        // Code draws in colours of its own, so a theme that only nudges
+        // another's is one more name for the same look.
+        let all = all_in(None);
+        for (i, a) in all.iter().enumerate() {
+            for b in all[i + 1..].iter().filter(|b| b.light == a.light) {
+                let bg = distance(a.pal.bg, b.pal.bg);
+                let pal = (1..7)
+                    .map(|k| distance(a.pal.ansi[k], b.pal.ansi[k]))
+                    .sum::<f64>()
+                    / 6.0;
+                assert!(
+                    bg >= 0.03 || pal >= 0.08,
+                    "{} and {} look alike: background {bg:.3}, palette {pal:.3}",
+                    a.name,
+                    b.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_contrast_themes_meet_wcag_aaa() {
+        let all = all_in(None);
+        let themes: Vec<_> = all
+            .iter()
+            .filter(|t| t.name.starts_with("blitz contrast"))
+            .collect();
+        assert_eq!(themes.len(), 2);
+        for t in themes {
+            let (p, ui) = (&t.pal, &t.ui);
+            assert!(contrast(p.fg, p.bg) >= 7.0, "{}: text", t.name);
+            assert!(
+                contrast(p.selection_fg, p.selection_bg) >= 7.0,
+                "{}: selected",
+                t.name
+            );
+            for (i, &c) in p.ansi.iter().enumerate().skip(1) {
+                let on = contrast(c, p.bg);
+                assert!(on >= 4.5, "{}: palette {i} {on:.2}", t.name);
+            }
+            for c in [ui.name, ui.msg, ui.dim, ui.label, ui.label_focus] {
+                let on = contrast(c, ui.side_bg);
+                assert!(on >= 7.0, "{}: {c:06x} on the sidebar {on:.2}", t.name);
+            }
+        }
+    }
+
     #[test]
     fn every_builtin_accent_is_an_attention_colour() {
         // Palette 3 is brown in some themes, which reads as text rather
@@ -977,8 +1095,8 @@ mod tests {
                 ("Latin", b"# Th\xe8me\nbackground = #000006\n"),
                 ("README.md", b"# Themes\n\nGhostty themes go here.\n"),
                 ("logo.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
-                ("Nord", b"notes = for Nord\n"),
-                ("nord.conf", b"palette = 0=#000007\n"),
+                ("Iris", b"notes = for Iris\n"),
+                ("iris.conf", b"palette = 0=#000007\n"),
             ],
         );
         std::fs::create_dir(f.0.join("folder")).unwrap();
@@ -989,15 +1107,15 @@ mod tests {
             .map(|t| (t.name.as_str(), t.pal.bg))
             .collect();
         // `Alpha` and `alpha.CONF` are one theme; backups, hidden files,
-        // folders and files that set no colour are none, so `nord.conf`
-        // is the only Nord; a file that is not UTF-8 still reads.
-        let nord = dark().bg;
+        // folders and files that set no colour are none, so `iris.conf`
+        // is the only Iris; a file that is not UTF-8 still reads.
+        let iris = dark().bg;
         assert_eq!(
             extra,
             [
                 ("Alpha", 3),
+                ("iris", iris),
                 ("Latin", 6),
-                ("nord", nord),
                 ("Zed", 0xffffff)
             ]
         );
@@ -1020,6 +1138,24 @@ mod tests {
             assert_eq!(current_of(all(), "light:x,dark:y", light).name, want);
             assert_eq!(current_of(Vec::new(), "nope", light).name, want);
         }
+    }
+
+    #[test]
+    fn a_dropped_builtin_gives_the_theme_that_took_its_place() {
+        for light in [false, true] {
+            let t = |setting| current_of(all_in(None), setting, light).name;
+            assert_eq!(t("GitHub Dark"), "blitz dark");
+            assert_eq!(t("github light"), "blitz light");
+            assert_eq!(
+                t("light:GitHub Light,dark:GitHub Dark"),
+                choose(DEFAULT, light)
+            );
+        }
+        assert!(all_in(None).iter().all(|t| successor(&t.name).is_none()));
+        // Its own file in the themes folder brings it back.
+        let f = Folder::new("dropped", &[("GitHub Dark", b"background = #0d1117\n")]);
+        let t = current_of(all_in(Some(&f.0)), "github dark", true);
+        assert_eq!((t.name.as_str(), t.pal.bg), ("GitHub Dark", 0x0d1117));
     }
 
     /// Windows 11's contrast themes as (window, text, highlight): Aquatic,
