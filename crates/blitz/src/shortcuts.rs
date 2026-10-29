@@ -156,8 +156,9 @@ impl Panel {
     }
 
     /// Whether a key pressed is the auto-repeat (`held`) of the key that
-    /// stopped the last wait, which does nothing more: a held Backspace
-    /// that gave keys back would go on to erase the search.
+    /// stopped the last wait, which does nothing more: a held Del that gave
+    /// keys back would go on to put the defaults back, or on a Mac, as
+    /// Backspace, to erase the search.
     pub fn repeats_stop(&mut self, vk: u16, held: bool) -> bool {
         if !held {
             self.stopped_by = None;
@@ -214,9 +215,11 @@ impl Panel {
     /// A key pressed while an action waits for new keys, as the chord it
     /// makes, or `None` for one AltGr types with. Returns the changes to
     /// save: Enter adds the chord pressed to the action, unless blitz
-    /// cannot take it; Del or Backspace gives that chord back to the
-    /// program when it is the action's, or else every chord of the action;
-    /// and Esc stops waiting. Any other key is the new chord pressed.
+    /// cannot take it; Del gives that chord back to the program when it is
+    /// the action's, or else every chord of the action; Backspace takes
+    /// back the chord pressed, but on a Mac, where it is the Delete key,
+    /// does what Del does; and Esc stops waiting. Any other key is the new
+    /// chord pressed.
     pub fn press(&mut self, key: Option<Chord>, user: &[Binding]) -> Vec<Rebind> {
         let Some(cap) = &mut self.capture else {
             return Vec::new();
@@ -235,6 +238,10 @@ impl Panel {
                 _ if own.is_some() => Vec::new(),
                 _ => return Vec::new(),
             },
+            Some((0, 0x08)) if !cfg!(target_os = "macos") => {
+                cap.pressed = None;
+                return Vec::new();
+            }
             Some((0, 0x08 | 0x2e)) => match own {
                 Some(c) => vec![line(c, None)],
                 None => unbind(a, user),
@@ -529,7 +536,7 @@ mod tests {
         assert!(p.capture.is_none());
         p.wait(&[]);
         let all = [none("ctrl+c"), none("ctrl+shift+c"), none("ctrl+insert")];
-        assert_eq!(p.press(Some(chord("backspace")), &[]), all);
+        assert_eq!(p.press(Some(chord("del")), &[]), all);
         // Keys only a binding gives it have no line once given back.
         let user = config::Config::parse("keybind = alt+c=copy").keys;
         p.wait(&user);
@@ -538,16 +545,41 @@ mod tests {
     }
 
     #[test]
+    fn backspace_takes_back_the_keys_pressed() {
+        let mut p = panel("copy");
+        p.wait(&[]);
+        let copy = if cfg!(target_os = "macos") {
+            "cmd+c"
+        } else {
+            "ctrl+c"
+        };
+        p.press(Some(chord(copy)), &[]);
+        let back = p.press(Some(chord("backspace")), &[]);
+        if cfg!(target_os = "macos") {
+            // The Delete key: Cmd+C goes back to the program.
+            assert_eq!(back, [(chord(copy), Some("cmd+c=none".into()))]);
+            assert!(p.capture.is_none());
+        } else {
+            assert!(back.is_empty());
+            assert!(p.capture.as_ref().is_some_and(|c| c.pressed.is_none()));
+            // Held, it goes on taking back nothing.
+            assert!(!p.repeats_stop(0x08, true));
+            assert!(p.press(Some(chord("backspace")), &[]).is_empty());
+            assert!(p.capture.is_some());
+        }
+    }
+
+    #[test]
     fn a_held_key_that_stops_waiting_does_nothing_more() {
         let mut p = panel("");
         p.wait(&[]);
-        assert!(!p.repeats_stop(0x08, false));
-        p.press(Some(chord("backspace")), &[]);
+        assert!(!p.repeats_stop(0x2e, false));
+        p.press(Some(chord("del")), &[]);
         assert!(p.capture.is_none());
-        assert!(p.repeats_stop(0x08, true) && p.repeats_stop(0x08, true));
-        // Pressed again, it erases the search, and so do its repeats.
-        assert!(!p.repeats_stop(0x08, false));
-        assert!(!p.repeats_stop(0x08, true));
+        assert!(p.repeats_stop(0x2e, true) && p.repeats_stop(0x2e, true));
+        // Pressed again, it puts the defaults back, and so do its repeats.
+        assert!(!p.repeats_stop(0x2e, false));
+        assert!(!p.repeats_stop(0x2e, true));
         // Keys pressed while waiting are not held back.
         p.wait(&[]);
         p.press(Some(chord("ctrl+alt+y")), &[]);

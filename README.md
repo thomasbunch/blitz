@@ -616,8 +616,9 @@ it now, grouped by what they do; a dot marks those you changed. Typing
 narrows the list by name or by keys. Enter on an action waits for new
 keys: press them and Enter adds them, or click the row. When they run
 something else it says what, and Enter moves them over; a key alone, or
-with only Shift, stays the program's. While it waits, Del gives the
-action's keys back to the program and Esc stops. Del on an action puts
+with only Shift, stays the program's. While it waits, Backspace takes
+back the keys pressed, Del (on macOS, Delete) gives the action's keys
+back to the program and Esc stops. Del on an action puts
 its default keys back. Changes apply at once, as `keybind` lines in
 `config.toml`, which you can also edit yourself.
 
