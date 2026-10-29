@@ -238,7 +238,7 @@ fn title(s: &str) -> String {
 }
 
 /// `10000` as `10,000`.
-fn thousands(n: usize) -> String {
+pub(crate) fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {

@@ -1119,6 +1119,8 @@ mod gpu {
             game: None,
             commands: None,
             find: None,
+            usage: None,
+            usage_line: None,
         };
         // One setting changed, to show its mark and a switch that is off.
         let config = crate::config::Config {

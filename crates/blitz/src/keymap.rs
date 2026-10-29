@@ -97,6 +97,9 @@ pub enum Action {
     /// Copy the hooks for Claude Code's settings, for a Claude Code that
     /// does not load blitz's own.
     ClaudeSetup,
+    /// Open or close the usage panel: what Claude Code's sessions would
+    /// cost this week.
+    Usage,
     /// Open the window menu, as Alt+Space does in other windows.
     SystemMenu,
     /// Type what a `text:` binding holds, from [`Config::texts`] by index.
@@ -172,6 +175,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Find, "find", "Find in the scrollback"),
     (Action::Files, "files", "Browse the files in this folder"),
     (Action::ClaudeSetup, "claude_setup", "Claude Code setup"),
+    (Action::Usage, "usage", "Claude Code usage and cost"),
     (Action::SystemMenu, "system_menu", "Window menu"),
     (Action::QuickSelect, "quick_select", "Quick select a link, path or hash"),
     (Action::ReportIssue, "report_issue", "Report an issue"),

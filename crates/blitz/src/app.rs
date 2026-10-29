@@ -177,6 +177,8 @@ pub enum UserEvent {
     GlobalJump,
     /// A folder or file read for a pane's Files view.
     Files(PaneId, files::Loaded),
+    /// What the reader of Claude Code's logs found.
+    Usage(Box<crate::usage::Report>),
 }
 
 /// Command-line options of the GUI.
@@ -1153,6 +1155,12 @@ struct App {
     settings: Option<Panel>,
     /// Where the settings panel was in the last frame, for clicks.
     settings_hits: Option<chrome::SettingsHits>,
+    /// Usage tracking, while it is on.
+    usage: Option<crate::usage::Tracking>,
+    /// The usage panel while it is open: its first line shown.
+    usage_panel: Option<usize>,
+    /// Where the usage panel was in the last frame, for clicks.
+    usage_hits: Option<Rect>,
     /// blitz run while it is open, and when it last moved.
     game: Option<(Run, Instant)>,
     /// When a session needing the user last closed blitz run.
@@ -1689,6 +1697,9 @@ impl App {
             picker: None,
             settings: None,
             settings_hits: None,
+            usage: None,
+            usage_panel: None,
+            usage_hits: None,
             game: None,
             game_ended: None,
             motion: animations_on(),
@@ -1930,6 +1941,7 @@ impl App {
                 }
             });
         }
+        self.track_usage();
         Ok(())
     }
 
@@ -2447,7 +2459,71 @@ impl App {
             }),
             spark: self.config.mascot.then(|| self.anim_time()),
             game: self.game.as_ref().map(|g| &g.0),
+            usage: self.usage_panel.map(|top| {
+                let on = self.config.usage_tracking;
+                crate::usage::panel(on, self.usage_report(), crate::usage::now(), top)
+            }),
+            usage_line: self.usage_report().and_then(crate::usage::sidebar),
         }
+    }
+
+    /// What the reader of Claude Code's logs last found, while tracking is
+    /// on.
+    fn usage_report(&self) -> Option<&crate::usage::Report> {
+        self.usage.as_ref().and_then(|t| t.report.as_deref())
+    }
+
+    /// Starts or stops reading Claude Code's logs as the settings say, and
+    /// reads them again for a week that starts at another time. Scripted
+    /// and test runs never read the user's logs.
+    fn track_usage(&mut self) {
+        let reset = crate::usage::reset(&self.config);
+        if !self.config.usage_tracking || self.args.scripted() {
+            // Its thread ends with it.
+            self.usage = None;
+        } else if let Some(t) = &mut self.usage {
+            if t.reset != reset {
+                t.ask(reset);
+            }
+        } else {
+            let proxy = self.proxy.clone();
+            let send = move |r| proxy.send_event(UserEvent::Usage(Box::new(r))).is_ok();
+            self.usage = Some(crate::usage::Tracking::start(reset, send));
+        }
+    }
+
+    /// Opens the usage panel in place of the settings panel, reading the
+    /// logs again so it shows what is new, or closes it.
+    fn toggle_usage(&mut self) {
+        if self.usage_panel.take().is_none() {
+            self.settings = None;
+            self.usage_panel = Some(0);
+            if let Some(t) = &mut self.usage {
+                t.ask(t.reset);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// A key while the usage panel is open: arrows and Page Up and Down
+    /// scroll it, Esc closes it, and Enter turns tracking on while it is
+    /// off.
+    fn usage_key(&mut self, k: &KeyInput) {
+        let Some(top) = &mut self.usage_panel else {
+            return;
+        };
+        match k.vk {
+            VK_ESCAPE => self.usage_panel = None,
+            VK_UP => *top = top.saturating_sub(1),
+            VK_DOWN => *top = top.saturating_add(1),
+            VK_PRIOR => *top = top.saturating_sub(10),
+            VK_NEXT => *top = top.saturating_add(10),
+            VK_RETURN if !self.config.usage_tracking => {
+                self.set_setting("usage_tracking", Some("true".into()));
+            }
+            _ => return,
+        }
+        self.request_redraw();
     }
 
     /// Seconds into the scenery and spark animations; always 0 when
@@ -2749,6 +2825,7 @@ impl App {
         if self.picker.is_none() {
             self.set_theme_from_config();
         }
+        self.track_usage();
         self.request_redraw();
     }
 
@@ -3010,8 +3087,8 @@ impl App {
     /// theme picker or the settings panel, or for the find bar. False when
     /// none is open.
     fn filter_text(&mut self, t: &str) -> bool {
-        if self.game.is_some() {
-            // The game takes keys, not text.
+        if self.game.is_some() || self.usage_panel.is_some() {
+            // The game and the usage panel take keys, not text.
         } else if let Some(cm) = &mut self.commands {
             cm.filter.push_str(t);
             cm.sel = 0;
@@ -3552,15 +3629,17 @@ impl App {
             || self.settings.is_some()
             || self.find.is_some()
             || self.game.is_some()
+            || self.usage_panel.is_some()
             || self.current().is_some_and(|v| v.files.is_some());
         let taken = self.eaten.0.contains(&k.vk);
         if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
             return;
         }
         // A paste key pastes into the open panel's text field; blitz run
-        // has none, and a shortcut closes it.
+        // and the usage panel have none, and a shortcut closes them.
         if panel
             && self.game.is_none()
+            && self.usage_panel.is_none()
             && k.down
             && keymap::action(k, &self.config.keys) == Some(Action::Paste)
         {
@@ -3626,6 +3705,22 @@ impl App {
                 _ => self.settings_key(k),
             }
             return;
+        }
+        // The usage panel takes keys too, but another shortcut closes it
+        // and runs; its own closes it.
+        if self.usage_panel.is_some() && k.down {
+            match keymap::action(k, &self.config.keys) {
+                Some(Action::Usage) => {}
+                Some(_) => {
+                    self.usage_panel = None;
+                    self.request_redraw();
+                }
+                None => {
+                    self.eaten.press(k.vk);
+                    self.usage_key(k);
+                    return;
+                }
+            }
         }
         // And for quick select.
         if self.quick.is_some() && k.down {
@@ -4123,6 +4218,7 @@ impl App {
             Action::ToggleSidebar => return self.toggle_sidebar(),
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
+            Action::Usage => self.toggle_usage(),
             Action::GoToSession => {
                 let now = Instant::now();
                 let list = (self.sessions().iter())
@@ -5051,7 +5147,10 @@ impl App {
         // on, it could pick an option of a Claude Code prompt the user has
         // not read yet.
         if activating {
-            let open = self.commands.is_some() || self.settings.is_some() || self.game.is_some();
+            let open = self.commands.is_some()
+                || self.settings.is_some()
+                || self.game.is_some()
+                || self.usage_panel.is_some();
             if let (Some(id), false) = (self.hit(self.mouse.pos).0, open) {
                 self.show(id);
             }
@@ -5061,8 +5160,17 @@ impl App {
         if pressed && self.quick.take().is_some() {
             self.request_redraw();
         }
-        // Presses go to the command palette or the settings panel; a
-        // release still goes wherever its press went.
+        // Presses go to the usage panel, the command palette or the
+        // settings panel; a release still goes wherever its press went. A
+        // click outside the usage panel closes it.
+        if pressed && self.usage_panel.is_some() {
+            let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
+            if b == 0 && !self.usage_hits.is_some_and(|r| r.contains(x, y)) {
+                self.usage_panel = None;
+                self.request_redraw();
+            }
+            return;
+        }
         if pressed && self.commands.is_some() {
             if b == 0 {
                 self.commands_click(el);
@@ -5136,6 +5244,7 @@ impl App {
                     }
                 }
                 Some(Side::More(ids)) => self.show_hidden(&ids),
+                Some(Side::Usage) => self.toggle_usage(),
                 Some(Side::Rail) => {
                     self.toggle_sidebar();
                 }
@@ -5427,7 +5536,8 @@ impl App {
         let panel = self.commands.is_some()
             || self.settings.is_some()
             || self.picker.is_some()
-            || self.game.is_some();
+            || self.game.is_some()
+            || self.usage_panel.is_some();
         let divider = self.divider_at(pos).map(|d| d.1).filter(|_| !panel);
         let hand = self.hover.is_some()
             || self.banner.as_ref().is_some_and(|b| inside(&b.0))
@@ -5524,7 +5634,8 @@ impl App {
             return;
         }
         let (x, y) = (pos.x as i32, pos.y as i32);
-        let panel = self.commands.is_some() || self.settings.is_some();
+        let panel =
+            self.commands.is_some() || self.settings.is_some() || self.usage_panel.is_some();
         let over = (x < self.tab_area().x && !panel).then(|| self.side.at(x, y));
         self.set_over_side(over.flatten());
         self.update_hover();
@@ -5567,6 +5678,11 @@ impl App {
         }
         if let Some(cm) = &mut self.commands {
             cm.move_by(-steps as isize);
+            self.request_redraw();
+            return;
+        }
+        if let Some(top) = &mut self.usage_panel {
+            *top = top.saturating_add_signed(-steps as isize);
             self.request_redraw();
             return;
         }
@@ -5695,6 +5811,13 @@ impl App {
         self.below = std::mem::take(&mut chrome.below);
         self.find_bar = chrome.find;
         self.settings_hits = chrome.settings.take();
+        self.usage_hits = chrome.usage.map(|(panel, top)| {
+            // Where it scrolled to, so arrows go on from there.
+            if let Some(t) = &mut self.usage_panel {
+                *t = top;
+            }
+            panel
+        });
         self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
             p.top = h.top;
@@ -7902,6 +8025,14 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Pane(id, note) => self.on_pane(el, id, note),
             UserEvent::Branch(id, dir, branch) => self.on_branch(id, dir, branch),
+            UserEvent::Usage(r) => {
+                // A report after tracking was turned off, or for the week
+                // before the reset changed, is dropped.
+                if let Some(t) = self.usage.as_mut().filter(|t| t.reset == r.reset) {
+                    t.report = Some(r);
+                    self.request_redraw();
+                }
+            }
             UserEvent::Files(id, loaded) => {
                 if let Some(f) = self.view_mut(id).and_then(|v| v.files.as_mut()) {
                     f.accept(loaded);
@@ -10955,7 +11086,11 @@ mod tests {
         c.filter = "claude".into();
         assert_eq!(
             c.matches(),
-            [run(Action::NewClaude), run(Action::ClaudeSetup)]
+            [
+                run(Action::NewClaude),
+                run(Action::ClaudeSetup),
+                run(Action::Usage)
+            ]
         );
         // Actions with no keys are here too.
         c.filter = "claude setup".into();

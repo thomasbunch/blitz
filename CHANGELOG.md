@@ -23,6 +23,18 @@ people who use blitz.
 - Double-clicking a session's row collapses the sidebar to the rail, and
   double-clicking one on the rail expands it again.
 
+### Usage
+
+- **Claude Code usage and cost** in the command palette shows what your
+  Claude Code sessions on this PC would cost at API prices: this week by
+  day, model and project, what agents spent, the tokens by kind and what
+  the prompt cache saved, last week's total and the 5-hour window under
+  way. Turn `usage_tracking` on in the settings first; it is off by
+  default.
+- The week follows your plan's weekly reset, set with `usage_reset_day`
+  and `usage_reset_hour`, and the expanded sidebar shows the week's
+  figure at its foot.
+
 ## [0.0.5] - 2026-10-15
 
 The biggest release yet: a command palette, your own key bindings, find,

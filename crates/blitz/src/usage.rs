@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{Config, DAYS};
 use crate::hook::Json;
+use crate::render::chrome::{self, UsageLine};
+use crate::settings::thousands;
 
 /// The weekly reset: the day, 0 for Monday, and the hour, local time.
 pub type Reset = (u8, u8);
@@ -126,6 +128,8 @@ impl Spend {
 /// What the logs add up to for one week.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Report {
+    /// The reset the week began at.
+    pub reset: Reset,
     /// The logs folder is there.
     pub found: bool,
     pub folder: String,
@@ -207,6 +211,183 @@ impl Tracking {
         }
         self.reset = reset;
         let _ = self.ask.send(reset);
+    }
+}
+
+/// What the usage panel shows, scrolled to line `top`: how to turn
+/// tracking on while it is not, then what the report `r` found.
+pub fn panel(on: bool, r: Option<&Report>, now: i64, top: usize) -> chrome::Usage {
+    let mut u = chrome::Usage {
+        head: String::new(),
+        lines: Vec::new(),
+        top,
+        note: String::new(),
+        hint: "Esc close",
+    };
+    let r = match r {
+        _ if !on => {
+            u.note = "Usage tracking is off. Turned on, blitz reads Claude Code's logs on \
+                      this PC once a minute to show what your sessions would cost at API \
+                      prices, week by week. Nothing is sent anywhere."
+                .into();
+            u.hint = "Enter turn on  \u{b7}  Esc close";
+            return u;
+        }
+        None => {
+            u.note = "Reading Claude Code's logs\u{2026}".into();
+            return u;
+        }
+        Some(r) if !r.found => {
+            u.note = format!("No Claude Code logs in {}", r.folder);
+            return u;
+        }
+        Some(r) => r,
+    };
+    u.hint = "\u{2191}\u{2193} scroll  \u{b7}  Esc close";
+    u.head = format!(
+        "since {} \u{b7} resets in {}",
+        r.since,
+        left(r.week.1 - now)
+    );
+    let total = r.this.cost;
+    // In the top block and Tokens a bar is the share of this week's cost.
+    let share = |c: f64| {
+        Some(if total > 0.0 {
+            (c / total).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        })
+    };
+    let row = |label: String, value: String, frac| UsageLine::Row(label, value, frac);
+    let l = &mut u.lines;
+    l.push(row(
+        format!("This week \u{b7} {}", requests(r.this.requests)),
+        dollars(total),
+        share(total),
+    ));
+    l.push(row("Last week".into(), dollars(r.last), share(r.last)));
+    if let Some((end, c)) = &r.window {
+        let value = format!("\u{2248} {}", dollars(*c));
+        l.push(row(format!("5-hour window, until {end}"), value, share(*c)));
+    }
+    // Elsewhere it is the share of the largest in its group.
+    let group = |l: &mut Vec<UsageLine>, head, rows: Vec<(String, String, f64)>| {
+        if rows.is_empty() {
+            return;
+        }
+        let most = rows.iter().map(|r| r.2).fold(0.0, f64::max);
+        l.push(UsageLine::Head(head));
+        for (label, value, c) in rows {
+            let frac = if most > 0.0 { (c / most) as f32 } else { 0.0 };
+            l.push(row(label, value, Some(frac)));
+        }
+    };
+    let days = r.days.iter().map(|(d, c)| (d.clone(), dollars(*c), *c));
+    group(l, "By day", days.collect());
+    let models = r.models.iter().map(|(name, c, guessed)| {
+        let value = match (c, guessed) {
+            (None, _) => "no price".into(),
+            (Some(c), true) => format!("\u{2248}{}", dollars(*c)),
+            (Some(c), false) => dollars(*c),
+        };
+        (name.clone(), value, c.unwrap_or(0.0))
+    });
+    group(l, "By model", most(models.collect()));
+    let projects = r
+        .projects
+        .iter()
+        .map(|(name, c)| (name.clone(), dollars(*c), *c));
+    group(l, "By project", most(projects.collect()));
+    let yours = total - r.agents;
+    group(
+        l,
+        "Sessions and agents",
+        vec![
+            ("Your sessions".into(), dollars(yours), yours),
+            ("Agents".into(), dollars(r.agents), r.agents),
+        ],
+    );
+    l.push(UsageLine::Head("Tokens"));
+    let kinds = ["Input", "Output", "Cache writes", "Cache reads"];
+    for (kind, (n, c)) in kinds.into_iter().zip(r.this.tokens) {
+        l.push(row(
+            format!("{kind} \u{b7} {}", tokens(n)),
+            dollars(c),
+            share(c),
+        ));
+    }
+    l.push(row("Cache saved".into(), dollars(r.this.saved), None));
+    if r.unpriced > 0 {
+        l.push(row("Without a price".into(), requests(r.unpriced), None));
+    }
+    u.note = "Priced at API rates from Claude Code's logs on this PC. A Pro or Max \
+              plan pays its own price."
+        .into();
+    if r.reset == (0, 0) {
+        u.note += "\nSet Week starts on and Week starts at in the settings to match \
+                   claude.ai's usage page.";
+    }
+    u
+}
+
+/// The line at the foot of the sidebar, as `$41.20 this week · resets Thu`;
+/// `None` without Claude Code's logs.
+pub fn sidebar(r: &Report) -> Option<String> {
+    let day = r.since.split(' ').next().filter(|_| r.found)?;
+    let cost = dollars(r.this.cost);
+    Some(format!("{cost} this week \u{b7} resets {day}"))
+}
+
+/// The four costliest of `rows`, and the rest together as `Others`.
+fn most(mut rows: Vec<(String, String, f64)>) -> Vec<(String, String, f64)> {
+    if rows.len() > 5 {
+        let rest: f64 = rows.drain(4..).map(|r| r.2).sum();
+        rows.push(("Others".into(), dollars(rest), rest));
+    }
+    rows
+}
+
+/// `$0.42`, `$12.30`, and from a thousand on `$1,234`.
+fn dollars(x: f64) -> String {
+    // Saturating: a sum that came out a hair under zero is 0.
+    let cents = (x * 100.0).round() as u64;
+    match cents {
+        0..100_000 => format!("${}.{:02}", cents / 100, cents % 100),
+        _ => format!("${}", thousands(((cents + 50) / 100) as usize)),
+    }
+}
+
+/// `1 request`, `1,234 requests`.
+fn requests(n: u32) -> String {
+    let s = if n == 1 { "" } else { "s" };
+    format!("{} request{s}", thousands(n as usize))
+}
+
+/// `980`, `4.2k`, `45k`, `1.2M`, `3.4B`.
+fn tokens(n: u64) -> String {
+    let short = |unit: f64, suffix: &str| {
+        let x = n as f64 / unit;
+        if x < 9.95 {
+            format!("{x:.1}{suffix}")
+        } else {
+            format!("{x:.0}{suffix}")
+        }
+    };
+    match n {
+        0..1000 => n.to_string(),
+        1000..999_500 => short(1e3, "k"),
+        999_500..999_500_000 => short(1e6, "M"),
+        _ => short(1e9, "B"),
+    }
+}
+
+/// How long until a reset `secs` away: `2d 4h` from a day on, else as
+/// [`chrome::elapsed`] says it.
+fn left(secs: i64) -> String {
+    let secs = secs.max(0);
+    match secs {
+        DAY.. => format!("{}d {}h", secs / DAY, secs % DAY / 3600),
+        _ => chrome::elapsed(Duration::from_secs(secs as u64)),
     }
 }
 
@@ -362,7 +543,7 @@ impl Tracker {
             && !p.cwd.is_empty()
             && (pr.1.is_empty() || (!p.agent && !pr.2))
         {
-            pr.1 = crate::render::chrome::folder_name(&p.cwd);
+            pr.1 = chrome::folder_name(&p.cwd);
             pr.2 = !p.agent;
         }
         let row = Row {
@@ -411,6 +592,7 @@ impl Tracker {
         );
         let bounds: Vec<i64> = (first..=today).map(|d| utc(d * DAY, off)).collect();
         let mut out = Report {
+            reset,
             found: self.root.as_ref().is_some_and(|r| r.is_dir()),
             folder: (self.root.as_ref()).map_or_else(String::new, |r| r.display().to_string()),
             week: (this, next),
@@ -1230,6 +1412,156 @@ mod tests {
         t.add(0, parsed(2, 1000, "claude-opus-5-5", "/w", false, 5));
         assert_eq!(t.rows.len(), 1);
         assert_eq!(t.rows[0].tokens[1], 5);
+    }
+
+    /// The texts of `u`'s lines.
+    fn texts(u: &chrome::Usage) -> Vec<(String, String)> {
+        (u.lines.iter())
+            .map(|l| match l {
+                UsageLine::Head(h) => (h.to_string(), String::new()),
+                UsageLine::Row(label, value, _) => (label.clone(), value.clone()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_panel_says_how_to_turn_tracking_on() {
+        let off = panel(false, None, 0, 0);
+        assert!(
+            off.note.starts_with("Usage tracking is off."),
+            "{}",
+            off.note
+        );
+        assert!(off.hint.starts_with("Enter turn on") && off.lines.is_empty());
+        assert_eq!(
+            panel(true, None, 0, 0).note,
+            "Reading Claude Code's logs\u{2026}"
+        );
+        let missing = Report {
+            folder: "/home/me/.claude/projects".into(),
+            ..Report::default()
+        };
+        let u = panel(true, Some(&missing), 0, 0);
+        assert_eq!(u.note, "No Claude Code logs in /home/me/.claude/projects");
+        assert!(u.lines.is_empty());
+        // Off, a report is not shown.
+        let found = Report {
+            found: true,
+            ..Report::default()
+        };
+        assert!(panel(false, Some(&found), 0, 0).lines.is_empty());
+    }
+
+    #[test]
+    fn the_panel_shows_the_week_by_day_model_and_project() {
+        let now = at("2026-10-29T14:00:00Z");
+        let mut r = Report {
+            reset: (3, 17),
+            found: true,
+            week: (
+                at("2026-10-22T17:00:00Z"),
+                at("2026-10-29T17:00:00Z") + 2 * DAY + 4 * 3600,
+            ),
+            since: "Thu 5 pm".into(),
+            last: 380.1,
+            days: vec![("Thu 22".into(), 40.1), ("Fri 23".into(), 372.2)],
+            models: vec![
+                ("Opus 5.5".into(), Some(400.0), false),
+                ("Opus 6".into(), Some(12.3), true),
+                ("gpt-5".into(), None, false),
+            ],
+            projects: (1..=6)
+                .map(|i| (format!("p{i}"), 70.0 - f64::from(i)))
+                .collect(),
+            agents: 100.0,
+            window: Some(("7:45 pm".into(), 12.4)),
+            unpriced: 3,
+            ..Report::default()
+        };
+        r.this.cost = 412.3;
+        r.this.requests = 1234;
+        r.this.tokens = [
+            (1_200_000, 4.8),
+            (3_400_000, 68.0),
+            (20_000_000, 100.0),
+            (450_000_000, 90.0),
+        ];
+        r.this.saved = 1710.0;
+        let u = panel(true, Some(&r), now, 0);
+        assert_eq!(u.head, "since Thu 5 pm \u{b7} resets in 2d 7h");
+        let t = texts(&u);
+        let has = |label: &str, value: &str| t.contains(&(label.into(), value.into()));
+        assert!(has("This week \u{b7} 1,234 requests", "$412.30"), "{t:?}");
+        assert!(has("Last week", "$380.10"));
+        assert!(has("5-hour window, until 7:45 pm", "\u{2248} $12.40"));
+        assert!(has("By day", "") && has("Tokens", ""));
+        assert!(has("Fri 23", "$372.20"));
+        assert!(has("Opus 6", "\u{2248}$12.30") && has("gpt-5", "no price"));
+        // Four projects and the rest.
+        assert!(has("p4", "$66.00") && !has("p5", "$65.00"));
+        assert!(has("Others", "$129.00"));
+        assert!(has("Your sessions", "$312.30") && has("Agents", "$100.00"));
+        assert!(has("Input \u{b7} 1.2M", "$4.80") && has("Cache reads \u{b7} 450M", "$90.00"));
+        assert!(has("Cache saved", "$1,710") && has("Without a price", "3 requests"));
+        // The largest of a group fills its bar; the top block's are shares of the week.
+        let frac = |label: &str| {
+            u.lines.iter().find_map(|l| match l {
+                UsageLine::Row(l, _, f) if l == label => Some(*f),
+                _ => None,
+            })
+        };
+        let near = |label, want: f64| {
+            frac(label)
+                .flatten()
+                .is_some_and(|f| (f64::from(f) - want).abs() < 1e-6)
+        };
+        assert!(near("Fri 23", 1.0) && near("Thu 22", 40.1 / 372.2));
+        assert!(near("Agents", 100.0 / 312.3) && near("Last week", 380.1 / 412.3));
+        assert_eq!(frac("Cache saved"), Some(None));
+        assert!(!u.note.contains("Week starts on"));
+        // At the default reset, the panel says where to set it.
+        r.reset = (0, 0);
+        assert!(
+            panel(true, Some(&r), now, 0)
+                .note
+                .contains("\nSet Week starts on")
+        );
+    }
+
+    #[test]
+    fn money_and_tokens_read_short() {
+        assert_eq!(dollars(0.4), "$0.40");
+        assert_eq!(dollars(12.3), "$12.30");
+        assert_eq!(dollars(999.99), "$999.99");
+        assert_eq!(dollars(1234.5), "$1,235");
+        assert_eq!(dollars(-1e-12), "$0.00");
+        assert_eq!(tokens(980), "980");
+        assert_eq!(tokens(4200), "4.2k");
+        assert_eq!(tokens(45_000), "45k");
+        assert_eq!(tokens(999_499), "999k");
+        assert_eq!(tokens(999_500), "1.0M");
+        assert_eq!(tokens(1_234_567), "1.2M");
+        assert_eq!(tokens(3_400_000_000), "3.4B");
+        assert_eq!(requests(1), "1 request");
+        assert_eq!(left(2 * DAY + 4 * 3600 + 59), "2d 4h");
+        assert_eq!(left(2 * 3600 + 300), "2h 5m");
+        assert_eq!(left(-5), "0s");
+    }
+
+    #[test]
+    fn the_sidebar_says_the_week_and_its_reset() {
+        let mut r = Report {
+            found: true,
+            since: "Thu 5 pm".into(),
+            ..Report::default()
+        };
+        r.this.cost = 41.2;
+        assert_eq!(
+            sidebar(&r).as_deref(),
+            Some("$41.20 this week \u{b7} resets Thu")
+        );
+        r.found = false;
+        assert_eq!(sidebar(&r), None);
     }
 
     #[test]
