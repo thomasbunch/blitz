@@ -10,7 +10,7 @@ const USAGE: &str = "usage: blitz [DIR | --cwd DIR] [--new-window] [--cmd CMD]
        blitz debug render (--vt FILE | --text FILE | --demo) --bmp OUT
              [--cols N --rows N] [--px N] [--warp] [--light] [--theme NAME]
              [--collapsed] [--banner TEXT] [--picker FILTER] [--settings N]
-             [--find TEXT]
+             [--find TEXT] [--usage]
 for tests: blitz [--selftest FILE] [--capture BMP] [--exit-after MS] ...";
 
 fn main() {
