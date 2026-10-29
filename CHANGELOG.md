@@ -35,9 +35,10 @@ people who use blitz.
   sea.
 - GitHub Dark and Light are gone, as blitz dark and light are near
   copies of them. A `theme` that names one gets blitz dark or light in
-  its place; to keep the original, put its file from
+  its place. To keep the original, save `GitHub Dark Default` or
+  `GitHub Light Default` from
   [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/ghostty)
-  in the themes folder.
+  in the themes folder as `GitHub Dark` or `GitHub Light`.
 - Each theme's swatch in the picker shows its text colour.
 
 ## [0.0.5] - 2026-10-15
