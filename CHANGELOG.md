@@ -6,6 +6,17 @@ people who use blitz.
 
 ## [Unreleased]
 
+### Keys
+
+- **Ctrl+Shift+/** (**Cmd+/** on macOS) lists every action and the keys
+  that run it, grouped by what they do, with a dot on the ones you
+  changed. The command palette and the settings panel open it too, and
+  typing narrows it by name or by keys.
+- Enter on an action waits for new keys and adds them, saying first what
+  they run now. A key alone, or with only Shift, stays the program's. Del
+  puts an action's default keys back. Changes apply at once and are saved
+  as `keybind` lines in `config.toml`, keeping the rest of the file.
+
 ### Files
 
 - **Ctrl+Shift+E** (**Shift+Cmd+E** on macOS) shows the files in the

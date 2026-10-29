@@ -135,7 +135,7 @@ pub struct Setting {
 /// and finished ones too.
 pub const TOASTS: &[&str] = &["off", "needs-you", "all"];
 
-const NOW: &str = "Applies now";
+pub const NOW: &str = "Applies now";
 const NEW_PANES: &str = "Applies to new panes";
 const RESTART: &str = "Applies when blitz restarts";
 

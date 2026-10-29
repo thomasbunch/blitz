@@ -71,6 +71,8 @@ const VK_ESCAPE: u16 = 0x1b;
 const VK_BACK: u16 = 0x08;
 const VK_PRIOR: u16 = 0x21;
 const VK_NEXT: u16 = 0x22;
+const VK_END: u16 = 0x23;
+const VK_HOME: u16 = 0x24;
 const VK_LEFT: u16 = 0x25;
 const VK_UP: u16 = 0x26;
 const VK_RIGHT: u16 = 0x27;
@@ -1153,6 +1155,9 @@ struct App {
     settings: Option<Panel>,
     /// Where the settings panel was in the last frame, for clicks.
     settings_hits: Option<chrome::SettingsHits>,
+    /// The keyboard shortcuts, while they are open. Drawn as the settings
+    /// panel is, and in its place.
+    shortcuts: Option<crate::shortcuts::Panel>,
     /// blitz run while it is open, and when it last moved.
     game: Option<(Run, Instant)>,
     /// When a session needing the user last closed blitz run.
@@ -1689,6 +1694,7 @@ impl App {
             picker: None,
             settings: None,
             settings_hits: None,
+            shortcuts: None,
             game: None,
             game_ended: None,
             motion: animations_on(),
@@ -2411,14 +2417,25 @@ impl App {
                 items: p.matches(),
                 sel: p.sel,
             }),
-            settings: self.settings.as_ref().map(|p| chrome::Settings {
-                page: chrome::Page::Settings,
-                filter: &p.filter,
-                rows: p.rows(&self.config, self.update_trouble()),
-                sel: p.sel,
-                top: p.top,
-                error: p.error.as_deref(),
-            }),
+            settings: (self.settings.as_ref())
+                .map(|p| chrome::Settings {
+                    page: chrome::Page::Settings,
+                    filter: &p.filter,
+                    rows: p.rows(&self.config, self.update_trouble()),
+                    sel: p.sel,
+                    top: p.top,
+                    error: p.error.as_deref(),
+                })
+                .or_else(|| {
+                    self.shortcuts.as_ref().map(|p| chrome::Settings {
+                        page: chrome::Page::Keys(p.capture.is_some()),
+                        filter: &p.filter,
+                        rows: p.rows(&self.config.keys),
+                        sel: p.sel,
+                        top: p.top,
+                        error: p.error.as_deref(),
+                    })
+                }),
             commands: self.commands.as_ref().map(|cm| chrome::Commands {
                 filter: &cm.filter,
                 items: (cm.matches().into_iter())
@@ -2614,6 +2631,15 @@ impl App {
         let fonts = crate::render::font::families().to_vec();
         let themes = crate::theme::all().into_iter().map(|t| t.name).collect();
         self.settings = Some(Panel::new(fonts, crate::shell::choices(), themes));
+        self.shortcuts = None;
+        self.request_redraw();
+    }
+
+    /// Opens the keyboard shortcuts on the first action, in place of the
+    /// settings panel.
+    fn open_shortcuts(&mut self) {
+        self.settings = None;
+        self.shortcuts = Some(Default::default());
         self.request_redraw();
     }
 
@@ -2715,6 +2741,109 @@ impl App {
                 .map(|e| format!("Cannot save to config.toml: {e}"));
         }
         self.apply_config(c);
+    }
+
+    /// A key while the keyboard shortcuts are open: up and down choose an
+    /// action, Enter waits for new keys for it, Delete puts its default
+    /// keys back, typing narrows the list, and Esc clears what was typed,
+    /// then closes. While an action waits, every key is for it.
+    fn shortcuts_key(&mut self, k: &KeyInput) {
+        let (Some(p), user) = (&mut self.shortcuts, &self.config.keys) else {
+            return;
+        };
+        if p.capture.is_some() {
+            return self.capture_key(k);
+        }
+        let page = chrome::PICKER_ROWS as isize;
+        match k.vk {
+            VK_ESCAPE if !p.filter.is_empty() => {
+                p.filter.clear();
+                p.sel = 0;
+            }
+            VK_ESCAPE => self.shortcuts = None,
+            VK_UP => p.move_by(-1, user),
+            VK_DOWN => p.move_by(1, user),
+            VK_PRIOR => p.move_by(-page, user),
+            VK_NEXT => p.move_by(page, user),
+            VK_HOME => p.move_by(isize::MIN, user),
+            VK_END => p.move_by(isize::MAX, user),
+            VK_RETURN => p.wait(user),
+            VK_DELETE => {
+                if let Some(a) = p.selected(user) {
+                    let rebinds = crate::shortcuts::reset(a, user);
+                    self.set_keys(rebinds);
+                }
+            }
+            _ if edit_field(&mut p.filter, k) => p.sel = 0,
+            _ => return,
+        }
+        self.request_redraw();
+    }
+
+    /// A key pressed for the action that waits for new keys; the modifier
+    /// and lock keys alone are no chord.
+    fn capture_key(&mut self, k: &KeyInput) {
+        let modifier = matches!(
+            k.key,
+            vt::Key::Shift | vt::Key::Control | vt::Key::Alt | vt::Key::Super
+        );
+        let Some(p) = &mut self.shortcuts else {
+            return;
+        };
+        if modifier || lock_key(k.vk) {
+            return;
+        }
+        let rebinds = p.press(keymap::pressed(k), &self.config.keys);
+        self.set_keys(rebinds);
+        self.request_redraw();
+    }
+
+    /// Makes `rebinds`, saves them, and shows the change.
+    fn set_keys(&mut self, rebinds: Vec<keymap::Rebind>) {
+        if rebinds.is_empty() {
+            return;
+        }
+        let mut c = self.config.clone();
+        c.set_keys(&rebinds);
+        let saved = crate::config::save_keys(&rebinds);
+        if let Some(p) = &mut self.shortcuts {
+            p.error = saved
+                .err()
+                .map(|e| format!("Cannot save to config.toml: {e}"));
+        }
+        self.apply_config(c);
+    }
+
+    /// A left click while the keyboard shortcuts are open: one on the
+    /// highlighted action waits for new keys, or with them pressed adds
+    /// them, as Enter does; one on another action highlights it, or stops
+    /// waiting; and one outside closes them.
+    fn shortcuts_click(&mut self) {
+        let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
+        let inside = |r: &Rect| r.contains(x, y);
+        let Some(h) = &self.settings_hits else {
+            return;
+        };
+        if !inside(&h.panel) {
+            self.shortcuts = None;
+            self.request_redraw();
+            return;
+        }
+        let row = h.rows.iter().find(|r| inside(&r.1)).map(|r| r.0);
+        let (Some(p), user) = (&mut self.shortcuts, &self.config.keys) else {
+            return;
+        };
+        match row {
+            Some(i) if i == p.sel && p.capture.is_some() => {
+                let rebinds = p.press(Some((0, VK_RETURN)), user);
+                self.set_keys(rebinds);
+            }
+            _ if p.capture.is_some() => p.capture = None,
+            Some(i) if i == p.sel => p.wait(user),
+            Some(i) => p.sel = i,
+            None => {}
+        }
+        self.request_redraw();
     }
 
     /// Takes new settings and shows the font and theme they pick. The
@@ -3008,8 +3137,8 @@ impl App {
     }
 
     /// Typed or pasted text for the filter of the command palette, the
-    /// theme picker or the settings panel, or for the find bar. False when
-    /// none is open.
+    /// theme picker, the settings panel or the keyboard shortcuts, or for
+    /// the find bar. False when none is open.
     fn filter_text(&mut self, t: &str) -> bool {
         if self.game.is_some() {
             // The game takes keys, not text.
@@ -3024,6 +3153,13 @@ impl App {
         } else if let Some(p) = &mut self.settings {
             p.filter.push_str(t);
             p.sel = 0;
+            self.request_redraw();
+        } else if let Some(p) = &mut self.shortcuts {
+            // Text that comes while an action waits for keys is dropped.
+            if p.capture.is_none() {
+                p.filter.push_str(t);
+                p.sel = 0;
+            }
             self.request_redraw();
         } else if let Some(f) = &mut self.find {
             f.type_text(t);
@@ -3551,6 +3687,7 @@ impl App {
         let panel = self.commands.is_some()
             || self.picker.is_some()
             || self.settings.is_some()
+            || self.shortcuts.is_some()
             || self.find.is_some()
             || self.game.is_some()
             || self.current().is_some_and(|v| v.files.is_some());
@@ -3559,9 +3696,11 @@ impl App {
             return;
         }
         // A paste key pastes into the open panel's text field; blitz run
-        // has none, and a shortcut closes it.
+        // has none, and a shortcut closes it. An action waiting for new
+        // keys takes it as its keys instead.
         if panel
             && self.game.is_none()
+            && !self.shortcuts.as_ref().is_some_and(|p| p.capture.is_some())
             && k.down
             && keymap::action(k, &self.config.keys) == Some(Action::Paste)
         {
@@ -3624,7 +3763,24 @@ impl App {
                     self.request_redraw();
                 }
                 Some(Action::ThemePicker) => self.open_picker(),
+                Some(Action::Keys) => self.open_shortcuts(),
                 _ => self.settings_key(k),
+            }
+            return;
+        }
+        // The same for the keyboard shortcuts, but while they wait for new
+        // keys every key is the new keys, a shortcut's too.
+        if let Some(p) = &self.shortcuts
+            && k.down
+        {
+            self.eaten.press(k.vk);
+            match keymap::action(k, &self.config.keys).filter(|_| p.capture.is_none()) {
+                Some(Action::Keys) => {
+                    self.shortcuts = None;
+                    self.request_redraw();
+                }
+                Some(Action::Settings) => self.open_settings(),
+                _ => self.shortcuts_key(k),
             }
             return;
         }
@@ -4124,6 +4280,7 @@ impl App {
             Action::ToggleSidebar => return self.toggle_sidebar(),
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
+            Action::Keys => self.open_shortcuts(),
             Action::GoToSession => {
                 let now = Instant::now();
                 let list = (self.sessions().iter())
@@ -4939,9 +5096,11 @@ impl App {
     }
 
     /// The divider of the active tab under a point, if the settings panel
-    /// is not over it. Dividers are 1 px wide, so a few px either side count.
+    /// or the keyboard shortcuts are not over it. Dividers are 1 px wide, so
+    /// a few px either side count.
     fn divider_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, Axis)> {
-        let t = (self.win.tabs.get(self.win.active)).filter(|_| self.settings.is_none())?;
+        let t = (self.win.tabs.get(self.win.active))
+            .filter(|_| self.settings.is_none() && self.shortcuts.is_none())?;
         let slop = (3.0 * self.scale).round() as i32;
         t.divider_at(self.tab_area(), pos.x as i32, pos.y as i32, slop)
     }
@@ -5052,7 +5211,10 @@ impl App {
         // on, it could pick an option of a Claude Code prompt the user has
         // not read yet.
         if activating {
-            let open = self.commands.is_some() || self.settings.is_some() || self.game.is_some();
+            let open = self.commands.is_some()
+                || self.settings.is_some()
+                || self.shortcuts.is_some()
+                || self.game.is_some();
             if let (Some(id), false) = (self.hit(self.mouse.pos).0, open) {
                 self.show(id);
             }
@@ -5073,6 +5235,12 @@ impl App {
         if pressed && self.settings.is_some() && self.picker.is_none() {
             if b == 0 {
                 self.settings_click();
+            }
+            return;
+        }
+        if pressed && self.shortcuts.is_some() {
+            if b == 0 {
+                self.shortcuts_click();
             }
             return;
         }
@@ -5427,6 +5595,7 @@ impl App {
         let inside = |r: &Rect| r.contains(x, y);
         let panel = self.commands.is_some()
             || self.settings.is_some()
+            || self.shortcuts.is_some()
             || self.picker.is_some()
             || self.game.is_some();
         let divider = self.divider_at(pos).map(|d| d.1).filter(|_| !panel);
@@ -5525,7 +5694,7 @@ impl App {
             return;
         }
         let (x, y) = (pos.x as i32, pos.y as i32);
-        let panel = self.commands.is_some() || self.settings.is_some();
+        let panel = self.commands.is_some() || self.settings.is_some() || self.shortcuts.is_some();
         let over = (x < self.tab_area().x && !panel).then(|| self.side.at(x, y));
         self.set_over_side(over.flatten());
         self.update_hover();
@@ -5573,6 +5742,14 @@ impl App {
         }
         if let Some(p) = self.settings.as_mut().filter(|_| self.picker.is_none()) {
             p.move_by(-steps as isize);
+            self.request_redraw();
+            return;
+        }
+        if let Some(p) = &mut self.shortcuts {
+            // The highlight is the action waiting for keys until it stops.
+            if p.capture.is_none() {
+                p.move_by(-steps as isize, &self.config.keys);
+            }
             self.request_redraw();
             return;
         }
@@ -5698,6 +5875,9 @@ impl App {
         self.settings_hits = chrome.settings.take();
         self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
+            p.top = h.top;
+        }
+        if let (Some(p), Some(h)) = (&mut self.shortcuts, &self.settings_hits) {
             p.top = h.top;
         }
 

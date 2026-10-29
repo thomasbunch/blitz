@@ -67,6 +67,8 @@ pub enum Action {
     ThemePicker,
     /// Open or close the settings panel.
     Settings,
+    /// Open or close the keyboard shortcuts.
+    Keys,
     /// Open `config.toml` in an editor.
     OpenConfig,
     /// Open the themes folder in Explorer.
@@ -150,6 +152,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Update, "update", "Update blitz"),
     (Action::ThemePicker, "theme_picker", "Pick a theme"),
     (Action::Settings, "settings", "Settings"),
+    (Action::Keys, "keys", "Keyboard shortcuts"),
     (Action::OpenConfig, "open_config", "Open config.toml"),
     (Action::OpenThemes, "open_themes", "Open themes folder"),
     (Action::Zoom, "zoom", "Zoom the pane, or show every pane"),
@@ -248,6 +251,10 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CTRL | SHIFT, b'K' as u16, Action::ThemePicker),
     // VK_OEM_COMMA: the comma key on every layout.
     (CTRL, 0xbc, Action::Settings),
+    // VK_OEM_2, the / key: Ctrl+? on a US layout, which would reach the
+    // program as ^?, a second Backspace. Not Ctrl+/: that is ^_, Claude
+    // Code's undo.
+    (CTRL | SHIFT, 0xbf, Action::Keys),
     (CTRL | SHIFT, b'Z' as u16, Action::Zoom),
     // VK_OEM_PLUS and VK_OEM_MINUS, with Shift too where + needs it, and
     // the keypad's. Ctrl+Shift+- still goes to the program: it is Claude
@@ -317,6 +324,8 @@ const DEFAULT_KEYS: &[(u8, u16, Action)] = &[
     (CMD | SHIFT, b'U' as u16, Action::Update),
     (CMD | SHIFT, b'K' as u16, Action::ThemePicker),
     (CMD, 0xbc, Action::Settings),
+    // Not Cmd+?: that is the Help menu's.
+    (CMD, 0xbf, Action::Keys),
     (CMD | SHIFT, 0x0d, Action::Zoom),
     (CMD, 0xbb, Action::FontSize(1)),
     (CMD | SHIFT, 0xbb, Action::FontSize(1)),
@@ -1789,6 +1798,8 @@ mod msg_to_key_tests {
         assert_eq!(press(0x25, &[LCTRL, LSHIFT]), None, "selects a word");
         assert_eq!(press(0xbd, &[LCTRL]), Some(Action::FontSize(-1)));
         assert_eq!(press(0xbd, &[LCTRL, LSHIFT]), None, "Claude Code's undo");
+        assert_eq!(press(0xbf, &[LCTRL, LSHIFT]), Some(Action::Keys));
+        assert_eq!(press(0xbf, &[LCTRL]), None, "Claude Code's undo too");
         // Ctrl and + with Shift, as on a US layout, and on the keypad.
         assert_eq!(press(0xbb, &[LCTRL, LSHIFT]), Some(Action::FontSize(1)));
         assert_eq!(press(0x6b, &[LCTRL]), Some(Action::FontSize(1)));
@@ -2519,6 +2530,9 @@ mod winit_key_tests {
         assert_eq!(action(&k, &[]), Some(Action::Copy));
         let k = winit_key(&press(KeyCode::Digit3, "3", Some("3")), cmd, &mut text);
         assert_eq!(action(&k, &[]), Some(Action::GoToTab(2)));
+        let k = winit_key(&press(KeyCode::Slash, "/", Some("/")), cmd, &mut text);
+        assert_eq!(action(&k, &[]), Some(Action::Keys));
+        assert_eq!(keys_for(Action::Keys, &[]).as_deref(), Some("Cmd+/"));
         // Ctrl+C is the program's.
         let ctrl = mods(|m| m.lctrl = true);
         let k = winit_key(&press(KeyCode::KeyC, "c", Some("c")), ctrl, &mut text);
@@ -2536,6 +2550,8 @@ mod winit_key_tests {
         let both = mods(|m| (m.lctrl, m.lshift) = (true, true));
         let k = winit_key(&press(KeyCode::KeyT, "t", Some("T")), both, &mut text);
         assert_eq!(action(&k, &[]), Some(Action::NewTab));
+        let k = winit_key(&press(KeyCode::Slash, "/", Some("?")), both, &mut text);
+        assert_eq!(action(&k, &[]), Some(Action::Keys));
         let sup = mods(|m| m.lsuper = true);
         let k = winit_key(&press(KeyCode::KeyC, "c", Some("c")), sup, &mut text);
         assert_eq!(action(&k, &[]), None);
