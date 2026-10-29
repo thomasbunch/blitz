@@ -11,7 +11,7 @@
 
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::attention::Attn;
@@ -114,9 +114,11 @@ pub fn parse(line: &str) -> Result<(String, Op), &'static str> {
                 Some("tab") => Place::Tab,
                 _ => return Err("place is right, down or tab"),
             },
+            // As for a folder a program reports with OSC 7: blitz looks in
+            // it, and a network path would make it sign in to that host.
             cwd: match text("cwd")? {
-                Some(d) if Path::new(&d).is_absolute() => Some(d.into()),
-                Some(_) => return Err("cwd is not an absolute folder"),
+                Some(d) if vt::osc::local_dir(&d) => Some(d.into()),
+                Some(_) => return Err("cwd is not a folder on this machine"),
                 None => None,
             },
             command: text("command")?.filter(|c| !c.is_empty()),
@@ -150,7 +152,7 @@ pub fn parse(line: &str) -> Result<(String, Op), &'static str> {
         Some("read") => Op::Read {
             pane: pane()?,
             lines: match j.get("lines") {
-                None => 100,
+                None | Some(Json::Null) => 100,
                 Some(n) => number(n).ok_or("lines is not a number")? as usize,
             }
             .min(MAX_LINES),
@@ -169,6 +171,11 @@ fn number(j: &Json) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+/// Whether `s` is `len` lowercase hex digits, as a channel's name has.
+fn hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Whether tokens `a` and `b` are the same, in a time that does not say
@@ -232,8 +239,10 @@ fn serve(conn: &mut (impl Read + Write), answer: impl Fn(String) -> String) {
     let mut line = Vec::new();
     let read =
         io::BufReader::new((&mut *conn).take(MAX_REQUEST as u64 + 1)).read_until(b'\n', &mut line);
+    // A caller that sent nothing, as one that only looks whether blitz
+    // listens, has nothing for the window to answer.
     let reply = match (read, String::from_utf8(line)) {
-        (Ok(_), Ok(line)) if line.len() <= MAX_REQUEST => answer(line),
+        (Ok(1..), Ok(line)) if line.len() <= MAX_REQUEST => answer(line),
         _ => error("not a request"),
     };
     let _ = conn.write_all(format!("{reply}\n").as_bytes());
@@ -462,13 +471,18 @@ mod tests {
                 lines: MAX_LINES
             })
         );
-        assert_eq!(
-            op(r#"{"token":"t","op":"read","pane":7}"#),
-            Ok(Op::Read {
-                pane: PaneId(7),
-                lines: 100
-            })
-        );
+        for read in [
+            r#"{"token":"t","op":"read","pane":7}"#,
+            r#"{"token":"t","op":"read","pane":7,"lines":null}"#,
+        ] {
+            assert_eq!(
+                op(read),
+                Ok(Op::Read {
+                    pane: PaneId(7),
+                    lines: 100
+                })
+            );
+        }
         assert_eq!(
             op(r#"{"token":"t","op":"close","pane":3}"#),
             Ok(Op::Close { pane: PaneId(3) })
@@ -509,6 +523,35 @@ mod tests {
             reply.get("error").and_then(Json::as_str),
             Some("pane \"7\"")
         );
+    }
+
+    /// Looking in a folder on another host signs in to it, on the window's
+    /// thread.
+    #[test]
+    fn control_open_takes_only_folders_on_this_machine() {
+        let open = |cwd: &str| {
+            let mut j = String::new();
+            escape_json(cwd, &mut j);
+            op(&format!(r#"{{"token":"t","op":"open","cwd":"{j}"}}"#)).map(|_| ())
+        };
+        let refused = Err("cwd is not a folder on this machine");
+        for bad in [
+            r"\\host\share",
+            r"\\?\UNC\h\s",
+            "//host/x",
+            "relative",
+            "C:x",
+        ] {
+            assert_eq!(open(bad), refused, "{bad}");
+        }
+        // Elsewhere a path from one `/` is local to OSC 7 and hand-offs
+        // too, automounted `/net` included.
+        if cfg!(windows) {
+            assert_eq!(open("/net/host/x"), refused);
+            assert_eq!(open(r"C:\x"), Ok(()));
+        } else {
+            assert_eq!(open("/home/x"), Ok(()));
+        }
     }
 
     #[test]

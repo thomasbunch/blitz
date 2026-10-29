@@ -601,6 +601,25 @@ impl Terminal {
         rows_text((0..g.scrollback_len()).filter_map(|i| g.line(i)))
     }
 
+    /// The last `n` rows of [`Self::scrollback_text`] then
+    /// [`Self::screen_text`], blank rows at the bottom left out, without
+    /// reading the rows before them.
+    pub fn last_text(&self, n: usize) -> String {
+        let (shown, main) = (&self.screen.grid, &self.main().grid);
+        let screen = (0..shown.lines()).rev().map(|y| shown.row(y));
+        let back = (0..main.scrollback_len())
+            .rev()
+            .filter_map(|i| main.line(i));
+        let blank = |r: &&Row| {
+            let mut s = String::new();
+            r.push_text(&mut s);
+            s.trim_end_matches(' ').is_empty()
+        };
+        let mut rows: Vec<&Row> = screen.chain(back).skip_while(blank).take(n).collect();
+        rows.reverse();
+        rows_text(rows.into_iter())
+    }
+
     /// The numbers of the lines kept on the screen being shown, scrollback
     /// first. A line keeps its number while output scrolls it into
     /// scrollback, until it drops off the top, so the host can point at

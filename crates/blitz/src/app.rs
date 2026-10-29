@@ -2101,11 +2101,13 @@ impl App {
             self.error(id, e);
             return;
         }
-        // The new session takes the old one's row in the sidebar.
+        // The new session takes the old one's row in the sidebar, and the
+        // panes the old one opened.
         let named = self.views.swap_remove(i).pane.named;
         if let Some(v) = self.view_mut(new) {
             v.pane.named = named;
         }
+        hand_down(self.views.iter_mut().map(|v| &mut v.parent), id, Some(new));
         self.resume(new, claude);
         self.install(win);
     }
@@ -2317,6 +2319,8 @@ impl App {
         }
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
+        // What its program opened is the user's now.
+        hand_down(self.views.iter_mut().map(|v| &mut v.parent), id, None);
         self.taskbar_progress();
         self.taskbar_badge();
         self.keep_awake();
@@ -2416,10 +2420,9 @@ impl App {
                     Ok(v) => &v.pane,
                     Err(e) => return e,
                 };
-                let text = {
-                    let term = lock(&p.term);
-                    read_text(&term.scrollback_text(), &term.screen_text(), lines)
-                };
+                let lines = lines.min(crate::control::MAX_LINES);
+                // Only the rows asked for, not all of the scrollback.
+                let text = read_text(&lock(&p.term).last_text(lines), lines);
                 let mut out = String::from("{\"ok\":true,\"text\":\"");
                 escape_json(&text, &mut out);
                 let (attn, exit) = (state(p.attn.state), num(p.exit_code));
@@ -7750,14 +7753,11 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// What `blitz pane read` returns of a pane's `scrollback` and `screen`:
-/// the last `n` lines, at most [`crate::control::MAX_LINES`] and
+/// What `blitz pane read` returns of a pane's newest `text`: the last `n`
+/// lines, at most [`crate::control::MAX_LINES`] and
 /// [`crate::control::MAX_READ`] bytes, the newest kept.
-fn read_text(scrollback: &str, screen: &str, n: usize) -> String {
-    let text = last_lines(
-        &format!("{scrollback}\n{screen}"),
-        n.min(crate::control::MAX_LINES),
-    );
+fn read_text(text: &str, n: usize) -> String {
+    let text = last_lines(text, n.min(crate::control::MAX_LINES));
     let mut cut = text.len().saturating_sub(crate::control::MAX_READ);
     while !text.is_char_boundary(cut) {
         cut += 1;
@@ -7779,7 +7779,8 @@ fn send_refused(id: PaneId, exit: Option<u32>, waits: bool) -> Option<String> {
 /// Whether `target` is a pane the program in pane `caller` opened, or one
 /// a pane it opened did, and so on; `parent` says which pane opened one.
 /// A pane closed in between ends the line. A pane opens only newer ones,
-/// so the walk ends.
+/// and only one nothing opened starts again under a new id, so the walk
+/// ends.
 fn opened_by(caller: PaneId, target: PaneId, parent: impl Fn(PaneId) -> Option<PaneId>) -> bool {
     let mut at = target;
     while let Some(p) = parent(at) {
@@ -7789,6 +7790,19 @@ fn opened_by(caller: PaneId, target: PaneId, parent: impl Fn(PaneId) -> Option<P
         at = p;
     }
     false
+}
+
+/// Gives the panes that pane `from` opened, as `parents` says, to `to`:
+/// its new session when it starts again, or none once it closes, which
+/// makes them the user's own.
+fn hand_down<'a>(
+    parents: impl Iterator<Item = &'a mut Option<PaneId>>,
+    from: PaneId,
+    to: Option<PaneId>,
+) {
+    for p in parents.filter(|p| **p == Some(from)) {
+        *p = to;
+    }
 }
 
 /// Where a new pane starts: `cwd` if it is still a directory, else the
@@ -11622,6 +11636,46 @@ mod tests {
         assert!(!may(1, 6), "a pane the user opened");
     }
 
+    /// A pane that starts again under a new id keeps the panes it opened,
+    /// and only those.
+    #[test]
+    fn app_a_restarted_pane_keeps_the_panes_it_opened() {
+        let mut parents = [Some(PaneId(1)), Some(PaneId(2)), None, Some(PaneId(1))];
+        hand_down(parents.iter_mut(), PaneId(1), Some(PaneId(9)));
+        assert_eq!(
+            parents,
+            [Some(PaneId(9)), Some(PaneId(2)), None, Some(PaneId(9))]
+        );
+        let parent = |p: PaneId| parents.get(p.0 as usize).copied().flatten();
+        assert!(opened_by(PaneId(9), PaneId(0), parent));
+    }
+
+    /// The panes a closed pane opened are the user's: saved, reopened and
+    /// started again as any other, and out of reach of the pane above.
+    #[test]
+    fn app_a_closed_pane_leaves_its_panes_to_the_user() {
+        // 1 opened 2, which opened 3 and 4; 5 is 3's.
+        let mut parents = [
+            None,
+            None,
+            Some(PaneId(1)),
+            Some(PaneId(2)),
+            Some(PaneId(2)),
+            Some(PaneId(3)),
+        ];
+        hand_down(parents.iter_mut(), PaneId(2), None);
+        assert_eq!(parents[3..], [None, None, Some(PaneId(3))]);
+        let parent = |p: PaneId| parents.get(p.0 as usize).copied().flatten();
+        assert!(
+            !opened_by(PaneId(1), PaneId(3), parent),
+            "not the pane above"
+        );
+        assert!(
+            opened_by(PaneId(3), PaneId(5), parent),
+            "their own still are"
+        );
+    }
+
     /// Typing into a pane is refused once its program exited, and while
     /// Claude Code there waits for its user, whose answer it would be.
     #[test]
@@ -11639,13 +11693,13 @@ mod tests {
 
     #[test]
     fn app_read_returns_the_newest_output_within_its_caps() {
-        assert_eq!(read_text("a\nb", "c\n\n", 2), "b\nc");
-        assert_eq!(read_text("", "only\n", 100), "only");
+        assert_eq!(read_text("a\nb\nc\n\n", 2), "b\nc");
+        assert_eq!(read_text("\nonly\n", 100), "only");
         let many: Vec<String> = (0..3000).map(|i| i.to_string()).collect();
-        let text = read_text(&many.join("\n"), "", usize::MAX);
+        let text = read_text(&many.join("\n"), usize::MAX);
         assert!(text.ends_with("\n2999") && text.lines().count() <= crate::control::MAX_LINES);
-        let wide = "é".repeat(crate::control::MAX_READ);
-        let text = read_text(&wide, "end", 10);
+        let wide = "é".repeat(crate::control::MAX_READ) + "\nend";
+        let text = read_text(&wide, 10);
         assert!(text.len() <= crate::control::MAX_READ && text.ends_with("é\nend"));
     }
 

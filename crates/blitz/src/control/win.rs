@@ -4,6 +4,8 @@
 use std::fs::File;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -16,6 +18,7 @@ use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
 };
+use windows::Win32::System::IO::CancelSynchronousIo;
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientSessionId, GetNamedPipeServerSessionId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
@@ -28,6 +31,11 @@ const PREFIX: &str = r"\\.\pipe\blitz-";
 /// How long a caller waits for blitz to open the pipe again while it
 /// answers others.
 const BUSY: Duration = Duration::from_secs(2);
+/// How long a caller may take in all, the window's answer included.
+const DEADLINE: Duration = super::ANSWER.saturating_add(Duration::from_secs(5));
+/// The most callers served at once, and how many are now.
+const MAX_CALLS: usize = 64;
+static CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Listens on a new pipe of this process's own and answers each request
 /// with `answer`, on a thread per connection. Returns the pipe's name.
@@ -64,23 +72,63 @@ pub fn listen(answer: impl Fn(String) -> String + Clone + Send + 'static) -> io:
                 if connected.is_err_and(|e| e.code() != ERROR_PIPE_CONNECTED.to_hresult()) {
                     continue;
                 }
+                // Past the cap a caller is dropped at once, so a flood
+                // cannot use up the instances blitz listens with.
+                if CALLS.fetch_add(1, Ordering::SeqCst) >= MAX_CALLS {
+                    CALLS.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
                 let answer = answer.clone();
-                let _ = std::thread::Builder::new()
-                    .name("pane-control-call".into())
-                    .spawn(move || {
-                        // A program in another session, as another user's
-                        // signed in alongside, gets nothing.
-                        if !same_session(&pipe) {
-                            return;
-                        }
+                let call = move || {
+                    // A program in another session, as another user's
+                    // signed in alongside, gets nothing.
+                    if same_session(&pipe) {
                         let mut f = File::from(pipe);
                         super::serve(&mut f, answer);
-                        // Until the reply is read: closing drops what is unread.
+                        // Until the reply is read: closing drops what is
+                        // unread.
                         let _ = f.sync_all();
+                    }
+                };
+                let watched = std::thread::Builder::new()
+                    .name("pane-control-call".into())
+                    .spawn(move || {
+                        within(DEADLINE, call);
+                        CALLS.fetch_sub(1, Ordering::SeqCst);
                     });
+                if watched.is_err() {
+                    CALLS.fetch_sub(1, Ordering::SeqCst);
+                }
             }
         })?;
     Ok(name)
+}
+
+/// Runs `work` on a thread of its own until it ends. Past `deadline` the
+/// reads and writes it waits on are cancelled, again until it ends: a
+/// caller that sends nothing, or never reads the reply, would otherwise
+/// hold it for good.
+fn within(deadline: Duration, work: impl FnOnce() + Send + 'static) {
+    let (done, ended) = mpsc::channel::<()>();
+    let worker = std::thread::Builder::new()
+        .name("pane-control-serve".into())
+        .spawn(move || {
+            work();
+            drop(done);
+        });
+    let Ok(worker) = worker else {
+        return;
+    };
+    if ended.recv_timeout(deadline) == Err(RecvTimeoutError::Timeout) {
+        // Again, as it may start its next wait after a cancel.
+        while !worker.is_finished() {
+            // SAFETY: the thread's own handle, which `worker` keeps open;
+            // one that waits on nothing has nothing cancelled.
+            let _ = unsafe { CancelSynchronousIo(HANDLE(worker.as_raw_handle())) };
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = worker.join();
 }
 
 /// A new instance of the pipe `name`, guarded by the descriptor `sddl`;
@@ -132,9 +180,7 @@ fn same_session(pipe: &OwnedHandle) -> bool {
 /// Whether `name` is a pipe [`listen`] could have made: never a network
 /// path, which opening would sign in to that host.
 pub fn valid(name: &str) -> bool {
-    name.strip_prefix(PREFIX).is_some_and(|hex| {
-        hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
+    name.strip_prefix(PREFIX).is_some_and(|h| super::hex(h, 32))
 }
 
 /// Opens the pipe `name`, waiting a while when blitz is busy with others.
@@ -161,6 +207,8 @@ pub fn connect(name: &str) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, Read, Write};
+
     use super::*;
 
     #[test]
@@ -180,5 +228,53 @@ mod tests {
         }
         assert!(!valid(&format!("{ok}0")));
         assert!(!valid(&format!("{ok}\\x")));
+    }
+
+    /// A caller that connects and says nothing is cut off at the deadline.
+    #[test]
+    fn control_a_silent_caller_is_cut_off() {
+        let name = format!("{PREFIX}{}", crate::pty::pane_token().expect("a name"));
+        let me = crate::hook::user_sid().expect("a SID");
+        let sddl = HSTRING::from(format!("D:P(A;;GA;;;{me})"));
+        let server = instance(&HSTRING::from(&name), &sddl, true).expect("a pipe");
+        let _silent = connect(&name).expect("connect");
+        let start = Instant::now();
+        within(Duration::from_millis(200), move || {
+            let _ = File::from(server).read(&mut [0; 1]);
+        });
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(200), "it waited: {took:?}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+    }
+
+    /// Callers past the cap are dropped at once, and blitz goes on
+    /// listening.
+    #[test]
+    fn control_callers_past_the_cap_are_dropped() {
+        let pipe = listen(|_| r#"{"ok":true}"#.into()).expect("listen");
+        let calls = || CALLS.load(Ordering::SeqCst);
+        let wait_for = |done: &dyn Fn() -> bool| {
+            let start = Instant::now();
+            while !done() {
+                assert!(start.elapsed() < Duration::from_secs(10), "{}", calls());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let idle: Vec<File> = (0..MAX_CALLS)
+            .map(|_| connect(&pipe).expect("connect"))
+            .collect();
+        wait_for(&|| calls() == MAX_CALLS);
+        let mut over = connect(&pipe).expect("connect");
+        let _ = over.write_all(b"{}\n");
+        let mut got = Vec::new();
+        let _ = over.read_to_end(&mut got);
+        assert!(got.is_empty(), "{got:?}");
+        drop(idle);
+        wait_for(&|| calls() == 0);
+        let mut c = connect(&pipe).expect("connect");
+        c.write_all(b"x\n").expect("write");
+        let mut reply = String::new();
+        io::BufReader::new(c).read_line(&mut reply).expect("read");
+        assert_eq!(reply, "{\"ok\":true}\n");
     }
 }

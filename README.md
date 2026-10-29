@@ -270,7 +270,9 @@ with `blitz pane`, from any shell in blitz:
 
 - `blitz pane split [--down] [--cwd DIR] [--focus] [CMD...]` opens a
   shell beside this pane, on the right or below, and prints its ID. CMD
-  is typed at its first prompt.
+  is typed at its first prompt, its words joined by spaces, so a command
+  with quotes of its own goes as one quoted string:
+  `blitz pane split "git commit -m 'fix the bug'"`.
 - `blitz pane tab [--cwd DIR] [--focus] [CMD...]` does the same in a new
   tab right after this pane's.
 - `blitz pane send ID [--key KEY]... [TEXT]` types TEXT into the pane as
@@ -295,14 +297,17 @@ A new pane starts in this pane's folder and leaves focus where it is.
 With `--focus` it takes focus, but only while you are in the pane that
 asked and have not typed for two seconds. TEXT goes in as a paste,
 with its control characters left out, and nothing presses Enter after
-it: add `--key enter` to run what it typed.
+it: add `--key enter` to run what it typed. A line break in TEXT goes
+as Enter does, though, so a program that does not mark pastes, such as
+cmd or PowerShell without PSReadLine, runs each line it ends.
 
 A program reaches only the panes it opened, and the panes those opened;
 never yours, nor the pane it runs in. `send` refuses a pane whose
 program has exited, and one where Claude Code is waiting for you: the
 answer is yours. Panes a program opened are not saved with the window,
 and **Reopen the last closed pane** does not bring them back; Enter on
-one whose program exited closes it.
+one whose program exited closes it. Once the pane that opened one
+closes, it is yours like any other.
 
 Errors go to stderr as `blitz: ...` with exit code 1, and a mistyped
 command exits with 2. A pane finds blitz by `BLITZ_PIPE` and itself by
