@@ -692,7 +692,7 @@ mod tests {
             let p = parse(name, text).pal;
             let text = contrast(p.fg, p.bg);
             assert!(text >= 4.5, "{name}: text contrast {text:.2}");
-            let sel = contrast(p.fg, p.selection_bg);
+            let sel = contrast(p.selection_fg, p.selection_bg);
             assert!(sel >= 4.5, "{name}: selected text contrast {sel:.2}");
             let cursor = contrast(p.cursor, p.bg);
             assert!(cursor >= 3.0, "{name}: cursor contrast {cursor:.2}");
@@ -966,14 +966,17 @@ mod tests {
 
     #[test]
     fn the_contrast_themes_meet_wcag_aaa() {
-        for t in all_in(None)
+        let all = all_in(None);
+        let themes: Vec<_> = all
             .iter()
             .filter(|t| t.name.starts_with("blitz contrast"))
-        {
+            .collect();
+        assert_eq!(themes.len(), 2);
+        for t in themes {
             let (p, ui) = (&t.pal, &t.ui);
             assert!(contrast(p.fg, p.bg) >= 7.0, "{}: text", t.name);
             assert!(
-                contrast(p.fg, p.selection_bg) >= 7.0,
+                contrast(p.selection_fg, p.selection_bg) >= 7.0,
                 "{}: selected",
                 t.name
             );

@@ -31,8 +31,8 @@ people who use blitz.
   text meets WCAG AAA. And Dracula, Nord, One Dark, One Light, Night
   Owl, Kanagawa Wave, Ayu Light and Everforest Light.
 - **blitz ember** and **blitz tide** no longer look like blitz dark and
-  light with a tint: ember glows orange on dark brown, tide aqua on deep
-  sea.
+  light with a tint: ember is orange on dark brown or peach, tide aqua on
+  deep sea or pale surf.
 - GitHub Dark and Light are gone, as blitz dark and light are near
   copies of them. A `theme` that names one gets blitz dark or light in
   its place. To keep the original, save `GitHub Dark Default` or
