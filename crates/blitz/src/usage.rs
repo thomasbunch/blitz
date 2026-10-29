@@ -1376,9 +1376,9 @@ mod tests {
         tr.read(since);
         assert_eq!(tr.rows.len(), 3);
         // Rewritten shorter, it is read again, and counts nothing twice.
-        std::fs::write(&log, format!("{a}\n{b}\n")).unwrap();
+        std::fs::write(&log, format!("{a}\n{}\n", line("f1", ts, SMALL))).unwrap();
         tr.read(since);
-        assert_eq!(tr.rows.len(), 3);
+        assert_eq!(tr.rows.len(), 4);
         assert_eq!(tr.projects[0].1, "shop", "named from the row's folder");
         // A log last written before the week cannot hold its rows.
         let old = dir.join("old.jsonl");
@@ -1388,7 +1388,7 @@ mod tests {
             .unwrap();
         drop(f);
         tr.read(since);
-        assert_eq!(tr.rows.len(), 3);
+        assert_eq!(tr.rows.len(), 4);
         assert!(!tr.files.contains_key(&old));
         // A workflow agent's log, deep down.
         let deep =
@@ -1402,7 +1402,7 @@ mod tests {
         std::fs::write(&agent, format!("{}\n", line("e1", ts, SMALL))).unwrap();
         std::fs::write(deep.join("agent-a.meta.json"), "{}").unwrap();
         tr.read(since);
-        assert_eq!(tr.rows.len(), 4);
+        assert_eq!(tr.rows.len(), 5);
         // A log deleted is forgotten.
         std::fs::remove_file(&log).unwrap();
         tr.read(since);
