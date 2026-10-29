@@ -32,7 +32,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
-use super::{PtyEvent, SpawnOpts, Writer, foreign, lock};
+use super::{PtyEvent, SpawnOpts, Writer, foreign, lock, with_path};
 
 /// Lay out glyphs by grapheme cluster, matching the terminal's width model.
 const PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES: u32 = 0x8;
@@ -509,18 +509,6 @@ fn start(
     // SAFETY: initialized above and no longer used.
     unsafe { DeleteProcThreadAttributeList(list) };
     result
-}
-
-/// `vars` with `path`, when there is one, in place of their PATH, whatever
-/// its case.
-fn with_path(
-    vars: impl IntoIterator<Item = (OsString, OsString)>,
-    path: Option<OsString>,
-) -> impl Iterator<Item = (OsString, OsString)> {
-    let fresh = path.is_some();
-    (vars.into_iter())
-        .filter(move |(k, _)| !fresh || !k.eq_ignore_ascii_case("PATH"))
-        .chain(path.map(|p| ("Path".into(), p)))
 }
 
 /// What WSL passes from a pane into Linux: how blitz describes itself, and

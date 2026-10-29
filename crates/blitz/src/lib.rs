@@ -5,6 +5,7 @@ pub mod arcade;
 pub mod attention;
 pub mod clipboard;
 pub mod config;
+pub mod control;
 pub mod debug;
 pub mod desktop;
 pub mod files;

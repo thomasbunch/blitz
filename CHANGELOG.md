@@ -65,6 +65,14 @@ people who use blitz.
   and `usage_reset_hour`, and the expanded sidebar shows the week's
   figure at its foot.
 
+### Scripting panes
+
+- `blitz pane split`, `tab`, `send`, `read`, `list` and `close` let a
+  script or an agent in a pane open panes of its own, type into them and
+  read what they show. A program reaches only the panes it opened, never
+  types into one waiting for you, and its panes are not saved with the
+  window.
+
 ## [0.0.5] - 2026-10-15
 
 The biggest release yet: a command palette, your own key bindings, find,

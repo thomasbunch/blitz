@@ -5,6 +5,7 @@ const USAGE: &str = "usage: blitz [DIR | --cwd DIR] [--new-window] [--cmd CMD]
        blitz --version | --help
        blitz setup claude [--wsl]
        blitz setup shell bash|zsh
+       blitz pane list | split | tab | send | read | close ...
        blitz debug run --script FILE [--cmd CMD] [--cwd DIR] [--cols N --rows N]
              [--timeout MS] [--trace FILE] [--setenv K=V]...
        blitz debug render (--vt FILE | --text FILE | --demo) --bmp OUT
@@ -59,6 +60,7 @@ fn main() {
             0
         }
         ["setup", ..] => blitz::hook::setup(&args[1..]),
+        ["pane", ..] => blitz::control::cli(&args[1..]),
         ["debug", "run", ..] => blitz::debug::run(&args[2..]),
         ["debug", "render", ..] => blitz::render::debug_render(&args[2..]),
         _ => {
@@ -70,13 +72,13 @@ fn main() {
 }
 
 /// Whether `args` ask for something said on the console rather than a
-/// window. `setup` or `debug` alone opens a folder of that name, as
-/// `blitz DIR` does, unless no such folder is there.
+/// window. `setup`, `pane` or `debug` alone opens a folder of that name,
+/// as `blitz DIR` does, unless no such folder is there.
 fn console(args: &[&str]) -> bool {
     match args {
         ["--version" | "--help" | "-h" | "/?", ..] => true,
-        [tool @ ("setup" | "debug")] => !std::path::Path::new(tool).is_dir(),
-        ["setup" | "debug", ..] => true,
+        [tool @ ("setup" | "pane" | "debug")] => !std::path::Path::new(tool).is_dir(),
+        ["setup" | "pane" | "debug", ..] => true,
         _ => false,
     }
 }
@@ -95,6 +97,7 @@ mod tests {
         assert!(!setup);
         assert!(debug);
         assert!(super::console(&["setup", "claude"]));
+        assert!(super::console(&["pane", "list"]));
         assert!(super::console(&["--version"]));
         assert!(!super::console(&["."]));
     }

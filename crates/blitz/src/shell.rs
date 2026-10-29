@@ -57,15 +57,39 @@ pub fn pane_env(path: Option<OsString>) -> impl Fn(&str) -> Option<OsString> {
     }
 }
 
-/// A variable as a new pane gets it: PATH from [`fresh_path`], the rest as
-/// blitz has them.
+/// The folder every pane's PATH ends with, which has `blitz pane`; see
+/// [`crate::hook::install_bin`].
+static PATH_TAIL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets the folder every new pane's PATH ends with, once.
+pub fn set_path_tail(dir: &Path) {
+    let _ = PATH_TAIL.set(dir.to_string_lossy().into_owned());
+}
+
+/// A variable as a new pane gets it: PATH from [`fresh_path`] and
+/// [`with_tail`], the rest as blitz has them.
 pub fn pane_var(k: &str) -> Option<OsString> {
     let var = std::env::var_os(k);
     if !k.eq_ignore_ascii_case("PATH") {
         return var;
     }
     let inherited = var.map(|v| v.to_string_lossy().into_owned());
-    fresh_path(registry_path(true), registry_path(false), inherited).map(Into::into)
+    let path = fresh_path(registry_path(true), registry_path(false), inherited);
+    with_tail(path, PATH_TAIL.get().map(String::as_str)).map(Into::into)
+}
+
+/// `path` with the folder `tail` last, unless it has it already. A program
+/// of the same name in any folder before it still comes first.
+fn with_tail(path: Option<String>, tail: Option<&str>) -> Option<String> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let Some(tail) = tail.filter(|t| !t.is_empty() && !t.contains(sep)) else {
+        return path;
+    };
+    match path {
+        Some(p) if p.split(sep).any(|d| d == tail) => Some(p),
+        Some(p) if !p.is_empty() => Some(format!("{}{sep}{tail}", p.trim_end_matches(sep))),
+        _ => Some(tail.to_owned()),
+    }
 }
 
 /// PATH for a new pane: `inherited`, blitz's own PATH, in its order, so a
@@ -1111,6 +1135,25 @@ PROMPT_COMMAND+=(three); . "$1"; declare -p PROMPT_COMMAND; echo "${PS0//[^C]}""
         assert_eq!(fresh_path(None, None, s("a;b")), s("a;b"));
         assert_eq!(fresh_path(None, s("u"), None), s("u"));
         assert_eq!(fresh_path(None, None, None), None);
+    }
+
+    /// `blitz pane` is found last, so a blitz or a program of that name
+    /// the user has comes first.
+    #[test]
+    fn new_panes_find_blitz_pane_last() {
+        let s = |v: &str| Some(v.to_string());
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let path = format!("a{sep}b{sep}");
+        assert_eq!(
+            with_tail(s(&path), Some("bin")),
+            Some(format!("a{sep}b{sep}bin"))
+        );
+        let had = format!("bin{sep}a");
+        assert_eq!(with_tail(s(&had), Some("bin")), s(&had), "once");
+        assert_eq!(with_tail(None, Some("bin")), s("bin"));
+        assert_eq!(with_tail(s("a"), None), s("a"));
+        let odd = format!("b{sep}in");
+        assert_eq!(with_tail(s("a"), Some(&odd)), s("a"), "a separator in it");
     }
 
     /// As a sign-in would, from variables blitz's own environment may not

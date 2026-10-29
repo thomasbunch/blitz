@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{PtyEvent, SpawnOpts, Writer, foreign, lock};
+use super::{PtyEvent, SpawnOpts, Writer, foreign, lock, with_path};
 
 /// The most one read of the terminal takes.
 const READ_BYTES: usize = 128 * 1024;
@@ -279,8 +279,9 @@ impl Pty {
     ) -> io::Result<Pty> {
         let (master, slave) = open(opts.cols, opts.rows)?;
         let mut cmd = command(opts.cmdline);
+        let parent = with_path(std::env::vars_os(), crate::shell::pane_var("PATH"));
         cmd.env_clear()
-            .envs(child_env(std::env::vars_os(), opts.pane_id, opts.env))
+            .envs(child_env(parent, opts.pane_id, opts.env))
             .stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
             .stderr(Stdio::from(slave));
