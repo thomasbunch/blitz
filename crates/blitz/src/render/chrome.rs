@@ -1750,7 +1750,7 @@ fn usage(
     let pw = s(560.0).min(a.w - s(32.0)).max(0);
     let width = pw - 2 * one - 2 * pad;
     let note: Vec<String> = (u.note.lines())
-        .flat_map(|l| wrap(l, width, tw, 3))
+        .flat_map(|l| wrap(l, width, tw, 6))
         .collect();
     let listed = !u.lines.is_empty();
     // Everything but the list: border, title, rules, note and hint.
@@ -3468,6 +3468,35 @@ mod tests {
         let note = |p: &Prim| matches!(p, Prim::Text { text, color, .. } if text == "Usage tracking is off." && *color == msg);
         assert!(c.prims.iter().any(note));
         assert!(texts(&c).contains(&"Enter turn on  \u{b7}  Esc close"));
+    }
+
+    #[test]
+    fn usage_tracking_says_whole_that_nothing_is_sent() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let help = (crate::config::SETTINGS.iter())
+            .find(|s| s.key == "usage_tracking")
+            .expect("the setting")
+            .help;
+        let mut rows = setting_rows();
+        rows[0].help = help;
+        m.settings = Some(Settings {
+            filter: "",
+            rows,
+            sel: 0,
+            top: 0,
+            error: None,
+        });
+        let shown = texts(&build(&m)).join(" ");
+        assert!(shown.contains(help), "{shown}");
+        // The panel's note too, in a larger font.
+        m.settings = None;
+        m.text_cell = (9, 19);
+        let off = crate::usage::panel(false, None, 0, 0);
+        let note = off.note.clone();
+        m.usage = Some(off);
+        let shown = texts(&build(&m)).join(" ");
+        assert!(shown.contains(&note), "{shown}");
     }
 
     #[test]

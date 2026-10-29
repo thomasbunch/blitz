@@ -334,9 +334,7 @@ pub const SETTINGS: &[Setting] = &[
         group: "Usage",
         label: "Track Claude Code usage",
         help: "Reads Claude Code's logs on this PC once a minute to show what \
-               your sessions would cost at API prices this week, by day, model \
-               and project. Claude Code usage and cost in the command palette \
-               shows it. Nothing is sent anywhere.",
+               your sessions would cost at API prices. Nothing is sent anywhere.",
         kind: Kind::Toggle,
         applies: NOW,
     },
