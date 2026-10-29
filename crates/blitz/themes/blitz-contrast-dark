@@ -1,0 +1,44 @@
+# blitz contrast dark
+# blitz original (MIT)
+background = #000000
+foreground = #ffffff
+cursor-color = #ffd400
+selection-background = #0050c8
+palette = 0=#262626
+palette = 1=#ff6666
+palette = 2=#4dff4d
+palette = 3=#ffd400
+palette = 4=#66b3ff
+palette = 5=#ff80ff
+palette = 6=#33ffff
+palette = 7=#e6e6e6
+palette = 8=#a6a6a6
+palette = 9=#ff9999
+palette = 10=#99ff99
+palette = 11=#ffe680
+palette = 12=#99ccff
+palette = 13=#ffb3ff
+palette = 14=#99ffff
+palette = 15=#ffffff
+accent = #ffd400
+# Window chrome. Leave these out and blitz mixes them from the colours above.
+sidebar-background = #0d0d0d
+border = #8c8c8c
+rule = #595959
+row-focus = #262626
+title = #ffffff
+dim = #c8c8c8
+message = #e6e6e6
+track = #404040
+progress = #ffffff
+error = #ff6666
+header-background = #0d0d0d
+header-line = #595959
+header-title = #ffffff
+header-cwd = #c8c8c8
+rail-focus = #262626
+rail-work = #e6e6e6
+idle = #8c8c8c
+label = #c8c8c8
+label-focus = #e6e6e6
+top-track = #262626

@@ -23,6 +23,24 @@ people who use blitz.
 - Double-clicking a session's row collapses the sidebar to the rail, and
   double-clicking one on the rail expands it again.
 
+### Themes
+
+- Fifteen new built-in themes. Radiant: **blitz neon** and **blitz
+  volt**. Retro: **blitz phosphor** and **blitz phosphor amber**. Plain:
+  **blitz paper light**, and **blitz contrast** dark and light, whose
+  text meets WCAG AAA. And Dracula, Nord, One Dark, One Light, Night
+  Owl, Kanagawa Wave, Ayu Light and Everforest Light.
+- **blitz ember** and **blitz tide** no longer look like blitz dark and
+  light with a tint: ember is orange on dark brown or peach, tide aqua on
+  deep sea or pale surf.
+- GitHub Dark and Light are gone, as blitz dark and light are near
+  copies of them. A `theme` that names one gets blitz dark or light in
+  its place. To keep the original, save `GitHub Dark Default` or
+  `GitHub Light Default` from
+  [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/ghostty)
+  in the themes folder as `GitHub Dark` or `GitHub Light`.
+- Each theme's swatch in the picker shows its text colour.
+
 ## [0.0.5] - 2026-10-15
 
 The biggest release yet: a command palette, your own key bindings, find,

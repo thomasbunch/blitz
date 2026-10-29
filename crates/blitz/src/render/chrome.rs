@@ -1284,8 +1284,9 @@ fn picker(
         width: 380.0,
         caret,
     };
-    // The theme's needs-you dot, then six of its colours, on its own
-    // background.
+    // The theme's needs-you dot, its text, then five of its colours, on
+    // its own background. Palette 3 is left out: the dot is that colour
+    // in most themes.
     let (sq, gap, one) = (s(8.0), s(4.0), s(1.0).max(1));
     let strip_w = 7 * sq + 8 * gap;
     let (_, _, field) = list(p, &l, c, a, &s, cells, |p, i, row, right| {
@@ -1310,7 +1311,11 @@ fn picker(
             stroke: 0.0,
             color: t.ui.mark,
         });
-        for (k, &col) in t.pal.ansi[1..7].iter().enumerate() {
+        let [_, red, green, _, blue, magenta, cyan, ..] = t.pal.ansi;
+        for (k, col) in [t.pal.fg, red, green, blue, magenta, cyan]
+            .into_iter()
+            .enumerate()
+        {
             p.push(Prim::Rect(square(k as i32 + 1), col));
         }
         strip.x
@@ -3454,9 +3459,9 @@ mod tests {
     }
 
     #[test]
-    fn picker_swatches_show_each_themes_needs_you_dot() {
+    fn picker_swatches_show_each_themes_dot_and_text() {
         let (win, sessions, now) = fleet(true);
-        let t = crate::theme::parse("teal", "accent = #2ec4b6");
+        let t = crate::theme::parse("teal", "accent = #2ec4b6\nforeground = #123456");
         let mut m = model(&win, &sessions, now);
         m.picker = Some(Picker {
             filter: "",
@@ -3469,6 +3474,8 @@ mod tests {
                 if *color == t.ui.mark && *radius == r.w as f32 / 2.0)
         };
         assert!(c.prims.iter().any(dot));
+        let text = |p: &Prim| matches!(p, Prim::Rect(r, 0x123456) if r.w == r.h);
+        assert!(c.prims.iter().any(text));
     }
 
     #[test]
