@@ -325,6 +325,10 @@ Built in, in the picker's order:
 - Radiant: **blitz neon**, pink and cyan on deep violet; **blitz volt**,
   electric lime on black; and **blitz ember** and **blitz tide**, each
   dark and light, glowing orange on dark brown and aqua on deep sea.
+- Retro and plain: **blitz phosphor** and **blitz phosphor amber**, the
+  green and amber screens of old terminals; **blitz paper light**, ink
+  on warm paper; and **blitz contrast** dark and light, whose text meets
+  WCAG AAA.
 - For developers, as their authors made them: Catppuccin Mocha and
   Latte, Gruvbox Dark and Light, Rose Pine and Rose Pine Dawn, Solarized
   Dark and Light, and Tokyo Night and Tokyo Night Day.
@@ -676,6 +680,8 @@ and swap repeat; the others act once, so a held key never answers its own
   effects are off. `flash = false` stops the taskbar button flashing.
 - With a Windows contrast theme on and the `theme` setting at its
   default, blitz takes the contrast theme's colours.
+- **blitz contrast** dark and light keep text at 7:1 or more (WCAG AAA)
+  and program colours at 4.5:1, without a Windows contrast theme.
 - blitz keeps the system caret, hidden, on the cursor, so Magnifier and
   other tools that follow the text cursor follow it. Claude Code draws a
   cursor of its own instead; set `CLAUDE_CODE_ACCESSIBILITY=1` in your

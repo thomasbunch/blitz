@@ -25,8 +25,10 @@ people who use blitz.
 
 ### Themes
 
-- Two new built-in themes, both radiant: **blitz neon** and **blitz
-  volt**.
+- Seven new built-in themes. Radiant: **blitz neon** and **blitz volt**.
+  Retro: **blitz phosphor** and **blitz phosphor amber**. Plain: **blitz
+  paper light**, and **blitz contrast** dark and light, whose text meets
+  WCAG AAA.
 - **blitz ember** and **blitz tide** no longer look like blitz dark and
   light with a tint: ember glows orange on dark brown, tide aqua on deep
   sea.

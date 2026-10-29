@@ -1,0 +1,44 @@
+# blitz phosphor amber
+# blitz original (MIT)
+background = #0f0a02
+foreground = #ffb43d
+cursor-color = #ffd27a
+selection-background = #4a3008
+palette = 0=#261a08
+palette = 1=#ff5c3d
+palette = 2=#d6cc4a
+palette = 3=#ffe14d
+palette = 4=#e0a860
+palette = 5=#ff8c6b
+palette = 6=#f0cc80
+palette = 7=#e6c08c
+palette = 8=#7d5c2b
+palette = 9=#ff8466
+palette = 10=#e6e080
+palette = 11=#fff08c
+palette = 12=#f2c890
+palette = 13=#ffb39c
+palette = 14=#ffe0a8
+palette = 15=#fff0d6
+accent = #fff04d
+# Window chrome. Leave these out and blitz mixes them from the colours above.
+sidebar-background = #0c0802
+border = #573d14
+rule = #3f2c0e
+row-focus = #271b08
+title = #ffdda8
+dim = #a67527
+message = #eea839
+track = #442f0f
+progress = #ffb43d
+error = #ff5c3d
+header-background = #1d1405
+header-line = #31220a
+header-title = #c88d2f
+header-cwd = #936822
+rail-focus = #271b08
+rail-work = #ffb43d
+idle = #3f2c0e
+label = #936822
+label-focus = #a67527
+top-track = #271b08

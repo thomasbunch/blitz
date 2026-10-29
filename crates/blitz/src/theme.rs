@@ -35,6 +35,23 @@ const BUILTIN: &[(&str, &str)] = &[
         "blitz tide light",
         include_str!("../themes/blitz-tide-light"),
     ),
+    ("blitz phosphor", include_str!("../themes/blitz-phosphor")),
+    (
+        "blitz phosphor amber",
+        include_str!("../themes/blitz-phosphor-amber"),
+    ),
+    (
+        "blitz paper light",
+        include_str!("../themes/blitz-paper-light"),
+    ),
+    (
+        "blitz contrast dark",
+        include_str!("../themes/blitz-contrast-dark"),
+    ),
+    (
+        "blitz contrast light",
+        include_str!("../themes/blitz-contrast-light"),
+    ),
     (
         "Catppuccin Mocha",
         include_str!("../themes/catppuccin-mocha"),
@@ -884,6 +901,30 @@ mod tests {
             // SGR 90, the grey of hints and Claude Code's tool results.
             let grey = contrast(p.ansi[8], p.bg);
             assert!(grey >= 1.5, "{}: palette 8 contrast {grey:.2}", t.name);
+        }
+    }
+
+    #[test]
+    fn the_contrast_themes_meet_wcag_aaa() {
+        for t in all_in(None)
+            .iter()
+            .filter(|t| t.name.starts_with("blitz contrast"))
+        {
+            let (p, ui) = (&t.pal, &t.ui);
+            assert!(contrast(p.fg, p.bg) >= 7.0, "{}: text", t.name);
+            assert!(
+                contrast(p.fg, p.selection_bg) >= 7.0,
+                "{}: selected",
+                t.name
+            );
+            for (i, &c) in p.ansi.iter().enumerate().skip(1) {
+                let on = contrast(c, p.bg);
+                assert!(on >= 4.5, "{}: palette {i} {on:.2}", t.name);
+            }
+            for c in [ui.name, ui.msg, ui.dim, ui.label, ui.label_focus] {
+                let on = contrast(c, ui.side_bg);
+                assert!(on >= 7.0, "{}: {c:06x} on the sidebar {on:.2}", t.name);
+            }
         }
     }
 

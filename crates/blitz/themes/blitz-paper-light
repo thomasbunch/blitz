@@ -1,0 +1,44 @@
+# blitz paper light
+# blitz original (MIT)
+background = #e6dcc6
+foreground = #2a241d
+cursor-color = #2a241d
+selection-background = #d2c3a3
+palette = 0=#2a241d
+palette = 1=#a3271c
+palette = 2=#46691f
+palette = 3=#855600
+palette = 4=#234f94
+palette = 5=#8a2f75
+palette = 6=#1e6a65
+palette = 7=#6e6457
+palette = 8=#5e554a
+palette = 9=#bf3a2b
+palette = 10=#557a2a
+palette = 11=#9e6a0a
+palette = 12=#3463ab
+palette = 13=#a1438a
+palette = 14=#2a807a
+palette = 15=#a69a87
+accent = #e05a1a
+# Window chrome. Leave these out and blitz mixes them from the colours above.
+sidebar-background = #ded4bf
+border = #cac0ad
+rule = #ccc2ae
+row-focus = #d3cab5
+title = #13100d
+dim = #534c42
+message = #2a241d
+track = #c0b7a4
+progress = #645d51
+error = #a3271c
+header-background = #dad0bb
+header-line = #d3cab5
+header-title = #3d362e
+header-cwd = #5d564b
+rail-focus = #cec4b0
+rail-work = #61594e
+idle = #b1a897
+label = #5b5449
+label-focus = #534c42
+top-track = #d6ccb8
