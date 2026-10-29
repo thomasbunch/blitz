@@ -185,15 +185,10 @@ impl Tracking {
                 if !send(t.report(now, reset, off)) {
                     return;
                 }
-                match asked.recv_timeout(EVERY) {
-                    Ok(r) => reset = r,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                }
-                // A burst of asks costs one read.
-                while let Ok(r) = asked.try_recv() {
-                    reset = r;
-                }
+                let Some(r) = wait(&asked, reset) else {
+                    return;
+                };
+                reset = r;
             }
         });
         Tracking {
@@ -211,6 +206,25 @@ impl Tracking {
         }
         self.reset = reset;
         let _ = self.ask.send(reset);
+    }
+}
+
+/// Waits up to `EVERY` for an ask, and gives the reset to read for next:
+/// the last one asked, or `reset` when none came. `None` once the
+/// `Tracking` is dropped, even with asks still queued.
+fn wait(asked: &mpsc::Receiver<Reset>, mut reset: Reset) -> Option<Reset> {
+    match asked.recv_timeout(EVERY) {
+        Ok(r) => reset = r,
+        Err(mpsc::RecvTimeoutError::Timeout) => return Some(reset),
+        Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+    }
+    // A burst of asks costs one read.
+    loop {
+        match asked.try_recv() {
+            Ok(r) => reset = r,
+            Err(mpsc::TryRecvError::Empty) => return Some(reset),
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+        }
     }
 }
 
@@ -1399,6 +1413,18 @@ mod tests {
                 .report(0, (0, 0), UTC)
                 .found
         );
+    }
+
+    #[test]
+    fn tracking_reads_once_for_a_burst_and_not_once_dropped() {
+        let (ask, asked) = mpsc::channel();
+        ask.send((1, 0)).unwrap();
+        ask.send((3, 17)).unwrap();
+        assert_eq!(wait(&asked, (0, 0)), Some((3, 17)));
+        // Asks still queued when it is dropped are not read for.
+        ask.send((2, 0)).unwrap();
+        drop(ask);
+        assert_eq!(wait(&asked, (0, 0)), None);
     }
 
     #[test]
