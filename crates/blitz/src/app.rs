@@ -1846,7 +1846,7 @@ impl App {
         crate::handoff::install(self.hwnd, self.proxy.clone(), self.args.main());
         crate::notify::install(self.hwnd, self.proxy.clone());
         watch_settings(self.proxy.clone());
-        let plugin = crate::hook::install_plugin();
+        let plugin = crate::hook::install_plugin(self.config.claude_pane_tools);
         // `blitz pane` in every pane, found after the programs on its PATH.
         if let (Some(dir), Ok(hook)) = (&plugin, crate::hook::hook_exe())
             && let Some(bin) = crate::hook::install_bin(dir, &hook)
@@ -3139,6 +3139,7 @@ impl App {
             self.font_zoom = 0.0;
         }
         let jump = c.global_jump != self.config.global_jump;
+        let tools = c.claude_pane_tools != self.config.claude_pane_tools;
         // The banner, and an update left for when blitz closes, go with
         // the checks; looks stop at the next start.
         if self.config.check_updates && !c.check_updates {
@@ -3152,6 +3153,10 @@ impl App {
         self.config = c;
         if jump {
             self.global_jump();
+        }
+        // Claude Code sessions started from now on load the plugin so.
+        if tools {
+            crate::hook::install_plugin(self.config.claude_pane_tools);
         }
         self.keep_awake();
         if font {

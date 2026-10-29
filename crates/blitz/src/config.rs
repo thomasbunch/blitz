@@ -52,6 +52,9 @@ pub struct Config {
     pub restore_scrollback: bool,
     /// Keep the PC from going to sleep while a session works.
     pub keep_awake: bool,
+    /// Give each Claude Code session the pane tools of
+    /// [`crate::control::mcp`].
+    pub claude_pane_tools: bool,
     /// Pixel scenery behind the panes, one of
     /// [`SCENES`](crate::arcade::scenery::SCENES).
     pub scenery: String,
@@ -104,6 +107,7 @@ impl Default for Config {
             restore_claude: true,
             restore_scrollback: false,
             keep_awake: false,
+            claude_pane_tools: true,
             scenery: "off".into(),
             mascot: false,
             right_click_paste: true,
@@ -225,6 +229,15 @@ pub const SETTINGS: &[Setting] = &[
                working. The screen can still turn off.",
         kind: Kind::Toggle,
         applies: NOW,
+    },
+    Setting {
+        key: "claude_pane_tools",
+        group: "Sessions",
+        label: "Pane tools for Claude Code",
+        help: "Gives each Claude Code session tools to open, read and type into \
+               panes it opens. New sessions pick it up.",
+        kind: Kind::Toggle,
+        applies: NEW_PANES,
     },
     Setting {
         key: "shell",
@@ -466,6 +479,7 @@ impl Config {
             "restore_claude" => flag(self.restore_claude),
             "restore_scrollback" => flag(self.restore_scrollback),
             "keep_awake" => flag(self.keep_awake),
+            "claude_pane_tools" => flag(self.claude_pane_tools),
             "flash" => flag(self.flash),
             "toasts" => quote(&self.toasts),
             "sound" => flag(self.sound),
@@ -580,6 +594,7 @@ impl Config {
             "restore_claude" => &mut self.restore_claude,
             "restore_scrollback" => &mut self.restore_scrollback,
             "keep_awake" => &mut self.keep_awake,
+            "claude_pane_tools" => &mut self.claude_pane_tools,
             "flash" => &mut self.flash,
             "sound" => &mut self.sound,
             "global_jump" => &mut self.global_jump,
@@ -1390,6 +1405,7 @@ scenery = stars
             ("restore_claude", "false"),
             ("restore_scrollback", "true"),
             ("keep_awake", "true"),
+            ("claude_pane_tools", "false"),
             ("flash", "false"),
             ("toasts", "\"all\""),
             ("sound", "true"),

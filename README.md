@@ -182,6 +182,27 @@ front; half a minute without a key or mouse touch counts as away, even
 with blitz in front. Ctrl+Shift+J goes to questions you have not seen
 first, then those you have, then finished sessions, then failed ones.
 
+### Pane tools
+
+blitz's plugin gives each Claude Code session tools for panes of its
+own, the same as [`blitz pane`](#scripting-panes): `open` starts a shell
+beside the session's pane or in a tab after it, typing a command at its
+first prompt; `send` types into one and presses keys; `read` returns
+what one shows; `list` lists them; `close` closes one. They reach only
+the panes the session opened, and the panes those opened: never yours,
+nor the session's own.
+
+Claude Code asks you before it first uses each tool, as for any other.
+**Allowing `open` or `send` for good is as broad as allowing Bash:**
+Claude can then run any command in a shell without asking. `list` and
+`read` only look. In permission rules the tools are
+`mcp__plugin_blitz_pane__open` and so on, and `/mcp` lists them under
+`plugin:blitz:pane`.
+
+Turn **Pane tools for Claude Code** (`claude_pane_tools`) off in the
+settings to leave them out; Claude Code sessions started after that do
+not have them.
+
 ### Other agents
 
 Agents with hooks of their own can report the same way: `blitz-hook
@@ -351,6 +372,7 @@ there shows in the panel with what blitz uses instead.
 | `restore_claude` | `true` | Resume the Claude Code sessions they were running |
 | `restore_scrollback` | `false` | Save each pane's last 1000 lines when blitz closes and show them again above the new prompt. Off by default because old output can contain secrets |
 | `keep_awake` | `false` | Keep the PC from going to sleep by itself while Claude Code works in a session, as its hooks say |
+| `claude_pane_tools` | `true` | Give each new Claude Code session tools to open, read and type into the panes it opens. See [Pane tools](#pane-tools) |
 | `check_updates` | `true` | Look for a newer release |
 | `flash` | `true` | Flash the taskbar button when a session needs you |
 | `toasts` | `"needs-you"` | Windows notifications while blitz is in the background: `"needs-you"` for sessions that need you or failed, `"all"` for finished ones too, or `"off"`. Clicking one takes you to the session |

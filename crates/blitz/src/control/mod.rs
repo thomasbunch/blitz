@@ -19,6 +19,7 @@ use crate::attention::Attn;
 use crate::hook::{Json, escape_json};
 use crate::layout::{Dir, PaneId};
 
+pub mod mcp;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
