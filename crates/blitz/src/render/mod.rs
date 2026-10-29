@@ -1347,6 +1347,12 @@ mod tests {
         assert_eq!(toward(0x123456, 0x123456), 0x123456);
     }
 
+    /// The tests that draw take turns. Linux's Vulkan loader can crash
+    /// naming an object while another thread destroys a device, and wgpu
+    /// names everything it makes in a debug build.
+    #[cfg(any(windows, unix))]
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The colour of the pixel at (`x`, `y`) of `w`-wide BGRA pixels.
     #[cfg(any(windows, unix))]
     fn pixel(px: &[u8], w: u32, x: u32, y: u32) -> u32 {
@@ -1358,6 +1364,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn render_too_large_a_target_is_an_error() {
+        let _turn = TURN.lock();
         let r = Renderer::new(true, 16.0).expect("renderer");
         let max = r.gpu.device.limits().max_texture_dimension_2d;
         assert!(r.gpu.offscreen(max + 1, 4).is_err());
@@ -1369,6 +1376,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_clipped_keeps_a_grid_inside_its_pane() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let snap = text_snapshot("\u{2588}\u{2588}\u{2588}", 3, 1, &p);
@@ -1396,6 +1404,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_unfocused_pane_hollows_cursor_and_hides_selection() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}  ", 3, 1, &p);
@@ -1429,6 +1438,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_glyph_under_a_block_cursor_takes_the_background() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}\u{2588}", 2, 1, &p);
@@ -1462,6 +1472,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_strike_and_overline_cross_the_cell() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         // Through the terminal, so the attributes come from SGR.
@@ -1498,6 +1509,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_set_font_draws_at_the_new_size() {
+        let _turn = TURN.lock();
         let p = pal();
         let snap = text_snapshot("\u{2588}", 1, 1, &p);
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1562,6 +1574,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_snapshot_draws_glyphs_and_cursor() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("A\u{2588}", 3, 1, &p);
@@ -1589,6 +1602,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_dim_text_is_halfway_to_its_background() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}\u{2588}", 2, 1, &p);
@@ -1612,6 +1626,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_text_close_to_its_background_shows_but_shapes_keep_their_colour() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         // Black text on the dark background, underlined so its colour
@@ -1638,6 +1653,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_underline_selection_and_bar_cursor() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("_中x", 4, 2, &p);
@@ -1669,6 +1685,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_program_cursor_colour_and_hollow_cursor() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let (cw, ch) = r.cell();
@@ -1705,6 +1722,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_bar_and_underline_cursors_show_over_text_at_any_scale() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let (cw, ch) = r.cell();
@@ -1744,6 +1762,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_lines_and_underline_colours() {
+        let _turn = TURN.lock();
         use vt::snapshot::attr;
 
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1792,6 +1811,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_selection_shows_text_close_to_its_background() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("\u{2588}", 1, 1, &p);
@@ -1807,6 +1827,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_theme_colours_for_selected_text_and_text_on_the_cursor() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = Palette {
             selection_fg: 0x00ff00,
@@ -1834,6 +1855,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_search_matches_and_the_current_one() {
+        let _turn = TURN.lock();
         use vt::snapshot::Highlight;
 
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -1876,6 +1898,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_block_selection_takes_the_same_columns_of_each_row() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("", 3, 2, &p);
@@ -1895,6 +1918,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_link_under_the_pointer_is_underlined() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("", 3, 2, &p);
@@ -1915,6 +1939,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_chrome_shapes_and_text() {
+        let _turn = TURN.lock();
         use crate::layout::Rect;
         use chrome::{Chrome, Prim};
 
@@ -1975,6 +2000,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_italic_text_draws_another_face() {
+        let _turn = TURN.lock();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let p = pal();
         let mut snap = text_snapshot("ll", 2, 1, &p);
@@ -1994,6 +2020,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_full_atlas_leaves_earlier_glyphs_alone() {
+        let _turn = TURN.lock();
         let p = pal();
         let snap = text_snapshot("HELLO\nabcdefghijklmnopqrstuvwxyz0123456789", 36, 2, &p);
         let mut r = Renderer::new(true, 16.0).expect("renderer");
@@ -2008,6 +2035,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_glyph_too_big_for_the_atlas_is_left_out() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         r.set_atlas_size(8, 8);
@@ -2024,6 +2052,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_wide_clusters_stay_inside_their_grid() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         let mut snap = text_snapshot("ab", 4, 1, &p);
@@ -2053,6 +2082,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_combining_marks_stay_on_their_character() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         // Ink in the first and second cell of `text` on a 2x1 screen.
@@ -2087,6 +2117,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     fn render_warp_spreads_font_lookups_over_frames() {
+        let _turn = TURN.lock();
         let p = pal();
         let mut r = Renderer::new(true, 16.0).expect("renderer");
         // More new fallback characters than one frame looks up.
