@@ -131,6 +131,22 @@ impl Panel {
         self.sel = self.sel.saturating_add_signed(by).min(last);
     }
 
+    /// Keeps the highlight, and the wait for new keys, on their action when
+    /// the keys change from `old` to `new`, which can take actions out of
+    /// the list or put them in. When it goes, the highlight stays in the
+    /// list and the wait stops.
+    pub fn rekey(&mut self, old: &[Binding], new: &[Binding]) {
+        let held = (self.capture.as_ref().map(|c| c.action)).or_else(|| self.selected(old));
+        let found = self.matches(new);
+        match found.iter().position(|&a| Some(a) == held) {
+            Some(i) => self.sel = i,
+            None => {
+                self.sel = self.sel.min(found.len().saturating_sub(1));
+                self.capture = None;
+            }
+        }
+    }
+
     /// Waits for new keys for the highlighted action.
     pub fn wait(&mut self, user: &[Binding]) {
         self.capture = (self.selected(user)).map(|action| Capture {
@@ -439,6 +455,36 @@ mod tests {
         assert!(keymap::chords(Action::NewTab, &c.keys).is_empty());
         let both = [chord("ctrl+shift+t"), chord("ctrl+shift+r")];
         assert_eq!(keymap::chords(Action::SplitRight, &c.keys), both);
+    }
+
+    // Windows' and Linux's chords.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_highlight_stays_on_its_action_as_keys_change() {
+        let mut c = config::Config::default();
+        let previous = Action::CycleTab(-1);
+        let mut p = panel("ctrl+shift+t");
+        p.move_by(1, &c.keys);
+        assert_eq!(p.selected(&c.keys), Some(previous));
+        p.wait(&c.keys);
+        p.press(Some(chord("ctrl+shift+t")), &c.keys);
+        let r = p.press(Some(chord("enter")), &c.keys);
+        let old = c.keys.clone();
+        c.set_keys(&r);
+        p.rekey(&old, &c.keys);
+        // New tab has no Ctrl+Shift+T now, so it left the list above.
+        assert_eq!(p.matches(&c.keys), [previous]);
+        assert_eq!(p.selected(&c.keys), Some(previous));
+        // A config.toml that takes the waiting action out of the list
+        // stops the wait.
+        p.wait(&c.keys);
+        let given = config::Config::parse(
+            "keybind = ctrl+shift+t=none\n\
+             keybind = ctrl+shift+tab=none\n",
+        );
+        p.rekey(&c.keys, &given.keys);
+        assert!(p.capture.is_none() && p.matches(&given.keys).is_empty());
+        assert_eq!(p.sel, 0);
     }
 
     // Windows' and Linux's chords.

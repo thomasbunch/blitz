@@ -2865,6 +2865,9 @@ impl App {
             self.at_close = kept_at_close(self.at_close.take(), self.updating.is_some());
         }
         let skipped = c.skips_other_lines(&self.config);
+        if let Some(p) = &mut self.shortcuts {
+            p.rekey(&self.config.keys, &c.keys);
+        }
         self.config = c;
         if jump {
             self.global_jump();
