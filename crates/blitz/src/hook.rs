@@ -512,11 +512,7 @@ fn setup_claude(wsl: bool) -> i32 {
         print!("{}", claude_settings(&path));
         return 0;
     }
-    let settings = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::home_dir().map(|h| h.join(".claude")))
-        .unwrap_or_default()
-        .join("settings.json");
+    let settings = claude_dir().unwrap_or_default().join("settings.json");
     eprintln!(
         "blitz loads these hooks itself in its panes, with Claude Code 2.1.280 or\n\
          later: there is nothing to set up. An older Claude Code, or settings that\n\
@@ -533,6 +529,15 @@ fn setup_claude(wsl: bool) -> i32 {
     }
     print!("{}", claude_settings(&hook.to_string_lossy()));
     0
+}
+
+/// Claude Code's own folder: `CLAUDE_CONFIG_DIR`, or `.claude` in the home
+/// folder.
+pub fn claude_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|h| h.join(".claude")))
 }
 
 /// `C:\x\y` where WSL mounts it, `/mnt/c/x/y`; `None` for a path not on a

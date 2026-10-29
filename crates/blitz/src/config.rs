@@ -33,6 +33,14 @@ pub struct Config {
     /// Whether BEL, or a notification without the pane's token, in an
     /// unfocused pane asks for attention.
     pub bell_attention: bool,
+    /// Read Claude Code's logs to show what its sessions would cost; see
+    /// [`crate::usage`].
+    pub usage_tracking: bool,
+    /// The day the user's Claude plan's weekly limit resets, one of
+    /// [`DAYS`].
+    pub usage_reset_day: String,
+    /// The hour of that reset, 0 to 23, local time.
+    pub usage_reset_hour: u8,
     /// Look for a newer release on GitHub at start and every six hours.
     pub check_updates: bool,
     /// Reopen the last window's tabs, splits and folders at start.
@@ -88,6 +96,9 @@ impl Default for Config {
             sound: false,
             global_jump: false,
             bell_attention: true,
+            usage_tracking: false,
+            usage_reset_day: "mon".into(),
+            usage_reset_hour: 0,
             check_updates: true,
             restore_session: true,
             restore_claude: true,
@@ -136,6 +147,9 @@ pub struct Setting {
 /// The values of `toasts`: none, sessions that need the user or failed,
 /// and finished ones too.
 pub const TOASTS: &[&str] = &["off", "needs-you", "all"];
+
+/// The values of `usage_reset_day`, Monday first.
+pub const DAYS: &[&str] = &["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 pub const NOW: &str = "Applies now";
 const NEW_PANES: &str = "Applies to new panes";
@@ -326,6 +340,32 @@ pub const SETTINGS: &[Setting] = &[
         applies: NOW,
     },
     Setting {
+        key: "usage_tracking",
+        group: "Usage",
+        label: "Track Claude Code usage",
+        help: "Reads Claude Code's logs on this PC once a minute to show what \
+               your sessions would cost at API prices. Nothing is sent anywhere.",
+        kind: Kind::Toggle,
+        applies: NOW,
+    },
+    Setting {
+        key: "usage_reset_day",
+        group: "Usage",
+        label: "Week starts on",
+        help: "The day your Claude plan's weekly limit resets, as claude.ai's \
+               usage page shows it. The usage panel counts each week from then.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
+        key: "usage_reset_hour",
+        group: "Usage",
+        label: "Week starts at",
+        help: "The hour of that reset, by this PC's clock.",
+        kind: Kind::Choice,
+        applies: NOW,
+    },
+    Setting {
         key: "check_updates",
         group: "Updates",
         label: "Check for updates",
@@ -431,6 +471,9 @@ impl Config {
             "sound" => flag(self.sound),
             "global_jump" => flag(self.global_jump),
             "bell_attention" => flag(self.bell_attention),
+            "usage_tracking" => flag(self.usage_tracking),
+            "usage_reset_day" => quote(&self.usage_reset_day),
+            "usage_reset_hour" => self.usage_reset_hour.to_string(),
             "check_updates" => flag(self.check_updates),
             "scenery" => quote(&self.scenery),
             "mascot" => flag(self.mascot),
@@ -491,6 +534,14 @@ impl Config {
                 s if TOASTS.contains(&s.as_str()) => self.toasts = s,
                 _ => return false,
             },
+            "usage_reset_day" => match text.to_lowercase() {
+                s if DAYS.contains(&s.as_str()) => self.usage_reset_day = s,
+                _ => return false,
+            },
+            "usage_reset_hour" => match num.filter(|n| (0.0..=23.0).contains(n)) {
+                Some(n) if n.fract() == 0.0 => self.usage_reset_hour = n as u8,
+                _ => return false,
+            },
             "font_size" => match num.filter(|n| (4.0..=72.0).contains(n)) {
                 Some(n) => self.font_size = n as f32,
                 None => return false,
@@ -533,6 +584,7 @@ impl Config {
             "sound" => &mut self.sound,
             "global_jump" => &mut self.global_jump,
             "bell_attention" => &mut self.bell_attention,
+            "usage_tracking" => &mut self.usage_tracking,
             "check_updates" => &mut self.check_updates,
             "mascot" => &mut self.mascot,
             "right_click_paste" => &mut self.right_click_paste,
@@ -1269,6 +1321,32 @@ scenery = stars
     }
 
     #[test]
+    fn config_reads_the_usage_week() {
+        let c = Config::parse("usage_reset_day = \"Thu\"\nusage_reset_hour = 17\n");
+        assert_eq!(
+            (c.usage_reset_day.as_str(), c.usage_reset_hour),
+            ("thu", 17)
+        );
+        assert_eq!(crate::usage::reset(&c), (3, 17));
+        // A day's whole name is skipped, as is an hour past 23, part of
+        // one, or one in quotes.
+        let c = Config::parse(
+            "usage_reset_day = \"thursday\"\n\
+             usage_reset_hour = 24\n\
+             usage_reset_hour = 1.5\n\
+             usage_reset_hour = \"5\"\n",
+        );
+        assert_eq!(c.ignored.len(), 4);
+        let d = Config::default();
+        assert_eq!((d.usage_reset_day.as_str(), d.usage_reset_hour), ("mon", 0));
+        assert_eq!(
+            (&c.usage_reset_day, c.usage_reset_hour),
+            (&d.usage_reset_day, 0)
+        );
+        assert!(!d.usage_tracking);
+    }
+
+    #[test]
     fn config_missing_file_gives_defaults() {
         let t = Temp::new("missing");
         let path = t.0.join(FILE);
@@ -1317,6 +1395,9 @@ scenery = stars
             ("sound", "true"),
             ("global_jump", "true"),
             ("bell_attention", "false"),
+            ("usage_tracking", "true"),
+            ("usage_reset_day", "\"thu\""),
+            ("usage_reset_hour", "17"),
             ("check_updates", "false"),
             ("scenery", "\"snow\""),
             ("mascot", "true"),

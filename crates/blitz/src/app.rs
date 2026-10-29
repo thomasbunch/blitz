@@ -179,6 +179,8 @@ pub enum UserEvent {
     GlobalJump,
     /// A folder or file read for a pane's Files view.
     Files(PaneId, files::Loaded),
+    /// What the reader of Claude Code's logs found.
+    Usage(Box<crate::usage::Report>),
 }
 
 /// Command-line options of the GUI.
@@ -238,10 +240,12 @@ impl Args {
 
     /// A scripted or test run, which nobody watches.
     fn scripted(&self) -> bool {
-        self.cmd.is_some()
-            || self.selftest.is_some()
-            || self.exit_after.is_some()
-            || self.capture.is_some()
+        self.cmd.is_some() || self.test()
+    }
+
+    /// A test run: a self-test, a capture or one set to exit.
+    fn test(&self) -> bool {
+        self.selftest.is_some() || self.exit_after.is_some() || self.capture.is_some()
     }
 
     /// A window of its own, which takes no launches. Run as administrator,
@@ -1155,6 +1159,12 @@ struct App {
     settings: Option<Panel>,
     /// Where the settings panel was in the last frame, for clicks.
     settings_hits: Option<chrome::SettingsHits>,
+    /// Usage tracking, while it is on.
+    usage: Option<crate::usage::Tracking>,
+    /// The usage panel while it is open: its first line shown.
+    usage_panel: Option<usize>,
+    /// Where the usage panel was in the last frame, for clicks.
+    usage_hits: Option<Rect>,
     /// The keyboard shortcuts, while they are open. Drawn as the settings
     /// panel is, and in its place.
     shortcuts: Option<crate::shortcuts::Panel>,
@@ -1694,6 +1704,9 @@ impl App {
             picker: None,
             settings: None,
             settings_hits: None,
+            usage: None,
+            usage_panel: None,
+            usage_hits: None,
             shortcuts: None,
             game: None,
             game_ended: None,
@@ -1936,6 +1949,7 @@ impl App {
                 }
             });
         }
+        self.track_usage();
         Ok(())
     }
 
@@ -2465,7 +2479,72 @@ impl App {
             }),
             spark: self.config.mascot.then(|| self.anim_time()),
             game: self.game.as_ref().map(|g| &g.0),
+            usage: self.usage_panel.map(|top| {
+                let on = self.config.usage_tracking;
+                crate::usage::panel(on, self.usage_report(), crate::usage::now(), top)
+            }),
+            usage_line: self.usage_report().and_then(crate::usage::sidebar),
         }
+    }
+
+    /// What the reader of Claude Code's logs last found, while tracking is
+    /// on.
+    fn usage_report(&self) -> Option<&crate::usage::Report> {
+        self.usage.as_ref().and_then(|t| t.report.as_deref())
+    }
+
+    /// Starts or stops reading Claude Code's logs as the settings say, and
+    /// reads them again for a week that starts at another time. Test runs
+    /// never read the user's logs; a `--cmd` run, `claude` say, does.
+    fn track_usage(&mut self) {
+        let reset = crate::usage::reset(&self.config);
+        if !self.config.usage_tracking || self.args.test() {
+            // Its thread ends with it.
+            self.usage = None;
+        } else if let Some(t) = &mut self.usage {
+            if t.reset != reset {
+                t.ask(reset);
+            }
+        } else {
+            let proxy = self.proxy.clone();
+            let send = move |r| proxy.send_event(UserEvent::Usage(Box::new(r))).is_ok();
+            self.usage = Some(crate::usage::Tracking::start(reset, send));
+        }
+    }
+
+    /// Opens the usage panel in place of the settings panel, reading the
+    /// logs again so it shows what is new, or closes it.
+    fn toggle_usage(&mut self) {
+        if self.usage_panel.take().is_none() {
+            self.settings = None;
+            self.shortcuts = None;
+            self.usage_panel = Some(0);
+            if let Some(t) = &mut self.usage {
+                t.ask(t.reset);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// A key while the usage panel is open: arrows and Page Up and Down
+    /// scroll it, Esc closes it, and Enter turns tracking on while it is
+    /// off.
+    fn usage_key(&mut self, k: &KeyInput) {
+        let Some(top) = &mut self.usage_panel else {
+            return;
+        };
+        match k.vk {
+            VK_ESCAPE => self.usage_panel = None,
+            VK_UP => *top = top.saturating_sub(1),
+            VK_DOWN => *top = top.saturating_add(1),
+            VK_PRIOR => *top = top.saturating_sub(10),
+            VK_NEXT => *top = top.saturating_add(10),
+            VK_RETURN if !self.config.usage_tracking => {
+                self.set_setting("usage_tracking", Some("true".into()));
+            }
+            _ => return,
+        }
+        self.request_redraw();
     }
 
     /// Seconds into the scenery and spark animations; always 0 when
@@ -2639,6 +2718,7 @@ impl App {
     /// settings panel.
     fn open_shortcuts(&mut self) {
         self.settings = None;
+        self.usage_panel = None;
         self.shortcuts = Some(Default::default());
         self.request_redraw();
     }
@@ -2884,6 +2964,7 @@ impl App {
         if self.picker.is_none() {
             self.set_theme_from_config();
         }
+        self.track_usage();
         self.request_redraw();
     }
 
@@ -3145,8 +3226,8 @@ impl App {
     /// theme picker, the settings panel or the keyboard shortcuts, or for
     /// the find bar. False when none is open.
     fn filter_text(&mut self, t: &str) -> bool {
-        if self.game.is_some() {
-            // The game takes keys, not text.
+        if self.game.is_some() || self.usage_panel.is_some() {
+            // The game and the usage panel take keys, not text.
         } else if let Some(cm) = &mut self.commands {
             cm.filter.push_str(t);
             cm.sel = 0;
@@ -3695,16 +3776,18 @@ impl App {
             || self.shortcuts.is_some()
             || self.find.is_some()
             || self.game.is_some()
+            || self.usage_panel.is_some()
             || self.current().is_some_and(|v| v.files.is_some());
         let taken = self.eaten.0.contains(&k.vk);
         if held && k.down && keymap::drops_repeat(k, &self.config.keys, taken, panel) {
             return;
         }
         // A paste key pastes into the open panel's text field; blitz run
-        // has none, and a shortcut closes it. An action waiting for new
-        // keys takes it as its keys instead.
+        // and the usage panel have none, and a shortcut closes them. An
+        // action waiting for new keys takes it as its keys instead.
         if panel
             && self.game.is_none()
+            && self.usage_panel.is_none()
             && !self.shortcuts.as_ref().is_some_and(|p| p.capture.is_some())
             && k.down
             && keymap::action(k, &self.config.keys) == Some(Action::Paste)
@@ -3791,6 +3874,29 @@ impl App {
                 _ => self.shortcuts_key(k),
             }
             return;
+        }
+        // The usage panel takes keys too, but another shortcut closes it
+        // and runs; its own closes it. One that would reach the pane only
+        // closes it.
+        if self.usage_panel.is_some() && k.down {
+            match keymap::action(k, &self.config.keys) {
+                Some(Action::Usage) => {}
+                Some(a) if usage_runs(a) => {
+                    self.usage_panel = None;
+                    self.request_redraw();
+                }
+                Some(_) => {
+                    self.eaten.press(k.vk);
+                    self.usage_panel = None;
+                    self.request_redraw();
+                    return;
+                }
+                None => {
+                    self.eaten.press(k.vk);
+                    self.usage_key(k);
+                    return;
+                }
+            }
         }
         // And for quick select.
         if self.quick.is_some() && k.down {
@@ -4289,6 +4395,7 @@ impl App {
             Action::ThemePicker => self.open_picker(),
             Action::Settings => self.open_settings(),
             Action::Keys => self.open_shortcuts(),
+            Action::Usage => self.toggle_usage(),
             Action::GoToSession => {
                 let now = Instant::now();
                 let list = (self.sessions().iter())
@@ -5222,7 +5329,8 @@ impl App {
             let open = self.commands.is_some()
                 || self.settings.is_some()
                 || self.shortcuts.is_some()
-                || self.game.is_some();
+                || self.game.is_some()
+                || self.usage_panel.is_some();
             if let (Some(id), false) = (self.hit(self.mouse.pos).0, open) {
                 self.show(id);
             }
@@ -5232,8 +5340,17 @@ impl App {
         if pressed && self.quick.take().is_some() {
             self.request_redraw();
         }
-        // Presses go to the command palette or the settings panel; a
-        // release still goes wherever its press went.
+        // Presses go to the usage panel, the command palette or the
+        // settings panel; a release still goes wherever its press went. A
+        // click outside the usage panel closes it.
+        if pressed && self.usage_panel.is_some() {
+            let (x, y) = (self.mouse.pos.x as i32, self.mouse.pos.y as i32);
+            if b == 0 && !self.usage_hits.is_some_and(|r| r.contains(x, y)) {
+                self.usage_panel = None;
+                self.request_redraw();
+            }
+            return;
+        }
         if pressed && self.commands.is_some() {
             if b == 0 {
                 self.commands_click(el);
@@ -5313,6 +5430,7 @@ impl App {
                     }
                 }
                 Some(Side::More(ids)) => self.show_hidden(&ids),
+                Some(Side::Usage) => self.toggle_usage(),
                 Some(Side::Rail) => {
                     self.toggle_sidebar();
                 }
@@ -5605,7 +5723,8 @@ impl App {
             || self.settings.is_some()
             || self.shortcuts.is_some()
             || self.picker.is_some()
-            || self.game.is_some();
+            || self.game.is_some()
+            || self.usage_panel.is_some();
         let divider = self.divider_at(pos).map(|d| d.1).filter(|_| !panel);
         let hand = self.hover.is_some()
             || self.banner.as_ref().is_some_and(|b| inside(&b.0))
@@ -5702,7 +5821,10 @@ impl App {
             return;
         }
         let (x, y) = (pos.x as i32, pos.y as i32);
-        let panel = self.commands.is_some() || self.settings.is_some() || self.shortcuts.is_some();
+        let panel = self.commands.is_some()
+            || self.settings.is_some()
+            || self.shortcuts.is_some()
+            || self.usage_panel.is_some();
         let over = (x < self.tab_area().x && !panel).then(|| self.side.at(x, y));
         self.set_over_side(over.flatten());
         self.update_hover();
@@ -5745,6 +5867,11 @@ impl App {
         }
         if let Some(cm) = &mut self.commands {
             cm.move_by(-steps as isize);
+            self.request_redraw();
+            return;
+        }
+        if let Some(top) = &mut self.usage_panel {
+            *top = top.saturating_add_signed(-steps as isize);
             self.request_redraw();
             return;
         }
@@ -5881,6 +6008,13 @@ impl App {
         self.below = std::mem::take(&mut chrome.below);
         self.find_bar = chrome.find;
         self.settings_hits = chrome.settings.take();
+        self.usage_hits = chrome.usage.map(|(panel, top)| {
+            // Where it scrolled to, so arrows go on from there.
+            if let Some(t) = &mut self.usage_panel {
+                *t = top;
+            }
+            panel
+        });
         self.commands_hits = chrome.commands.take();
         if let (Some(p), Some(h)) = (&mut self.settings, &self.settings_hits) {
             p.top = h.top;
@@ -6514,6 +6648,16 @@ fn ime_area(
 /// closes the bar. Paste is left to the bar.
 fn find_runs(a: Action) -> bool {
     a != Action::Paste
+}
+
+/// Whether a shortcut pressed while the usage panel is open runs once it
+/// closes the panel. Those that type into the pane, or hand it a copy key
+/// with nothing to copy, would reach a program the panel was covering.
+fn usage_runs(a: Action) -> bool {
+    !matches!(
+        a,
+        Action::Copy | Action::CopyUnindented | Action::Paste | Action::SendText(_)
+    )
 }
 
 /// Whether shortcut `a` runs while the Files view covers the focused
@@ -8106,6 +8250,14 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Pane(id, note) => self.on_pane(el, id, note),
             UserEvent::Branch(id, dir, branch) => self.on_branch(id, dir, branch),
+            UserEvent::Usage(r) => {
+                // A report after tracking was turned off, or for the week
+                // before the reset changed, is dropped.
+                if let Some(t) = self.usage.as_mut().filter(|t| t.reset == r.reset) {
+                    t.report = Some(r);
+                    self.request_redraw();
+                }
+            }
             UserEvent::Files(id, loaded) => {
                 if let Some(f) = self.view_mut(id).and_then(|v| v.files.as_mut()) {
                     f.accept(loaded);
@@ -9764,6 +9916,26 @@ mod tests {
     }
 
     #[test]
+    fn only_shortcuts_that_leave_the_pane_alone_run_over_usage() {
+        for a in [
+            Action::Palette,
+            Action::SplitRight,
+            Action::ScrollPage(1),
+            Action::Settings,
+        ] {
+            assert!(usage_runs(a), "{a:?}");
+        }
+        for a in [
+            Action::Copy,
+            Action::CopyUnindented,
+            Action::Paste,
+            Action::SendText(0),
+        ] {
+            assert!(!usage_runs(a), "{a:?}");
+        }
+    }
+
+    #[test]
     fn app_shortcuts_close_the_find_bar_and_run() {
         for a in [
             Action::Copy,
@@ -10732,6 +10904,9 @@ mod tests {
         };
         assert!(parse(&["--capture", "f.bmp"]).scripted());
         assert!(!parse(&["--cwd", "C:\\", "--new-window"]).scripted());
+        // A command of the user's own is no test run, and reads their logs.
+        assert!(a.test() && parse(&["--capture", "f.bmp"]).test());
+        assert!(!parse(&["--cmd", "claude"]).test());
     }
 
     #[cfg(windows)]
@@ -11183,7 +11358,11 @@ mod tests {
         c.filter = "claude".into();
         assert_eq!(
             c.matches(),
-            [run(Action::NewClaude), run(Action::ClaudeSetup)]
+            [
+                run(Action::NewClaude),
+                run(Action::ClaudeSetup),
+                run(Action::Usage)
+            ]
         );
         // Actions with no keys are here too.
         c.filter = "claude setup".into();

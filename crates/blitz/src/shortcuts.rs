@@ -61,7 +61,8 @@ fn group(a: Action) -> usize {
         | Action::JumpToAttention
         | Action::GoToSession
         | Action::RenameSession
-        | Action::ClaudeSetup => 5,
+        | Action::ClaudeSetup
+        | Action::Usage => 5,
         Action::Palette
         | Action::Keys
         | Action::Settings

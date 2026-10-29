@@ -1,7 +1,7 @@
 //! The settings panel: which settings match what was typed, what each one
 //! shows, and the value the arrow keys move it to.
 
-use crate::config::{Config, FALLBACK_FONTS, Kind, SETTINGS, Setting, TOASTS, quote};
+use crate::config::{Config, DAYS, FALLBACK_FONTS, Kind, SETTINGS, Setting, TOASTS, quote};
 use crate::keymap::{self, Action};
 use crate::render::chrome::SettingRow;
 
@@ -115,6 +115,10 @@ impl Panel {
                 .collect(),
             "editor_uri" => (EDITORS.iter())
                 .map(|(name, uri)| (name.to_string(), quote(uri)))
+                .collect(),
+            "usage_reset_day" => DAYS.iter().map(|d| (title(d), quote(d))).collect(),
+            "usage_reset_hour" => (0..24)
+                .map(|h| (crate::usage::clock_time(h * 3600), h.to_string()))
                 .collect(),
             _ => Vec::new(),
         };
@@ -238,7 +242,7 @@ fn title(s: &str) -> String {
 }
 
 /// `10000` as `10,000`.
-fn thousands(n: usize) -> String {
+pub(crate) fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
@@ -498,6 +502,24 @@ mod tests {
         assert!(c.set("toasts", &next));
         assert_eq!(p.shown(toasts, &c), "All");
         assert_eq!(p.step(toasts, &c, 1, false), None);
+    }
+
+    #[test]
+    fn usage_week_steps_through_days_and_hours() {
+        let (p, c) = (panel(), Config::default());
+        let day = setting("usage_reset_day");
+        assert_eq!(p.shown(day, &c), "Mon");
+        assert_eq!(p.step(day, &c, 1, false).as_deref(), Some("\"tue\""));
+        assert_eq!(p.step(day, &c, -1, false), None);
+        let hour = setting("usage_reset_hour");
+        assert_eq!(p.shown(hour, &c), "12 am");
+        assert_eq!(p.step(hour, &c, -1, false), None);
+        assert_eq!(p.step(hour, &c, 1, false).as_deref(), Some("1"));
+        let pm = Config {
+            usage_reset_hour: 17,
+            ..Config::default()
+        };
+        assert_eq!(p.shown(hour, &pm), "5 pm");
     }
 
     #[test]

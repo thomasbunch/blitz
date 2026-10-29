@@ -173,6 +173,20 @@ pub fn local_stamp() -> String {
     }
 }
 
+/// How far the local clock is ahead of UTC, in seconds, at Unix time `t`,
+/// daylight saving included.
+pub fn utc_offset(t: i64) -> i64 {
+    let t = t as libc::time_t;
+    // SAFETY: `t` and `tm` are plain values the call reads and fills.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
 /// Whether blitz runs as root.
 pub fn elevated() -> bool {
     // SAFETY: a plain query.
@@ -418,5 +432,13 @@ mod tests {
         assert_eq!(s.len(), 16, "{s}");
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[10..11], " ");
+    }
+
+    #[test]
+    fn the_clock_is_at_most_14_hours_off_utc() {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        assert!(utc_offset(now).abs() <= 14 * 3600);
     }
 }

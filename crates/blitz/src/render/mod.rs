@@ -931,14 +931,21 @@ mod gpu {
     /// `--rows` give the window size in pixels, `--picker` opens the
     /// theme picker filtered to `--picker`'s value, `--settings N` opens
     /// the settings panel with row N highlighted, `--keys N` draws the
-    /// keyboard shortcuts with row N highlighted (over `--settings`), and
-    /// `--find TEXT` finds TEXT in the focused pane.
+    /// keyboard shortcuts with row N highlighted (over `--settings`),
+    /// `--find TEXT` finds TEXT in the focused pane, and `--usage` opens
+    /// the usage panel on a made-up week.
     fn render_demo(
         r: &mut Renderer,
         theme: &crate::theme::Theme,
         collapsed: bool,
         banner: Option<&str>,
-        (picker, settings, keys, find): (Option<&str>, Option<usize>, Option<usize>, Option<&str>),
+        (picker, settings, keys, find, usage): (
+            Option<&str>,
+            Option<usize>,
+            Option<usize>,
+            Option<&str>,
+            bool,
+        ),
         (w, h): (u32, u32),
         scale: f32,
     ) -> Result<Vec<u8>> {
@@ -1120,6 +1127,8 @@ mod gpu {
             game: None,
             commands: None,
             find: None,
+            usage: None,
+            usage_line: None,
         };
         // One setting changed, to show its mark and a switch that is off,
         // and one action given more keys.
@@ -1155,6 +1164,11 @@ mod gpu {
                 top: 0,
                 error: None,
             });
+        }
+        if usage {
+            let r = demo_usage();
+            model.usage = Some(crate::usage::panel(true, Some(&r), 0, 0));
+            model.usage_line = crate::usage::sidebar(&r);
         }
         let themes = crate::theme::all();
         if let Some(f) = picker {
@@ -1225,11 +1239,57 @@ mod gpu {
         r.gpu.read(&target)
     }
 
+    /// A week of Claude Code at the default reset, three days and nine
+    /// hours before the next one.
+    fn demo_usage() -> crate::usage::Report {
+        let named = |rows: &[(&str, f64)]| rows.iter().map(|&(n, c)| (n.to_string(), c)).collect();
+        crate::usage::Report {
+            reset: (0, 0),
+            found: true,
+            week: (0, (3 * 24 + 9) * 3600),
+            since: "Mon 12 am".into(),
+            this: crate::usage::Spend {
+                cost: 412.3,
+                saved: 3610.0,
+                requests: 1234,
+                tokens: [
+                    (1_200_000, 4.8),
+                    (3_400_000, 68.0),
+                    (29_900_000, 149.5),
+                    (950_000_000, 190.0),
+                ],
+            },
+            last: 380.1,
+            days: named(&[
+                ("Mon 26", 88.2),
+                ("Tue 27", 97.3),
+                ("Wed 28", 113.2),
+                ("Thu 29", 113.6),
+            ]),
+            models: vec![
+                ("Opus 5.5".into(), Some(398.2), false),
+                ("Haiku 4.5".into(), Some(14.1), false),
+            ],
+            projects: named(&[
+                ("shop", 240.5),
+                ("infra", 96.3),
+                ("db", 50.2),
+                ("web", 20.1),
+                ("docs", 3.4),
+                ("site", 1.8),
+            ]),
+            agents: 151.7,
+            window: Some(("7:45 pm".into(), 12.4)),
+            ..Default::default()
+        }
+    }
+
     pub fn debug_render(args: &[String]) -> std::result::Result<String, String> {
         let mut vt_file = None;
         let mut text_file = None;
         let mut bmp = None;
         let (mut warp, mut light, mut demo, mut collapsed) = (false, false, false, false);
+        let mut usage = false;
         let (mut banner, mut theme, mut picker, mut settings) = (None, None, None, None);
         let (mut keys, mut find) = (None, None);
         let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
@@ -1255,6 +1315,7 @@ mod gpu {
                 "--settings" => settings = Some(usize::from(num(val()?)?)),
                 "--keys" => keys = Some(usize::from(num(val()?)?)),
                 "--find" => find = Some(val()?.clone()),
+                "--usage" => usage = true,
                 "--script" => {
                     return Err("--script is not supported yet; pass --vt FILE".into());
                 }
@@ -1282,7 +1343,7 @@ mod gpu {
                 &theme,
                 collapsed,
                 banner.as_deref(),
-                (picker.as_deref(), settings, keys, find.as_deref()),
+                (picker.as_deref(), settings, keys, find.as_deref(), usage),
                 (w, h),
                 scale,
             )

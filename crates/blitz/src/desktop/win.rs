@@ -223,6 +223,42 @@ pub fn local_stamp() -> String {
     )
 }
 
+/// How far the local clock is ahead of UTC, in seconds, at Unix time `t`,
+/// daylight saving included.
+pub fn utc_offset(t: i64) -> i64 {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{
+        FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime,
+    };
+    // FILETIME counts 100 ns from 1601.
+    let Some(ticks) = (u64::try_from(t).ok())
+        .and_then(|s| s.checked_add(11_644_473_600)?.checked_mul(10_000_000))
+    else {
+        return 0;
+    };
+    let utc = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let (mut st, mut local, mut out) = (
+        SYSTEMTIME::default(),
+        SYSTEMTIME::default(),
+        FILETIME::default(),
+    );
+    // SAFETY: each call reads and writes the plain values passed by
+    // pointer; None is the time zone in use.
+    let ok = unsafe {
+        FileTimeToSystemTime(&utc, &mut st).is_ok()
+            && SystemTimeToTzSpecificLocalTime(None, &st, &mut local).is_ok()
+            && SystemTimeToFileTime(&local, &mut out).is_ok()
+    };
+    if !ok {
+        return 0;
+    }
+    let local = (u64::from(out.dwHighDateTime) << 32) | u64::from(out.dwLowDateTime);
+    (local as i64 - ticks as i64) / 10_000_000
+}
+
 /// Whether blitz runs elevated, as administrator.
 pub fn elevated() -> bool {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -521,5 +557,14 @@ mod tests {
         assert!(!sign_in_starts(true, Some(0x07)));
         assert!(!sign_in_starts(false, None));
         assert!(!sign_in_starts(false, Some(0x02)));
+    }
+
+    #[test]
+    fn the_clock_is_at_most_14_hours_off_utc() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        assert!(utc_offset(now).abs() <= 14 * 3600);
+        assert_eq!(utc_offset(-1), 0);
     }
 }

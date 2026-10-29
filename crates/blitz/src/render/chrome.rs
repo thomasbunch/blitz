@@ -95,6 +95,10 @@ pub struct ChromeModel<'a> {
     pub game: Option<&'a crate::arcade::run::Run>,
     pub commands: Option<Commands<'a>>,
     pub find: Option<FindBar<'a>>,
+    pub usage: Option<Usage>,
+    /// What Claude Code's sessions cost this week, at the foot of the
+    /// expanded sidebar.
+    pub usage_line: Option<String>,
 }
 
 /// The find bar, drawn at the top right of the focused pane.
@@ -186,6 +190,28 @@ pub struct SettingRow {
     pub changed: bool,
 }
 
+/// The usage panel, drawn over the panes.
+pub struct Usage {
+    /// Said on the title line: the week the figures count.
+    pub head: String,
+    pub lines: Vec<UsageLine>,
+    /// The first line to show.
+    pub top: usize,
+    /// Said under the figures, or in their place while there are none.
+    /// Each line of it is wrapped on its own.
+    pub note: String,
+    pub hint: &'static str,
+}
+
+/// A line of the usage panel.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UsageLine {
+    Head(&'static str),
+    /// What a figure is, the figure, and its share of the largest in its
+    /// group, drawn as a bar.
+    Row(String, String, Option<f32>),
+}
+
 /// Where the settings panel went, for clicks.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SettingsHits {
@@ -240,6 +266,8 @@ pub struct Chrome {
     /// The find bar, for clicks.
     pub find: Option<Rect>,
     pub settings: Option<SettingsHits>,
+    /// The usage panel, for clicks, and the first line it shows.
+    pub usage: Option<(Rect, usize)>,
     /// The command palette and each row it shows, by index, for clicks.
     pub commands: Option<(Rect, Vec<(usize, Rect)>)>,
     /// Where text typed into the open panel or bar goes next, for the IME,
@@ -256,6 +284,8 @@ pub struct SideHits {
     pub heads: Vec<(usize, Rect)>,
     /// The "+N more" footer and the sessions it stands for.
     pub more: Option<(Rect, Vec<PaneId>)>,
+    /// The week's cost at the foot.
+    pub usage: Option<Rect>,
     /// The collapsed rail.
     pub rail: Option<Rect>,
 }
@@ -268,6 +298,8 @@ pub enum Side {
     Tab(usize),
     /// The "+N more" footer, with the sessions it stands for.
     More(Vec<PaneId>),
+    /// The week's cost at the foot.
+    Usage,
     /// The rail between its rows.
     Rail,
 }
@@ -284,6 +316,9 @@ impl SideHits {
         }
         if let Some((_, ids)) = self.more.as_ref().filter(|m| inside(&m.0)) {
             return Some(Side::More(ids.clone()));
+        }
+        if self.usage.is_some_and(|r| inside(&r)) {
+            return Some(Side::Usage);
         }
         self.rail.filter(inside).map(|_| Side::Rail)
     }
@@ -606,7 +641,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
         // every pane.
         let lh = th + s(3.0);
         let cue = (m.banner.filter(|_| bh == 0)).and_then(|msg| foot_lines(msg, side, m.scale, tw));
-        let bottom = h - cue.as_ref().map_or(0, |l| l.len() as i32 * lh + s(10.0));
+        let mut bottom = h - cue.as_ref().map_or(0, |l| l.len() as i32 * lh + s(10.0));
         if let Some(lines) = cue {
             let foot = Rect {
                 x: 0,
@@ -631,6 +666,20 @@ pub fn build(m: &ChromeModel) -> Chrome {
             for (i, l) in lines.iter().enumerate() {
                 text(p, s(16.0), first + i as i32 * lh, l, c.dim, false);
             }
+        }
+        // Above the cue, what Claude Code cost this week; a click on it
+        // opens the usage panel.
+        if let Some(line) = &m.usage_line {
+            bottom -= lh + s(10.0);
+            let strip = Rect {
+                x: 0,
+                y: bottom,
+                w: side - 1,
+                h: lh + s(10.0),
+            };
+            let ty = bottom + s(5.0) + (lh - th) / 2;
+            text(p, s(16.0), ty, &fit(line, side - s(24.0), tw), c.dim, false);
+            out.side.usage = Some(strip);
         }
         let (gh, gap) = (s(26.0), s(2.0));
         let (l1, l2, l3) = (s(18.0).max(th), s(16.0).max(th), s(17.0).max(th));
@@ -984,8 +1033,11 @@ pub fn build(m: &ChromeModel) -> Chrome {
             });
         }
     }
-    let typing =
-        m.find.is_some() || m.settings.is_some() || m.picker.is_some() || m.commands.is_some();
+    let typing = m.find.is_some()
+        || m.settings.is_some()
+        || m.picker.is_some()
+        || m.commands.is_some()
+        || m.usage.is_some();
     if let (Some((col, row, t)), Some(r), false) = (m.preedit, pane(tab.focus), typing) {
         let (x, y) = (r.x + i32::from(col) * cw, r.y + i32::from(row) * ch);
         // Cut at the pane's edge, so a long composition cannot draw over
@@ -1021,6 +1073,9 @@ pub fn build(m: &ChromeModel) -> Chrome {
         let hits = settings(&mut extra, st, c, area, s, (tw, th), to_settings);
         out.field = out.field.or(to_settings.then_some(hits.field));
         out.settings = Some(hits);
+    }
+    if let Some(u) = &m.usage {
+        out.usage = Some(usage(&mut extra, u, c, area, s, (tw, th)));
     }
     if let Some(pk) = &m.picker {
         let at = picker(&mut extra, pk, c, area, s, (tw, th), to_picker);
@@ -1707,6 +1762,142 @@ fn settings(
     hits
 }
 
+/// The usage panel: the title and the week it counts, the figures under
+/// group headings, each with a bar for its share, a note and a key hint.
+/// Returns the panel and the first line shown: `u.top`, or less when that
+/// would leave the panel short of lines.
+fn usage(
+    p: &mut Vec<Prim>,
+    u: &Usage,
+    c: &Ui,
+    a: Rect,
+    s: impl Fn(f32) -> i32,
+    (tw, th): (i32, i32),
+) -> (Rect, usize) {
+    let text = |p: &mut Vec<Prim>, x, y, t: String, color, bold| {
+        p.push(Prim::Text {
+            x,
+            y,
+            text: t,
+            color,
+            bold,
+            term: false,
+        });
+    };
+    let (pad, line_h, one, gap) = (s(16.0), th + s(10.0), s(1.0).max(1), s(4.0));
+    let (head_h, note_h) = (line_h + gap, th + s(4.0));
+    let pw = s(560.0).min(a.w - s(32.0)).max(0);
+    let width = pw - 2 * one - 2 * pad;
+    let note: Vec<String> = (u.note.lines())
+        .flat_map(|l| wrap(l, width, tw, 6))
+        .collect();
+    let listed = !u.lines.is_empty();
+    // Everything but the list: border, title, rules, note and hint.
+    let lower = if listed { gap + one + s(8.0) } else { 0 };
+    let fixed = 2 * one + head_h + one + gap + lower + note.len() as i32 * note_h + s(4.0) + line_h;
+    let room = (a.h - s(48.0) - fixed) / line_h.max(1);
+    let shown = match listed {
+        true => room.clamp(1, u.lines.len() as i32) as usize,
+        false => 0,
+    };
+    let top = u.top.min(u.lines.len() - shown);
+    let ph = fixed + shown as i32 * line_h;
+    let panel = Rect {
+        x: a.x + (a.w - pw) / 2,
+        y: a.y + s(48.0).min((a.h - ph) / 2).max(0),
+        w: pw,
+        h: ph,
+    };
+    p.push(Prim::Rect(panel, c.border));
+    let inner = inset(panel, one);
+    p.push(Prim::Rect(inner, c.side_bg));
+    let (left, right) = (inner.x + pad, inner.right() - pad);
+    let mid = |y: i32, hh: i32| y + (hh - th) / 2;
+    let rule = |p: &mut Vec<Prim>, y| {
+        let r = Rect {
+            x: inner.x,
+            y,
+            w: inner.w,
+            h: one,
+        };
+        p.push(Prim::Rect(r, c.rule));
+    };
+
+    let mut y = inner.y;
+    text(p, left, mid(y, head_h), "Usage".into(), c.name, true);
+    let head = fit(&u.head, right - left - text_w("Usage", tw) - 2 * tw, tw);
+    let hx = right - text_w(&head, tw);
+    text(p, hx, mid(y, head_h), head, c.dim, false);
+    y += head_h;
+    rule(p, y);
+    y += one + gap;
+
+    // The bars line up: each starts past the longest label with a bar and
+    // ends short of the widest figure.
+    let barred = (u.lines.iter()).filter_map(|l| match l {
+        UsageLine::Row(label, value, Some(_)) => Some((label, value)),
+        _ => None,
+    });
+    let label_w = (barred.clone().map(|(l, _)| text_w(l, tw)).max())
+        .unwrap_or(0)
+        .min((right - left) / 2);
+    let value_w = barred.map(|(_, v)| text_w(v, tw)).max().unwrap_or(0);
+    let (x0, x1) = (left + label_w + s(16.0), right - value_w - s(12.0));
+    for line in u.lines.iter().skip(top).take(shown) {
+        match line {
+            UsageLine::Head(g) => {
+                let ty = y + line_h - th - s(3.0);
+                text(p, left, ty, g.to_uppercase(), c.dim, false);
+            }
+            UsageLine::Row(label, value, frac) => {
+                let (ty, vx) = (mid(y, line_h), right - text_w(value, tw));
+                text(p, vx, ty, value.clone(), c.name, false);
+                let end = if frac.is_some() {
+                    left + label_w
+                } else {
+                    vx - s(8.0)
+                };
+                text(p, left, ty, fit(label, end - left, tw), c.msg, false);
+                if let Some(f) = frac.filter(|&f| f > 0.0)
+                    && x1 > x0
+                {
+                    let bar = Rect {
+                        x: x0,
+                        y: y + (line_h - s(4.0)) / 2,
+                        w: (((x1 - x0) as f32 * f.min(1.0)).round() as i32).max(1),
+                        h: s(4.0),
+                    };
+                    p.push(Prim::Rect(bar, c.fill));
+                }
+            }
+        }
+        y += line_h;
+    }
+    // Under the figures, or with none in their place.
+    let color = if listed {
+        y += gap;
+        rule(p, y);
+        y += one + s(8.0);
+        c.dim
+    } else {
+        c.msg
+    };
+    for l in note {
+        text(p, left, y, l, color, false);
+        y += note_h;
+    }
+    let hy = inner.bottom() - line_h;
+    text(
+        p,
+        left,
+        mid(hy, line_h),
+        fit(u.hint, right - left, tw),
+        c.dim,
+        false,
+    );
+    (panel, top)
+}
+
 /// The update cue `msg` on the lines it takes at the foot of a sidebar
 /// `side` px wide, or None when it does not fit there whole, such as a
 /// failure that names the installer's long log path.
@@ -2052,6 +2243,8 @@ mod tests {
             game: None,
             commands: None,
             find: None,
+            usage: None,
+            usage_line: None,
         }
     }
 
@@ -3289,6 +3482,145 @@ mod tests {
         assert!(texts(&c).contains(&"shop api"));
         assert!(!texts(&c).contains(&unnamed), "a name is typed");
         assert!(c.commands.expect("palette").1.is_empty(), "no rows to pick");
+    }
+
+    fn usage_panel(lines: usize, top: usize) -> Usage {
+        let row = |i: usize| match i % 10 {
+            0 => UsageLine::Head("By day"),
+            _ => UsageLine::Row(format!("Day {i}"), format!("${i}.00"), Some(0.5)),
+        };
+        Usage {
+            head: "since Thu 5 pm \u{b7} resets in 2d 4h".into(),
+            lines: (0..lines).map(row).collect(),
+            top,
+            note: "Priced at API rates.\nSet the week in the settings.".into(),
+            hint: "\u{2191}\u{2193} scroll  \u{b7}  Esc close",
+        }
+    }
+
+    #[test]
+    fn usage_panel_shows_its_figures_and_scrolls() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.usage = Some(usage_panel(40, 0));
+        let c = build(&m);
+        let (panel, top) = c.usage.expect("the panel");
+        assert_eq!(top, 0);
+        let a = area(&win, m.size, 1.0, None, 7);
+        assert!(panel.x > a.x && panel.right() < a.right() && panel.bottom() <= AREA.h);
+        let t = texts(&c);
+        for want in [
+            "Usage",
+            "since Thu 5 pm \u{b7} resets in 2d 4h",
+            "BY DAY",
+            "Day 1",
+            "$1.00",
+        ] {
+            assert!(t.contains(&want), "missing {want:?} in {t:?}");
+        }
+        // Each note line on its own, under the figures.
+        assert!(
+            t.contains(&"Priced at API rates.") && t.contains(&"Set the week in the settings.")
+        );
+        let shown = t.iter().filter(|x| x.starts_with("Day ")).count();
+        assert!(shown > 5 && shown < 36, "{shown} of 36 rows");
+        // Scrolled past the end, it stops with the last line in view.
+        m.usage = Some(usage_panel(40, 100));
+        let c = build(&m);
+        let (_, top) = c.usage.expect("the panel");
+        assert!(top > 0 && top < 40);
+        assert!(texts(&c).contains(&"Day 39"));
+        // A bar for each row, in the fill colour, none past the panel.
+        let fill = m.ui.fill;
+        let bars: Vec<Rect> = (c.prims.iter())
+            .filter_map(|p| match p {
+                Prim::Rect(r, color) if *color == fill && r.h == 4 => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !bars.is_empty()
+                && bars
+                    .iter()
+                    .all(|b| b.x > panel.x && b.right() < panel.right())
+        );
+        assert!(bars.windows(2).all(|w| w[0].x == w[1].x), "they line up");
+    }
+
+    #[test]
+    fn a_usage_panel_with_no_figures_says_why() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        m.usage = Some(Usage {
+            note: "Usage tracking is off.".into(),
+            hint: "Enter turn on  \u{b7}  Esc close",
+            ..usage_panel(0, 3)
+        });
+        let c = build(&m);
+        assert_eq!(c.usage.map(|u| u.1), Some(0));
+        let msg = m.ui.msg;
+        let note = |p: &Prim| matches!(p, Prim::Text { text, color, .. } if text == "Usage tracking is off." && *color == msg);
+        assert!(c.prims.iter().any(note));
+        assert!(texts(&c).contains(&"Enter turn on  \u{b7}  Esc close"));
+    }
+
+    #[test]
+    fn usage_tracking_says_whole_that_nothing_is_sent() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        let help = (crate::config::SETTINGS.iter())
+            .find(|s| s.key == "usage_tracking")
+            .expect("the setting")
+            .help;
+        let mut rows = setting_rows();
+        rows[0].help = help.to_string();
+        m.settings = Some(Settings {
+            page: Page::Settings,
+            filter: "",
+            rows,
+            sel: 0,
+            top: 0,
+            error: None,
+        });
+        let shown = texts(&build(&m)).join(" ");
+        assert!(shown.contains(help), "{shown}");
+        // The panel's note too, in a larger font.
+        m.settings = None;
+        m.text_cell = (9, 19);
+        let off = crate::usage::panel(false, None, 0, 0);
+        let note = off.note.clone();
+        m.usage = Some(off);
+        let shown = texts(&build(&m)).join(" ");
+        assert!(shown.contains(&note), "{shown}");
+    }
+
+    #[test]
+    fn the_sidebar_shows_the_weeks_cost_at_its_foot() {
+        let (win, sessions, now) = fleet(true);
+        let mut m = model(&win, &sessions, now);
+        // As long as it gets, it fits whole.
+        m.usage_line = Some("$999.99 this week \u{b7} resets Wed".into());
+        let c = build(&m);
+        assert!(texts(&c).contains(&"$999.99 this week \u{b7} resets Wed"));
+        let line = c.side.usage.expect("the line");
+        assert_eq!(line.bottom(), AREA.h);
+        assert!(c.side.rows.iter().all(|(_, r)| r.bottom() <= line.y));
+        assert_eq!(c.side.at(line.x + 20, line.y + 5), Some(Side::Usage));
+        // Above the update cue, when there is one.
+        m.banner = Some("blitz 0.0.2 is available");
+        let c = build(&m);
+        let (foot, line) = (c.banner.expect("cue"), c.side.usage.expect("the line"));
+        assert_eq!(line.bottom(), foot.y);
+    }
+
+    #[test]
+    fn no_usage_line_on_the_rail() {
+        let (win, sessions, now) = fleet(false);
+        let mut m = model(&win, &sessions, now);
+        m.usage_line = Some("$41.20 this week \u{b7} resets Thu".into());
+        let c = build(&m);
+        assert!(c.side.usage.is_none());
+        assert!(!texts(&c).iter().any(|t| t.contains("this week")));
     }
 
     #[test]

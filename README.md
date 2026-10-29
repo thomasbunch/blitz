@@ -299,6 +299,9 @@ there shows in the panel with what blitz uses instead.
 | `sound` | `false` | Play a sound when a session wants you while blitz is in the background: the notification's, or the default beep without one |
 | `global_jump` | `false` | Let Ctrl+Alt+J bring blitz to the front from any program, on the session that needs you |
 | `bell_attention` | `true` | Treat a bell or a notification in a background pane as needing you |
+| `usage_tracking` | `false` | Read Claude Code's logs to show what your sessions would cost at API prices. Off by default. See [Usage](#usage) |
+| `usage_reset_day` | `"mon"` | The day your Claude plan's weekly limit resets, `"mon"` to `"sun"` |
+| `usage_reset_hour` | `0` | The hour of that reset, 0 to 23, by the PC's clock |
 | `right_click_paste` | `true` | A right click copies the selection, or pastes when nothing is selected |
 | `editor_uri` | `""` | Ctrl+click on a file path opens it at its line through this URI, such as `"vscode://file/{path}:{line}:{col}"`. Empty opens the file with its program, or shows it in Explorer when it has none |
 | `open_files_in_blitz` | `true` | Ctrl+click on a text file shows it at its line in the [Files view](#files), unless `editor_uri` names an editor |
@@ -519,6 +522,32 @@ With `open_files_in_blitz` on, as it is unless you turn it off, Ctrl+click on a
 text file's path, or Shift and its quick select letter, opens it here at
 its line, marked, unless `editor_uri` names an editor.
 
+## Usage
+
+With `usage_tracking` on, **Claude Code usage and cost** in the command
+palette shows what Claude Code's sessions on this PC would have cost at
+API prices: this week by day, model and project, what agents spent, the
+tokens by kind and what the prompt cache saved, last week's total, and
+the 5-hour window under way. On a Pro or Max plan you pay the plan's
+price; this shows how you used it. Up and down scroll the panel and Esc
+closes it; opened with tracking off, it says what it would do, and Enter
+turns it on. It has no key of its own; `keybind = ctrl+shift+y=usage`
+gives it one.
+
+The week starts when your plan's weekly limit resets: set
+`usage_reset_day` and `usage_reset_hour` (**Week starts on** and **Week
+starts at** in the settings) to what claude.ai's usage page says. The
+5-hour window is an estimate from when your requests came. The expanded
+sidebar shows the week's figure at its foot, and a click on it opens the
+panel.
+
+blitz reads the logs in `~/.claude/projects` (or under
+`CLAUDE_CONFIG_DIR`) on a thread of its own once a minute, and only what
+was added since. It sends nothing anywhere and keeps nothing on disk.
+Claude Code deletes its logs after 30 days. Prices are built in; a model
+newer than the release is priced as the newest of its family and marked
+≈.
+
 ## Default keys
 
 | Keys | Action |
@@ -676,8 +705,8 @@ The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
 `equalize`, `font_size_up`, `font_size_down`, `font_size_reset`,
 `fullscreen`, `command_palette`, `find`, `files`, `quick_select`,
 `previous_prompt`, `next_prompt`, `system_menu`, `claude_setup`,
-`report_issue`, `go_to_tab_1` to `go_to_tab_8` and `last_tab`. Typing a
-name in the command palette finds its action.
+`usage`, `report_issue`, `go_to_tab_1` to `go_to_tab_8` and `last_tab`.
+Typing a name in the command palette finds its action.
 
 A binding can also type text into the focused pane: `text:` and the
 text, with `\e` for Esc, `\r` for Enter, `\n`, `\t`, `\s` for a space,

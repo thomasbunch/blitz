@@ -23,3 +23,4 @@ pub mod shell;
 pub mod shortcuts;
 pub mod theme;
 pub mod update;
+pub mod usage;
