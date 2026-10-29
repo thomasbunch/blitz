@@ -202,7 +202,7 @@ impl Panel {
                     .map(Into::into),
                 group: s.group,
                 label: s.label,
-                help: s.help,
+                help: s.help.into(),
                 applies: s.applies,
                 on: (s.kind == Kind::Toggle).then(|| c.get(s.key) == "true"),
                 value: self.shown(s, c),

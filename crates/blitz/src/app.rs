@@ -2412,6 +2412,7 @@ impl App {
                 sel: p.sel,
             }),
             settings: self.settings.as_ref().map(|p| chrome::Settings {
+                page: chrome::Page::Settings,
                 filter: &p.filter,
                 rows: p.rows(&self.config, self.update_trouble()),
                 sel: p.sel,

@@ -1131,6 +1131,7 @@ mod gpu {
         if let Some(sel) = settings {
             panel.sel = sel;
             model.settings = Some(chrome::Settings {
+                page: chrome::Page::Settings,
                 filter: "",
                 rows: panel.rows(&config, None),
                 sel,
