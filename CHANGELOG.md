@@ -38,6 +38,7 @@ people who use blitz.
   its place; to keep the original, put its file from
   [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/ghostty)
   in the themes folder.
+- Each theme's swatch in the picker shows its text colour.
 
 ## [0.0.5] - 2026-10-15
 
