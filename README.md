@@ -615,11 +615,13 @@ palette or the settings panel, lists every action with the keys that run
 it now, grouped by what they do; a dot marks those you changed. Typing
 narrows the list by name or by keys. Enter on an action waits for new
 keys: press them and Enter adds them, or click the row. When they run
-something else it says what, and Enter moves them over; a key alone, or
-with only Shift, stays the program's. While it waits, Backspace takes
-back the keys pressed, Del (on macOS, Delete) gives the action's keys
-back to the program and Esc stops. Del on an action puts
-its default keys back. Changes apply at once, as `keybind` lines in
+something else it says what, and Enter moves them over. A key alone
+stays the program's, but for F1 to F24, and so does a key with only
+Shift, but for those and the arrows, Home, End, PgUp, PgDn, Insert and
+Delete.
+While it waits, Backspace takes back the keys pressed, Del (on macOS,
+Delete) gives the action's keys back to the program and Esc stops. Del
+on an action puts its default keys back. Changes apply at once, as `keybind` lines in
 `config.toml`, which you can also edit yourself.
 
 Each line binds a chord to an action, or with `none` gives a chord back

@@ -13,8 +13,8 @@ people who use blitz.
   changed. The command palette and the settings panel open it too, and
   typing narrows it by name or by keys.
 - Enter on an action waits for new keys and adds them, saying first what
-  they run now. A key alone, or with only Shift, stays the program's. Del
-  puts an action's default keys back. Changes apply at once and are saved
+  they run now. A key alone (but F1 to F24), or a typing key with only
+  Shift, stays the program's. Del puts an action's default keys back. Changes apply at once and are saved
   as `keybind` lines in `config.toml`, keeping the rest of the file.
 
 ### Files
