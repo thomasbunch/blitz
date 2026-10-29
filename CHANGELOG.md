@@ -73,6 +73,14 @@ people who use blitz.
   types into one waiting for you, and its panes are not saved with the
   window while it is open.
 
+### Agent teams
+
+- **New agent team** in the command palette starts Claude Code with its
+  agent teammates as blitz panes, in a tab beside the lead laid out as a
+  grid, while the lead keeps focus. `"teammateMode": "tmux"` in Claude
+  Code's settings does the same for every session. A real tmux on the
+  PATH still comes first.
+
 ## [0.0.5] - 2026-10-15
 
 The biggest release yet: a command palette, your own key bindings, find,

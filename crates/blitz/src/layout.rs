@@ -522,6 +522,39 @@ impl Tab {
         self.root.equalize();
     }
 
+    /// Lays `panes` out as a grid in their order, ⌈√n⌉ to a row, the rows
+    /// as tall as each other and the panes of a row as wide. Focus stays
+    /// when its pane is among them, else goes to the first.
+    pub fn tile(&mut self, panes: &[PaneId]) {
+        let Some(&first) = panes.first() else {
+            return;
+        };
+        // `panes` side by side along `axis`, in splits nested to the right.
+        let line = |nodes: Vec<Node>, axis| {
+            (nodes.into_iter().rev())
+                .reduce(|b, a| {
+                    Node::Split(Box::new(Split {
+                        axis,
+                        ratio: 0.5,
+                        a,
+                        b,
+                    }))
+                })
+                .unwrap_or(Node::Leaf(first))
+        };
+        let cols = (1..).find(|c| c * c >= panes.len()).unwrap_or(1);
+        let rows = (panes.chunks(cols))
+            .map(|r| line(r.iter().map(|&p| Node::Leaf(p)).collect(), Axis::Row))
+            .collect();
+        self.root = line(rows, Axis::Column);
+        self.root.equalize();
+        self.zoom = None;
+        self.mru.retain(|p| panes.contains(p));
+        if !panes.contains(&self.focus) {
+            self.focus(first);
+        }
+    }
+
     /// Removes `p` and gives its space to its sibling. If `p` had focus, the
     /// most recently focused pane on the sibling's side gets it. Returns
     /// false if `p` is not in this tab or is its only pane; closing the
@@ -1260,6 +1293,35 @@ mod tests {
             (w.tabs[2].name.as_str(), w.tabs[2].panes()),
             ("x", ids(&[3]))
         );
+    }
+
+    /// A team's tab is a grid filled row by row, ⌈√n⌉ to a row, and the
+    /// last row's panes share its width.
+    #[test]
+    fn tile_makes_a_grid_in_order() {
+        let mut t = Tab::new("t".into(), PaneId(9));
+        t.tile(&ids(&[1]));
+        assert_eq!(
+            (t.rects(AREA), t.focus),
+            (vec![(PaneId(1), AREA)], PaneId(1))
+        );
+        t.tile(&ids(&[1, 2, 3]));
+        assert_eq!(
+            t.rects(AREA),
+            vec![
+                (PaneId(1), r(0, 0, 500, 300)),
+                (PaneId(2), r(501, 0, 500, 300)),
+                (PaneId(3), r(0, 301, 1001, 300)),
+            ]
+        );
+        t.focus(PaneId(3));
+        t.tile(&ids(&[1, 3, 4, 5, 6]));
+        assert_eq!(t.panes(), ids(&[1, 3, 4, 5, 6]));
+        let widths: Vec<i32> = t.rects(AREA).iter().map(|(_, r)| r.w).collect();
+        assert_eq!(widths, [333, 333, 333, 500, 500]);
+        assert_eq!((t.focus, t.zoom), (PaneId(3), None), "focus stays");
+        t.tile(&[]);
+        assert_eq!(t.panes(), ids(&[1, 3, 4, 5, 6]), "never empty");
     }
 
     /// A tab a program opens goes right after that program's tab, and the

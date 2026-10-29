@@ -1313,6 +1313,8 @@ struct App {
     /// Where `blitz pane` reaches this window, which every pane gets as
     /// `BLITZ_PIPE`.
     pipe: Option<String>,
+    /// Claude Code's agent teams, which open their teammates here.
+    teams: crate::tmux::Teams,
     /// When the user last typed into a pane.
     typed_at: Option<Instant>,
     /// A hint about Claude Code's hooks was shown; one per run is enough.
@@ -1783,6 +1785,7 @@ impl App {
             taskbar_shows: None,
             plugin: None,
             pipe: None,
+            teams: Default::default(),
             typed_at: None,
             hooks_hinted: false,
             badge_shows: None,
@@ -1903,8 +1906,11 @@ impl App {
             let id = PaneId(self.next_id);
             win.tabs.push(Tab::new(String::new(), id));
             win.active = win.tabs.len() - 1;
-            let cmd = self.args.cmd.clone();
-            self.open(win, id, cmd.as_deref(), "", cwd, None)?;
+            let cmd = crate::shell::Launch {
+                cmdline: self.args.cmd.clone().unwrap_or_default(),
+                env: Vec::new(),
+            };
+            self.open(win, id, &cmd, "", cwd, None)?;
             // Said where it is seen: the release build has no console. It
             // stays, as nothing this window does is saved, and takes the
             // place of a shell that failed, which each new pane says again.
@@ -1997,7 +2003,7 @@ impl App {
         &mut self,
         win: layout::Window,
         id: PaneId,
-        cmd: Option<&str>,
+        cmd: &crate::shell::Launch,
         shell: &str,
         cwd: Option<PathBuf>,
         split: Option<PaneId>,
@@ -2036,10 +2042,12 @@ impl App {
             let (cwd, old) = (start_dir(&meta.cwd), old.as_deref());
             // When the retry fails too, the first failure says why. A shell
             // that has gone gives way in `spawn` itself.
-            let started = (self.spawn(id, &grids, None, &meta.shell, cwd, old)).or_else(|first| {
-                (self.spawn(id, &grids, None, &meta.shell, None, old))
-                    .map_err(|then| joined(first, then))
-            });
+            let shell = crate::shell::Launch::default();
+            let started =
+                (self.spawn(id, &grids, &shell, &meta.shell, cwd, old)).or_else(|first| {
+                    (self.spawn(id, &grids, &shell, &meta.shell, None, old))
+                        .map_err(|then| joined(first, then))
+                });
             if let Err(e) = started {
                 self.views.clear();
                 self.next_num = 1;
@@ -2097,7 +2105,11 @@ impl App {
         let mut win = self.win.clone();
         win.replace_pane(id, new);
         let grids = self.grids(&win);
-        if let Err(e) = self.spawn(new, &grids, cmd.as_deref(), &shell, cwd, None) {
+        let cmd = crate::shell::Launch {
+            cmdline: cmd.unwrap_or_default(),
+            env: Vec::new(),
+        };
+        if let Err(e) = self.spawn(new, &grids, &cmd, &shell, cwd, None) {
             self.error(id, e);
             return;
         }
@@ -2113,14 +2125,15 @@ impl App {
     }
 
     /// Starts a session for pane `id`, sized as `grids` lays it out (or
-    /// 80x24 when it has no place there), running `cmd`, or else `shell`, a
-    /// `shell` setting (empty for the one in the settings), below `old`,
-    /// output saved by [`session::save_output`].
+    /// 80x24 when it has no place there), running `cmd`, or with no command
+    /// line there `shell`, a `shell` setting (empty for the one in the
+    /// settings), with `cmd`'s variables either way, below `old`, output
+    /// saved by [`session::save_output`].
     fn spawn(
         &mut self,
         id: PaneId,
         grids: &[(PaneId, (i32, i32))],
-        cmd: Option<&str>,
+        cmd: &crate::shell::Launch,
         shell: &str,
         cwd: Option<PathBuf>,
         old: Option<&str>,
@@ -2152,12 +2165,12 @@ impl App {
                 &self.config.env,
             )
         };
-        let mut launch = match cmd {
-            Some(c) => crate::shell::Launch {
+        let mut launch = match cmd.cmdline.as_str() {
+            "" => launch_of(setting),
+            c => crate::shell::Launch {
                 cmdline: c.to_string(),
                 env: Vec::new(),
             },
-            None => launch_of(setting),
         };
         // Claude Code loads blitz's hooks from there, with nothing pasted
         // into its settings.
@@ -2169,7 +2182,10 @@ impl App {
         // Where `blitz pane` reaches this window. Not passed into WSL,
         // which cannot open a Windows pipe.
         let pipe = (self.pipe.clone()).map(|p| ("BLITZ_PIPE".to_owned(), p));
-        let ours: Vec<_> = plugin.into_iter().chain(pipe).collect();
+        let ours: Vec<_> = (cmd.env.iter().cloned())
+            .chain(plugin)
+            .chain(pipe)
+            .collect();
         launch.env.extend(ours.clone());
         let start = |launch: &crate::shell::Launch| {
             // The integration's own variables win over the user's.
@@ -2204,7 +2220,7 @@ impl App {
             // fail every pane, and blitz would close as it opened. A pane's
             // own shell gives way to the one in the settings, and that to
             // the shell blitz finds; the pane says why.
-            Err(e) if cmd.is_none() && !setting.is_empty() => {
+            Err(e) if cmd.cmdline.is_empty() && !setting.is_empty() => {
                 let mut started = Err(String::new());
                 for next in fallbacks(shell, &self.config.shell) {
                     let mut l = launch_of(next);
@@ -2248,7 +2264,7 @@ impl App {
             prompted: false,
             sync_until: None,
             key,
-            cmd: cmd.map(str::to_owned),
+            cmd: Some(cmd.cmdline.clone()).filter(|c| !c.is_empty()),
             num: self.next_num,
             // What runs: once fallen back, the shell the settings name.
             shell: if fell_back.is_some() { "" } else { shell }.into(),
@@ -2281,14 +2297,15 @@ impl App {
         self.focus_moved(before);
     }
 
-    /// Opens a pane running `shell` (see [`App::spawn`]) in a copy of the
-    /// layout that `place` changes; tells the user in the focused pane when
-    /// that fails. The pane starts in `dir`, or else where the focused one
-    /// is.
+    /// Opens a pane running `shell` (see [`App::spawn`]), with `env` added
+    /// to its variables, in a copy of the layout that `place` changes;
+    /// tells the user in the focused pane when that fails. The pane starts
+    /// in `dir`, or else where the focused one is.
     fn add(
         &mut self,
         dir: Option<PathBuf>,
         shell: &str,
+        env: Vec<(String, String)>,
         place: impl FnOnce(&mut layout::Window, PaneId) -> bool,
     ) {
         let cwd = dir.or_else(|| start_dir(self.current().map_or("", |v| v.pane.cwd.as_str())));
@@ -2297,7 +2314,11 @@ impl App {
         if !place(&mut win, id) {
             return;
         }
-        if let Err(e) = self.open(win, id, None, shell, cwd, self.focus_id())
+        let cmd = crate::shell::Launch {
+            cmdline: String::new(),
+            env,
+        };
+        if let Err(e) = self.open(win, id, &cmd, shell, cwd, self.focus_id())
             && let Some(id) = self.focus_id()
         {
             self.error(id, e);
@@ -2311,7 +2332,12 @@ impl App {
         if let Some(v) = self.view(id).filter(|v| v.parent.is_none()) {
             self.closed = Some((v.pane.cwd.clone(), v.pane.claude.clone()));
         }
+        let mates = self.teams.mates(id);
         self.win.close_pane(id);
+        // A team's tab stays a grid.
+        if let Some(m) = mates {
+            crate::tmux::regrid(&mut self.win, &m, None);
+        }
         // The divider being dragged may be gone, even when focus stays.
         self.mouse.divider = None;
         if self.view_mut(id).is_some_and(|v| v.toast.take().is_some()) {
@@ -2435,7 +2461,56 @@ impl App {
                 self.close(el, pane);
                 ok
             }
+            Op::Tmux { argv, env } => {
+                use crate::tmux::Effect;
+                let live: Vec<_> = self.views.iter().map(|v| v.pane.id).collect();
+                let (mut reply, effect) =
+                    (self.teams).run(caller, &argv, &env, &live, &mut self.next_id);
+                match effect {
+                    Effect::Start(s) => {
+                        let id = s.id;
+                        if let Err(why) = self.start_teammate(s) {
+                            reply = self.teams.failed(id, why);
+                        }
+                    }
+                    Effect::Close(id) => self.close(el, id),
+                    Effect::None => {}
+                }
+                if cfg!(debug_assertions) {
+                    let argv = crate::tmux::redacted(&argv);
+                    eprintln!("blitz: tmux {argv} -> {}", reply.code);
+                }
+                reply.json()
+            }
         }
+    }
+
+    /// Opens teammate `s` of a Claude Code agent team in its team's tab,
+    /// laid out as a grid again, or in a new one after its lead's; the
+    /// lead keeps focus. Refused when a pane of the grid would be too
+    /// small, which Claude Code explains.
+    fn start_teammate(&mut self, s: crate::tmux::Start) -> Result<(), &'static str> {
+        use crate::tmux::{NO_SPACE, NOT_STARTED};
+        let mut win = self.win.clone();
+        let tab = crate::tmux::place(&mut win, &s).ok_or(NOT_STARTED)?;
+        let panes = win.tabs[tab].panes();
+        let small = |&(p, (c, r)): &(PaneId, (i32, i32))| {
+            panes.contains(&p) && (c < layout::MIN_COLS || r < layout::MIN_ROWS)
+        };
+        if self.grids(&win).iter().any(small) {
+            return Err(NO_SPACE);
+        }
+        let cmd = crate::shell::Launch {
+            cmdline: s.cmdline,
+            env: s.env,
+        };
+        // What went wrong may name the command, which may hold a secret.
+        (self.open(win, s.id, &cmd, "", Some(s.cwd), None)).map_err(|_| NOT_STARTED)?;
+        if let Some(v) = self.view_mut(s.id) {
+            v.parent = Some(s.lead);
+            v.pane.named = Some(s.title);
+        }
+        Ok(())
     }
 
     /// Opens a shell for the program in pane `caller`, at `place`, in
@@ -2470,7 +2545,7 @@ impl App {
         if !placed {
             return Err("no room for another pane".into());
         }
-        self.open(win, id, None, "", cwd, split)?;
+        self.open(win, id, &Default::default(), "", cwd, split)?;
         let now = Instant::now();
         if let Some(v) = self.view_mut(id) {
             v.parent = Some(caller);
@@ -3290,7 +3365,7 @@ impl App {
                 }
             }
             Pick::Show(id) => self.show(id),
-            Pick::Shell(shell) => self.add(None, &shell, new_tab),
+            Pick::Shell(shell) => self.add(None, &shell, Vec::new(), new_tab),
             Pick::Settings => {
                 self.open_settings();
                 if let Some(p) = &mut self.settings {
@@ -4493,7 +4568,7 @@ impl App {
                 }
                 self.request_redraw();
             }
-            Action::NewTab => self.add(None, "", new_tab),
+            Action::NewTab => self.add(None, "", Vec::new(), new_tab),
             Action::ClosePane => {
                 let Some(v) = self.current() else {
                     return true;
@@ -4569,7 +4644,7 @@ impl App {
                 } else {
                     Dir::Down
                 };
-                self.add(None, "", split(dir));
+                self.add(None, "", Vec::new(), split(dir));
             }
             Action::ReopenClosed => {
                 let Some((cwd, claude)) = self.closed.take() else {
@@ -4580,7 +4655,7 @@ impl App {
                     return true;
                 };
                 let id = PaneId(self.next_id);
-                self.add(start_dir(&cwd), "", split(Dir::Right));
+                self.add(start_dir(&cwd), "", Vec::new(), split(Dir::Right));
                 if self.view(id).is_some() {
                     self.resume(id, claude);
                 } else {
@@ -4593,6 +4668,19 @@ impl App {
                 self.act(el, Action::SplitRight);
                 if let Some(v) = self.view_mut(id) {
                     v.resume = Some(("claude\r".into(), Instant::now() + RESUME_AFTER));
+                }
+            }
+            // As `NewClaude`, with teammates in blitz panes; see
+            // [`crate::tmux`].
+            Action::NewTeam => {
+                let id = PaneId(self.next_id);
+                let teams = ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".into(), "1".into());
+                self.add(None, "", vec![teams], split(Dir::Right));
+                if let Some(v) = self.view_mut(id) {
+                    let line = "claude --teammate-mode tmux\r";
+                    v.resume = Some((line.into(), Instant::now() + RESUME_AFTER));
+                    let text = "Teammates open in a tab beside this one. /restart turns this off; to keep it, set teammateMode to tmux in Claude Code's settings.";
+                    self.set_notice(id, text, Some(Instant::now() + HINT), true);
                 }
             }
             Action::ToggleSidebar => return self.toggle_sidebar(),
@@ -5407,7 +5495,7 @@ impl App {
             }
             Some(Dropped::Open(dirs)) => {
                 for dir in dirs {
-                    self.add(Some(dir), "", new_tab);
+                    self.add(Some(dir), "", Vec::new(), new_tab);
                 }
             }
             None => {}
@@ -8612,7 +8700,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // foreground.
                 self.to_front();
                 if let crate::handoff::Ask::Open(dir) = ask {
-                    self.add(Some(dir), "", new_tab);
+                    self.add(Some(dir), "", Vec::new(), new_tab);
                 }
             }
             // So does a click on a notification, and the jump key.

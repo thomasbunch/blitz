@@ -153,7 +153,7 @@ const STRIP: &[&str] = &[
 
 /// Whether a variable named `upper`, in capitals, is another terminal's or
 /// blitz's own, and so stays out of a pane's environment.
-fn foreign(upper: &str) -> bool {
+pub(crate) fn foreign(upper: &str) -> bool {
     STRIP.contains(&upper) || STRIP_PREFIXES.iter().any(|p| upper.starts_with(p))
 }
 

@@ -3,7 +3,8 @@
 //!
 //! blitz copies it into its plugin folder as `blitz`, which panes find on
 //! their PATH: by that name it runs `blitz pane`, waited for in any shell,
-//! as blitz.exe, a windowed program on Windows, is not.
+//! as blitz.exe, a windowed program on Windows, is not. As `tmux` there it
+//! opens Claude Code's agent teammates as blitz panes.
 
 fn main() {
     let name = std::env::current_exe().ok().and_then(|p| {
@@ -11,6 +12,10 @@ fn main() {
         Some(stem)
     });
     let code = match name.as_deref() {
+        Some("tmux") => {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            blitz::tmux::client(&args)
+        }
         Some("blitz") => {
             let args: Vec<String> = std::env::args().skip(1).collect();
             match args.split_first() {
