@@ -993,6 +993,7 @@ mod gpu {
             progress: None,
             exit_code: None,
             below: 0,
+            parent: None,
         };
         let sessions = [
             session(

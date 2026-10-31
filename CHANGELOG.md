@@ -34,6 +34,8 @@ people who use blitz.
 
 - Double-clicking a session's row collapses the sidebar to the rail, and
   double-clicking one on the rail expands it again.
+- Panes a program opened with `blitz pane` are listed under its session,
+  indented, in their own tab's group.
 
 ### Themes
 
