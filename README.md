@@ -269,7 +269,8 @@ beside the session's pane or in a tab after it, typing a command at its
 first prompt; `send` types into one and presses keys; `read` returns
 what one shows; `list` lists them; `close` closes one. They reach only
 the panes the session opened, and the panes those opened: never yours,
-nor the session's own.
+nor the session's own. A lead's [agent teammates](#agent-teams) count
+as panes it opened, so its tools can type into them and close them too.
 
 Claude Code asks you before it first uses each tool, as for any other.
 **Allowing `open` or `send` for good is broader than allowing Bash:**
