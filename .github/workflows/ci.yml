@@ -63,6 +63,32 @@ jobs:
           ok="$ok|crates/blitz/icon/blitz\.(ico|svg)|crates/blitz/themes/[a-z0-9-]+"
           bad="$(git ls-files | grep -vxE "$ok" || true)"
           [ -z "$bad" ] || { echo "::error::files of a kind this repo does not track:"; echo "$bad"; exit 1; }
+      # Nobody reads a picture in a diff, so the README's may hold only an
+      # image: no metadata chunk, and nothing after the last chunk.
+      - name: README pictures hold only an image
+        run: |
+          python3 - .github/readme/*.webp <<'PY'
+          import struct, sys
+          bad = []
+          for p in sys.argv[1:]:
+              b = open(p, 'rb').read()
+              if b[:4] != b'RIFF' or b[8:12] != b'WEBP' or struct.unpack('<I', b[4:8])[0] + 8 != len(b):
+                  bad.append(f'{p}: not one whole WebP')
+                  continue
+              i = 12
+              while i + 8 <= len(b):
+                  kind, size = b[i:i + 4], struct.unpack('<I', b[i + 4:i + 8])[0]
+                  if kind not in (b'VP8 ', b'VP8L', b'VP8X', b'ALPH'):
+                      bad.append(f'{p}: a {kind!r} chunk')
+                  i += 8 + size + (size & 1)
+              if i > len(b):
+                  bad.append(f'{p}: a chunk runs past the end of the file')
+              elif i < len(b):
+                  bad.append(f'{p}: bytes after the last chunk')
+          if bad:
+              print('::error::README pictures with more than an image in them:', *bad, sep='\n')
+              sys.exit(1)
+          PY
       - name: CI tests the ConPTY that releases ship
         run: |
           for k in CONPTY_VERSION CONPTY_SHA256; do
