@@ -36,7 +36,6 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   there. Panes a program opened are listed under its session, indented.
   Sessions that do not fit are counted at the foot, in the accent
   colour when one of them needs you, and a click there goes to it.
-  Panes a session's program opened are listed under it.
 - Claude Code's title tells blitz when a session works and when it
   stops, and its hooks, which blitz sets up itself, when it needs input.
   The window title starts with how many need you, as in `(2) pwsh`. If
@@ -79,9 +78,9 @@ shells, side by side, and seeing at a glance which one is waiting for you.
 Three ways in, and one rule: a program reaches only the panes it opened,
 and the panes those opened, never yours.
 
-- **[Agent teams](#agent-teams)**: `claude --teammate-mode tmux` opens
-  each teammate as a blitz pane, through a stand-in for tmux that blitz
-  puts on the PATH of its panes.
+- **[Agent teams](#agent-teams)**: **New agent team** in the command
+  palette opens each teammate as a blitz pane, through a stand-in for
+  tmux that blitz puts on the PATH of its panes.
 - **[Scripting panes](#scripting-panes)**: `blitz pane split`, `tab`,
   `send`, `read`, `list` and `close`, from any shell in blitz.
 - **[Pane tools](#pane-tools)**: every Claude Code session gets `open`,
