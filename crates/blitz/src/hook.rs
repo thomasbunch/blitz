@@ -385,30 +385,39 @@ fn swap_in(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Copies the blitz-hook at `hook` into the plugin folder `plugin` as
-/// `bin/blitz`, which runs `blitz pane` and nothing else, and returns that
-/// folder for the end of every pane's PATH. A copy rather than a link, so
-/// it knows itself by its name. A copy a `blitz pane` holds open stays as
-/// it is. None when others could replace it, or there is none.
+/// `bin/blitz`, which runs `blitz pane` and nothing else, and as
+/// `bin/tmux`, which opens Claude Code's teammates as panes, and returns
+/// that folder for the end of every pane's PATH. Copies rather than links,
+/// so each knows itself by its name. A copy in use stays as it is. None
+/// when others could replace them, or there is no `blitz`.
 pub fn install_bin(plugin: &Path, hook: &Path) -> Option<PathBuf> {
     let bin = plugin.join("bin");
-    let exe = bin.join(format!("blitz{}", std::env::consts::EXE_SUFFIX));
+    let exe = |name| bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     if let Err(e) = std::fs::create_dir_all(&bin) {
         eprintln!("blitz: making {}: {e}", bin.display());
         return None;
     }
-    if exposed(&exe) {
+    let exes = ["blitz", "tmux"].map(exe);
+    if exes.iter().any(|e| exposed(e)) {
         return None;
     }
-    let copied = std::fs::read(hook).and_then(|bytes| swap_in(&exe, &bytes));
-    #[cfg(unix)]
-    let copied = copied.and_then(|()| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
-    });
-    if let Err(e) = copied {
-        eprintln!("blitz: copying blitz-hook to {}: {e}", exe.display());
+    match std::fs::read(hook) {
+        Ok(bytes) => {
+            for exe in &exes {
+                let copied = swap_in(exe, &bytes);
+                #[cfg(unix)]
+                let copied = copied.and_then(|()| {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755))
+                });
+                if let Err(e) = copied {
+                    eprintln!("blitz: copying blitz-hook to {}: {e}", exe.display());
+                }
+            }
+        }
+        Err(e) => eprintln!("blitz: reading {}: {e}", hook.display()),
     }
-    exe.is_file().then_some(bin)
+    exes[0].is_file().then_some(bin)
 }
 
 /// Writes the plugin where this blitz keeps its state, for the blitz-hook
@@ -1282,8 +1291,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// `blitz pane` comes from a copy of blitz-hook in the plugin's `bin`,
-    /// made again only when blitz-hook changed.
+    /// `blitz pane` and `tmux` come from copies of blitz-hook in the
+    /// plugin's `bin`, made again only when blitz-hook changed.
     #[test]
     fn plugin_bin_has_a_copy_of_blitz_hook() {
         let dir = std::env::temp_dir().join(format!("blitz-bin-{}", std::process::id()));
@@ -1303,20 +1312,25 @@ mod tests {
         let hook = dir.join("blitz-hook");
         std::fs::write(&hook, "one").unwrap();
         let bin = install_bin(&dir.join("plugin"), &hook).expect("a bin folder");
-        let exe = bin.join(format!("blitz{}", std::env::consts::EXE_SUFFIX));
-        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "one");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o755);
+        let exes =
+            ["blitz", "tmux"].map(|n| bin.join(format!("{n}{}", std::env::consts::EXE_SUFFIX)));
+        for exe in &exes {
+            assert_eq!(std::fs::read_to_string(exe).unwrap(), "one");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(exe).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o755);
+            }
         }
         std::fs::write(&hook, "two").unwrap();
         assert_eq!(install_bin(&dir.join("plugin"), &hook), Some(bin.clone()));
-        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "two");
+        for exe in &exes {
+            assert_eq!(std::fs::read_to_string(exe).unwrap(), "two");
+        }
         assert_eq!(
             std::fs::read_dir(&bin).unwrap().count(),
-            1,
+            2,
             "no temporary file"
         );
         // Without a blitz-hook to copy there is no `blitz pane`.

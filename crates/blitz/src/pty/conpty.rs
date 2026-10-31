@@ -577,9 +577,19 @@ pub fn child_env(
         ("BLITZ_PANE_ID", id.as_str()),
         ("WSLENV", wslenv.as_str()),
     ];
+    // A cmd prompt of blitz's holds a pane's token, so only this pane's
+    // own is passed on: another's would let the child act as that pane.
+    let token = (extra.iter().rev())
+        .find(|(k, _)| k.eq_ignore_ascii_case("BLITZ_PANE_TOKEN"))
+        .map_or("", |(_, v)| v.as_str());
+    let others = |k: &str, v: &str| {
+        k.eq_ignore_ascii_case("PROMPT")
+            && crate::shell::is_blitz_prompt(v.as_ref())
+            && !v.contains(&format!("blitz={token}$e"))
+    };
     let sets = ours.into_iter().chain(
         (extra.iter())
-            .filter(|(k, _)| !is_wslenv(k))
+            .filter(|(k, v)| !is_wslenv(k) && !others(k, v))
             .map(|(k, v)| (k.as_str(), v.as_str())),
     );
     for (k, v) in sets {
@@ -668,7 +678,7 @@ mod tests {
         assert_eq!(String::from_utf16(&block).unwrap(), "=C:=C:\\work\0\0");
 
         // The user's own prompt is theirs to keep; blitz's own for a pane
-        // replaces any.
+        // replaces any, and another pane's is never passed on.
         let prompt = |parent: &str, extra: &[(String, String)]| {
             let env = child_env([("prompt".into(), parent.into())], 1, extra);
             (env.iter())
@@ -676,12 +686,13 @@ mod tests {
                 .map(|(_, v)| v.to_string_lossy().into_owned())
         };
         assert_eq!(prompt("$P$G$_", &[]).as_deref(), Some("$P$G$_"));
+        let theirs = crate::shell::cmd_prompt("0f1e", "$P$G");
         let ours = crate::shell::cmd_prompt("5eed", "$P$G");
-        let set = [("PROMPT".to_owned(), ours.clone())];
-        assert_eq!(
-            prompt(&crate::shell::cmd_prompt("0f1e", "$P$G"), &set),
-            Some(ours)
-        );
+        let set = |p: &str| {
+            [("PROMPT", p), ("BLITZ_PANE_TOKEN", "5eed")].map(|(k, v)| (k.to_owned(), v.to_owned()))
+        };
+        assert_eq!(prompt(&theirs, &set(&ours)), Some(ours));
+        assert_eq!(prompt("$P$G$_", &set(&theirs)).as_deref(), Some("$P$G$_"));
     }
 
     /// The pane's token reaches Claude Code in WSL, and a hook it runs gets

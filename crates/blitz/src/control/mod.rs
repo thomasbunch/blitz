@@ -94,6 +94,12 @@ pub enum Op {
     Close {
         pane: PaneId,
     },
+    /// What Claude Code asks its tmux; see [`crate::tmux`]. `env` is the
+    /// asking program's, given only to start a teammate.
+    Tmux {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+    },
 }
 
 /// The token a request line carries and what it asks, or why it is not
@@ -166,6 +172,23 @@ pub fn parse(line: &str) -> Result<(String, Op), &'static str> {
             .min(MAX_LINES),
         },
         Some("close") => Op::Close { pane: pane()? },
+        Some("tmux") => Op::Tmux {
+            argv: match j.get("argv") {
+                Some(Json::Arr(a)) => (a.iter())
+                    .map(|w| w.as_str().map(str::to_owned))
+                    .collect::<Option<_>>()
+                    .ok_or("argv is a list of words")?,
+                _ => return Err("argv is a list of words"),
+            },
+            env: match j.get("env") {
+                None | Some(Json::Null) => Vec::new(),
+                Some(Json::Obj(o)) => (o.iter())
+                    .map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                    .collect::<Option<_>>()
+                    .ok_or("env maps names to text")?,
+                _ => return Err("env maps names to text"),
+            },
+        },
         _ => return Err("no such op"),
     };
     Ok((token.to_owned(), op))
@@ -256,10 +279,8 @@ fn serve(conn: &mut (impl Read + Write), answer: impl Fn(String) -> String) {
     let _ = conn.write_all(format!("{reply}\n").as_bytes());
 }
 
-/// Sends `fields`, the inside of a request's JSON object, with this pane's
-/// token to the blitz the pane is in, and returns its reply, or why there
-/// is none or what it refused.
-pub fn call(fields: &str) -> Result<Json, String> {
+/// This pane's token and where its blitz listens, or why it has not both.
+pub(crate) fn reach() -> Result<(String, String), String> {
     let token = std::env::var("BLITZ_PANE_TOKEN").unwrap_or_default();
     if token.is_empty() {
         return Err(NOT_IN_PANE.into());
@@ -272,6 +293,14 @@ pub fn call(fields: &str) -> Result<Json, String> {
     if !valid(&pipe) {
         return Err("BLITZ_PIPE is not one blitz made".into());
     }
+    Ok((token, pipe))
+}
+
+/// Sends `fields`, the inside of a request's JSON object, with this pane's
+/// token to the blitz the pane is in, and returns its reply, or why there
+/// is none or what it refused.
+pub fn call(fields: &str) -> Result<Json, String> {
+    let (token, pipe) = reach()?;
     let mut conn = connect(&pipe).map_err(|e| format!("cannot reach blitz: {e}"))?;
     let mut req = String::from("{\"token\":\"");
     escape_json(&token, &mut req);
@@ -495,6 +524,13 @@ mod tests {
             op(r#"{"token":"t","op":"close","pane":3}"#),
             Ok(Op::Close { pane: PaneId(3) })
         );
+        assert_eq!(
+            op(r#"{"token":"t","op":"tmux","argv":["kill-pane"],"env":{"A":"1"}}"#),
+            Ok(Op::Tmux {
+                argv: vec!["kill-pane".into()],
+                env: vec![("A".into(), "1".into())],
+            })
+        );
     }
 
     /// A refused request is told why in blitz's words, never with any of
@@ -520,6 +556,9 @@ mod tests {
             format!(r#"{{"token":"t","op":"send","pane":1,"keys":[{keys}]}}"#),
             r#"{"token":"t","op":"read","pane":1,"lines":"secret"}"#.into(),
             r#"{"token":"t","op":"focus","pane":1}"#.into(),
+            r#"{"token":"t","op":"tmux","argv":"secret"}"#.into(),
+            r#"{"token":"t","op":"tmux","argv":[1]}"#.into(),
+            r#"{"token":"t","op":"tmux","argv":[],"env":{"A":["secret"]}}"#.into(),
         ] {
             let why = parse(&bad).map(|_| ()).expect_err(&bad);
             assert!(!why.contains("secret"), "{bad}: {why}");

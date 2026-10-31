@@ -58,6 +58,7 @@ fn group(a: Action) -> usize {
         | Action::ToggleSidebar
         | Action::Files => 4,
         Action::NewClaude
+        | Action::NewTeam
         | Action::JumpToAttention
         | Action::GoToSession
         | Action::RenameSession

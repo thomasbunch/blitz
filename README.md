@@ -183,6 +183,36 @@ front; half a minute without a key or mouse touch counts as away, even
 with blitz in front. Ctrl+Shift+J goes to questions you have not seen
 first, then those you have, then finished sessions, then failed ones.
 
+### Agent teams
+
+**New agent team** in the command palette opens a Claude Code session
+beside the focused pane, as **New Claude Code session** does, with
+`claude --teammate-mode tmux` and `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`
+set in that pane only. Teammates you ask it for open as blitz panes, in
+a tab right after the lead's, laid out as a grid that fills again as
+they start and close; the lead keeps focus, and in the sidebar each
+teammate is listed under its lead. A teammate that finishes closes its
+pane, one that fails keeps it with the error, and the lead closes the
+rest as it exits.
+
+Claude Code's `/restart` and Agent View start it again without the
+flag. To have teams in every session, plain `claude` too, put this in
+`~/.claude/settings.json` instead:
+
+```json
+{
+  "teammateMode": "tmux",
+  "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+}
+```
+
+Claude Code drives teammates through tmux, and the `tmux` blitz panes
+find is a copy of `blitz-hook` that opens them as panes and does
+nothing else. It is at the end of the PATH, so a real tmux earlier on
+the PATH comes first, and teammates then open there. Teammates are not
+reopened when blitz starts again, as Claude Code cannot resume them.
+Tested with Claude Code 2.1.312; on macOS and Linux it is experimental.
+
 ### Other agents
 
 Agents with hooks of their own can report the same way: `blitz-hook
@@ -756,8 +786,9 @@ The actions are `copy`, `copy_without_indent`, `paste`, `select_all`,
 `reset_terminal`, `new_tab`, `close_pane`, `close_tab`, `reopen_closed`,
 `rename_session`, `rename_tab`, `next_tab`, `previous_tab`,
 `move_tab_left`, `move_tab_right`, `move_pane_to_new_tab`,
-`split_right`, `split_down`, `new_claude`, `focus_left`, `focus_right`,
-`focus_up`, `focus_down`, `jump_to_attention`, `go_to_session`,
+`split_right`, `split_down`, `new_claude`, `new_agent_team`,
+`focus_left`, `focus_right`, `focus_up`, `focus_down`,
+`jump_to_attention`, `go_to_session`,
 `toggle_sidebar`, `update`, `theme_picker`, `settings`, `keys`, `open_config`,
 `open_themes`, `zoom`, `resize_left`, `resize_right`, `resize_up`,
 `resize_down`, `swap_left`, `swap_right`, `swap_up`, `swap_down`,
