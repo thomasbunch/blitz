@@ -362,19 +362,53 @@ pub fn write_plugin(dir: &Path, hook_exe: &str) -> io::Result<()> {
         (".claude-plugin/plugin.json", PLUGIN_JSON.to_owned()),
         ("hooks/hooks.json", claude_settings(hook_exe)),
     ] {
-        let path = dir.join(name);
-        if std::fs::read(&path).is_ok_and(|old| old == text.as_bytes()) {
-            continue;
-        }
-        std::fs::create_dir_all(path.parent().unwrap_or(dir))?;
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-        let swapped = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path));
-        if swapped.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        swapped?;
+        swap_in(&dir.join(name), text.as_bytes())?;
     }
     Ok(())
+}
+
+/// Writes `bytes` to `path` beside it, then swaps it in; nothing when it
+/// already holds them.
+fn swap_in(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if std::fs::read(path).is_ok_and(|old| old == bytes) {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let swapped = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if swapped.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    swapped
+}
+
+/// Copies the blitz-hook at `hook` into the plugin folder `plugin` as
+/// `bin/blitz`, which runs `blitz pane` and nothing else, and returns that
+/// folder for the end of every pane's PATH. A copy rather than a link, so
+/// it knows itself by its name. A copy a `blitz pane` holds open stays as
+/// it is. None when others could replace it, or there is none.
+pub fn install_bin(plugin: &Path, hook: &Path) -> Option<PathBuf> {
+    let bin = plugin.join("bin");
+    let exe = bin.join(format!("blitz{}", std::env::consts::EXE_SUFFIX));
+    if let Err(e) = std::fs::create_dir_all(&bin) {
+        eprintln!("blitz: making {}: {e}", bin.display());
+        return None;
+    }
+    if exposed(&exe) {
+        return None;
+    }
+    let copied = std::fs::read(hook).and_then(|bytes| swap_in(&exe, &bytes));
+    #[cfg(unix)]
+    let copied = copied.and_then(|()| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+    });
+    if let Err(e) = copied {
+        eprintln!("blitz: copying blitz-hook to {}: {e}", exe.display());
+    }
+    exe.is_file().then_some(bin)
 }
 
 /// Writes the plugin where this blitz keeps its state, for the blitz-hook
@@ -555,54 +589,30 @@ fn runs_blitz_hook(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|s| s.to_ascii_lowercase().contains("blitz-hook"))
 }
 
-/// Whether anyone but this user, SYSTEM, Administrators or TrustedInstaller
-/// may change `path`, or add and remove files in it if it is a folder. Deny
-/// entries are not weighed against the grants, so it errs towards yes.
+/// `sid` as a string, such as `S-1-5-18`.
 #[cfg(windows)]
-fn others_can_write(path: &std::path::Path) -> bool {
-    use windows::Win32::Foundation::{
-        CloseHandle, GENERIC_ALL, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree,
-    };
-    use windows::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    };
-    use windows::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, GetTokenInformation,
-        INHERIT_ONLY_ACE, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    };
-    use windows::Win32::Storage::FileSystem::{
-        DELETE, FILE_DELETE_CHILD, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::core::{HSTRING, PWSTR};
+fn sid_string(sid: windows::Win32::Security::PSID) -> Option<String> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    let mut s = windows::core::PWSTR::null();
+    // SAFETY: a valid SID; the string is copied, then freed.
+    unsafe {
+        ConvertSidToStringSidW(sid, &mut s).ok()?;
+        let out = s.to_string().ok();
+        LocalFree(Some(HLOCAL(s.0.cast())));
+        out
+    }
+}
 
-    // For a folder, FILE_WRITE_DATA is the right to add files.
-    const WRITE: u32 = FILE_WRITE_DATA.0
-        | FILE_DELETE_CHILD.0
-        | DELETE.0
-        | WRITE_DAC.0
-        | WRITE_OWNER.0
-        | GENERIC_WRITE.0
-        | GENERIC_ALL.0;
-    // SYSTEM, Administrators and TrustedInstaller.
-    const TRUSTED: [&str; 3] = [
-        "S-1-5-18",
-        "S-1-5-32-544",
-        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
-    ];
-    let sid_string = |sid: PSID| {
-        let mut s = PWSTR::null();
-        // SAFETY: a valid SID; the string is copied, then freed.
-        unsafe {
-            ConvertSidToStringSidW(sid, &mut s).ok()?;
-            let out = s.to_string().ok();
-            LocalFree(Some(HLOCAL(s.0.cast())));
-            out
-        }
-    };
+/// The SID of the user this process runs as, as a string.
+#[cfg(windows)]
+pub(crate) fn user_sid() -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     // SAFETY: the buffer is as large as the call is told; the token is
     // closed after use.
-    let me = unsafe {
+    unsafe {
         let mut token = HANDLE::default();
         let mut user = [0u64; 64];
         let mut len = 0;
@@ -618,7 +628,40 @@ fn others_can_write(path: &std::path::Path) -> bool {
         let _ = CloseHandle(token);
         ok.then(|| sid_string((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid))
             .flatten()
+    }
+}
+
+/// Whether anyone but this user, SYSTEM, Administrators or TrustedInstaller
+/// may change `path`, or add and remove files in it if it is a folder. Deny
+/// entries are not weighed against the grants, so it errs towards yes.
+#[cfg(windows)]
+fn others_can_write(path: &std::path::Path) -> bool {
+    use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, INHERIT_ONLY_ACE,
+        PSECURITY_DESCRIPTOR, PSID,
     };
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_DELETE_CHILD, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows::core::HSTRING;
+
+    // For a folder, FILE_WRITE_DATA is the right to add files.
+    const WRITE: u32 = FILE_WRITE_DATA.0
+        | FILE_DELETE_CHILD.0
+        | DELETE.0
+        | WRITE_DAC.0
+        | WRITE_OWNER.0
+        | GENERIC_WRITE.0
+        | GENERIC_ALL.0;
+    // SYSTEM, Administrators and TrustedInstaller.
+    const TRUSTED: [&str; 3] = [
+        "S-1-5-18",
+        "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    ];
+    let me = user_sid();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: valid out pointers. The DACL and its entries live inside `sd`,
@@ -1237,6 +1280,49 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(dir.join("hooks")).unwrap().collect();
         assert_eq!(left.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `blitz pane` comes from a copy of blitz-hook in the plugin's `bin`,
+    /// made again only when blitz-hook changed.
+    #[test]
+    fn plugin_bin_has_a_copy_of_blitz_hook() {
+        let dir = std::env::temp_dir().join(format!("blitz-bin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // This user's alone, whatever the temporary folder lets others do.
+        #[cfg(windows)]
+        {
+            let me = format!("*{}:(OI)(CI)F", user_sid().expect("a SID"));
+            let icacls = std::process::Command::new("icacls")
+                .arg(&dir)
+                .args(["/inheritance:r", "/grant:r", &me])
+                .output()
+                .expect("icacls");
+            assert!(icacls.status.success());
+        }
+        let hook = dir.join("blitz-hook");
+        std::fs::write(&hook, "one").unwrap();
+        let bin = install_bin(&dir.join("plugin"), &hook).expect("a bin folder");
+        let exe = bin.join(format!("blitz{}", std::env::consts::EXE_SUFFIX));
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+        std::fs::write(&hook, "two").unwrap();
+        assert_eq!(install_bin(&dir.join("plugin"), &hook), Some(bin.clone()));
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "two");
+        assert_eq!(
+            std::fs::read_dir(&bin).unwrap().count(),
+            1,
+            "no temporary file"
+        );
+        // Without a blitz-hook to copy there is no `blitz pane`.
+        let none = install_bin(&dir.join("other"), &dir.join("missing"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(none, None);
     }
 
     #[test]

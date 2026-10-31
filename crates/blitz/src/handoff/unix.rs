@@ -30,6 +30,11 @@ fn socket() -> Option<PathBuf> {
     } else {
         "blitz.sock"
     };
+    Some(private_dir()?.join(name))
+}
+
+/// A folder for sockets that only this user can reach.
+pub fn private_dir() -> Option<PathBuf> {
     // The user's own runtime folder on Linux; on macOS the temporary
     // folder is the user's own already.
     let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
@@ -40,7 +45,7 @@ fn socket() -> Option<PathBuf> {
     // A temporary folder others can write to gets a folder of this
     // user's own.
     if private {
-        return Some(dir.join(name));
+        return Some(dir);
     }
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
@@ -50,7 +55,7 @@ fn socket() -> Option<PathBuf> {
     let ok = made.is_ok()
         || std::fs::symlink_metadata(&own)
             .is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0);
-    ok.then(|| own.join(name))
+    ok.then_some(own)
 }
 
 /// What a message asks, or `None` when its folder is not a local one.

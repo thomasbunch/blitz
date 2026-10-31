@@ -400,8 +400,23 @@ impl Tab {
     /// `dir` side. Refused when either half would be smaller than `min`
     /// (width, height).
     pub fn split(&mut self, dir: Dir, new: PaneId, area: Rect, min: (i32, i32)) -> bool {
-        let focus = self.focus;
-        let Some(&(_, r)) = self.tiles(area).iter().find(|t| t.0 == focus) else {
+        let done = self.split_at(self.focus, dir, new, area, min);
+        if done {
+            self.focus(new);
+        }
+        done
+    }
+
+    /// [`Tab::split`] of pane `at`, leaving focus where it is.
+    pub fn split_at(
+        &mut self,
+        at: PaneId,
+        dir: Dir,
+        new: PaneId,
+        area: Rect,
+        min: (i32, i32),
+    ) -> bool {
+        let Some(&(_, r)) = self.tiles(area).iter().find(|t| t.0 == at) else {
             return false;
         };
         let axis = dir.axis();
@@ -409,10 +424,10 @@ impl Tab {
         if a.w.min(b.w) < min.0 || a.h.min(b.h) < min.1 {
             return false;
         }
-        let Some(leaf) = self.root.leaf_mut(focus) else {
+        let Some(leaf) = self.root.leaf_mut(at) else {
             return false;
         };
-        let (old, new_leaf) = (Node::Leaf(focus), Node::Leaf(new));
+        let (old, new_leaf) = (Node::Leaf(at), Node::Leaf(new));
         let (a, b) = match dir {
             Dir::Right | Dir::Down => (old, new_leaf),
             Dir::Left | Dir::Up => (new_leaf, old),
@@ -423,7 +438,7 @@ impl Tab {
             a,
             b,
         }));
-        self.focus(new);
+        self.zoom = None;
         true
     }
 
@@ -659,6 +674,19 @@ impl Window {
         self.active = self.tabs.len() - 1;
         true
     }
+
+    /// Puts pane `new` in a tab of its own right after the tab of pane
+    /// `p`; the tab shown stays shown. Returns false if no tab has `p`.
+    pub fn tab_beside(&mut self, p: PaneId, new: PaneId) -> bool {
+        let Some(i) = self.tabs.iter().position(|t| t.root.contains(p)) else {
+            return false;
+        };
+        self.tabs.insert(i + 1, Tab::new(String::new(), new));
+        if self.active > i {
+            self.active += 1;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -727,6 +755,22 @@ mod tests {
         assert!(t.split(Dir::Up, PaneId(3), AREA, MIN));
         assert_eq!(t.panes(), ids(&[3, 2, 1]));
         assert_eq!(t.focus, PaneId(3));
+    }
+
+    /// A pane a program opens goes beside that program's pane, and focus
+    /// stays where the user had it.
+    #[test]
+    fn split_at_leaves_focus_alone() {
+        let mut t = four();
+        t.focus(PaneId(4));
+        t.toggle_zoom();
+        assert!(t.split_at(PaneId(2), Dir::Down, PaneId(5), AREA, MIN));
+        assert_eq!(t.panes(), ids(&[1, 2, 5, 3, 4]));
+        assert_eq!((t.focus, t.zoom), (PaneId(4), None));
+        assert!(!t.split_at(PaneId(9), Dir::Down, PaneId(6), AREA, MIN));
+        let before = t.clone();
+        assert!(!t.split_at(PaneId(5), Dir::Down, PaneId(6), r(0, 0, 100, 100), MIN));
+        assert_eq!(t, before);
     }
 
     #[test]
@@ -1216,5 +1260,22 @@ mod tests {
             (w.tabs[2].name.as_str(), w.tabs[2].panes()),
             ("x", ids(&[3]))
         );
+    }
+
+    /// A tab a program opens goes right after that program's tab, and the
+    /// tab shown stays shown.
+    #[test]
+    fn a_tab_beside_keeps_the_tab_shown() {
+        let mut w = Window::default();
+        for n in 1..=3 {
+            w.tabs.push(Tab::new(format!("t{n}"), PaneId(n)));
+        }
+        w.active = 2;
+        assert!(w.tab_beside(PaneId(1), PaneId(4)));
+        let first = |w: &Window| w.tabs.iter().map(|t| t.panes()[0].0).collect::<Vec<_>>();
+        assert_eq!((first(&w), w.active), (vec![1, 4, 2, 3], 3));
+        assert!(w.tab_beside(PaneId(3), PaneId(5)));
+        assert_eq!((first(&w), w.active), (vec![1, 4, 2, 3, 5], 3));
+        assert!(!w.tab_beside(PaneId(9), PaneId(6)));
     }
 }

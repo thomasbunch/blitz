@@ -116,6 +116,9 @@ const AWAY_AFTER: Duration = Duration::from_secs(30);
 /// How long a restored pane waits for its shell's first prompt before it
 /// types the Claude Code resume command anyway.
 const RESUME_AFTER: Duration = Duration::from_secs(3);
+/// How long after a key the user still counts as typing, so a pane a
+/// program opens does not take the keys that follow.
+const TYPING: Duration = Duration::from_secs(2);
 /// Lines of output saved per pane when `restore_scrollback` is on.
 const SAVED_LINES: usize = 1000;
 /// How long a changed layout waits before it is saved, so holding a resize
@@ -181,6 +184,9 @@ pub enum UserEvent {
     Files(PaneId, files::Loaded),
     /// What the reader of Claude Code's logs found.
     Usage(Box<crate::usage::Report>),
+    /// A request from a program in a pane, and where its reply goes; see
+    /// [`crate::control`].
+    Control(String, std::sync::mpsc::Sender<String>),
 }
 
 /// Command-line options of the GUI.
@@ -1132,6 +1138,9 @@ struct View {
     /// it drew in the last frame.
     files: Option<Box<FileView>>,
     files_snap: Snapshot,
+    /// The pane whose program opened this one with `blitz pane`. Such a
+    /// pane is that program's: it is never saved or reopened.
+    parent: Option<PaneId>,
 }
 
 impl View {
@@ -1301,6 +1310,11 @@ struct App {
     /// blitz's Claude Code plugin, which every pane loads; `None` when it
     /// could not be written.
     plugin: Option<String>,
+    /// Where `blitz pane` reaches this window, which every pane gets as
+    /// `BLITZ_PIPE`.
+    pipe: Option<String>,
+    /// When the user last typed into a pane.
+    typed_at: Option<Instant>,
     /// A hint about Claude Code's hooks was shown; one per run is enough.
     hooks_hinted: bool,
     /// The state whose dot badges the taskbar button.
@@ -1768,6 +1782,8 @@ impl App {
             taskbar: Default::default(),
             taskbar_shows: None,
             plugin: None,
+            pipe: None,
+            typed_at: None,
             hooks_hinted: false,
             badge_shows: None,
             jump_key: false,
@@ -1830,7 +1846,26 @@ impl App {
         crate::handoff::install(self.hwnd, self.proxy.clone(), self.args.main());
         crate::notify::install(self.hwnd, self.proxy.clone());
         watch_settings(self.proxy.clone());
-        self.plugin = crate::hook::install_plugin().map(|d| d.to_string_lossy().into_owned());
+        let plugin = crate::hook::install_plugin();
+        // `blitz pane` in every pane, found after the programs on its PATH.
+        if let (Some(dir), Ok(hook)) = (&plugin, crate::hook::hook_exe())
+            && let Some(bin) = crate::hook::install_bin(dir, &hook)
+        {
+            crate::shell::set_path_tail(&bin);
+        }
+        self.plugin = plugin.map(|d| d.to_string_lossy().into_owned());
+        let proxy = self.proxy.clone();
+        let listened = crate::control::listen(move |line| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            // Once the window has gone, so has `tx`, and this does not wait.
+            let _ = proxy.send_event(UserEvent::Control(line, tx));
+            (rx.recv_timeout(crate::control::ANSWER))
+                .unwrap_or_else(|_| crate::control::error("blitz did not answer"))
+        });
+        match listened {
+            Ok(pipe) => self.pipe = Some(pipe),
+            Err(e) => eprintln!("blitz: `blitz pane` cannot reach this window: {e}"),
+        }
         self.window = Some(Arc::new(window));
         self.frame_theme();
         self.ensure_gfx();
@@ -1869,7 +1904,7 @@ impl App {
             win.tabs.push(Tab::new(String::new(), id));
             win.active = win.tabs.len() - 1;
             let cmd = self.args.cmd.clone();
-            self.open(win, id, cmd.as_deref(), "", cwd)?;
+            self.open(win, id, cmd.as_deref(), "", cwd, None)?;
             // Said where it is seen: the release build has no console. It
             // stays, as nothing this window does is saved, and takes the
             // place of a shell that failed, which each new pane says again.
@@ -1955,9 +1990,9 @@ impl App {
 
     /// Starts a session for pane `id` and shows `win`, a layout that
     /// already holds it, running `cmd` or else `shell` (see [`App::spawn`]).
-    /// Once a session exists, a layout that leaves the new pane, or the one
-    /// it split, below the minimum size is refused; panes the window already
-    /// made small do not count.
+    /// Once a session exists, a layout that leaves the new pane, or `split`,
+    /// the one it split, below the minimum size is refused; panes the window
+    /// already made small do not count.
     fn open(
         &mut self,
         win: layout::Window,
@@ -1965,9 +2000,10 @@ impl App {
         cmd: Option<&str>,
         shell: &str,
         cwd: Option<PathBuf>,
+        split: Option<PaneId>,
     ) -> Result<(), String> {
         let grids = self.grids(&win);
-        if !self.views.is_empty() && no_room(&win, &grids, id, self.focus_id()) {
+        if !self.views.is_empty() && no_room(&win, &grids, id, split) {
             return Err("no room for another pane".into());
         }
         self.spawn(id, &grids, cmd, shell, cwd, None)?;
@@ -2065,11 +2101,13 @@ impl App {
             self.error(id, e);
             return;
         }
-        // The new session takes the old one's row in the sidebar.
+        // The new session takes the old one's row in the sidebar, and the
+        // panes the old one opened.
         let named = self.views.swap_remove(i).pane.named;
         if let Some(v) = self.view_mut(new) {
             v.pane.named = named;
         }
+        hand_down(self.views.iter_mut().map(|v| &mut v.parent), id, Some(new));
         self.resume(new, claude);
         self.install(win);
     }
@@ -2128,7 +2166,11 @@ impl App {
             let dirs = crate::hook::plugin_dirs(inherited.as_deref(), dir);
             ("CLAUDE_CODE_PLUGIN_DIRS".to_owned(), dirs)
         });
-        launch.env.extend(plugin.clone());
+        // Where `blitz pane` reaches this window. Not passed into WSL,
+        // which cannot open a Windows pipe.
+        let pipe = (self.pipe.clone()).map(|p| ("BLITZ_PIPE".to_owned(), p));
+        let ours: Vec<_> = plugin.into_iter().chain(pipe).collect();
+        launch.env.extend(ours.clone());
         let start = |launch: &crate::shell::Launch| {
             // The integration's own variables win over the user's.
             let env: Vec<_> = (self.config.env.iter().cloned())
@@ -2166,7 +2208,7 @@ impl App {
                 let mut started = Err(String::new());
                 for next in fallbacks(shell, &self.config.shell) {
                     let mut l = launch_of(next);
-                    l.env.extend(plugin.clone());
+                    l.env.extend(ours.clone());
                     match start(&l) {
                         Ok(p) => {
                             started = Ok((p, l));
@@ -2216,6 +2258,7 @@ impl App {
             selection: None,
             files: None,
             files_snap: Snapshot::default(),
+            parent: None,
         });
         if let Some(text) = fell_back {
             // It covers the pane's last row, so it stays only until the
@@ -2254,7 +2297,7 @@ impl App {
         if !place(&mut win, id) {
             return;
         }
-        if let Err(e) = self.open(win, id, None, shell, cwd)
+        if let Err(e) = self.open(win, id, None, shell, cwd, self.focus_id())
             && let Some(id) = self.focus_id()
         {
             self.error(id, e);
@@ -2264,7 +2307,8 @@ impl App {
     /// Closes a session and its pane. The window closes with the last one.
     fn close(&mut self, el: &ActiveEventLoop, id: PaneId) {
         let before = self.focus_id();
-        if let Some(v) = self.view(id) {
+        // A pane a program opened is that program's to open again.
+        if let Some(v) = self.view(id).filter(|v| v.parent.is_none()) {
             self.closed = Some((v.pane.cwd.clone(), v.pane.claude.clone()));
         }
         self.win.close_pane(id);
@@ -2275,6 +2319,8 @@ impl App {
         }
         // Dropping the pane closes its pseudoconsole.
         self.views.retain(|v| v.pane.id != id);
+        // What its program opened is the user's now.
+        hand_down(self.views.iter_mut().map(|v| &mut v.parent), id, None);
         self.taskbar_progress();
         self.taskbar_badge();
         self.keep_awake();
@@ -2288,6 +2334,161 @@ impl App {
             return;
         }
         self.focus_moved(before);
+    }
+
+    /// Answers `line`, a request from the program in a pane; see
+    /// [`crate::control`]. A refusal says why in blitz's words, never in
+    /// the request's.
+    fn control(&mut self, el: &ActiveEventLoop, line: &str) -> String {
+        use crate::control::{Op, error, state};
+        use crate::hook::escape_json;
+        let (token, op) = match crate::control::parse(line) {
+            Ok(r) => r,
+            Err(why) => return error(why),
+        };
+        // Every live pane is compared in full, so how long this takes says
+        // nothing of how near a token came.
+        let caller = (self.views.iter())
+            .filter(|v| v.pane.exit_code.is_none())
+            .fold(None, |found, v| {
+                crate::control::same(&v.pane.token, &token)
+                    .then_some(v.pane.id)
+                    .or(found)
+            });
+        let Some(caller) = caller else {
+            return error("not the token of a pane in this window");
+        };
+        let num = |n: Option<u32>| n.map_or_else(|| "null".into(), |n| n.to_string());
+        let target = |pane: PaneId| {
+            (self.view(pane))
+                .filter(|_| self.may(caller, pane))
+                .ok_or_else(|| error(&format!("no pane {} that this pane opened", pane.0)))
+        };
+        let ok = "{\"ok\":true}".to_owned();
+        match op {
+            Op::List => {
+                let mut out = String::from("{\"ok\":true,\"panes\":[");
+                for s in (self.sessions().iter()).filter(|s| self.may(caller, s.id)) {
+                    if !out.ends_with('[') {
+                        out.push(',');
+                    }
+                    let parent = self.view(s.id).and_then(|v| v.parent).map(|p| p.0);
+                    out += &format!(
+                        "{{\"pane\":{},\"parent\":{},\"state\":\"{}\",\"exit\":{},\"name\":\"",
+                        s.id.0,
+                        num(parent),
+                        state(s.state),
+                        num(s.exit_code)
+                    );
+                    escape_json(&s.name, &mut out);
+                    out.push_str("\",\"cwd\":\"");
+                    escape_json(&s.cwd, &mut out);
+                    out.push_str("\"}");
+                }
+                out + "]}"
+            }
+            Op::Open {
+                place,
+                cwd,
+                command,
+                focus,
+            } => match self.control_open(caller, place, cwd, command, focus) {
+                Ok(id) => format!("{{\"ok\":true,\"pane\":{}}}", id.0),
+                Err(why) => error(&why),
+            },
+            Op::Send { pane, text, keys } => {
+                let p = match target(pane) {
+                    Ok(v) => &v.pane,
+                    Err(e) => return e,
+                };
+                let waits = p.hooked && p.attn.state == Attn::NeedsYou;
+                if let Some(why) = send_refused(pane, p.exit_code, waits) {
+                    return error(&why);
+                }
+                let modes = lock(&p.term).input_modes();
+                match crate::control::send_bytes(&text, &keys, &modes) {
+                    // Not as the user typing: a question there stays.
+                    Ok(bytes) => {
+                        p.send(bytes);
+                        ok
+                    }
+                    Err(why) => error(why),
+                }
+            }
+            Op::Read { pane, lines } => {
+                let p = match target(pane) {
+                    Ok(v) => &v.pane,
+                    Err(e) => return e,
+                };
+                // Only the rows asked for, not all of the scrollback.
+                let text = read_text(&lock(&p.term).last_text(lines), lines);
+                let mut out = String::from("{\"ok\":true,\"text\":\"");
+                escape_json(&text, &mut out);
+                let (attn, exit) = (state(p.attn.state), num(p.exit_code));
+                out + &format!("\",\"state\":\"{attn}\",\"exit\":{exit}}}")
+            }
+            Op::Close { pane } => {
+                if let Err(e) = target(pane) {
+                    return e;
+                }
+                // Without asking: the program that opened it asked.
+                self.close(el, pane);
+                ok
+            }
+        }
+    }
+
+    /// Opens a shell for the program in pane `caller`, at `place`, in
+    /// `cwd` or else the caller's folder, typing `command` at its first
+    /// prompt. It takes focus only when asked, and only while the user is
+    /// in the caller's pane and not typing: keys meant for it would land
+    /// in the new one.
+    fn control_open(
+        &mut self,
+        caller: PaneId,
+        place: crate::control::Place,
+        cwd: Option<PathBuf>,
+        command: Option<String>,
+        focus: bool,
+    ) -> Result<PaneId, String> {
+        use crate::control::Place;
+        let cwd = match cwd {
+            Some(d) if d.is_dir() => Some(d),
+            Some(_) => return Err("cwd is not a folder".into()),
+            None => start_dir(self.view(caller).map_or("", |v| v.pane.cwd.as_str())),
+        };
+        let id = PaneId(self.next_id);
+        let mut win = self.win.clone();
+        let (placed, split) = match place {
+            Place::Tab => (win.tab_beside(caller, id), None),
+            Place::Beside(dir) => {
+                let tab = win.tabs.iter_mut().find(|t| t.root.contains(caller));
+                let placed = tab.is_some_and(|t| t.split_at(caller, dir, id, ANY, (0, 0)));
+                (placed, Some(caller))
+            }
+        };
+        if !placed {
+            return Err("no room for another pane".into());
+        }
+        self.open(win, id, None, "", cwd, split)?;
+        let now = Instant::now();
+        if let Some(v) = self.view_mut(id) {
+            v.parent = Some(caller);
+            if let Some(c) = command {
+                v.resume = Some((crate::control::typed_line(&c), now + RESUME_AFTER));
+            }
+        }
+        let typing = self.typed_at.is_some_and(|t| now - t < TYPING);
+        if focus && self.focused && self.focus_id() == Some(caller) && !typing {
+            self.show(id);
+        }
+        Ok(id)
+    }
+
+    /// Whether the program in pane `caller` may touch pane `target`; see
+    /// [`opened_by`].
+    fn may(&self, caller: PaneId, target: PaneId) -> bool {
+        opened_by(caller, target, |p| self.view(p).and_then(|v| v.parent))
     }
 
     /// Catches up after the focused pane may have changed: focus reports,
@@ -3990,11 +4191,13 @@ impl App {
         };
         if v.pane.exit_code.is_some() {
             if k.down && matches!(k.vk, VK_RETURN | VK_ESCAPE) {
-                let id = v.pane.id;
+                let (id, child) = (v.pane.id, v.parent.is_some());
                 // The release must not reach the pane that takes focus.
                 self.eaten.press(k.vk);
                 match k.vk {
-                    VK_RETURN => self.restart(id),
+                    // A pane a program opened is that program's to start
+                    // again.
+                    VK_RETURN if !child => self.restart(id),
                     _ => self.close(el, id),
                 }
             }
@@ -4026,6 +4229,7 @@ impl App {
         // ponytail: from when blitz handles the key, which leaves out
         // its wait in the message queue
         self.counters.typed(Instant::now());
+        self.typed_at = Some(Instant::now());
         self.orphan = None;
         self.answered(id);
     }
@@ -6175,7 +6379,9 @@ impl App {
                     };
                     g.r.clipped(at, |r| {
                         r.grid(snap, &pal, at.x, at.y, dim, hollow, scenery.is_none());
-                        if let Some((text, dim)) = notice_line(v.notice.as_ref(), v.pane.exit_code)
+                        let child = v.parent.is_some();
+                        if let Some((text, dim)) =
+                            notice_line(v.notice.as_ref(), v.pane.exit_code, child)
                         {
                             draw_notice(r, &pal, at, (v.grid.0, rows), &text, dim);
                         }
@@ -6328,7 +6534,12 @@ impl App {
                 shell: v.map(|v| v.shell.clone()).unwrap_or_default(),
             }
         };
-        let s = session::State::capture(&self.win, self.placed, meta);
+        // Panes programs opened go with those programs.
+        let mut win = self.win.clone();
+        for v in self.views.iter().filter(|v| v.parent.is_some()) {
+            win.close_pane(v.pane.id);
+        }
+        let s = session::State::capture(&win, self.placed, meta);
         let changed = changed(self.saved.as_ref(), &s);
         let dragging = self.mouse.divider.is_some();
         if !force && !save_now(changed, dragging, Instant::now(), &mut self.save_after) {
@@ -6361,7 +6572,8 @@ impl App {
     /// deletes what an earlier run saved when it is off.
     fn save_output(&self) {
         let stamp = local_stamp();
-        let views = (self.views.iter()).filter(|_| self.config.restore_scrollback);
+        let views =
+            (self.views.iter()).filter(|v| self.config.restore_scrollback && v.parent.is_none());
         let panes: Vec<_> = views
             .filter_map(|v| {
                 let term = lock(&v.pane.term);
@@ -7208,12 +7420,17 @@ fn hint_into(slot: &mut Option<Notice>, text: String, until: Instant) -> bool {
 
 /// The notice of a pane, and whether it is dim: its own, else for
 /// a program that exited, how and what Enter and Esc do, which comes
-/// back when a notice over it goes.
-fn notice_line(n: Option<&Notice>, exit: Option<u32>) -> Option<(Cow<'_, str>, bool)> {
+/// back when a notice over it goes. Enter closes a `child`, a pane a
+/// program opened.
+fn notice_line(n: Option<&Notice>, exit: Option<u32>, child: bool) -> Option<(Cow<'_, str>, bool)> {
     match (n, exit) {
         (Some(n), _) => Some((Cow::Borrowed(n.text.as_str()), n.dim)),
         (None, Some(code)) => {
-            let text = format!("{} \u{b7} Enter restart \u{b7} Esc close", exit_text(code));
+            let keys = match child {
+                true => "Enter or Esc close",
+                false => "Enter restart \u{b7} Esc close",
+            };
+            let text = format!("{} \u{b7} {keys}", exit_text(code));
             Some((Cow::Owned(text), false))
         }
         (None, None) => None,
@@ -7288,19 +7505,22 @@ fn tab_grids(
 }
 
 /// Whether `grids` leave pane `id`, new in `win`, or `split`, the pane it
-/// split, below the minimum size. Only the tab shown counts: a new tab
-/// splits nothing, and the pane focused before it may be one the window
-/// already made small.
+/// split, below the minimum size. Only the new pane's tab counts, shown or
+/// not: a new tab splits nothing, and the pane focused before it may be
+/// one the window already made small.
 fn no_room(
     win: &layout::Window,
     grids: &[(PaneId, (i32, i32))],
     id: PaneId,
     split: Option<PaneId>,
 ) -> bool {
-    let shown = win.tabs.get(win.active).map(Tab::panes).unwrap_or_default();
+    let tab = (win.tabs.iter())
+        .find(|t| t.root.contains(id))
+        .map(Tab::panes)
+        .unwrap_or_default();
     grids.iter().any(|&(p, (c, r))| {
         (p == id || Some(p) == split)
-            && shown.contains(&p)
+            && tab.contains(&p)
             && (c < layout::MIN_COLS || r < layout::MIN_ROWS)
     })
 }
@@ -7532,6 +7752,58 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// What `blitz pane read` returns of a pane's newest `text`: the last `n`
+/// lines, at most [`crate::control::MAX_LINES`] and
+/// [`crate::control::MAX_READ`] bytes, the newest kept.
+fn read_text(text: &str, n: usize) -> String {
+    let text = last_lines(text, n.min(crate::control::MAX_LINES));
+    let mut cut = text.len().saturating_sub(crate::control::MAX_READ);
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    text[cut..].to_owned()
+}
+
+/// Why `blitz pane send` may not type into pane `id`, if it may not: its
+/// program exited, or Claude Code there `waits` for its user, whose answer
+/// it would be.
+fn send_refused(id: PaneId, exit: Option<u32>, waits: bool) -> Option<String> {
+    match (exit, waits) {
+        (Some(_), _) => Some(format!("pane {} has exited", id.0)),
+        (None, true) => Some(format!("pane {} is waiting for its user", id.0)),
+        (None, false) => None,
+    }
+}
+
+/// Whether `target` is a pane the program in pane `caller` opened, or one
+/// a pane it opened did, and so on; `parent` says which pane opened one.
+/// A pane closed in between ends the line. A pane opens only newer ones,
+/// and only one nothing opened starts again under a new id, so the walk
+/// ends.
+fn opened_by(caller: PaneId, target: PaneId, parent: impl Fn(PaneId) -> Option<PaneId>) -> bool {
+    let mut at = target;
+    while let Some(p) = parent(at) {
+        if p == caller {
+            return target != caller;
+        }
+        at = p;
+    }
+    false
+}
+
+/// Gives the panes that pane `from` opened, as `parents` says, to `to`:
+/// its new session when it starts again, or none once it closes, which
+/// makes them the user's own.
+fn hand_down<'a>(
+    parents: impl Iterator<Item = &'a mut Option<PaneId>>,
+    from: PaneId,
+    to: Option<PaneId>,
+) {
+    for p in parents.filter(|p| **p == Some(from)) {
+        *p = to;
+    }
+}
+
 /// Where a new pane starts: `cwd` if it is still a directory, else the
 /// user's profile folder.
 fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
@@ -7543,20 +7815,21 @@ fn start_dir(cwd: impl AsRef<Path>) -> Option<PathBuf> {
     std::env::var_os(home).map(PathBuf::from)
 }
 
+/// The area a new pane is split off in: only the pane minimum matters, and
+/// [`App::open`] checks that against the real window.
+const ANY: Rect = Rect {
+    x: 0,
+    y: 0,
+    w: 1 << 16,
+    h: 1 << 16,
+};
+
 /// Splits the focused pane of the active tab, putting the new one on the
 /// `dir` side; for [`App::add`].
 fn split(dir: Dir) -> impl FnOnce(&mut layout::Window, PaneId) -> bool {
     move |win, id| {
-        // Only the pane minimum matters, and `open` checks that against the
-        // real window.
-        let any = Rect {
-            x: 0,
-            y: 0,
-            w: 1 << 16,
-            h: 1 << 16,
-        };
         let active = win.active;
-        (win.tabs.get_mut(active)).is_some_and(|t| t.split(dir, id, any, (0, 0)))
+        (win.tabs.get_mut(active)).is_some_and(|t| t.split(dir, id, ANY, (0, 0)))
     }
 }
 
@@ -8351,6 +8624,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.jump();
                 self.to_front();
             }
+            UserEvent::Control(line, reply) => {
+                let _ = reply.send(self.control(el, &line));
+            }
         }
     }
 
@@ -8380,6 +8656,11 @@ impl ApplicationHandler<UserEvent> for App {
         // Closing the window, Alt+F4 and an update all keep the layout.
         self.save_session(true);
         crate::notify::untoast_all();
+        // A pipe goes with the process; a socket stays as a file.
+        #[cfg(unix)]
+        if let Some(socket) = &self.pipe {
+            let _ = std::fs::remove_file(socket);
+        }
         // Not when that would close another blitz window opened since; the
         // banner offers it again at the next start.
         if let Some((_, Some(installer))) = self.at_close.take()
@@ -10229,6 +10510,9 @@ mod tests {
             (PaneId(2), (80, 24)),
         ];
         assert!(!no_room(&win, &grids, PaneId(2), Some(PaneId(1))), "a tab");
+        // A program in a tab not shown splits its own pane, not the
+        // focused one.
+        assert!(no_room(&win, &grids, PaneId(3), Some(PaneId(1))), "hidden");
         win.active = 0;
         assert!(no_room(&win, &grids, PaneId(3), Some(PaneId(1))), "a split");
     }
@@ -11226,17 +11510,19 @@ mod tests {
             assert!(!hint_into(&mut slot, "hint".into(), until));
             assert!(slot.is_some_and(|n| n.ask == ask && n.text == "n"));
         }
-        let exited = notice_line(None, Some(2)).expect("a line");
+        let exited = notice_line(None, Some(2), false).expect("a line");
         assert_eq!(
             exited,
             ("exit 2 \u{b7} Enter restart \u{b7} Esc close".into(), false)
         );
+        let child = notice_line(None, Some(2), true).expect("a line");
+        assert_eq!(child, ("exit 2 \u{b7} Enter or Esc close".into(), false));
         let error = notice(Ask::Key, false);
         assert_eq!(
-            notice_line(Some(&error), Some(2)),
+            notice_line(Some(&error), Some(2), false),
             Some(("n".into(), false))
         );
-        assert_eq!(notice_line(None, None), None);
+        assert_eq!(notice_line(None, None, false), None);
     }
 
     /// Focus leaving a pane takes its close or paste question with it, and
@@ -11326,6 +11612,94 @@ mod tests {
         );
         let mut none = layout::Window::default();
         assert!(!split(Dir::Down)(&mut none, PaneId(3)), "no tab");
+    }
+
+    /// A program reaches the panes it opened and theirs, never its own
+    /// pane, the pane that opened it, or one past a pane closed between.
+    #[test]
+    fn app_a_program_touches_only_the_panes_it_opened() {
+        // 1 opened 2, which opened 3 and 4. 1 opened 8 too, which opened
+        // 5 and then closed, so it has no parent to tell.
+        let parent = |p: PaneId| match p.0 {
+            2 => Some(PaneId(1)),
+            3 | 4 => Some(PaneId(2)),
+            5 => Some(PaneId(8)),
+            _ => None,
+        };
+        let may = |c: u32, t: u32| opened_by(PaneId(c), PaneId(t), parent);
+        assert!(may(1, 2) && may(1, 3) && may(2, 4));
+        assert!(!may(2, 1), "the pane that opened it");
+        assert!(!may(2, 2) && !may(1, 1), "its own");
+        assert!(!may(3, 4), "a sibling");
+        assert!(!may(1, 5), "past a closed pane");
+        assert!(!may(1, 6), "a pane the user opened");
+    }
+
+    /// A pane that starts again under a new id keeps the panes it opened,
+    /// and only those.
+    #[test]
+    fn app_a_restarted_pane_keeps_the_panes_it_opened() {
+        let mut parents = [Some(PaneId(1)), Some(PaneId(2)), None, Some(PaneId(1))];
+        hand_down(parents.iter_mut(), PaneId(1), Some(PaneId(9)));
+        assert_eq!(
+            parents,
+            [Some(PaneId(9)), Some(PaneId(2)), None, Some(PaneId(9))]
+        );
+        let parent = |p: PaneId| parents.get(p.0 as usize).copied().flatten();
+        assert!(opened_by(PaneId(9), PaneId(0), parent));
+    }
+
+    /// The panes a closed pane opened are the user's: saved, reopened and
+    /// started again as any other, and out of reach of the pane above.
+    #[test]
+    fn app_a_closed_pane_leaves_its_panes_to_the_user() {
+        // 1 opened 2, which opened 3 and 4; 5 is 3's.
+        let mut parents = [
+            None,
+            None,
+            Some(PaneId(1)),
+            Some(PaneId(2)),
+            Some(PaneId(2)),
+            Some(PaneId(3)),
+        ];
+        hand_down(parents.iter_mut(), PaneId(2), None);
+        assert_eq!(parents[3..], [None, None, Some(PaneId(3))]);
+        let parent = |p: PaneId| parents.get(p.0 as usize).copied().flatten();
+        assert!(
+            !opened_by(PaneId(1), PaneId(3), parent),
+            "not the pane above"
+        );
+        assert!(
+            opened_by(PaneId(3), PaneId(5), parent),
+            "their own still are"
+        );
+    }
+
+    /// Typing into a pane is refused once its program exited, and while
+    /// Claude Code there waits for its user, whose answer it would be.
+    #[test]
+    fn app_send_is_refused_where_it_would_answer() {
+        assert_eq!(send_refused(PaneId(7), None, false), None);
+        assert_eq!(
+            send_refused(PaneId(7), None, true).as_deref(),
+            Some("pane 7 is waiting for its user")
+        );
+        assert_eq!(
+            send_refused(PaneId(7), Some(0), false).as_deref(),
+            Some("pane 7 has exited")
+        );
+    }
+
+    #[test]
+    fn app_read_returns_the_newest_output_within_its_caps() {
+        assert_eq!(read_text("a\nb\nc\n\n", 2), "b\nc");
+        assert_eq!(read_text("\nonly\n", 100), "only");
+        let many: Vec<String> = (0..3000).map(|i| i.to_string()).collect();
+        let text = read_text(&many.join("\n"), usize::MAX);
+        assert!(text.ends_with("\n2999") && text.lines().count() <= crate::control::MAX_LINES);
+        let wide = "é".repeat(crate::control::MAX_READ) + "\nend";
+        let text = read_text(&wide, 10);
+        assert!(text.len() <= crate::control::MAX_READ && text.ends_with("é\nend"));
     }
 
     // Windows' and Linux's chords.

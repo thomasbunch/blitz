@@ -772,7 +772,7 @@ impl Runner {
 /// then the modifiers go up in reverse order. Names are case-insensitive;
 /// the key is a name (`enter`, `esc`, `up`, `f5`, ...) or one character.
 /// The inputs borrow their text from `text`.
-fn chord<'a>(spec: &str, text: &'a mut String) -> Result<Vec<KeyInput<'a>>, String> {
+pub(crate) fn chord<'a>(spec: &str, text: &'a mut String) -> Result<Vec<KeyInput<'a>>, String> {
     let spec = spec.trim().to_ascii_lowercase();
     // A trailing "+" is the plus key: "+", "ctrl++".
     let (modifiers, name) = match spec.strip_suffix('+') {

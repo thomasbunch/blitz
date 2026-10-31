@@ -217,6 +217,30 @@ fn scrollback_is_capped() {
     assert_eq!(t.scrollback_text(), lines(397..=496));
 }
 
+/// The newest rows read the same as the end of all the text, without the
+/// blank rows under the cursor.
+#[test]
+fn last_text_is_the_end_of_scrollback_and_screen() {
+    let mut t = Terminal::new(Options {
+        cols: 20,
+        rows: 5,
+        scrollback_lines: 100,
+        ambiguous_wide: false,
+    });
+    for i in 1..=50 {
+        feed(&mut t, &format!("line {i}\r\n"));
+    }
+    assert_eq!(t.last_text(3), lines(48..=50));
+    let all = format!("{}\n{}", t.scrollback_text(), t.screen_text());
+    assert_eq!(t.last_text(1000), all.trim_end_matches('\n'));
+    assert_eq!(t.last_text(1000), lines(1..=50));
+    assert_eq!(t.last_text(0), "");
+    // A full-screen program's screen comes after the shell's scrollback,
+    // as in the text above.
+    feed(&mut t, "\x1b[?1049h\x1b[Hmenu");
+    assert_eq!(t.last_text(2), "line 46\nmenu");
+}
+
 #[test]
 fn the_host_clears_the_scrollback() {
     let mut t = run(20, 3, "");

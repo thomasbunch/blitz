@@ -263,6 +263,64 @@ prints lines to add to the end of `~/.bashrc` (`zsh` prints them for
 WSL only folders under `/mnt` are reported, and the lines need
 `BLITZ_PANE_TOKEN`, which reaches WSL only when `WSLENV` lists it.
 
+## Scripting panes
+
+A script or an agent in a pane can open panes of its own and drive them
+with `blitz pane`, from any shell in blitz:
+
+- `blitz pane split [--down] [--cwd DIR] [--focus] [CMD...]` opens a
+  shell beside this pane, on the right or below, and prints its ID. CMD
+  is typed at its first prompt, its words joined by spaces, so a command
+  with quotes of its own goes as one quoted string:
+  `blitz pane split "git commit -m 'fix the bug'"`.
+- `blitz pane tab [--cwd DIR] [--focus] [CMD...]` does the same in a new
+  tab right after this pane's.
+- `blitz pane send ID [--key KEY]... [TEXT]` types TEXT into the pane as
+  a paste, then presses each key: `enter`, `tab`, `esc`, `up`, `f5`,
+  `ctrl+c` and the like.
+- `blitz pane read ID [--lines N]` prints the pane's last N lines, 100
+  unless given, at most 2000 lines and 40 KB.
+- `blitz pane list` prints the panes it can reach, one a line, with tabs
+  between: ID, the ID of the pane that opened it, state (`working`,
+  `needs-you`, `done`, `error` or `idle`), name and folder.
+- `blitz pane close ID` closes the pane without asking.
+
+In PowerShell, for one:
+
+```
+$id = blitz pane split --down npm test
+blitz pane send $id --key ctrl+c
+blitz pane read $id --lines 20
+```
+
+A new pane starts in this pane's folder and leaves focus where it is.
+With `--focus` it takes focus, but only while you are in the pane that
+asked and have not typed for two seconds. TEXT goes in as a paste,
+with its control characters left out, and nothing presses Enter after
+it: add `--key enter` to run what it typed. A line break in TEXT goes
+as Enter does, though, so a program that does not mark pastes, such as
+cmd or PowerShell without PSReadLine, runs each line it ends.
+
+A program reaches only the panes it opened, and the panes those opened;
+never yours, nor the pane it runs in. `send` refuses a pane whose
+program has exited, and one where Claude Code is waiting for you: the
+answer is yours. Panes a program opened are not saved with the window,
+and **Reopen the last closed pane** does not bring them back; Enter on
+one whose program exited closes it. Once the pane that opened one
+closes, it is yours like any other.
+
+Errors go to stderr as `blitz: ...` with exit code 1, and a mistyped
+command exits with 2. A pane finds blitz by `BLITZ_PIPE` and itself by
+`BLITZ_PANE_TOKEN`, so `blitz pane` fails outside blitz, inside WSL, and
+where Claude Code's `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` removed the
+token. The `blitz` panes find is a copy of `blitz-hook` in blitz's
+Claude Code plugin folder, at the end of the PATH, so a `blitz` earlier
+on the PATH comes first. That copy runs only `blitz pane`.
+
+Keeping each program to its own panes keeps programs that play along
+apart. It is no sandbox: other programs you run can do anything you
+can, in blitz and out of it.
+
 ## Settings
 
 Ctrl+, opens the settings panel. Up and down choose a setting, left and

@@ -1,6 +1,7 @@
 //! A child process on its own terminal: ConPTY on Windows, a pseudo
 //! terminal elsewhere. Both give a pane the same [`Pty`].
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -154,6 +155,19 @@ const STRIP: &[&str] = &[
 /// blitz's own, and so stays out of a pane's environment.
 fn foreign(upper: &str) -> bool {
     STRIP.contains(&upper) || STRIP_PREFIXES.iter().any(|p| upper.starts_with(p))
+}
+
+/// `vars` with `path`, when there is one, in place of their PATH, whatever
+/// its case.
+fn with_path(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+    path: Option<OsString>,
+) -> impl Iterator<Item = (OsString, OsString)> {
+    let fresh = path.is_some();
+    let name = if cfg!(windows) { "Path" } else { "PATH" };
+    (vars.into_iter())
+        .filter(move |(k, _)| !fresh || !k.eq_ignore_ascii_case("PATH"))
+        .chain(path.map(|p| (name.into(), p)))
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
