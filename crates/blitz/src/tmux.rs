@@ -368,12 +368,13 @@ fn format(f: &Flags, want: &str) -> Result<(), &'static str> {
 }
 
 /// The server a `-L` names, which must be one of Claude Code's, then the
-/// subcommand of `argv` and what follows it.
+/// subcommand of `argv` and what follows it. A pid has at most 10 digits,
+/// as a pane id does: every member keeps the name.
 pub fn sub(argv: &[String]) -> Result<(Option<&str>, &str, &[String]), &'static str> {
     let (server, rest) = match argv {
         [l, name, rest @ ..] if l == "-L" => {
             let pid = name.strip_prefix("claude-swarm-").unwrap_or_default();
-            if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            if !(1..=10).contains(&pid.len()) || !pid.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(ONLY);
             }
             (Some(name.as_str()), rest)
@@ -1366,6 +1367,13 @@ mod tests {
             &["-L", "default", "has-session", "-t", "claude-swarm"][..],
             &["-L", "claude-swarm-", "has-session", "-t", "claude-swarm"],
             &["-L", "claude-swarm-x", "has-session", "-t", "claude-swarm"],
+            &[
+                "-L",
+                "claude-swarm-12345678901",
+                "has-session",
+                "-t",
+                "claude-swarm",
+            ],
             &["list-panes", "-t", W, "-F", "#{pane_index}"],
             &["list-panes", "-t", W],
             &["list-windows", "-t", "claude-swarm", "-F", "#{pane_id}"],
