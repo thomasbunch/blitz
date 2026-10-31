@@ -2504,10 +2504,18 @@ impl App {
             cmdline: s.cmdline,
             env: s.env,
         };
-        // What went wrong may name the command, which may hold a secret.
-        (self.open(win, s.id, &cmd, "", Some(s.cwd), None)).map_err(|_| NOT_STARTED)?;
+        // What went wrong may name the command, which may hold a secret:
+        // the log says why without it.
+        (self.open(win, s.id, &cmd, "", Some(s.cwd), None)).map_err(|e| {
+            eprintln!(
+                "blitz: a teammate: {}",
+                e.replace(&cmd.cmdline, "its program")
+            );
+            NOT_STARTED
+        })?;
         if let Some(v) = self.view_mut(s.id) {
             v.parent = Some(s.lead);
+            v.pane.name = s.name;
             v.pane.named = Some(s.title);
         }
         Ok(())

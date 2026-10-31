@@ -6,7 +6,8 @@
 //! which sends its arguments here, so a real tmux earlier on PATH still
 //! comes first.
 //!
-//! A team is the pane whose program asks, its lead. Placeholders live only
+//! A team is the pane whose program asks, its lead, under the server that
+//! program names, as each Claude Code names its own. Placeholders live only
 //! here: the `cat` they would run never does. A teammate that starts opens
 //! in the team's tab, right after the lead's, which blitz lays out as a
 //! grid whenever one starts or closes. Anything else fails, loudly, so a
@@ -24,6 +25,11 @@ pub const NO_SPACE: &str = "no space for new pane";
 pub const NOT_STARTED: &str = "blitz: the teammate's program did not start";
 /// The one session Claude Code makes.
 const SESSION: &str = "claude-swarm";
+/// The most panes a team has, teammates and placeholders, as any program
+/// in the lead's pane may ask for more.
+const MAX_PANES: usize = 64;
+/// The longest name kept: a teammate's title, its team's, a window's.
+const MAX_NAME: usize = 64;
 const PANE_ID: &str = "#{pane_id}";
 const WINDOW_NAME: &str = "#{window_name}";
 /// The options Claude Code sets, which change nothing here.
@@ -91,6 +97,8 @@ pub struct Start {
     pub mates: Vec<PaneId>,
     pub cwd: PathBuf,
     pub cmdline: String,
+    /// Its program's name, as outside Windows `cmdline` starts `exec`.
+    pub name: String,
     pub env: Vec<(String, String)>,
     pub title: String,
     /// The name of the team, for its tab.
@@ -100,6 +108,8 @@ pub struct Start {
 #[derive(Debug)]
 struct Member {
     lead: PaneId,
+    /// What `-L` named when it was made, if anything.
+    server: Option<String>,
     id: PaneId,
     window: String,
     title: Option<String>,
@@ -177,7 +187,12 @@ impl Teams {
         env: &[(String, String)],
         next: &mut u32,
     ) -> Result<(String, Effect), &'static str> {
-        let (sub, rest) = sub(argv)?;
+        let (server, sub, rest) = sub(argv)?;
+        // Another Claude Code in the lead's pane names a server of its own,
+        // which, like a fresh tmux, holds nothing the last one left.
+        if let Some(s) = server {
+            (self.members).retain(|m| m.lead != lead || m.server.as_deref().is_none_or(|t| t == s));
+        }
         let f = flags(rest).ok_or(ONLY)?;
         let done = Ok((String::new(), Effect::None));
         match sub {
@@ -197,17 +212,17 @@ impl Teams {
                 }
                 match f.cmd {
                     [] => done,
-                    _ => self.placeholder(lead, f.get(b'n').unwrap_or("0"), &f, next),
+                    _ => self.placeholder(lead, server, f.get(b'n').unwrap_or("0"), &f, next),
                 }
             }
             "new-window" => {
                 session(f.get(b't'))?;
-                self.placeholder(lead, f.get(b'n').unwrap_or("0"), &f, next)
+                self.placeholder(lead, server, f.get(b'n').unwrap_or("0"), &f, next)
             }
             // Where and which way does not matter: the tab is a grid.
             "split-window" => {
                 let window = self.members[self.member(lead, f.get(b't'))?].window.clone();
-                self.placeholder(lead, &window, &f, next)
+                self.placeholder(lead, server, &window, &f, next)
             }
             "list-windows" => {
                 session(f.get(b't'))?;
@@ -230,7 +245,9 @@ impl Teams {
             }
             "select-pane" => {
                 let at = self.member(lead, f.get(b't'))?;
-                self.members[at].title = Some(f.get(b'T').ok_or(ONLY)?.to_owned());
+                // A model chose it, so it is shown as an OSC title would be.
+                let title = vt::osc::clean(f.get(b'T').ok_or(ONLY)?, MAX_NAME);
+                self.members[at].title = Some(title);
                 done
             }
             "set-option" => match f.words[..] {
@@ -248,10 +265,12 @@ impl Teams {
                     return Err(SHAPE);
                 };
                 let cmd = command(line)?;
+                let clean = |s: &str| vt::osc::clean(s, MAX_NAME);
                 let title = (m.title.clone())
-                    .or_else(|| flag(&cmd.argv, "--agent-name").map(str::to_owned))
+                    .or_else(|| flag(&cmd.argv, "--agent-name").map(clean))
                     .unwrap_or_else(|| "teammate".into());
                 let team = flag(&cmd.argv, "--team-name").unwrap_or("agent team");
+                let name = Path::new(&cmd.argv[0]).file_stem();
                 let id = m.id;
                 self.members[at].started = true;
                 let start = Start {
@@ -259,7 +278,8 @@ impl Teams {
                     id,
                     mates: self.mates(id).unwrap_or_default(),
                     cmdline: cmdline(&cmd.argv),
-                    team: team.to_owned(),
+                    name: name.map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                    team: clean(team),
                     cwd: cmd.cwd,
                     env: teammate_env(env, cmd.env),
                     title,
@@ -283,6 +303,7 @@ impl Teams {
     fn placeholder(
         &mut self,
         lead: PaneId,
+        server: Option<&str>,
         window: &str,
         f: &Flags,
         next: &mut u32,
@@ -290,10 +311,17 @@ impl Teams {
         if f.has(b'P') {
             format(f, PANE_ID)?;
         }
+        if window.len() > MAX_NAME {
+            return Err("blitz: a window's name is too long");
+        }
+        if self.team(lead).count() >= MAX_PANES {
+            return Err(NO_SPACE);
+        }
         let id = PaneId(*next);
-        *next += 1;
+        *next = next.checked_add(1).ok_or(NO_SPACE)?;
         self.members.push(Member {
             lead,
+            server: server.map(str::to_owned),
             id,
             window: window.to_owned(),
             title: None,
@@ -339,22 +367,21 @@ fn format(f: &Flags, want: &str) -> Result<(), &'static str> {
     }
 }
 
-/// The subcommand of `argv` and what follows it, past a `-L` that must
-/// name a server of Claude Code's: what it names does not matter, as a
-/// team is its lead's pane.
-pub fn sub(argv: &[String]) -> Result<(&str, &[String]), &'static str> {
-    let rest = match argv {
+/// The server a `-L` names, which must be one of Claude Code's, then the
+/// subcommand of `argv` and what follows it.
+pub fn sub(argv: &[String]) -> Result<(Option<&str>, &str, &[String]), &'static str> {
+    let (server, rest) = match argv {
         [l, name, rest @ ..] if l == "-L" => {
             let pid = name.strip_prefix("claude-swarm-").unwrap_or_default();
             if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(ONLY);
             }
-            rest
+            (Some(name.as_str()), rest)
         }
-        _ => argv,
+        _ => (None, argv),
     };
     let (sub, rest) = rest.split_first().ok_or(ONLY)?;
-    Ok((sub.as_str(), rest))
+    Ok((server, sub.as_str(), rest))
 }
 
 /// The flags of one command: those Claude Code gives, and no others.
@@ -515,18 +542,23 @@ fn command(line: &str) -> Result<Cmd, &'static str> {
             vars.push((k.to_owned(), v.to_owned()));
         }
     }
+    // UNC and device paths go before either is looked at: looking at
+    // `\\host\share` makes Windows sign in to that host.
+    let local = |p: &str| vt::osc::local_dir(p) && Path::new(p).is_absolute();
     let cwd = PathBuf::from(dir);
-    if !cwd.is_absolute() || !cwd.is_dir() {
+    if !local(dir) || !cwd.is_dir() {
         return Err("blitz: a teammate's folder is not a folder named in full");
     }
     let prog = Path::new(words[at]);
-    if !prog.is_absolute() || !prog.is_file() {
+    if !local(words[at]) || !prog.is_file() {
         return Err("blitz: a teammate's program is not a file named in full");
     }
-    // Windows runs those through cmd, which reads the line its own way.
+    // Windows runs those through cmd, which reads the line its own way, and
+    // finds one with dots and spaces after its name too.
     let batch =
         |e: &std::ffi::OsStr| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat");
-    if cfg!(windows) && prog.extension().is_some_and(batch) {
+    let named = Path::new(words[at].trim_end_matches(['.', ' ']));
+    if cfg!(windows) && named.extension().is_some_and(batch) {
         return Err("blitz: a teammate's program is not a batch file");
     }
     let argv = words[at..].iter().map(|w| w.to_string()).collect();
@@ -552,10 +584,15 @@ fn cmdline(argv: &[String]) -> String {
 }
 
 /// The variables a teammate starts with: its lead's, but another
-/// terminal's and blitz's own, under those its command `set`.
+/// terminal's and blitz's own, under those its command `set`. A cmd
+/// prompt of blitz's holds the lead's token, so it goes too.
 fn teammate_env(lead: &[(String, String)], set: Vec<(String, String)>) -> Vec<(String, String)> {
     (lead.iter())
-        .filter(|(k, _)| !crate::pty::foreign(&k.to_ascii_uppercase()))
+        .filter(|(k, v)| {
+            let k = k.to_ascii_uppercase();
+            !crate::pty::foreign(&k)
+                && !(k == "PROMPT" && crate::shell::is_blitz_prompt(v.as_ref()))
+        })
         .cloned()
         .chain(set)
         .collect()
@@ -628,7 +665,7 @@ pub fn client(args: &[String]) -> i32 {
     }
     fields.push(']');
     // A teammate starts with what its lead has; nothing else needs it.
-    if matches!(sub(args), Ok(("respawn-pane", _))) {
+    if matches!(sub(args), Ok((_, "respawn-pane", _))) {
         fields.push_str(",\"env\":{");
         let vars = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
@@ -925,6 +962,18 @@ mod tests {
             shell("; rm -rf x"),
             shell("&& secret"),
             shell("$secret"),
+            // UNC, device and verbatim paths, even to what is there.
+            format!(
+                "cd {} && env A=1 {}",
+                q(&format!(r"\\?\{}", dir())),
+                q(&exe())
+            ),
+            format!("cd {} && env A=1 {}", q(&format!("/{}", dir())), q(&exe())),
+            format!(
+                "cd {} && env A=1 {}",
+                q(&dir()),
+                q(&format!(r"\\?\{}", exe()))
+            ),
         ] {
             let why = command(&bad).expect_err(&bad);
             assert!(
@@ -936,8 +985,12 @@ mod tests {
         {
             let bat = std::env::temp_dir().join(format!("blitz-tmux-{}.cmd", std::process::id()));
             std::fs::write(&bat, "").unwrap();
-            let run = format!("cd {} && env A=1 {}", q(&dir()), q(&bat.to_string_lossy()));
-            assert!(command(&run).is_err());
+            // Windows finds it with dots and spaces after its name too.
+            for end in ["", ".", " ", ". ."] {
+                let bat = format!("{}{end}", bat.to_string_lossy());
+                let run = format!("cd {} && env A=1 {}", q(&dir()), q(&bat));
+                assert!(command(&run).is_err(), "{bat:?}");
+            }
             std::fs::remove_file(&bat).unwrap();
         }
     }
@@ -947,11 +1000,13 @@ mod tests {
     #[test]
     fn tmux_a_teammate_command_empties_what_it_sets_empty() {
         let mut lead = Lead::new(&[]);
+        let prompt = crate::shell::cmd_prompt("lead", "$P$G");
         lead.env = [
             ("CLAUDE_CODE_EVEN_MORE_DANGEROUSLY_SKIP_PERMISSIONS", "1"),
             ("BLITZ_PANE_TOKEN", "lead"),
             ("TERM_PROGRAM", "other"),
             ("HOME", "/home/me"),
+            ("Prompt", prompt.as_str()),
         ]
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .to_vec();
@@ -978,6 +1033,8 @@ mod tests {
             (last("BLITZ_PANE_TOKEN"), last("TERM_PROGRAM")),
             (None, None)
         );
+        // cmd's prompt in a blitz pane holds the lead's token.
+        assert!(!env.iter().any(|e| e.1.contains("lead")), "{env:?}");
     }
 
     /// The calls 2.1.312 makes for three teammates outside tmux, then as
@@ -1022,6 +1079,8 @@ mod tests {
         assert_eq!((s[1].title.as_str(), s[1].team.as_str()), ("b", "demo"));
         assert_eq!(s[2].cwd, PathBuf::from(dir()));
         assert!(s[2].cmdline.contains("c@demo"), "{}", s[2].cmdline);
+        let name = std::ffi::OsStr::new(&s[2].name);
+        assert_eq!(Path::new(&exe()).file_stem(), Some(name), "not exec");
         // One tab after the lead's, a grid, and the lead keeps focus.
         assert_eq!((lead.win.tabs.len(), lead.win.active), (2, 0));
         assert_eq!(
@@ -1138,6 +1197,113 @@ mod tests {
         lead.respawn("%3", "b");
         lead.respawn("%2", "a");
         assert_eq!((lead.win.tabs.len(), lead.team_tab()), (2, vec![2, 3]));
+    }
+
+    /// A second Claude Code in the lead's pane names another server, and
+    /// finds nothing the first left: not its teammates, nor a placeholder
+    /// it stopped before using.
+    #[test]
+    fn tmux_a_second_claude_code_makes_a_team_of_its_own() {
+        let mut lead = Lead::new(&["-L", "claude-swarm-100"]);
+        let new = [
+            "new-session",
+            "-d",
+            "-s",
+            "claude-swarm",
+            "-n",
+            "swarm-view",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "--",
+            "cat",
+        ];
+        assert_eq!(lead.ok(&new), "%2\n");
+        lead.respawn("%2", "a");
+        let split = [
+            "split-window",
+            "-d",
+            "-t",
+            "%2",
+            "-h",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "--",
+            "cat",
+        ];
+        assert_eq!(lead.ok(&split), "%3\n");
+        lead.server = words(&["-L", "claude-swarm-200"]);
+        lead.fails(&["has-session", "-t", "claude-swarm"]);
+        assert_eq!(lead.ok(&new), "%4\n");
+        assert_eq!(
+            lead.ok(&["list-panes", "-t", W, "-F", "#{pane_id}"]),
+            "%4\n"
+        );
+        lead.respawn("%4", "b");
+        assert!(lead.started[1].mates.is_empty());
+        // A tab of its own, beside the lead's.
+        assert_eq!((lead.win.tabs.len(), lead.team_tab()), (3, vec![4]));
+    }
+
+    /// The names a model chose are shown as an OSC title would be: with
+    /// no controls, nothing that turns text around, and cut short.
+    #[test]
+    fn tmux_cleans_the_names_it_shows() {
+        let mut lead = Lead::new(&[]);
+        lead.ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "claude-swarm",
+            "-n",
+            "swarm-view",
+            "--",
+            "cat",
+        ]);
+        let long = "x".repeat(100);
+        lead.ok(&[
+            "select-pane",
+            "-t",
+            "%2",
+            "-T",
+            &format!("\u{202E}a\x1bb{long}"),
+        ]);
+        let team = format!("--team-name '\u{202E}team{long}'");
+        let run = line("a").replace("--team-name demo", &team);
+        lead.ok(&["respawn-pane", "-k", "-t", "%2", "--", &run]);
+        let s = &lead.started[0];
+        assert_eq!(s.title, format!("ab{}", &long[..62]));
+        assert_eq!(s.team, format!("team{}", &long[..60]));
+        assert_eq!(lead.win.tabs[1].name, s.team);
+    }
+
+    /// Anything in the lead's pane may ask for placeholders, which stay
+    /// until they are killed: a team holds so many, named so long.
+    #[test]
+    fn tmux_limits_placeholders() {
+        let mut lead = Lead::new(&[]);
+        let new = ["new-window", "-t", "claude-swarm", "--", "cat"];
+        let long = "x".repeat(65);
+        let named = ["new-window", "-t", "claude-swarm", "-n", &long, "--", "cat"];
+        assert!(lead.fails(&named).contains("too long"));
+        lead.ok(&[
+            "new-window",
+            "-t",
+            "claude-swarm",
+            "-n",
+            &long[1..],
+            "--",
+            "cat",
+        ]);
+        for _ in 1..MAX_PANES {
+            lead.ok(&new);
+        }
+        assert_eq!(lead.fails(&new), format!("{NO_SPACE}\n"));
+        // Nor does a pane id come round again.
+        lead.ok(&["kill-pane", "-t", "%2"]);
+        lead.next = u32::MAX;
+        assert_eq!(lead.fails(&new), format!("{NO_SPACE}\n"));
     }
 
     /// A teammate blitz could not start leaves no placeholder behind, and
