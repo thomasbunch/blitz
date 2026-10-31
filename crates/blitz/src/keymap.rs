@@ -52,6 +52,9 @@ pub enum Action {
     SplitDown,
     /// Split right and start Claude Code in the new pane's shell.
     NewClaude,
+    /// [`Action::NewClaude`], opening its agent teammates as panes in a
+    /// tab beside it.
+    NewTeam,
     Focus(Dir),
     /// Move the nearest divider of the focused pane toward `Dir`.
     Resize(Dir),
@@ -145,6 +148,7 @@ pub const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::SplitRight, "split_right", "Split right"),
     (Action::SplitDown, "split_down", "Split down"),
     (Action::NewClaude, "new_claude", "New Claude Code session"),
+    (Action::NewTeam, "new_agent_team", "New agent team"),
     (Action::Focus(Dir::Left), "focus_left", "Focus the pane on the left"),
     (Action::Focus(Dir::Right), "focus_right", "Focus the pane on the right"),
     (Action::Focus(Dir::Up), "focus_up", "Focus the pane above"),

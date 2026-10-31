@@ -23,5 +23,6 @@ pub mod settings;
 pub mod shell;
 pub mod shortcuts;
 pub mod theme;
+pub mod tmux;
 pub mod update;
 pub mod usage;
