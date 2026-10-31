@@ -3163,19 +3163,18 @@ impl App {
             && self.plugin.is_some()
             && let Err(e) = crate::hook::install_plugin(on)
         {
+            // What it means first, as the panel shows one line.
             let text = if on {
-                format!("Cannot add the pane tools to the Claude Code plugin: {e}")
+                format!("Cannot add the pane tools: {e}")
             } else {
-                format!(
-                    "Cannot take the pane tools out of the Claude Code plugin: {e}; new sessions keep them"
-                )
+                format!("New Claude Code sessions keep the pane tools: {e}")
             };
             let focus = self.focus_id();
             match (&mut self.settings, focus) {
-                // After a save that failed too, which the user must hear of.
+                // Before a save that failed too, which the line may cut.
                 (Some(p), _) => {
                     p.error = Some(match p.error.take() {
-                        Some(was) => format!("{was}. {text}"),
+                        Some(was) => format!("{text}. {was}"),
                         None => text,
                     })
                 }
