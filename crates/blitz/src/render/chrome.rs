@@ -419,13 +419,16 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let session = |id: PaneId| m.sessions.iter().find(|x| x.id == id);
     // A tab's sessions in reading order, as its panes sit, each followed
     // by the ones it opened, depth first, with how many steps in its row
-    // sits: one a level, up to two. One opened from another tab takes its
-    // place in reading order, a step in, however deep its opener sits.
+    // sits: one a level, up to two. Those opened from another tab come
+    // first, a step in however deep their opener sits, so that none sits
+    // under a row of this tab's as if that one opened it.
     let members = |t: &Tab| -> Vec<(&Session, i32)> {
         let list: Vec<&Session> = t.panes().into_iter().filter_map(session).collect();
         let top = |x: &Session| x.parent.is_none_or(|p| list.iter().all(|y| y.id != p));
-        let mut stack: Vec<(&Session, i32)> = (list.iter().rev())
-            .filter(|x| top(x))
+        // Popped from the end: this tab's own go in first.
+        let roots =
+            |away: bool| (list.iter().rev()).filter(move |x| top(x) && x.parent.is_some() == away);
+        let mut stack: Vec<(&Session, i32)> = (roots(false).chain(roots(true)))
             .map(|&x| (x, x.parent.is_some() as i32))
             .collect();
         let mut out = Vec::new();
@@ -2525,7 +2528,8 @@ mod tests {
     }
 
     /// The sessions a session's program opened follow its row, depth
-    /// first and indented, in their own tab's group.
+    /// first and indented, in their own tab's group, where those opened
+    /// from another tab come first.
     #[test]
     fn opened_sessions_sit_under_their_opener() {
         let now = Instant::now();
@@ -2569,6 +2573,24 @@ mod tests {
         let c = build(&model(&win, &sessions, now));
         let rows: Vec<_> = c.side.rows.iter().map(|(id, r)| (id.0, r.x)).collect();
         assert_eq!(rows, want.map(|(id, _)| (id, 0)));
+        // One opened from the other tab, then swapped to the right of a
+        // pane of that tab's own, still does not sit under it.
+        let a = Tab::new("shop".into(), PaneId(1));
+        let mut b = Tab::new("team".into(), PaneId(5));
+        assert!(b.split(Dir::Right, PaneId(6), AREA, (1, 1)));
+        let win = Window {
+            tabs: vec![a, b],
+            active: 0,
+            sidebar_expanded: true,
+            narrow: None,
+        };
+        let mut sessions: Vec<_> = [1, 5, 6]
+            .map(|i| session(i, &format!("s{i}"), Attn::Idle, now))
+            .into();
+        sessions[2].parent = Some(PaneId(1));
+        let c = build(&model(&win, &sessions, now));
+        let rows: Vec<_> = c.side.rows.iter().map(|(id, r)| (id.0, r.x)).collect();
+        assert_eq!(rows, [(1, 8), (6, 20), (5, 8)]);
     }
 
     #[test]
