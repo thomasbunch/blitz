@@ -433,30 +433,30 @@ pub fn install_bin(plugin: &Path, hook: &Path) -> Option<PathBuf> {
 }
 
 /// Writes the plugin where this blitz keeps its state, for the blitz-hook
-/// next to it, with the pane tools when `tools`, and returns its folder;
-/// `None` when that cannot be done.
-pub fn install_plugin(tools: bool) -> Option<PathBuf> {
-    plugin_for(&hook_exe().ok()?, &crate::session::dir()?, tools)
+/// next to it, with the pane tools when `tools`, and returns its folder,
+/// or why that cannot be done.
+pub fn install_plugin(tools: bool) -> Result<PathBuf, String> {
+    let hook = hook_exe().map_err(|e| e.to_string())?;
+    let state = crate::session::dir().ok_or("no folder for blitz's state")?;
+    plugin_for(&hook, &state, tools)
 }
 
 /// [`install_plugin`] for the blitz-hook at `hook`, under `state`. Each
 /// blitz-hook has a folder of its own, so a second copy of blitz, such as
 /// a portable one or a release build, never points the panes of the first
-/// at its own. None for a blitz-hook other users can replace, which Claude
-/// Code would run in every session.
-fn plugin_for(hook: &Path, state: &Path, tools: bool) -> Option<PathBuf> {
-    if !hook.is_file() || exposed(hook) {
-        return None;
+/// at its own. Never for a blitz-hook other users can replace, which
+/// Claude Code would run in every session.
+fn plugin_for(hook: &Path, state: &Path, tools: bool) -> Result<PathBuf, String> {
+    if !hook.is_file() {
+        return Err("no blitz-hook next to blitz".into());
+    }
+    if exposed(hook) {
+        return Err("other users can replace blitz-hook".into());
     }
     let hook = hook.to_string_lossy();
     let dir = plugin_dir(state, &hook);
-    match write_plugin(&dir, &hook, tools) {
-        Ok(()) => Some(dir),
-        Err(e) => {
-            eprintln!("blitz: writing the Claude Code plugin: {e}");
-            None
-        }
-    }
+    write_plugin(&dir, &hook, tools).map_err(|e| e.to_string())?;
+    Ok(dir)
 }
 
 /// The plugin folder under `state` for the blitz-hook at `hook`.
@@ -1913,7 +1913,7 @@ mod tests {
         let _ = std::fs::remove_file(&hook);
         let _ = std::fs::remove_dir(&dir);
         made.expect("blitz-hook");
-        assert_eq!(plugin, None);
+        assert!(plugin.is_err(), "{plugin:?}");
         assert!(!state.exists());
         for (grant, got, want) in seen {
             assert_eq!(got, want, "after {grant}");

@@ -106,12 +106,18 @@ pub fn answer(line: &str, call: &dyn Fn(&str) -> Result<Json, String>) -> Option
     let Some(msg) = Json::parse(line) else {
         return Some(reply("null", Err((-32700, "Parse error", None))));
     };
-    // The id goes back as it came, as a double cannot hold every number.
-    let (Some(method), Some(id)) = (
-        msg.get("method").and_then(Json::as_str),
-        Json::raw(line, "id"),
-    ) else {
+    let (Some(method), Some(id)) = (msg.get("method").and_then(Json::as_str), msg.get("id")) else {
         return None;
+    };
+    // A number goes back as it came, as a double cannot hold every one;
+    // anything else is written again, escaped.
+    let id = match (id, Json::raw(line, "id")) {
+        (Json::Num(_), Some(raw)) => raw.to_owned(),
+        _ => {
+            let mut text = String::new();
+            id.write(&mut text);
+            text
+        }
     };
     let params = msg.get("params");
     let wanted = (params.and_then(|p| p.get("_meta")))
@@ -145,7 +151,7 @@ pub fn answer(line: &str, call: &dyn Fn(&str) -> Result<Json, String>) -> Option
         ("tools/call", _) => tool(params, call),
         _ => Err((-32601, "Method not found", None)),
     };
-    Some(reply(id, outcome))
+    Some(reply(&id, outcome))
 }
 
 /// The JSON-RPC line answering request `id` with `outcome`.
@@ -308,6 +314,9 @@ mod tests {
             ping(r#""a\"b""#).as_deref(),
             Some(r#"{"jsonrpc":"2.0","id":"a\"b","result":{}}"#)
         );
+        // Control characters sent raw in a string go back escaped.
+        let got = ping("\"a\u{1b}[2J\r\"").unwrap();
+        assert!(!got.contains(['\u{1b}', '\r']), "{got:?}");
 
         // Notifications, and answers to requests never made, get none.
         for quiet in [

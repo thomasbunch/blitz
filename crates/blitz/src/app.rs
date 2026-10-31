@@ -1846,7 +1846,9 @@ impl App {
         crate::handoff::install(self.hwnd, self.proxy.clone(), self.args.main());
         crate::notify::install(self.hwnd, self.proxy.clone());
         watch_settings(self.proxy.clone());
-        let plugin = crate::hook::install_plugin(self.config.claude_pane_tools);
+        let plugin = crate::hook::install_plugin(self.config.claude_pane_tools)
+            .inspect_err(|e| eprintln!("blitz: writing the Claude Code plugin: {e}"))
+            .ok();
         // `blitz pane` in every pane, found after the programs on its PATH.
         if let (Some(dir), Ok(hook)) = (&plugin, crate::hook::hook_exe())
             && let Some(bin) = crate::hook::install_bin(dir, &hook)
@@ -3157,16 +3159,27 @@ impl App {
         // Claude Code sessions started from now on get the pane tools, or
         // not. Without a plugin they get none either way.
         let on = self.config.claude_pane_tools;
-        if tools && self.plugin.is_some() && crate::hook::install_plugin(on).is_none() {
+        if tools
+            && self.plugin.is_some()
+            && let Err(e) = crate::hook::install_plugin(on)
+        {
             let text = if on {
-                "Cannot add the pane tools to the Claude Code plugin"
+                format!("Cannot add the pane tools to the Claude Code plugin: {e}")
             } else {
-                "Cannot take the pane tools out of the Claude Code plugin; new sessions keep them"
+                format!(
+                    "Cannot take the pane tools out of the Claude Code plugin: {e}; new sessions keep them"
+                )
             };
             let focus = self.focus_id();
             match (&mut self.settings, focus) {
-                (Some(p), _) => p.error = Some(text.into()),
-                (None, Some(id)) => self.error(id, text),
+                // After a save that failed too, which the user must hear of.
+                (Some(p), _) => {
+                    p.error = Some(match p.error.take() {
+                        Some(was) => format!("{was}. {text}"),
+                        None => text,
+                    })
+                }
+                (None, Some(id)) => self.error(id, &text),
                 (None, None) => {}
             }
         }
