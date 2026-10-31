@@ -3589,7 +3589,7 @@ impl App {
                     } else {
                         0
                     },
-                    parent: v.parent.filter(|&id| self.view(id).is_some()),
+                    parent: v.parent,
                 }
             })
             .collect();

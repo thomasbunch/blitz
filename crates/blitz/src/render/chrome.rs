@@ -418,25 +418,23 @@ pub fn build(m: &ChromeModel) -> Chrome {
     let (side, bh) = (area.x, h - area.bottom());
     let session = |id: PaneId| m.sessions.iter().find(|x| x.id == id);
     // A tab's sessions in reading order, as its panes sit, each followed
-    // by the ones it opened, depth first. One opened from another tab
-    // takes its place in reading order.
-    let members = |t: &Tab| -> Vec<&Session> {
+    // by the ones it opened, depth first, with how many steps in its row
+    // sits: one a level, up to two. One opened from another tab takes its
+    // place in reading order, a step in, however deep its opener sits.
+    let members = |t: &Tab| -> Vec<(&Session, i32)> {
         let list: Vec<&Session> = t.panes().into_iter().filter_map(session).collect();
         let top = |x: &Session| x.parent.is_none_or(|p| list.iter().all(|y| y.id != p));
-        let mut stack: Vec<&Session> = list.iter().rev().filter(|x| top(x)).copied().collect();
+        let mut stack: Vec<(&Session, i32)> = (list.iter().rev())
+            .filter(|x| top(x))
+            .map(|&x| (x, x.parent.is_some() as i32))
+            .collect();
         let mut out = Vec::new();
-        while let Some(x) = stack.pop() {
-            out.push(x);
-            stack.extend(list.iter().rev().filter(|y| y.parent == Some(x.id)));
+        while let Some((x, d)) = stack.pop() {
+            out.push((x, d));
+            let opened = list.iter().rev().filter(|y| y.parent == Some(x.id));
+            stack.extend(opened.map(|&y| (y, (d + 1).min(2))));
         }
         out
-    };
-    // How far in a session's row sits: a step for the session that
-    // opened it, and another when a session opened that one.
-    let depth = |x: &Session| {
-        std::iter::successors(x.parent, |&p| session(p)?.parent)
-            .take(2)
-            .count() as i32
     };
     let p = &mut out.prims;
     let text = |p: &mut Vec<Prim>, x, y, t: &str, color, bold| {
@@ -708,7 +706,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
         // under the pointer. When they do not all fit, every row drops its
         // message, and the sessions that still do not fit are counted in
         // a footer.
-        let groups: Vec<Vec<&Session>> = m.win.tabs.iter().map(members).collect();
+        let groups: Vec<Vec<(&Session, i32)>> = m.win.tabs.iter().map(members).collect();
         let need = |rh: i32| {
             let n = groups.len() as i32;
             let rows = groups.iter().map(Vec::len).sum::<usize>() as i32;
@@ -734,7 +732,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
             let skip = if ti > 0 { s(14.0) } else { 0 };
             // A heading goes only with room for a row under it.
             if y + skip + gh + rh > limit {
-                hidden.extend(list);
+                hidden.extend(list.iter().map(|&(x, _)| x));
                 continue;
             }
             y += skip;
@@ -775,14 +773,14 @@ pub fn build(m: &ChromeModel) -> Chrome {
             out.side.heads.push((ti, head));
             y += gh;
 
-            for &x in list {
+            for &(x, depth) in list {
                 if y + rh > limit {
                     hidden.push(x);
                     continue;
                 }
                 let focused = ti == m.win.active && x.id == t.focus;
                 let bar = x.state == Attn::Working || x.progress.is_some();
-                let indent = depth(x) * s(12.0);
+                let indent = depth * s(12.0);
                 let row = Rect {
                     x: s(8.0) + indent,
                     y,
@@ -954,7 +952,7 @@ pub fn build(m: &ChromeModel) -> Chrome {
                 y += s(12.0);
             }
             let top = y;
-            for x in members(t) {
+            for (x, _) in members(t) {
                 let row = Rect {
                     x: 0,
                     y,
@@ -2552,8 +2550,8 @@ mod tests {
         }
         let c = build(&model(&win, &sessions, now));
         let rows: Vec<_> = c.side.rows.iter().map(|(id, r)| (id.0, r.x)).collect();
-        // Two steps in at most.
-        let want = [(1, 8), (2, 20), (4, 32), (3, 20), (5, 20), (6, 32)];
+        // Two steps in at most, and one for those opened from the other tab.
+        let want = [(1, 8), (2, 20), (4, 32), (3, 20), (5, 20), (6, 20)];
         assert_eq!(rows, want);
         assert!(c.side.rows.iter().all(|(_, r)| r.right() == 230));
         // Each tab keeps its heading, and the focused pane, 4, its tint.
