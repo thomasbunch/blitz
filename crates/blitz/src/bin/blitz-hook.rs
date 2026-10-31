@@ -1,5 +1,6 @@
 //! Claude Code hook command. A console program, so the hook runner can read
-//! its stdout without a window flashing up.
+//! its stdout without a window flashing up. `blitz-hook mcp` is the server
+//! of Claude Code's pane tools.
 //!
 //! blitz copies it into its plugin folder as `blitz`, which panes find on
 //! their PATH: by that name it runs `blitz pane`, waited for in any shell,
@@ -26,6 +27,7 @@ fn main() {
                 }
             }
         }
+        _ if std::env::args().nth(1).as_deref() == Some("mcp") => blitz::control::mcp::run(),
         _ => blitz::hook::run(),
     };
     std::process::exit(code);

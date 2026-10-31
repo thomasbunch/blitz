@@ -351,20 +351,41 @@ const PLUGIN_JSON: &str = concat!(
 );
 
 /// Writes blitz's Claude Code plugin to `dir`: a manifest, and in
-/// `hooks/hooks.json` the hooks of [`claude_settings`], running `hook_exe`.
+/// `hooks/hooks.json` the hooks of [`claude_settings`], running `hook_exe`;
+/// with `tools`, in `.mcp.json`, the pane tools of [`crate::control::mcp`].
 /// Claude Code 2.1.280 and later load it in every pane through
 /// `CLAUDE_CODE_PLUGIN_DIRS`, so nothing needs pasting into its settings.
 /// A file that already holds what it should is left alone, so most starts
 /// write nothing, and one that changes is swapped in whole, so a Claude
 /// Code starting meanwhile never reads half of it.
-pub fn write_plugin(dir: &Path, hook_exe: &str) -> io::Result<()> {
+pub fn write_plugin(dir: &Path, hook_exe: &str, tools: bool) -> io::Result<()> {
     for (name, text) in [
         (".claude-plugin/plugin.json", PLUGIN_JSON.to_owned()),
         ("hooks/hooks.json", claude_settings(hook_exe)),
     ] {
         swap_in(&dir.join(name), text.as_bytes())?;
     }
-    Ok(())
+    let mcp = dir.join(".mcp.json");
+    if tools {
+        return swap_in(&mcp, mcp_json(hook_exe).as_bytes());
+    }
+    match std::fs::remove_file(&mcp) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The plugin's `.mcp.json`: `hook_exe mcp`, handed the pane's token and
+/// pipe by name, as Claude Code can be set to scrub them from what it runs.
+fn mcp_json(hook_exe: &str) -> String {
+    let mut cmd = String::new();
+    escape_json(hook_exe, &mut cmd);
+    format!(
+        "{{\n  \"mcpServers\": {{\n    \"pane\": {{\n      \"command\": \"{cmd}\",\n      \
+         \"args\": [\"mcp\"],\n      \"env\": {{\n        \
+         \"BLITZ_PANE_TOKEN\": \"${{BLITZ_PANE_TOKEN:-}}\",\n        \
+         \"BLITZ_PIPE\": \"${{BLITZ_PIPE:-}}\"\n      }}\n    }}\n  }}\n}}\n"
+    )
 }
 
 /// Writes `bytes` to `path` beside it, then swaps it in; nothing when it
@@ -421,29 +442,30 @@ pub fn install_bin(plugin: &Path, hook: &Path) -> Option<PathBuf> {
 }
 
 /// Writes the plugin where this blitz keeps its state, for the blitz-hook
-/// next to it, and returns its folder; `None` when that cannot be done.
-pub fn install_plugin() -> Option<PathBuf> {
-    plugin_for(&hook_exe().ok()?, &crate::session::dir()?)
+/// next to it, with the pane tools when `tools`, and returns its folder,
+/// or why that cannot be done.
+pub fn install_plugin(tools: bool) -> Result<PathBuf, String> {
+    let hook = hook_exe().map_err(|e| e.to_string())?;
+    let state = crate::session::dir().ok_or("no folder for blitz's state")?;
+    plugin_for(&hook, &state, tools)
 }
 
 /// [`install_plugin`] for the blitz-hook at `hook`, under `state`. Each
 /// blitz-hook has a folder of its own, so a second copy of blitz, such as
 /// a portable one or a release build, never points the panes of the first
-/// at its own. None for a blitz-hook other users can replace, which Claude
-/// Code would run in every session.
-fn plugin_for(hook: &Path, state: &Path) -> Option<PathBuf> {
-    if !hook.is_file() || exposed(hook) {
-        return None;
+/// at its own. Never for a blitz-hook other users can replace, which
+/// Claude Code would run in every session.
+fn plugin_for(hook: &Path, state: &Path, tools: bool) -> Result<PathBuf, String> {
+    if !hook.is_file() {
+        return Err("no blitz-hook next to blitz".into());
+    }
+    if exposed(hook) {
+        return Err("other users can replace blitz-hook".into());
     }
     let hook = hook.to_string_lossy();
     let dir = plugin_dir(state, &hook);
-    match write_plugin(&dir, &hook) {
-        Ok(()) => Some(dir),
-        Err(e) => {
-            eprintln!("blitz: writing the Claude Code plugin: {e}");
-            None
-        }
-    }
+    write_plugin(&dir, &hook, tools).map_err(|e| e.to_string())?;
+    Ok(dir)
 }
 
 /// The plugin folder under `state` for the blitz-hook at `hook`.
@@ -780,6 +802,71 @@ impl Json {
         match self {
             Json::Str(s) => Some(s),
             _ => None,
+        }
+    }
+
+    /// The value under `key` in the JSON object `s`, as `s` writes it: a
+    /// number there can have more digits than a double keeps. With
+    /// duplicate keys the last one wins, as in [`Json::get`].
+    pub fn raw<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+        Json::parse(s)?.get(key)?;
+        let mut p = Parser { s, i: 0 };
+        p.eat(b'{');
+        let mut found = None;
+        loop {
+            p.ws();
+            let k = p.string()?;
+            p.eat(b':');
+            p.ws();
+            let start = p.i;
+            p.value(1)?;
+            if k == key {
+                found = Some(&s[start..p.i]);
+            }
+            if !p.eat(b',') {
+                return found;
+            }
+        }
+    }
+
+    /// Appends this value to `out` as JSON text. A number too big for a
+    /// double, which parsed as infinite, is written as null.
+    pub fn write(&self, out: &mut String) {
+        let quoted = |s: &str, out: &mut String| {
+            out.push('"');
+            escape_json(s, out);
+            out.push('"');
+        };
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Num(n) if n.is_finite() => {
+                let _ = write!(out, "{n}");
+            }
+            Json::Num(_) => out.push_str("null"),
+            Json::Str(s) => quoted(s, out),
+            Json::Arr(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(m) => {
+                out.push('{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    quoted(k, out);
+                    out.push(':');
+                    v.write(out);
+                }
+                out.push('}');
+            }
         }
     }
 }
@@ -1252,42 +1339,65 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blitz-plugin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let exe = r"C:\Program Files\blitz\blitz-hook.exe";
-        write_plugin(&dir, exe).expect("first write");
+        write_plugin(&dir, exe, true).expect("first write");
         let manifest = std::fs::read_to_string(dir.join(".claude-plugin/plugin.json")).unwrap();
         let manifest = Json::parse(&manifest).expect("manifest is JSON");
+        // Claude Code names the tools mcp__plugin_blitz_pane__*.
         assert_eq!(manifest.get("name").and_then(Json::as_str), Some("blitz"));
         let hooks = dir.join("hooks/hooks.json");
         assert_eq!(
             std::fs::read_to_string(&hooks).unwrap(),
             claude_settings(exe)
         );
+        let mcp = dir.join(".mcp.json");
+        let servers = Json::parse(&std::fs::read_to_string(&mcp).unwrap()).expect("JSON");
+        let pane = servers.get("mcpServers").and_then(|s| s.get("pane"));
+        let field = |k| pane.and_then(|p| p.get(k)).cloned();
+        assert_eq!(field("command"), Some(Json::Str(exe.into())));
+        assert_eq!(
+            field("args"),
+            Some(Json::Arr(vec![Json::Str("mcp".into())]))
+        );
+        let env = field("env").expect("env");
+        for k in ["BLITZ_PANE_TOKEN", "BLITZ_PIPE"] {
+            let want = format!("${{{k}:-}}");
+            assert_eq!(env.get(k).and_then(Json::as_str), Some(want.as_str()));
+        }
 
         // Unchanged, it is not written again: a read-only file would fail.
         // Elsewhere a rename replaces a read-only file all the same.
         #[cfg(windows)]
         {
             let readonly = |on: bool| {
-                for f in [&hooks, &dir.join(".claude-plugin/plugin.json")] {
+                for f in [&hooks, &dir.join(".claude-plugin/plugin.json"), &mcp] {
                     let mut p = std::fs::metadata(f).unwrap().permissions();
                     p.set_readonly(on);
                     std::fs::set_permissions(f, p).unwrap();
                 }
             };
             readonly(true);
-            let again = write_plugin(&dir, exe);
+            let again = write_plugin(&dir, exe, true);
             readonly(false);
             again.expect("nothing to write");
         }
 
         // blitz moved: the hooks follow, and no temporary file stays.
+        // Without the pane tools there is no `.mcp.json`.
         let moved = r"D:\tools\blitz\blitz-hook.exe";
-        write_plugin(&dir, moved).expect("rewrite");
+        write_plugin(&dir, moved, false).expect("rewrite");
         assert_eq!(
             std::fs::read_to_string(&hooks).unwrap(),
             claude_settings(moved)
         );
+        assert!(!mcp.exists());
+        write_plugin(&dir, moved, false).expect("nothing to remove");
         let left: Vec<_> = std::fs::read_dir(dir.join("hooks")).unwrap().collect();
         assert_eq!(left.len(), 1);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no temporary file"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1632,6 +1742,21 @@ mod tests {
         assert_eq!(v.get("f"), Some(&Json::Obj(vec![])));
         assert_eq!(v.get("zz"), None);
         assert_eq!(Json::parse("\"x\"").unwrap().get("x"), None);
+        let mut text = String::new();
+        v.write(&mut text);
+        assert_eq!(
+            text,
+            r#"{"a":[1,-2500,true,false,null],"b":{"c":"d"},"e":[],"f":{}}"#
+        );
+        let mut big = String::new();
+        Json::parse(r#"[1e999,"\u001b"]"#).unwrap().write(&mut big);
+        assert_eq!(big, r#"[null,"\u001b"]"#);
+        let raw = |s| Json::raw(s, "id");
+        assert_eq!(raw(r#" {"a": {"id": 1}, "id" : 1e999 } "#), Some("1e999"));
+        assert_eq!(raw(r#"{"id": 1, "id": "2"}"#), Some(r#""2""#));
+        assert_eq!(raw(r#"{"a": {"id": 1}}"#), None);
+        assert_eq!(raw(r#"[{"id": 1}]"#), None);
+        assert_eq!(raw(r#"{"id": 1"#), None);
     }
 
     #[test]
@@ -1798,11 +1923,11 @@ mod tests {
         let hook = dir.join("blitz-hook.exe");
         let made = std::fs::write(&hook, "");
         let state = dir.with_extension("state");
-        let plugin = plugin_for(&hook, &state);
+        let plugin = plugin_for(&hook, &state, true);
         let _ = std::fs::remove_file(&hook);
         let _ = std::fs::remove_dir(&dir);
         made.expect("blitz-hook");
-        assert_eq!(plugin, None);
+        assert!(plugin.is_err(), "{plugin:?}");
         assert!(!state.exists());
         for (grant, got, want) in seen {
             assert_eq!(got, want, "after {grant}");

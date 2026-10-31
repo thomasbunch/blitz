@@ -1849,7 +1849,9 @@ impl App {
         crate::handoff::install(self.hwnd, self.proxy.clone(), self.args.main());
         crate::notify::install(self.hwnd, self.proxy.clone());
         watch_settings(self.proxy.clone());
-        let plugin = crate::hook::install_plugin();
+        let plugin = crate::hook::install_plugin(self.config.claude_pane_tools)
+            .inspect_err(|e| eprintln!("blitz: writing the Claude Code plugin: {e}"))
+            .ok();
         // `blitz pane` in every pane, found after the programs on its PATH.
         if let (Some(dir), Ok(hook)) = (&plugin, crate::hook::hook_exe())
             && let Some(bin) = crate::hook::install_bin(dir, &hook)
@@ -3222,6 +3224,7 @@ impl App {
             self.font_zoom = 0.0;
         }
         let jump = c.global_jump != self.config.global_jump;
+        let tools = c.claude_pane_tools != self.config.claude_pane_tools;
         // The banner, and an update left for when blitz closes, go with
         // the checks; looks stop at the next start.
         if self.config.check_updates && !c.check_updates {
@@ -3235,6 +3238,32 @@ impl App {
         self.config = c;
         if jump {
             self.global_jump();
+        }
+        // Claude Code sessions started from now on get the pane tools, or
+        // not. Without a plugin they get none either way.
+        let on = self.config.claude_pane_tools;
+        if tools
+            && self.plugin.is_some()
+            && let Err(e) = crate::hook::install_plugin(on)
+        {
+            // What it means first, as the panel shows one line.
+            let text = if on {
+                format!("Cannot add the pane tools: {e}")
+            } else {
+                format!("New Claude Code sessions keep the pane tools: {e}")
+            };
+            let focus = self.focus_id();
+            match (&mut self.settings, focus) {
+                // Before a save that failed too, which the line may cut.
+                (Some(p), _) => {
+                    p.error = Some(match p.error.take() {
+                        Some(was) => format!("{text}. {was}"),
+                        None => text,
+                    })
+                }
+                (None, Some(id)) => self.error(id, &text),
+                (None, None) => {}
+            }
         }
         self.keep_awake();
         if font {

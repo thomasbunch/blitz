@@ -74,6 +74,12 @@ people who use blitz.
   read what they show. A program reaches only the panes it opened, never
   types into one waiting for you, and its panes are not saved with the
   window while it is open.
+- Claude Code sessions get the same as tools: `open`, `send`, `read`,
+  `list` and `close`, for the panes the session opened. Claude Code asks
+  before it first uses each; allowing `open` or `send` for good is
+  broader than allowing Bash, as Claude Code's Bash rules and sandbox do
+  not apply to what runs in a pane. **Pane tools for Claude Code** in the
+  settings turns them off.
 
 ### Agent teams
 
