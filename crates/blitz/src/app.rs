@@ -3589,6 +3589,7 @@ impl App {
                     } else {
                         0
                     },
+                    parent: v.parent,
                 }
             })
             .collect();
@@ -10964,6 +10965,7 @@ mod tests {
             progress: None,
             exit_code: None,
             below: 0,
+            parent: None,
         };
         assert_eq!(
             toast_text(&s(Attn::NeedsYou), false),
@@ -11773,6 +11775,7 @@ mod tests {
             progress: None,
             exit_code: None,
             below: 0,
+            parent: None,
         };
         let a = s(1, "claude 1", r"C:\dev\shop", Some("main"));
         assert_eq!(session_row(&a), "claude 1 \u{b7} shop \u{b7} main");
