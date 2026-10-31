@@ -31,8 +31,8 @@ const INSTRUCTIONS: &str = "Panes in blitz, the terminal this session runs in. o
 
 /// What `tools/list` lists, in its order.
 const TOOLS: &str = concat!(
-    r#"[{"name":"list","description":"Lists the blitz panes this session opened, and the panes "#,
-    r#"those opened: ID, name, state and folder.","#,
+    r#"[{"name":"list","description":"Lists the blitz panes this session opened, its agent "#,
+    r#"teammates among them, and the panes those opened: ID, name, state and folder.","#,
     r#""inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}},"#,
     r#"{"name":"open","description":"Opens a shell in a new blitz pane beside this session's "#,
     r#"pane, or in a tab after it, and returns its ID. The pane tools work only on panes this "#,
