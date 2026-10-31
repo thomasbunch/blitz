@@ -81,7 +81,9 @@ jobs:
                   if kind not in (b'VP8 ', b'VP8L', b'VP8X', b'ALPH'):
                       bad.append(f'{p}: a {kind!r} chunk')
                   i += 8 + size + (size & 1)
-              if i != len(b):
+              if i > len(b):
+                  bad.append(f'{p}: a chunk runs past the end of the file')
+              elif i < len(b):
                   bad.append(f'{p}: bytes after the last chunk')
           if bad:
               print('::error::README pictures with more than an image in them:', *bad, sep='\n')
