@@ -3,10 +3,30 @@
 A fast terminal for running several Claude Code sessions, or any other
 shells, side by side, and seeing at a glance which one is waiting for you.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/readme/hero-dark.webp">
+    <img src=".github/readme/hero-light.webp" width="880" alt="A blitz window: a sidebar of Claude Code sessions marked working, done, needs you and error, beside panes of git log, cargo test and a diff, with a tab of agent teammates behind it">
+  </picture>
+</p>
+
+<p align="center">
+  <a href="https://github.com/thomasbunch/blitz/releases/latest"><b>Download</b></a>
+  for Windows, macOS or Linux (experimental) &middot;
+  <a href="#install">Install</a> &middot;
+  <a href="#claude-code">Claude Code</a> &middot;
+  <a href="#let-agents-drive-it">Agents</a> &middot;
+  <a href="#default-keys">Keys</a>
+</p>
+
 > **Early alpha.** Windows and macOS; Linux builds are experimental and
 > untested. Expect rough edges and missing features.
 
 - Tabs and splits; every pane is its own shell.
+- Claude Code's agent teams, on Windows too: each teammate opens as a
+  blitz pane, in a tab of its own.
+- Scripts and agents open, type into and read panes of their own with
+  `blitz pane`, and Claude Code sessions get the same as tools.
 - With two or more sessions, a sidebar lists them with their directory,
   git branch and state: *needs you*, *working*, *done*, *error*.
   Ctrl+Shift+B collapses it to a narrow rail of status dots, and a click
@@ -16,6 +36,7 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   there. Panes a program opened are listed under its session, indented.
   Sessions that do not fit are counted at the foot, in the accent
   colour when one of them needs you, and a click there goes to it.
+  Panes a session's program opened are listed under it.
 - Claude Code's title tells blitz when a session works and when it
   stops, and its hooks, which blitz sets up itself, when it needs input.
   The window title starts with how many need you, as in `(2) pwsh`. If
@@ -38,6 +59,33 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   screenshot into Claude Code.
 - Direct3D 11 and DirectWrite rendering on Windows, with a software
   fallback; Metal on macOS and Vulkan or OpenGL on Linux, through wgpu.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/readme/layers-dark.webp">
+    <img src=".github/readme/layers-light.webp" width="820" alt="A blitz window taken apart in layers: the sidebar, the panes, the panes a program opened, and a tab of agent teammates">
+  </picture>
+</p>
+
+## Let agents drive it
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/readme/flow-dark.webp">
+    <img src=".github/readme/flow-light.webp" width="820" alt="Agent teams, scripts and Claude Code each reach blitz, which opens and drives panes for them">
+  </picture>
+</p>
+
+Three ways in, and one rule: a program reaches only the panes it opened,
+and the panes those opened, never yours.
+
+- **[Agent teams](#agent-teams)**: `claude --teammate-mode tmux` opens
+  each teammate as a blitz pane, through a stand-in for tmux that blitz
+  puts on the PATH of its panes.
+- **[Scripting panes](#scripting-panes)**: `blitz pane split`, `tab`,
+  `send`, `read`, `list` and `close`, from any shell in blitz.
+- **[Pane tools](#pane-tools)**: every Claude Code session gets `open`,
+  `send`, `read`, `list` and `close` as tools, unless you turn them off.
 
 ## Install
 

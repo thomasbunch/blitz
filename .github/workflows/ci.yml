@@ -57,7 +57,7 @@ jobs:
       - name: Only expected kinds of files are tracked
         run: |
           ok='\.gitignore|\.gitattributes|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|LICENSE|README\.md|CHANGELOG\.md'
-          ok="$ok|\.cargo/config\.toml|\.github/workflows/[a-z0-9-]+\.yml|\.github/(blitz\.iss|about\.toml|about\.hbs|dependabot\.yml)"
+          ok="$ok|\.cargo/config\.toml|\.github/workflows/[a-z0-9-]+\.yml|\.github/(blitz\.iss|about\.toml|about\.hbs|dependabot\.yml)|\.github/readme/[a-z]+-(dark|light)\.webp"
           ok="$ok|crates/[a-z0-9-]+/(Cargo\.toml|build\.rs)|crates/[a-z0-9-]+/(src|tests|examples)/.+\.rs"
           ok="$ok|crates/[a-z0-9-]+/tests/.+\.vt|crates/blitz/src/render/[a-z0-9_]+\.(hlsl|wgsl)"
           ok="$ok|crates/blitz/icon/blitz\.(ico|svg)|crates/blitz/themes/[a-z0-9-]+"
