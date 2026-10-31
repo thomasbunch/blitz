@@ -4,7 +4,34 @@ What changes in each blitz release. The newest release comes first. A
 release's section here becomes its notes on GitHub, so write it for the
 people who use blitz.
 
-## [Unreleased]
+## [0.0.6] - 2026-10-31
+
+Agents can drive blitz now: Claude Code's agent teams open as blitz
+panes, on Windows too, and scripts and Claude Code sessions open, type
+into and read panes of their own. Also a panel for every key, a files
+view, fifteen new themes and what Claude Code usage would cost.
+
+### Agent teams
+
+- **New agent team** in the command palette starts Claude Code with its
+  agent teammates as blitz panes, in a tab beside the lead laid out as a
+  grid, while the lead keeps focus. `"teammateMode": "tmux"` in Claude
+  Code's settings does the same for every session. A real tmux on the
+  PATH still comes first.
+
+### Scripting panes
+
+- `blitz pane split`, `tab`, `send`, `read`, `list` and `close` let a
+  script or an agent in a pane open panes of its own, type into them and
+  read what they show. A program reaches only the panes it opened, never
+  types into one waiting for you, and its panes are not saved with the
+  window while it is open.
+- Claude Code sessions get the same as tools: `open`, `send`, `read`,
+  `list` and `close`, for the panes the session opened. Claude Code asks
+  before it first uses each; allowing `open` or `send` for good is
+  broader than allowing Bash, as Claude Code's Bash rules and sandbox do
+  not apply to what runs in a pane. **Pane tools for Claude Code** in the
+  settings turns them off.
 
 ### Keys
 
@@ -66,28 +93,6 @@ people who use blitz.
 - The week follows your plan's weekly reset, set with `usage_reset_day`
   and `usage_reset_hour`, and the expanded sidebar shows the week's
   figure at its foot.
-
-### Scripting panes
-
-- `blitz pane split`, `tab`, `send`, `read`, `list` and `close` let a
-  script or an agent in a pane open panes of its own, type into them and
-  read what they show. A program reaches only the panes it opened, never
-  types into one waiting for you, and its panes are not saved with the
-  window while it is open.
-- Claude Code sessions get the same as tools: `open`, `send`, `read`,
-  `list` and `close`, for the panes the session opened. Claude Code asks
-  before it first uses each; allowing `open` or `send` for good is
-  broader than allowing Bash, as Claude Code's Bash rules and sandbox do
-  not apply to what runs in a pane. **Pane tools for Claude Code** in the
-  settings turns them off.
-
-### Agent teams
-
-- **New agent team** in the command palette starts Claude Code with its
-  agent teammates as blitz panes, in a tab beside the lead laid out as a
-  grid, while the lead keeps focus. `"teammateMode": "tmux"` in Claude
-  Code's settings does the same for every session. A real tmux on the
-  PATH still comes first.
 
 ## [0.0.5] - 2026-10-15
 
@@ -240,6 +245,7 @@ for macOS. Linux builds are experimental.
   *done* marks for Claude Code, Direct3D 11 and DirectWrite rendering, and
   Microsoft's ConPTY bundled for low input latency.
 
+[0.0.6]: https://github.com/thomasbunch/blitz/releases/tag/v0.0.6
 [0.0.5]: https://github.com/thomasbunch/blitz/releases/tag/v0.0.5
 [0.0.4]: https://github.com/thomasbunch/blitz/releases/tag/v0.0.4
 [0.0.3]: https://github.com/thomasbunch/blitz/releases/tag/v0.0.3
