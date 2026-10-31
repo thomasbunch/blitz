@@ -13,7 +13,8 @@ shells, side by side, and seeing at a glance which one is waiting for you.
   on the rail expands it again; double-clicking a session's row in
   either does both. A window under 800 pixels wide (at 100%
   scaling) shows the rail. Click a session or a tab's heading to go
-  there. Sessions that do not fit are counted at the foot, in the accent
+  there. Panes a program opened are listed under its session, indented.
+  Sessions that do not fit are counted at the foot, in the accent
   colour when one of them needs you, and a click there goes to it.
 - Claude Code's title tells blitz when a session works and when it
   stops, and its hooks, which blitz sets up itself, when it needs input.
