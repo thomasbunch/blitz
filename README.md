@@ -193,8 +193,9 @@ the panes the session opened, and the panes those opened: never yours,
 nor the session's own.
 
 Claude Code asks you before it first uses each tool, as for any other.
-**Allowing `open` or `send` for good is as broad as allowing Bash:**
-Claude can then run any command in a shell without asking. `list` and
+**Allowing `open` or `send` for good is broader than allowing Bash:**
+Claude can then run any command in a shell without asking, and Claude
+Code's Bash rules and sandbox do not apply to what runs there. `list` and
 `read` only look. In permission rules the tools are
 `mcp__plugin_blitz_pane__open` and so on, and `/mcp` lists them under
 `plugin:blitz:pane`.

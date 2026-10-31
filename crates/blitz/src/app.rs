@@ -3154,9 +3154,21 @@ impl App {
         if jump {
             self.global_jump();
         }
-        // Claude Code sessions started from now on load the plugin so.
-        if tools {
-            crate::hook::install_plugin(self.config.claude_pane_tools);
+        // Claude Code sessions started from now on get the pane tools, or
+        // not. Without a plugin they get none either way.
+        let on = self.config.claude_pane_tools;
+        if tools && self.plugin.is_some() && crate::hook::install_plugin(on).is_none() {
+            let text = if on {
+                "Cannot add the pane tools to the Claude Code plugin"
+            } else {
+                "Cannot take the pane tools out of the Claude Code plugin; new sessions keep them"
+            };
+            let focus = self.focus_id();
+            match (&mut self.settings, focus) {
+                (Some(p), _) => p.error = Some(text.into()),
+                (None, Some(id)) => self.error(id, text),
+                (None, None) => {}
+            }
         }
         self.keep_awake();
         if font {

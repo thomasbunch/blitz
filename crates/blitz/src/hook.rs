@@ -796,6 +796,30 @@ impl Json {
         }
     }
 
+    /// The value under `key` in the JSON object `s`, as `s` writes it: a
+    /// number there can have more digits than a double keeps. With
+    /// duplicate keys the last one wins, as in [`Json::get`].
+    pub fn raw<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+        Json::parse(s)?.get(key)?;
+        let mut p = Parser { s, i: 0 };
+        p.eat(b'{');
+        let mut found = None;
+        loop {
+            p.ws();
+            let k = p.string()?;
+            p.eat(b':');
+            p.ws();
+            let start = p.i;
+            p.value(1)?;
+            if k == key {
+                found = Some(&s[start..p.i]);
+            }
+            if !p.eat(b',') {
+                return found;
+            }
+        }
+    }
+
     /// Appends this value to `out` as JSON text. A number too big for a
     /// double, which parsed as infinite, is written as null.
     pub fn write(&self, out: &mut String) {
@@ -1713,6 +1737,12 @@ mod tests {
         let mut big = String::new();
         Json::parse(r#"[1e999,"\u001b"]"#).unwrap().write(&mut big);
         assert_eq!(big, r#"[null,"\u001b"]"#);
+        let raw = |s| Json::raw(s, "id");
+        assert_eq!(raw(r#" {"a": {"id": 1}, "id" : 1e999 } "#), Some("1e999"));
+        assert_eq!(raw(r#"{"id": 1, "id": "2"}"#), Some(r#""2""#));
+        assert_eq!(raw(r#"{"a": {"id": 1}}"#), None);
+        assert_eq!(raw(r#"[{"id": 1}]"#), None);
+        assert_eq!(raw(r#"{"id": 1"#), None);
     }
 
     #[test]

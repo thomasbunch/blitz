@@ -74,9 +74,10 @@ people who use blitz.
   window while it is open.
 - Claude Code sessions get the same as tools: `open`, `send`, `read`,
   `list` and `close`, for the panes the session opened. Claude Code asks
-  before it first uses each; allowing `open` or `send` for good is as
-  broad as allowing Bash. **Pane tools for Claude Code** in the settings
-  turns them off.
+  before it first uses each; allowing `open` or `send` for good is
+  broader than allowing Bash, as Claude Code's Bash rules and sandbox do
+  not apply to what runs in a pane. **Pane tools for Claude Code** in the
+  settings turns them off.
 
 ## [0.0.5] - 2026-10-15
 

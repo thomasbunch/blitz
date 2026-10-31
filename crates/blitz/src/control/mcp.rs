@@ -106,7 +106,11 @@ pub fn answer(line: &str, call: &dyn Fn(&str) -> Result<Json, String>) -> Option
     let Some(msg) = Json::parse(line) else {
         return Some(reply("null", Err((-32700, "Parse error", None))));
     };
-    let (Some(method), Some(id)) = (msg.get("method").and_then(Json::as_str), msg.get("id")) else {
+    // The id goes back as it came, as a double cannot hold every number.
+    let (Some(method), Some(id)) = (
+        msg.get("method").and_then(Json::as_str),
+        Json::raw(line, "id"),
+    ) else {
         return None;
     };
     let params = msg.get("params");
@@ -141,9 +145,7 @@ pub fn answer(line: &str, call: &dyn Fn(&str) -> Result<Json, String>) -> Option
         ("tools/call", _) => tool(params, call),
         _ => Err((-32601, "Method not found", None)),
     };
-    let mut id_text = String::new();
-    id.write(&mut id_text);
-    Some(reply(&id_text, outcome))
+    Some(reply(id, outcome))
 }
 
 /// The JSON-RPC line answering request `id` with `outcome`.
@@ -299,8 +301,8 @@ mod tests {
             answer(&line, &|_| panic!("no tool call"))
         };
         assert_eq!(
-            ping("12345678901").as_deref(),
-            Some(r#"{"jsonrpc":"2.0","id":12345678901,"result":{}}"#)
+            ping("12345678901234567891").as_deref(),
+            Some(r#"{"jsonrpc":"2.0","id":12345678901234567891,"result":{}}"#)
         );
         assert_eq!(
             ping(r#""a\"b""#).as_deref(),
