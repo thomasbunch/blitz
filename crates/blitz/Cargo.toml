@@ -26,7 +26,7 @@ libc = "=0.2.191"
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "gles", "wgsl"] }
 swash = "=0.2.10"
 fontdb = { version = "=0.24.0", default-features = false, features = ["std", "fs", "fontconfig"] }
-pollster = "=1.0.1"
+pollster = "=1.0.2"
 
 # The versions winit already uses, so AppKit is linked once.
 [target.'cfg(target_os = "macos")'.dependencies]
